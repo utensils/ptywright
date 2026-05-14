@@ -85,7 +85,7 @@ pub struct ScreenSnapshot {
 }
 ```
 
-The `sequence` increments as PTY output is processed or the terminal is resized. Matchers report the sequence they observed. `plain_text` remains the easiest matcher surface; `cells` expose row/column text, color/style flags, and wide-character metadata for adapters that need structured screen inspection.
+The `sequence` increments as PTY output is processed or the terminal is resized. Matchers report the sequence they observed. `plain_text` remains the easiest matcher surface; `cells` expose row/column text, color/style flags, and wide-character metadata for adapters that need structured screen inspection. `title` is populated from terminal OSC title sequences when applications set one.
 
 ## Actions and keys
 
