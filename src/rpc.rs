@@ -54,7 +54,12 @@ struct CreateParams {
 #[derive(Debug, Deserialize)]
 struct SessionParams {
     session: String,
-    /// Whether to redact sensitive-looking output fields. Defaults to true for read methods.
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionReadParams {
+    session: String,
+    /// Whether to redact sensitive-looking output fields. Defaults to true.
     redact: Option<bool>,
 }
 
@@ -408,7 +413,7 @@ impl RpcServer {
         &self,
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: SessionParams = parse_params(params)?;
+        let params: SessionReadParams = parse_params(params)?;
         let mut snapshot = self.session(&params.session)?.snapshot();
         if params.redact.unwrap_or(true) {
             snapshot = snapshot.redacted(&RedactionPolicy::default());
@@ -421,7 +426,7 @@ impl RpcServer {
         &self,
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: SessionParams = parse_params(params)?;
+        let params: SessionReadParams = parse_params(params)?;
         let session = self.session(&params.session)?;
         let text = if params.redact.unwrap_or(true) {
             session.redacted_transcript(&RedactionPolicy::default())

@@ -80,9 +80,35 @@ impl ScreenSnapshot {
         let mut snapshot = self.clone();
         snapshot.plain_text = policy.redact(&snapshot.plain_text);
         snapshot.title = snapshot.title.map(|title| policy.redact(&title));
-        for cell in &mut snapshot.cells {
-            cell.text = policy.redact(&cell.text);
+
+        for row in 0..snapshot.size.rows {
+            let row_text = snapshot
+                .cells
+                .iter()
+                .filter(|cell| cell.row == row)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>();
+            let redacted_row = policy.redact(&row_text);
+            if redacted_row != row_text {
+                for cell in snapshot.cells.iter_mut().filter(|cell| cell.row == row) {
+                    cell.text.clear();
+                }
+                for (col, character) in redacted_row
+                    .chars()
+                    .take(snapshot.size.cols as usize)
+                    .enumerate()
+                {
+                    if let Some(cell) = snapshot
+                        .cells
+                        .iter_mut()
+                        .find(|cell| cell.row == row && cell.col == col as u16)
+                    {
+                        cell.text = character.to_string();
+                    }
+                }
+            }
         }
+
         snapshot
     }
 }
@@ -279,7 +305,15 @@ mod tests {
         terminal.process(b"\x1b]2;token=title-secret\x07password=hunter2");
 
         let snapshot = terminal.snapshot(1).redacted(&RedactionPolicy::default());
+        let cell_text = snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+
         assert!(!snapshot.plain_text.contains("hunter2"));
+        assert!(!cell_text.contains("hunter2"));
+        assert!(cell_text.contains("password=[REDACTED]"));
         assert_eq!(snapshot.title.as_deref(), Some("token=[REDACTED]"));
     }
 }
