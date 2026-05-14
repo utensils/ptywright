@@ -9,6 +9,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::action::{Action, Key};
 use crate::error::{Error, Result};
 use crate::matcher::{MatchResult, Matcher, MatcherContext};
+use crate::redaction::RedactionPolicy;
 use crate::screen::{ScreenSnapshot, Terminal};
 use crate::target::{Target, TerminalSize};
 use crate::transcript::{Transcript, TranscriptConfig};
@@ -151,6 +152,12 @@ impl Session {
             .expect("session state poisoned")
             .transcript
             .text()
+    }
+
+    /// Return the retained transcript text with sensitive-looking values redacted.
+    #[must_use]
+    pub fn redacted_transcript(&self, policy: &RedactionPolicy) -> String {
+        policy.redact(&self.transcript())
     }
 
     /// Send an action to the session.
