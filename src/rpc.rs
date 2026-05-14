@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,6 +23,9 @@ pub struct RpcServer {
     claude_adapters: HashMap<String, ClaudeCodeAdapter>,
     next_session: u64,
     next_claude_adapter: u64,
+    notifications_enabled: bool,
+    last_notified_sequences: HashMap<String, u64>,
+    notified_exits: HashSet<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +113,11 @@ struct PluginManifestParams {
     manifest: PluginManifest,
 }
 
+#[derive(Debug, Deserialize)]
+struct NotificationsParams {
+    enabled: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RpcErrorCode {
     ParseError,
@@ -144,6 +152,9 @@ impl RpcServer {
             claude_adapters: HashMap::new(),
             next_session: 1,
             next_claude_adapter: 1,
+            notifications_enabled: false,
+            last_notified_sequences: HashMap::new(),
+            notified_exits: HashSet::new(),
         }
     }
 
@@ -179,6 +190,54 @@ impl RpcServer {
         }
     }
 
+    /// Handle one message and return the response plus any enabled notifications.
+    pub fn handle_line_messages(&mut self, line: &str) -> Result<Vec<String>> {
+        let mut messages = Vec::new();
+        if let Some(response) = self.handle_line(line)? {
+            messages.push(response);
+        }
+        if self.notifications_enabled {
+            messages.extend(self.poll_notifications()?);
+        }
+        Ok(messages)
+    }
+
+    fn poll_notifications(&mut self) -> Result<Vec<String>> {
+        let mut messages = Vec::new();
+        let mut ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+
+        for id in ids {
+            let Some(session) = self.sessions.get(&id) else {
+                continue;
+            };
+            let sequence = session.sequence();
+            if self.last_notified_sequences.get(&id).copied() != Some(sequence) {
+                self.last_notified_sequences.insert(id.clone(), sequence);
+                messages.push(serialize_response(json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session.changed",
+                    "params": {
+                        "session": id,
+                        "sequence": sequence,
+                    },
+                }))?);
+            }
+            if session.is_finished() && self.notified_exits.insert(id.clone()) {
+                messages.push(serialize_response(json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session.exited",
+                    "params": {
+                        "session": id,
+                        "sequence": sequence,
+                    },
+                }))?);
+            }
+        }
+
+        Ok(messages)
+    }
+
     fn handle_request(
         &mut self,
         request: Request,
@@ -200,9 +259,10 @@ impl RpcServer {
             "server.capabilities" => Ok(json!({
                 "name": NAME,
                 "version": VERSION,
-                "framing": "ndjson",
+                "framing": ["ndjson", "lsp"],
                 "methods": [
                     "server.capabilities",
+                    "server.set_notifications",
                     "session.create",
                     "session.list",
                     "session.close",
@@ -222,8 +282,9 @@ impl RpcServer {
                     "plugin.capabilities",
                     "plugin.validate_manifest"
                 ],
-                "notifications": []
+                "notifications": ["session.changed", "session.exited"]
             })),
+            "server.set_notifications" => self.server_set_notifications(request.params),
             "session.create" => self.session_create(request.params),
             "session.list" => Ok(self.session_list()),
             "session.close" => self.session_close(request.params),
@@ -247,6 +308,15 @@ impl RpcServer {
                 format!("unknown method: {method}"),
             )),
         }
+    }
+
+    fn server_set_notifications(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: NotificationsParams = parse_params(params)?;
+        self.notifications_enabled = params.enabled;
+        Ok(json!({ "enabled": self.notifications_enabled }))
     }
 
     fn session_create(
@@ -282,6 +352,8 @@ impl RpcServer {
         let params: SessionParams = parse_params(params)?;
         if let Some(session) = self.sessions.remove(&params.session) {
             let _ = session.kill();
+            self.last_notified_sequences.remove(&params.session);
+            self.notified_exits.remove(&params.session);
             Ok(json!({ "closed": true }))
         } else {
             Err((
@@ -531,12 +603,71 @@ pub fn serve_ndjson(input: impl Read, mut output: impl Write) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = server.handle_line(&line)? {
-            output.write_all(response.as_bytes())?;
+        for message in server.handle_line_messages(&line)? {
+            output.write_all(message.as_bytes())?;
             output.write_all(b"\n")?;
             output.flush()?;
         }
     }
+    Ok(())
+}
+
+/// Run an LSP-style `Content-Length` framed JSON-RPC server over arbitrary streams.
+pub fn serve_lsp(input: impl Read, mut output: impl Write) -> Result<()> {
+    let mut server = RpcServer::new();
+    let mut reader = BufReader::new(input);
+    while let Some(payload) = read_lsp_payload(&mut reader)? {
+        if payload.trim().is_empty() {
+            continue;
+        }
+        for message in server.handle_line_messages(&payload)? {
+            write_lsp_payload(&mut output, &message)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_lsp_payload(reader: &mut impl BufRead) -> Result<Option<String>> {
+    let mut content_length = None;
+    let mut saw_header = false;
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            if saw_header {
+                return Err(Error::Rpc("unexpected EOF in LSP headers".to_string()));
+            }
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        saw_header = true;
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.eq_ignore_ascii_case("Content-Length")
+        {
+            content_length =
+                Some(value.trim().parse::<usize>().map_err(|error| {
+                    Error::Rpc(format!("invalid Content-Length header: {error}"))
+                })?);
+        }
+    }
+
+    let length =
+        content_length.ok_or_else(|| Error::Rpc("missing Content-Length header".to_string()))?;
+    let mut payload = vec![0_u8; length];
+    reader.read_exact(&mut payload)?;
+    String::from_utf8(payload)
+        .map(Some)
+        .map_err(|error| Error::Rpc(format!("LSP payload is not valid UTF-8: {error}")))
+}
+
+fn write_lsp_payload(output: &mut impl Write, payload: &str) -> Result<()> {
+    write!(output, "Content-Length: {}\r\n\r\n", payload.len())?;
+    output.write_all(payload.as_bytes())?;
+    output.flush()?;
     Ok(())
 }
 
@@ -606,8 +737,11 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 1);
-        assert_eq!(response["result"]["framing"], "ndjson");
+        let framing = response["result"]["framing"].as_array().unwrap();
+        assert!(framing.contains(&json!("ndjson")));
+        assert!(framing.contains(&json!("lsp")));
         let methods = response["result"]["methods"].as_array().unwrap();
+        assert!(methods.contains(&json!("server.set_notifications")));
         assert!(methods.contains(&json!("session.create")));
         assert!(methods.contains(&json!("claude.start")));
         assert!(methods.contains(&json!("plugin.validate_manifest")));
@@ -630,6 +764,52 @@ mod tests {
             .expect("handle line");
 
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn notifications_are_explicitly_enabled() {
+        let mut server = RpcServer::new();
+        let messages = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+            )
+            .expect("handle line");
+
+        assert_eq!(messages.len(), 1);
+        let response: Value = serde_json::from_str(&messages[0]).expect("json response");
+        assert_eq!(response["result"]["enabled"], true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn notifications_report_session_changes() {
+        let mut server = RpcServer::new();
+        let _ = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+            )
+            .expect("enable notifications");
+        let create_messages = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","printf event"]}}"#,
+            )
+            .expect("create session");
+        let create_response: Value =
+            serde_json::from_str(&create_messages[0]).expect("json response");
+        let session = create_response["result"]["session"].as_str().unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+        let poll_messages = server
+            .handle_line_messages(&format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"session.snapshot","params":{{"session":"{session}"}}}}"#,
+            ))
+            .expect("snapshot");
+
+        assert!(
+            poll_messages
+                .iter()
+                .any(|message| message.contains("session.changed"))
+        );
     }
 
     #[test]
@@ -682,5 +862,31 @@ mod tests {
             serde_json::from_str::<Value>(lines[1]).unwrap()["result"]["sessions"],
             json!([])
         );
+    }
+
+    #[test]
+    fn serve_lsp_writes_content_length_frames() {
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"session.list"}"#;
+        let input = format!("Content-Length: {}\r\n\r\n{}", request.len(), request);
+        let mut output = Vec::new();
+
+        serve_lsp(input.as_bytes(), &mut output).expect("serve lsp");
+
+        let text = String::from_utf8(output).expect("utf8 output");
+        let (headers, payload) = text.split_once("\r\n\r\n").expect("lsp separator");
+        assert!(headers.contains("Content-Length:"));
+        let response: Value = serde_json::from_str(payload).expect("json payload");
+        assert_eq!(response["result"]["sessions"], json!([]));
+    }
+
+    #[test]
+    fn serve_lsp_skips_notifications_without_response_frames() {
+        let request = r#"{"jsonrpc":"2.0","method":"session.list"}"#;
+        let input = format!("Content-Length: {}\r\n\r\n{}", request.len(), request);
+        let mut output = Vec::new();
+
+        serve_lsp(input.as_bytes(), &mut output).expect("serve lsp");
+
+        assert!(output.is_empty());
     }
 }

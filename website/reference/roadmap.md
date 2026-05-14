@@ -18,19 +18,20 @@ ptywright is early-stage. This roadmap captures the intended shape without promi
 
 ## Terminal observation
 
-- Parse terminal output into screen snapshots.
-- Track cursor, alternate screen, and scrollback where possible.
+- Parse terminal output into rich screen snapshots.
+- Track cursor, alternate screen, terminal modes, cells, styles, and scrollback where possible.
 - Provide transcript-friendly debug output.
 
 ## Orchestration
 
-- Wait for screen/output matchers.
+- Wait for screen/output, stable-screen, and process-exit matchers.
 - Model turn boundaries.
 - Return structured success, timeout, and failure results.
 
 ## Protocol and CLI ergonomics
 
-- JSON-RPC over stdio for external automation clients.
+- JSON-RPC over stdio and Unix sockets for external automation clients with NDJSON and LSP-style framing.
+- Opt-in coalesced session notifications.
 - Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
 - Plugin manifests and host capability reporting.
 

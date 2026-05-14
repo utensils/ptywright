@@ -8,7 +8,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::action::{Action, Key};
 use crate::error::{Error, Result};
-use crate::matcher::{MatchResult, Matcher};
+use crate::matcher::{MatchResult, Matcher, MatcherContext};
 use crate::screen::{ScreenSnapshot, Terminal};
 use crate::target::{Target, TerminalSize};
 use crate::transcript::{Transcript, TranscriptConfig};
@@ -130,6 +130,18 @@ impl Session {
         state.terminal.snapshot(sequence)
     }
 
+    /// Whether the PTY reader or explicit lifecycle state indicates the session has finished.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
+            || !self
+                .shared
+                .state
+                .lock()
+                .expect("session state poisoned")
+                .reader_open
+    }
+
     /// Return the retained transcript text.
     #[must_use]
     pub fn transcript(&self) -> String {
@@ -180,12 +192,24 @@ impl Session {
         let started = Instant::now();
         let deadline = started + timeout;
         let mut guard = self.shared.state.lock().expect("session state poisoned");
+        let mut stable_sequence = self.sequence();
+        let mut stable_since = started;
 
         loop {
             let sequence = self.sequence();
+            if sequence != stable_sequence {
+                stable_sequence = sequence;
+                stable_since = Instant::now();
+            }
+
+            let process_exited = !guard.reader_open || self.shared.closed.load(Ordering::SeqCst);
             let snapshot = guard.terminal.snapshot(sequence);
             let transcript_tail = guard.transcript.tail(16 * 1024);
-            if matcher.is_match(&snapshot, &transcript_tail) {
+            let context = MatcherContext {
+                stable_for: stable_since.elapsed(),
+                process_exited,
+            };
+            if matcher.is_match_with_context(&snapshot, &transcript_tail, context) {
                 return Ok(MatchResult {
                     matched: true,
                     sequence,
@@ -195,7 +219,7 @@ impl Session {
                 });
             }
 
-            if !guard.reader_open || self.shared.closed.load(Ordering::SeqCst) {
+            if process_exited && matcher.minimum_stable_duration().is_none() {
                 return Err(Error::Closed);
             }
 
@@ -203,14 +227,20 @@ impl Session {
             if now >= deadline {
                 return Err(Error::Timeout);
             }
-            let wait_for = deadline.saturating_duration_since(now);
+            let mut wait_for = deadline.saturating_duration_since(now);
+            if let Some(min_stable) = matcher.minimum_stable_duration() {
+                let stable_for = stable_since.elapsed();
+                if stable_for < min_stable {
+                    wait_for = wait_for.min(min_stable - stable_for);
+                }
+            }
             let (next_guard, timeout_result) = self
                 .shared
                 .changed
                 .wait_timeout(guard, wait_for)
                 .expect("session state poisoned");
             guard = next_guard;
-            if timeout_result.timed_out() {
+            if timeout_result.timed_out() && Instant::now() >= deadline {
                 return Err(Error::Timeout);
             }
         }
@@ -314,6 +344,37 @@ mod tests {
 
         assert!(result.snapshot.plain_text.contains("ready"));
         assert!(session.transcript().contains("ready"));
+        assert!(session.wait().expect("wait child").success);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_screen_stable() {
+        let session =
+            Session::spawn_target(Target::new("/bin/sh").args(["-lc", "printf ready; sleep 0.2"]))
+                .expect("spawn session");
+
+        let result = session
+            .wait_for(
+                &Matcher::ScreenStable { min_ms: 50 },
+                Duration::from_secs(5),
+            )
+            .expect("wait for stable screen");
+
+        assert!(result.elapsed >= Duration::from_millis(50));
+        assert!(session.wait().expect("wait child").success);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_process_exited() {
+        let session = Session::spawn_target(echo_target()).expect("spawn session");
+
+        let result = session
+            .wait_for(&Matcher::ProcessExited, Duration::from_secs(5))
+            .expect("wait for process exit");
+
+        assert!(result.snapshot.plain_text.contains("ready"));
         assert!(session.wait().expect("wait child").success);
     }
 }

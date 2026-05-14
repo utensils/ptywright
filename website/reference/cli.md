@@ -25,7 +25,7 @@ ptywright 0.1.0
 
 ## `ptywright run`
 
-Run a command in a headless PTY and print its captured transcript after the command exits.
+Run a command in a headless PTY and bridge stdin/stdout live. This is intended for local debugging and smoke testing; use `serve --stdio` for machine-readable automation.
 
 ```bash
 ptywright run -- /bin/sh -lc 'printf ready'
@@ -44,25 +44,24 @@ Example:
 ptywright run --rows 40 --cols 120 -- /bin/sh -lc 'stty size; printf done'
 ```
 
-Current limitations:
-
-- `run` waits for the child to exit before printing the retained transcript.
-- Live stdin/stdout bridging is planned.
+`run` exits with the child process status when available.
 
 ## `ptywright serve --stdio`
 
-Start the NDJSON-framed JSON-RPC 2.0 server on stdin/stdout.
+Start the JSON-RPC 2.0 server on stdin/stdout.
 
 ```bash
 printf '{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}\n' | ptywright serve --stdio
+ptywright serve --stdio --framing lsp
+ptywright serve --socket /tmp/ptywright.sock
 ```
 
 Rules:
 
-- stdout is protocol-only.
-- stderr is reserved for diagnostics.
-- Each input line is one complete JSON-RPC request or notification.
-- Responses are one compact JSON object per line.
+- `--stdio` uses stdin/stdout. stdout is protocol-only; stderr is reserved for diagnostics.
+- `--socket PATH` listens on a local Unix socket on macOS/Linux. Windows named-pipe support is planned.
+- Default framing is `ndjson`: each input line is one complete JSON-RPC request or notification, and each response/notification is one compact JSON object per line.
+- `--framing lsp` uses `Content-Length: N\r\n\r\n<json>` frames.
 
 See [JSON-RPC](./json-rpc.md) for methods and payloads.
 

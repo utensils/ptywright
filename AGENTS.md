@@ -88,8 +88,8 @@ cargo run -- --help
 
 ## Current architecture
 
-- `src/main.rs` — clap CLI. With no args it prints help; `--version` prints package version; `run` executes a command in a headless PTY and prints the captured transcript; `serve --stdio` exposes JSON-RPC; `completions` generates shell completions.
-- `src/lib.rs` plus modules in `src/` — public library surface for target configuration, PTY sessions, screen snapshots, actions, matchers, transcripts, JSON-RPC, Claude Code adapter primitives, and plugin manifests.
+- `src/main.rs` — clap CLI. With no args it prints help; `--version` prints package version; `run` executes a command in a headless PTY with live stdin/stdout bridging; `serve --stdio` exposes JSON-RPC with NDJSON or LSP-style framing; `serve --socket` exposes a Unix socket on macOS/Linux; `completions` generates shell completions.
+- `src/lib.rs` plus modules in `src/` — public library surface for target configuration, PTY sessions, rich screen snapshots, actions, matchers, transcripts, JSON-RPC, Claude Code adapter primitives, and plugin manifests.
 - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
 - `website/` — VitePress docs site.
 - `.github/workflows/` — CI, docs deploy, and release packaging.
@@ -116,7 +116,7 @@ NIX_CONFIG="access-tokens = github.com=$TOKEN" nix flake update
 
 - Keep docs current when changing public behavior.
 - Document implemented PTY/session behavior as it lands.
-- Mark planned capabilities as planned; do not imply unimplemented live bridging, embedded plugin runtimes, or high-fidelity Claude Code turn detection works today.
+- Mark planned capabilities as planned; do not imply unimplemented Windows named-pipe serving, embedded plugin runtimes, WASM runtime, redaction policy, or high-fidelity Claude Code turn detection works today.
 - Keep install and release docs honest about platform support.
 
 ## Conventions

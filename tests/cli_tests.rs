@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 fn bin() -> Command {
@@ -37,6 +37,31 @@ fn run_executes_command_in_pty() {
 }
 
 #[test]
+#[cfg(unix)]
+fn run_bridges_stdin_to_child() {
+    let mut child = bin()
+        .args(["run", "--", "/bin/sh", "-lc", "read line; printf got:$line"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright run");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"hello\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait ptywright run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("got:hello"));
+}
+
+#[test]
 fn serve_stdio_returns_json_rpc_response() {
     let mut child = bin()
         .args(["serve", "--stdio"])
@@ -66,6 +91,93 @@ fn serve_stdio_returns_json_rpc_response() {
             .unwrap()
             .contains(&serde_json::json!("session.create"))
     );
+}
+
+#[test]
+fn serve_stdio_lsp_returns_json_rpc_response() {
+    let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session.list\"}";
+    let mut child = bin()
+        .args(["serve", "--stdio", "--framing", "lsp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve");
+
+    write!(
+        child.stdin.as_mut().expect("stdin"),
+        "Content-Length: {}\r\n\r\n",
+        request.len()
+    )
+    .expect("write headers");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(request)
+        .expect("write request");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait ptywright serve");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let (_, payload) = stdout.split_once("\r\n\r\n").expect("lsp separator");
+    let response: serde_json::Value = serde_json::from_str(payload).expect("json response");
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["result"]["sessions"], serde_json::json!([]));
+}
+
+#[test]
+#[cfg(unix)]
+fn serve_unix_socket_returns_json_rpc_response() {
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket = std::env::temp_dir().join(format!(
+        "ptywright-test-{}-{unique}.sock",
+        std::process::id()
+    ));
+
+    let mut child = bin()
+        .args(["serve", "--socket"])
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ptywright serve --socket");
+
+    let mut stream = None;
+    for _ in 0..100 {
+        match UnixStream::connect(&socket) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let mut stream = stream.expect("connect to socket");
+    stream
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session.list\"}\n")
+        .expect("write request");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown write");
+    let mut stdout = String::new();
+    stream.read_to_string(&mut stdout).expect("read response");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&socket);
+
+    let response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json response");
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["result"]["sessions"], serde_json::json!([]));
 }
 
 fn dynamic_completions(shell: &str, index: &str, words: &[&str]) -> String {

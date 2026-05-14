@@ -1,22 +1,25 @@
 # JSON-RPC reference
 
-`ptywright serve --stdio` exposes JSON-RPC 2.0 over newline-delimited JSON.
+`ptywright serve --stdio` exposes JSON-RPC 2.0 over stdin/stdout using newline-delimited JSON by default, or LSP-style `Content-Length` frames with `--framing lsp`. On macOS/Linux, `ptywright serve --socket PATH` serves the same protocol on a local Unix socket.
 
 This is the first automation protocol. It is intentionally separate from `ptywright run` so protocol responses never mix with raw terminal output.
 
 ## Framing rules
 
-- stdin: one complete JSON-RPC request or notification per line.
-- stdout: one compact JSON-RPC response per line.
-- stderr: diagnostics only.
-- Current framing: NDJSON.
-- Planned framing: optional LSP-style `Content-Length` framing.
+- stdout is protocol-only.
+- stderr is diagnostics only.
+- `--framing ndjson` default: stdin accepts one complete JSON-RPC request or notification per line; stdout writes one compact JSON-RPC response or notification per line.
+- `--framing lsp`: messages are framed as `Content-Length: N\r\n\r\n<json>`.
+- `--socket PATH`: macOS/Linux local Unix socket transport; Windows named-pipe support remains planned.
 
 ## Example
 
 ```bash
 printf '{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}\n' | \
   ptywright serve --stdio
+
+printf 'Content-Length: 48\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"session.list"}' | \
+  ptywright serve --stdio --framing lsp
 ```
 
 ## Methods
@@ -98,6 +101,28 @@ Action payloads use `type` plus `value` where needed:
 {"type":"kill"}
 ```
 
+### `server.set_notifications`
+
+Enable or disable coalesced server-originated notifications. Notifications are disabled by default so request/response clients continue to receive one response per request.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "server.set_notifications",
+  "params": { "enabled": true }
+}
+```
+
+When enabled, ptywright may emit:
+
+```json
+{"jsonrpc":"2.0","method":"session.changed","params":{"session":"s1","sequence":3}}
+{"jsonrpc":"2.0","method":"session.exited","params":{"session":"s1","sequence":3}}
+```
+
+For a request, the direct response is written first, followed by any queued notifications.
+
 ### `session.wait`
 
 Wait for a matcher to succeed.
@@ -126,7 +151,12 @@ Result includes evidence:
     "size": { "rows": 24, "cols": 80, "pixel_width": 0, "pixel_height": 0 },
     "cursor": { "row": 0, "col": 5, "visible": true },
     "sequence": 1,
-    "plain_text": "ready"
+    "plain_text": "ready",
+    "cells": [],
+    "alternate_screen": false,
+    "application_cursor": false,
+    "application_keypad": false,
+    "title": null
   },
   "transcript_tail": "ready"
 }
@@ -140,6 +170,8 @@ Matcher payloads:
 {"type":"transcript_contains","value":"ready"}
 {"type":"transcript_regex","value":"rea.y"}
 {"type":"cursor_at","value":{"row":0,"col":0}}
+{"type":"screen_stable","value":{"min_ms":250}}
+{"type":"process_exited"}
 {"type":"any","value":[{"type":"contains_text","value":"ready"}]}
 {"type":"all","value":[{"type":"contains_text","value":"rea"},{"type":"contains_text","value":"dy"}]}
 ```
@@ -183,7 +215,7 @@ See [Plugins and extensions](./plugins.md) for manifest fields and permission na
 
 ## Notifications
 
-The server accepts JSON-RPC notifications, but it does not emit asynchronous notifications yet. Coalesced `session.output`, `screen.changed`, and `session.exited` notifications are planned once the event subscription model lands.
+The server accepts JSON-RPC notifications. Server-originated notifications are opt-in through `server.set_notifications` and are currently emitted after request/notification handling rather than from a fully asynchronous event loop.
 
 ## Error codes
 

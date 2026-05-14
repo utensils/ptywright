@@ -1,8 +1,12 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
 
-use clap::{CommandFactory, Parser, Subcommand};
-use ptywright::{DESCRIPTION, NAME, Session, Target, TerminalSize, serve_ndjson};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use ptywright::{DESCRIPTION, NAME, Target, TerminalSize, serve_lsp, serve_ndjson};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -18,7 +22,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run a command in a headless PTY and print its captured transcript when it exits.
+    /// Run a command in a headless PTY, bridging stdin/stdout live.
     Run {
         /// Terminal rows.
         #[arg(long, default_value_t = 24)]
@@ -30,11 +34,17 @@ enum Commands {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Serve JSON-RPC 2.0 over stdio using newline-delimited JSON framing.
+    /// Serve JSON-RPC 2.0 over stdio.
     Serve {
         /// Use stdin/stdout for JSON-RPC. Stdout is protocol-only in this mode.
         #[arg(long)]
         stdio: bool,
+        /// Listen on a local Unix socket path. Unix-only; Windows named-pipe support is planned.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// JSON-RPC message framing to use.
+        #[arg(long, value_enum, default_value_t = RpcFraming::Ndjson)]
+        framing: RpcFraming,
     },
     /// Generate shell completions.
     #[command(after_long_help = "\
@@ -61,6 +71,14 @@ Setup instructions:
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RpcFraming {
+    /// Newline-delimited JSON, one JSON-RPC message per line.
+    Ndjson,
+    /// LSP-style Content-Length headers followed by JSON payloads.
+    Lsp,
+}
+
 fn main() -> ExitCode {
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
     match run() {
@@ -80,7 +98,11 @@ fn run() -> ptywright::Result<ExitCode> {
             cols,
             command,
         }) => run_command(command, TerminalSize::new(rows, cols)),
-        Some(Commands::Serve { stdio }) => serve_command(stdio),
+        Some(Commands::Serve {
+            stdio,
+            socket,
+            framing,
+        }) => serve_command(stdio, socket.as_deref(), framing),
         Some(Commands::Completions { shell }) => generate_completions(&shell),
         None => {
             let mut command = Cli::command();
@@ -156,25 +178,131 @@ compdef _clap_dynamic_completer_ptywright ptywright
     Ok(ExitCode::SUCCESS)
 }
 
-fn serve_command(stdio: bool) -> ptywright::Result<ExitCode> {
-    if !stdio {
-        return Err(ptywright::Error::Rpc(
-            "serve currently requires --stdio".to_string(),
-        ));
+fn serve_command(
+    stdio: bool,
+    socket: Option<&Path>,
+    framing: RpcFraming,
+) -> ptywright::Result<ExitCode> {
+    match (stdio, socket) {
+        (true, None) => match framing {
+            RpcFraming::Ndjson => serve_ndjson(io::stdin().lock(), io::stdout().lock())?,
+            RpcFraming::Lsp => serve_lsp(io::stdin().lock(), io::stdout().lock())?,
+        },
+        (false, Some(path)) => serve_socket(path, framing)?,
+        (true, Some(_)) => {
+            return Err(ptywright::Error::Rpc(
+                "serve accepts only one transport: use either --stdio or --socket".to_string(),
+            ));
+        }
+        (false, None) => {
+            return Err(ptywright::Error::Rpc(
+                "serve requires --stdio or --socket".to_string(),
+            ));
+        }
     }
-    serve_ndjson(io::stdin().lock(), io::stdout().lock())?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(unix)]
+fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.file_type().is_socket() {
+            std::fs::remove_file(path)?;
+        } else {
+            return Err(ptywright::Error::Rpc(format!(
+                "refusing to replace non-socket path: {}",
+                path.display()
+            )));
+        }
+    }
+
+    let listener = UnixListener::bind(path)?;
+    eprintln!("ptywright: listening on {}", path.display());
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let input = stream.try_clone()?;
+        match framing {
+            RpcFraming::Ndjson => serve_ndjson(input, stream)?,
+            RpcFraming::Lsp => serve_lsp(input, stream)?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn serve_socket(path: &Path, _framing: RpcFraming) -> ptywright::Result<()> {
+    Err(ptywright::Error::Rpc(format!(
+        "--socket is not supported on this platform yet; Windows named-pipe support is planned (requested {})",
+        path.display()
+    )))
 }
 
 fn run_command(mut command: Vec<String>, size: TerminalSize) -> ptywright::Result<ExitCode> {
     let program = command.remove(0);
     let target = Target::new(program).args(command).size(size);
-    let session = Session::spawn_target(target)?;
-    let status = session.wait()?;
-    io::stdout().write_all(session.transcript().as_bytes())?;
-    if status.success {
+
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows: target.size.rows,
+        cols: target.size.cols,
+        pixel_width: target.size.pixel_width,
+        pixel_height: target.size.pixel_height,
+    })?;
+
+    let mut builder = CommandBuilder::new(&target.program);
+    builder.args(target.args.iter().map(String::as_str));
+    let mut child = pair.slave.spawn_command(builder)?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader()?;
+    let mut writer = pair.master.take_writer()?;
+
+    let output_thread = thread::spawn(move || -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        let mut buf = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    stdout.write_all(&buf[..n])?;
+                    stdout.flush()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+
+    let _input_thread = thread::spawn(move || -> io::Result<()> {
+        let mut stdin = io::stdin().lock();
+        let mut buf = [0_u8; 8192];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    writer.write_all(&buf[..n])?;
+                    writer.flush()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+
+    let status = child.wait()?;
+    drop(pair.master);
+    if let Ok(Err(error)) = output_thread.join() {
+        return Err(error.into());
+    }
+
+    if status.success() {
         Ok(ExitCode::SUCCESS)
     } else {
-        Ok(ExitCode::from(status.code.min(u8::MAX as u32) as u8))
+        Ok(ExitCode::from(status.exit_code().min(u8::MAX as u32) as u8))
     }
 }

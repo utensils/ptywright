@@ -13,6 +13,42 @@ pub struct CursorState {
     pub visible: bool,
 }
 
+/// Rendered style metadata for a terminal cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenCellStyle {
+    /// Foreground color as a stable debug string (`default`, `idx:N`, or `rgb:R:G:B`).
+    pub foreground: String,
+    /// Background color as a stable debug string (`default`, `idx:N`, or `rgb:R:G:B`).
+    pub background: String,
+    /// Bold style flag.
+    pub bold: bool,
+    /// Dim style flag.
+    pub dim: bool,
+    /// Italic style flag.
+    pub italic: bool,
+    /// Underline style flag.
+    pub underline: bool,
+    /// Inverse style flag.
+    pub inverse: bool,
+}
+
+/// A rendered terminal cell in a screen snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenCell {
+    /// Zero-based row.
+    pub row: u16,
+    /// Zero-based column.
+    pub col: u16,
+    /// Text content in the cell. Empty cells use an empty string.
+    pub text: String,
+    /// Whether this cell contains a wide character.
+    pub wide: bool,
+    /// Whether this cell is the continuation half of a wide character.
+    pub wide_continuation: bool,
+    /// Cell style metadata.
+    pub style: ScreenCellStyle,
+}
+
 /// A rendered terminal snapshot suitable for automation decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenSnapshot {
@@ -24,39 +60,73 @@ pub struct ScreenSnapshot {
     pub sequence: u64,
     /// Visible text with terminal control sequences removed.
     pub plain_text: String,
+    /// Rendered cell metadata in row-major order.
+    pub cells: Vec<ScreenCell>,
+    /// Whether the terminal is currently using the alternate screen.
+    pub alternate_screen: bool,
+    /// Whether application cursor mode is active.
+    pub application_cursor: bool,
+    /// Whether application keypad mode is active.
+    pub application_keypad: bool,
+    /// Window title when the parser/backend exposes it.
+    pub title: Option<String>,
 }
 
-/// Incremental terminal parser and rendered screen state.
-pub struct Terminal {
+trait TerminalEngine: Send {
+    fn process(&mut self, bytes: &[u8]);
+    fn resize(&mut self, size: TerminalSize);
+    fn snapshot(&self, sequence: u64) -> ScreenSnapshot;
+}
+
+struct Vt100TerminalEngine {
     parser: vt100::Parser,
     size: TerminalSize,
 }
 
-impl Terminal {
-    /// Create a terminal parser for the given size.
-    #[must_use]
-    pub fn new(size: TerminalSize) -> Self {
+impl Vt100TerminalEngine {
+    fn new(size: TerminalSize) -> Self {
         Self {
             parser: vt100::Parser::new(size.rows, size.cols, 1_000),
             size,
         }
     }
+}
 
-    /// Process bytes read from the PTY.
-    pub fn process(&mut self, bytes: &[u8]) {
+impl TerminalEngine for Vt100TerminalEngine {
+    fn process(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
     }
 
-    /// Resize the terminal parser.
-    pub fn resize(&mut self, size: TerminalSize) {
+    fn resize(&mut self, size: TerminalSize) {
         self.parser.screen_mut().set_size(size.rows, size.cols);
         self.size = size;
     }
 
-    /// Return a snapshot for the provided session sequence number.
-    #[must_use]
-    pub fn snapshot(&self, sequence: u64) -> ScreenSnapshot {
+    fn snapshot(&self, sequence: u64) -> ScreenSnapshot {
         let screen = self.parser.screen();
+        let cells = (0..self.size.rows)
+            .flat_map(|row| {
+                (0..self.size.cols).filter_map(move |col| {
+                    screen.cell(row, col).map(|cell| ScreenCell {
+                        row,
+                        col,
+                        text: cell.contents().to_string(),
+                        wide: cell.is_wide(),
+                        wide_continuation: cell.is_wide_continuation(),
+                        style: ScreenCellStyle {
+                            foreground: color_name(cell.fgcolor()),
+                            background: color_name(cell.bgcolor()),
+                            bold: cell.bold(),
+                            dim: cell.dim(),
+                            italic: cell.italic(),
+                            underline: cell.underline(),
+                            inverse: cell.inverse(),
+                        },
+                    })
+                })
+            })
+            .collect();
+
         ScreenSnapshot {
             size: self.size,
             cursor: CursorState {
@@ -66,7 +136,51 @@ impl Terminal {
             },
             sequence,
             plain_text: screen.contents(),
+            cells,
+            alternate_screen: screen.alternate_screen(),
+            application_cursor: screen.application_cursor(),
+            application_keypad: screen.application_keypad(),
+            title: None,
         }
+    }
+}
+
+/// Incremental terminal parser and rendered screen state.
+pub struct Terminal {
+    engine: Box<dyn TerminalEngine>,
+}
+
+impl Terminal {
+    /// Create a terminal parser for the given size.
+    #[must_use]
+    pub fn new(size: TerminalSize) -> Self {
+        Self {
+            engine: Box::new(Vt100TerminalEngine::new(size)),
+        }
+    }
+
+    /// Process bytes read from the PTY.
+    pub fn process(&mut self, bytes: &[u8]) {
+        self.engine.process(bytes);
+    }
+
+    /// Resize the terminal parser.
+    pub fn resize(&mut self, size: TerminalSize) {
+        self.engine.resize(size);
+    }
+
+    /// Return a snapshot for the provided session sequence number.
+    #[must_use]
+    pub fn snapshot(&self, sequence: u64) -> ScreenSnapshot {
+        self.engine.snapshot(sequence)
+    }
+}
+
+fn color_name(color: vt100::Color) -> String {
+    match color {
+        vt100::Color::Default => "default".to_string(),
+        vt100::Color::Idx(index) => format!("idx:{index}"),
+        vt100::Color::Rgb(red, green, blue) => format!("rgb:{red}:{green}:{blue}"),
     }
 }
 
@@ -99,5 +213,19 @@ mod tests {
         terminal.resize(TerminalSize::new(10, 40));
 
         assert_eq!(terminal.snapshot(0).size, TerminalSize::new(10, 40));
+    }
+
+    #[test]
+    fn terminal_snapshot_includes_cells_and_modes() {
+        let mut terminal = Terminal::new(TerminalSize::new(2, 4));
+
+        terminal.process(b"A\x1b[31mB\x1b[0m");
+
+        let snapshot = terminal.snapshot(1);
+        assert_eq!(snapshot.cells.len(), 8);
+        assert_eq!(snapshot.cells[0].text, "A");
+        assert_eq!(snapshot.cells[1].text, "B");
+        assert_eq!(snapshot.cells[1].style.foreground, "idx:1");
+        assert!(!snapshot.alternate_screen);
     }
 }

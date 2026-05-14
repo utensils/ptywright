@@ -19,12 +19,12 @@ pub mod transcript;
 pub use action::{Action, Key};
 pub use adapters::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeState, ClaudeCodeStateSnapshot};
 pub use error::{Error, Result};
-pub use matcher::{MatchResult, Matcher};
+pub use matcher::{MatchResult, Matcher, MatcherContext};
 pub use plugin::{
     PluginHostCapabilities, PluginKind, PluginManifest, PluginManifestError, PluginPermission,
 };
-pub use rpc::{RpcServer, serve_ndjson};
-pub use screen::{CursorState, ScreenSnapshot, Terminal};
+pub use rpc::{RpcServer, serve_lsp, serve_ndjson};
+pub use screen::{CursorState, ScreenCell, ScreenCellStyle, ScreenSnapshot, Terminal};
 pub use session::{Session, SessionConfig, SessionExitStatus};
 pub use target::{Target, TerminalSize};
 pub use transcript::{Transcript, TranscriptConfig};

@@ -24,7 +24,7 @@ With no arguments, `ptywright` prints the help menu.
 ptywright run -- /bin/sh -lc 'printf ready'
 ```
 
-`run` starts the command behind a real PTY, waits for it to exit, and prints the retained transcript. It is an early debugging surface for the same PTY/session primitives exposed by the library; live interactive bridging is planned.
+`run` starts the command behind a real PTY and bridges stdin/stdout live. It is a debugging surface for the same PTY/session primitives exposed by the library; use JSON-RPC for machine-readable automation.
 
 ## Query JSON-RPC capabilities
 
@@ -33,7 +33,7 @@ printf '{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}\n' | \
   ptywright serve --stdio
 ```
 
-`serve --stdio` uses stdin/stdout for NDJSON-framed JSON-RPC. stdout is protocol-only in this mode.
+`serve --stdio` uses stdin/stdout for JSON-RPC. NDJSON is the default framing; `--framing lsp` enables LSP-style `Content-Length` frames. stdout is protocol-only in this mode. On macOS/Linux, `serve --socket /tmp/ptywright.sock` exposes the same protocol over a local Unix socket.
 
 ## Enable shell completions
 

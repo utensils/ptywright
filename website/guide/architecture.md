@@ -13,8 +13,8 @@ ptywright/
 │   ├── lib.rs         # public library surface
 │   ├── main.rs        # clap CLI entrypoint
 │   ├── matcher.rs     # screen/transcript predicates
-│   ├── rpc.rs         # NDJSON JSON-RPC server
-│   ├── screen.rs      # terminal parser and snapshots
+│   ├── rpc.rs         # JSON-RPC server and framing helpers
+│   ├── screen.rs      # terminal engine seam, parser, and snapshots
 │   ├── session.rs     # PTY-backed process lifecycle
 │   ├── target.rs      # spawn configuration
 │   └── transcript.rs  # bounded output transcript
@@ -69,16 +69,19 @@ Turn orchestration / adapters
 The first implementation uses:
 
 - `portable-pty` for cross-platform PTY creation and child process management.
-- `vt100` for the initial terminal parser and rendered screen snapshots.
+- `vt100` behind an internal terminal engine seam for the initial parser and rendered screen snapshots.
 - A reader thread per session that processes output in batches.
 - A monotonic sequence number for screen/transcript changes.
 - A bounded in-memory transcript to avoid unbounded output growth.
 - Event-driven matcher waits using a condition variable, not sleep polling.
-- JSON-RPC 2.0 over stdio with NDJSON framing for external automation clients.
+- Temporal/lifecycle matchers for stable screens and process-exit observation.
+- JSON-RPC 2.0 over stdio with NDJSON and LSP-style `Content-Length` framing for external automation clients.
+- Local Unix socket serving on macOS/Linux for longer-lived local automation processes.
+- Opt-in coalesced JSON-RPC notifications for session changes and exits.
 - Plugin manifest and permission types for future trusted extensions.
 - Dynamic shell completion generation through `clap_complete`.
 
-The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later.
+The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later. Screen snapshots expose portable cell/style/mode metadata instead of `vt100` types.
 
 ## Interactive Claude Code adapter
 

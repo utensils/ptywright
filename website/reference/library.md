@@ -58,6 +58,7 @@ Key methods:
 | `spawn_target` | Spawn a `Target` with default transcript settings. |
 | `snapshot`     | Return the current rendered screen snapshot.       |
 | `transcript`   | Return retained transcript text.                   |
+| `is_finished`  | Report whether the reader/session lifecycle ended. |
 | `send`         | Apply an `Action`.                                 |
 | `write_text`   | Write text bytes to the PTY.                       |
 | `send_key`     | Send a named key sequence.                         |
@@ -76,10 +77,15 @@ pub struct ScreenSnapshot {
     pub cursor: CursorState,
     pub sequence: u64,
     pub plain_text: String,
+    pub cells: Vec<ScreenCell>,
+    pub alternate_screen: bool,
+    pub application_cursor: bool,
+    pub application_keypad: bool,
+    pub title: Option<String>,
 }
 ```
 
-The `sequence` increments as PTY output is processed or the terminal is resized. Matchers report the sequence they observed.
+The `sequence` increments as PTY output is processed or the terminal is resized. Matchers report the sequence they observed. `plain_text` remains the easiest matcher surface; `cells` expose row/column text, color/style flags, and wide-character metadata for adapters that need structured screen inspection.
 
 ## Actions and keys
 
@@ -103,6 +109,8 @@ Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and 
 - `TranscriptContains`
 - `TranscriptRegex`
 - `CursorAt`
+- `ScreenStable`
+- `ProcessExited`
 - `Any`
 - `All`
 
@@ -124,7 +132,7 @@ See [Claude Code adapter](../guide/claude-code.md) for state and limitation deta
 
 ## JSON-RPC
 
-`RpcServer` handles one NDJSON-framed JSON-RPC message at a time, and `serve_ndjson` runs the same protocol over arbitrary `Read`/`Write` streams.
+`RpcServer` handles JSON-RPC messages, `serve_ndjson` runs newline-delimited JSON framing over arbitrary `Read`/`Write` streams, and `serve_lsp` runs LSP-style `Content-Length` framing.
 
 ```rust
 use ptywright::RpcServer;
@@ -137,7 +145,7 @@ assert!(response.is_some());
 # Ok::<(), ptywright::Error>(())
 ```
 
-The CLI exposes this through `ptywright serve --stdio`.
+The CLI exposes this through `ptywright serve --stdio` and `ptywright serve --stdio --framing lsp`. `RpcServer::handle_line_messages` returns a direct response plus opt-in coalesced notifications when enabled with `server.set_notifications`.
 
 ## Plugin manifests
 
