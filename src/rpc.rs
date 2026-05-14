@@ -11,6 +11,7 @@ use crate::adapters::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use crate::error::{Error, Result};
 use crate::matcher::Matcher;
 use crate::plugin::{PluginHostCapabilities, PluginManifest};
+use crate::redaction::RedactionPolicy;
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
 use crate::{NAME, VERSION};
@@ -53,6 +54,8 @@ struct CreateParams {
 #[derive(Debug, Deserialize)]
 struct SessionParams {
     session: String,
+    /// Whether to redact sensitive-looking output fields. Defaults to true for read methods.
+    redact: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,7 +409,10 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: SessionParams = parse_params(params)?;
-        let snapshot = self.session(&params.session)?.snapshot();
+        let mut snapshot = self.session(&params.session)?.snapshot();
+        if params.redact.unwrap_or(true) {
+            snapshot = snapshot.redacted(&RedactionPolicy::default());
+        }
         serde_json::to_value(snapshot)
             .map_err(|error| (RpcErrorCode::InternalError, error.to_string()))
     }
@@ -416,7 +422,13 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: SessionParams = parse_params(params)?;
-        Ok(json!({ "text": self.session(&params.session)?.transcript() }))
+        let session = self.session(&params.session)?;
+        let text = if params.redact.unwrap_or(true) {
+            session.redacted_transcript(&RedactionPolicy::default())
+        } else {
+            session.transcript()
+        };
+        Ok(json!({ "text": text }))
     }
 
     fn session_wait(
@@ -844,6 +856,39 @@ mod tests {
         );
 
         assert_eq!(response["result"]["valid"], true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transcript_read_methods_redact_by_default_and_allow_raw_opt_in() {
+        let mut server = RpcServer::new();
+        let create = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","printf 'token=super-secret'"]}}"#,
+        );
+        let session = create["result"]["session"].as_str().unwrap();
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"session.wait","params":{{"session":"{session}","matcher":{{"type":"contains_text","value":"token="}},"timeout_ms":5000}}}}"#,
+            ),
+        );
+
+        let redacted = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"session.transcript","params":{{"session":"{session}"}}}}"#,
+            ),
+        );
+        let raw = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"session.transcript","params":{{"session":"{session}","redact":false}}}}"#,
+            ),
+        );
+
+        assert_eq!(redacted["result"]["text"], "token=[REDACTED]");
+        assert_eq!(raw["result"]["text"], "token=super-secret");
     }
 
     #[test]

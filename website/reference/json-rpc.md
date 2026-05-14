@@ -213,6 +213,8 @@ See [Plugins and extensions](./plugins.md) for manifest fields and permission na
 | `session.kill`       | `{ "session": "s1" }`                          | `{ "killed": true }`.          |
 | `session.close`      | `{ "session": "s1" }`                          | Kills and removes the session. |
 
+`session.snapshot` and `session.transcript` redact sensitive-looking text by default. Pass `"redact": false` in params to opt into raw output for trusted local debugging.
+
 ## Notifications
 
 The server accepts JSON-RPC notifications. Server-originated notifications are opt-in through `server.set_notifications` and are currently emitted after request/notification handling rather than from a fully asynchronous event loop.

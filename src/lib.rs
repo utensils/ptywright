@@ -10,6 +10,7 @@ pub mod adapters;
 pub mod error;
 pub mod matcher;
 pub mod plugin;
+pub mod redaction;
 pub mod rpc;
 pub mod screen;
 pub mod session;
@@ -23,6 +24,7 @@ pub use matcher::{MatchResult, Matcher, MatcherContext};
 pub use plugin::{
     PluginHostCapabilities, PluginKind, PluginManifest, PluginManifestError, PluginPermission,
 };
+pub use redaction::RedactionPolicy;
 pub use rpc::{RpcServer, serve_lsp, serve_ndjson};
 pub use screen::{CursorState, ScreenCell, ScreenCellStyle, ScreenSnapshot, Terminal};
 pub use session::{Session, SessionConfig, SessionExitStatus};

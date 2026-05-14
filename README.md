@@ -8,7 +8,7 @@
 
 ptywright is an early general-purpose PTY/TUI automation toolkit. It is designed to drive interactive terminal applications from code without coupling the core abstractions to any one program.
 
-The library now includes initial target, session, rich screen snapshot, action, temporal matcher, transcript, JSON-RPC, interactive Claude Code adapter, plugin manifest, and shell completion primitives backed by real PTYs. The CLI includes `run` for live stdin/stdout PTY debugging, `serve --stdio` for NDJSON or LSP-style JSON-RPC automation, Unix socket serving on macOS/Linux, and `completions` for shell setup.
+The library now includes initial target, session, rich screen snapshot, action, temporal matcher, transcript, redaction, JSON-RPC, interactive Claude Code adapter, plugin manifest, and shell completion primitives backed by real PTYs. The CLI includes `run` for live stdin/stdout PTY debugging, `serve --stdio` for NDJSON or LSP-style JSON-RPC automation, Unix socket serving on macOS/Linux, and `completions` for shell setup.
 
 Docs: <https://utensils.io/ptywright/>
 
@@ -62,6 +62,7 @@ nix run github:utensils/ptywright -- --help
 9. Plugin manifests and permission declarations for future extensions.
 10. Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
 11. Rich screen snapshots with cell/style/mode metadata.
+12. Redaction helpers and default RPC redaction for sensitive-looking output.
 
 ## Planned layers
 

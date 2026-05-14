@@ -130,6 +130,17 @@ let state = claude.send_prompt("help")?;
 
 See [Claude Code adapter](../guide/claude-code.md) for state and limitation details.
 
+## Redaction
+
+`RedactionPolicy` redacts sensitive-looking values such as `token=...`, `password=...`, bearer tokens, and common API key shapes from strings. RPC read methods redact transcript and snapshot text by default, while in-process `Session::transcript()` remains raw and `Session::redacted_transcript()` applies an explicit policy.
+
+```rust
+use ptywright::RedactionPolicy;
+
+let safe = RedactionPolicy::default().redact("token=secret");
+assert_eq!(safe, "token=[REDACTED]");
+```
+
 ## JSON-RPC
 
 `RpcServer` handles JSON-RPC messages, `serve_ndjson` runs newline-delimited JSON framing over arbitrary `Read`/`Write` streams, and `serve_lsp` runs LSP-style `Content-Length` framing.

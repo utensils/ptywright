@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::redaction::RedactionPolicy;
 use crate::target::TerminalSize;
 
 /// Cursor position and visibility from the rendered terminal state.
@@ -70,6 +71,20 @@ pub struct ScreenSnapshot {
     pub application_keypad: bool,
     /// Window title when the parser/backend exposes it.
     pub title: Option<String>,
+}
+
+impl ScreenSnapshot {
+    /// Return a copy with sensitive-looking text fields redacted by policy.
+    #[must_use]
+    pub fn redacted(&self, policy: &RedactionPolicy) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.plain_text = policy.redact(&snapshot.plain_text);
+        snapshot.title = snapshot.title.map(|title| policy.redact(&title));
+        for cell in &mut snapshot.cells {
+            cell.text = policy.redact(&cell.text);
+        }
+        snapshot
+    }
 }
 
 trait TerminalEngine: Send {
@@ -255,5 +270,16 @@ mod tests {
             terminal.snapshot(1).title.as_deref(),
             Some("ptywright test")
         );
+    }
+
+    #[test]
+    fn screen_snapshot_redacts_text_and_title() {
+        let mut terminal = Terminal::new(TerminalSize::new(2, 40));
+
+        terminal.process(b"\x1b]2;token=title-secret\x07password=hunter2");
+
+        let snapshot = terminal.snapshot(1).redacted(&RedactionPolicy::default());
+        assert!(!snapshot.plain_text.contains("hunter2"));
+        assert_eq!(snapshot.title.as_deref(), Some("token=[REDACTED]"));
     }
 }
