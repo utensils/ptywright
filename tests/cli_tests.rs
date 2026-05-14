@@ -18,6 +18,7 @@ fn prints_help_by_default() {
 }
 
 #[test]
+#[cfg(unix)]
 fn run_executes_command_in_pty() {
     let mut command = bin();
     command.arg("run").arg("--");

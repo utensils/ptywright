@@ -301,6 +301,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn session_captures_process_output() {
         let session = Session::spawn_target(echo_target()).expect("spawn session");
 
