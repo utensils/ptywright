@@ -71,7 +71,7 @@ jobs:
         run: |
           export RUSTC="$(rustup which rustc --toolchain stable)"
           CARGO_BIN="$(rustup which cargo --toolchain stable)"
-          "$CARGO_BIN" test --locked
+          "$CARGO_BIN" test --locked --lib --bins --tests
       - name: Test
         if: runner.os != 'macOS'
         run: rustup run stable cargo test --locked

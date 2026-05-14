@@ -798,17 +798,17 @@ mod tests {
             serde_json::from_str(&create_messages[0]).expect("json response");
         let session = create_response["result"]["session"].as_str().unwrap();
 
-        std::thread::sleep(Duration::from_millis(50));
         let poll_messages = server
             .handle_line_messages(&format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"session.snapshot","params":{{"session":"{session}"}}}}"#,
+                r#"{{"jsonrpc":"2.0","id":3,"method":"session.wait","params":{{"session":"{session}","matcher":{{"type":"contains_text","value":"event"}},"timeout_ms":5000}}}}"#,
             ))
-            .expect("snapshot");
+            .expect("wait for output");
 
         assert!(
             poll_messages
                 .iter()
-                .any(|message| message.contains("session.changed"))
+                .any(|message| message.contains("session.changed")),
+            "expected session.changed notification, got: {poll_messages:?}"
         );
     }
 
