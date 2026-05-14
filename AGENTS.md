@@ -112,7 +112,8 @@ Use normal branch-and-PR development moving forward.
 - Keep commits small and use Conventional Commits: `<type>(optional-scope): <summary>`.
 - Commit types should match the branch purpose where practical: `feat`, `fix`, `docs`, `chore`, `test`, `refactor`, `ci`, `perf`, or `build`.
 - Push the branch and open a pull request with a concise summary and test results.
-- Let CI run on the PR and address failures with additional commits on the same branch.
+- Copilot review is requested automatically for non-draft PRs by the `Copilot Review` workflow; if it does not appear, request `copilot-pull-request-reviewer[bot]` manually.
+- Let CI and Copilot review run on the PR and address failures or valid findings with additional commits on the same branch.
 - Prefer merge commits or squash merges through GitHub; never force-push `main`.
 - If a feature branch must be rebased after review starts, use `--force-with-lease` and mention it in the PR.
 - Keep docs, README, `AGENTS.md`, and the `CLAUDE.md` symlink target synchronized in the same PR when behavior or workflow changes.
