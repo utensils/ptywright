@@ -14,6 +14,8 @@ Build a local, scriptable driver for terminal software:
 
 The core must stay generic. Do not bake a single target application into core names, traits, modules, or docs unless the code is explicitly adapter-specific.
 
+Long-form design notes, milestone history, and open questions live in [`SPEC.md`](SPEC.md). Read it before making structural changes.
+
 ## Abstraction rules
 
 Prefer small, explicit layers:
@@ -76,25 +78,57 @@ Devshell commands:
 | run | `ptywright` | `cargo run -- "$@"` |
 | docs | `docs-dev` / `docs-build` / `docs-preview` | VitePress documentation |
 
-Direct Cargo fallback:
+Direct Cargo fallback (CI uses `--locked` on every check; mirror it when reproducing CI failures locally):
 
 ```bash
 cargo fmt --all -- --check
-cargo check
-cargo clippy -- -D warnings
-cargo test
+cargo check --locked
+cargo clippy --locked -- -D warnings
+cargo test --locked
 cargo run -- --help
 ```
 
+Run a single test:
+
+```bash
+cargo test --test cli_tests <test_name>   # one integration test in tests/cli_tests.rs
+cargo test <module>::<test_name>          # one unit test inside a src/ module
+cargo test <substring> -- --nocapture     # filter by substring and show stdout
+```
+
+The default build embeds Lua 5.4 via `mlua` with the `vendored` feature, so source builds outside the Nix devshell need a working C compiler.
+
 ## Current architecture
+
+The codebase is organized so each generic abstraction layer lives in one focused module, and adapters are layered on top without leaking back into the core.
 
 - `src/main.rs` — clap CLI wiring. With no args it prints help; `--version` prints package version; `serve --stdio` exposes JSON-RPC with NDJSON or LSP-style framing; `serve --socket` exposes a Unix socket on macOS/Linux; `completions` generates shell completions.
 - `src/run_terminal.rs` — `ptywright run` implementation for live stdin/stdout PTY bridging, raw-mode handling, and terminal-generated input filtering.
-- `src/lib.rs` plus modules in `src/` — public library surface for target configuration, PTY sessions, rich screen snapshots, actions, matchers, transcripts, redaction, JSON-RPC, Claude Code adapter primitives, and plugin manifests.
-- `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
-- `website/` — VitePress docs site.
-- `.github/workflows/` — CI, docs deploy, and release packaging.
-- `flake.nix` — Nix package, app, formatter, and devshell.
+- `src/lib.rs` — public library surface; re-exports the layer types listed below.
+- Generic layer modules (one module per abstraction, named after the concept):
+  - `src/target.rs` — target configuration (executable, args, env, cwd, terminal size).
+  - `src/session.rs` — PTY session lifecycle and exit status.
+  - `src/screen.rs` — `vt100`-backed terminal parser, rich `ScreenSnapshot` with cell/style/cursor metadata.
+  - `src/action.rs` — `Action`/`Key` input model.
+  - `src/matcher.rs` — temporal matchers and wait policies.
+  - `src/transcript.rs` — bounded in-memory and file transcript capture.
+  - `src/redaction.rs` — redaction helpers and the default RPC redaction policy.
+  - `src/rpc.rs` — JSON-RPC server, NDJSON + LSP framing, stdio + Unix socket transports.
+  - `src/error.rs` — crate-wide `Error` / `Result`.
+- Plugin and adapter layer (application-specific code lives here, not in the generic layers):
+  - `src/plugin.rs` — plugin manifests, permission declarations, runtime trait, built-in `claude_code_manifest`.
+  - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by adapters.
+  - `src/adapters/` — adapter implementations layered over the generic primitives; `claude_code.rs` is the current production adapter and drives Claude Code through Lua.
+  - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, and usage-output parsing.
+- Tests:
+  - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
+  - `tests/fixtures/claude_code/` — recorded screen fixtures for adapter transition tests; update these when Claude Code's UI shifts.
+- Tooling and packaging:
+  - `website/` — VitePress docs site.
+  - `.github/workflows/` — CI, docs deploy (`pages.yml`), and release packaging (`release.yml`).
+  - `flake.nix` — Nix package, app, formatter, and devshell.
+
+When adding behavior, decide first which layer it belongs to. Claude-specific logic must not land in the generic modules; new generic primitives should not import from `adapters/`.
 
 ## Git workflow
 
