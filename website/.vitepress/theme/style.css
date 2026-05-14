@@ -1,0 +1,130 @@
+@import 'tailwindcss';
+
+:root {
+  --ptywright-violet: #7c3aed;
+  --ptywright-violet-soft: #a78bfa;
+  --ptywright-violet-deep: #5b21b6;
+  --ptywright-ink: #17131f;
+  --ptywright-paper: #f7f4ff;
+
+  --vp-c-brand-1: var(--ptywright-violet-deep);
+  --vp-c-brand-2: var(--ptywright-violet);
+  --vp-c-brand-3: #4c1d95;
+  --vp-c-brand-soft: rgba(124, 58, 237, 0.14);
+
+  --vp-c-bg: #fbfaff;
+  --vp-c-bg-alt: var(--ptywright-paper);
+  --vp-c-bg-soft: #f1ecff;
+  --vp-c-bg-elv: #ffffff;
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(
+    120deg,
+    #4c1d95 0%,
+    #7c3aed 52%,
+    #a78bfa 100%
+  );
+  --vp-home-hero-image-background-image:
+    radial-gradient(
+      circle at 30% 30%,
+      rgba(124, 58, 237, 0.28) 0%,
+      transparent 55%
+    ),
+    radial-gradient(
+      circle at 70% 70%,
+      rgba(91, 33, 182, 0.22) 0%,
+      transparent 60%
+    );
+  --vp-home-hero-image-filter: blur(52px);
+
+  --vp-button-brand-border: var(--ptywright-violet-deep);
+  --vp-button-brand-text: #ffffff;
+  --vp-button-brand-bg: var(--ptywright-violet-deep);
+  --vp-button-brand-hover-border: #4c1d95;
+  --vp-button-brand-hover-text: #ffffff;
+  --vp-button-brand-hover-bg: #4c1d95;
+  --vp-button-brand-active-border: #4c1d95;
+  --vp-button-brand-active-text: #ffffff;
+  --vp-button-brand-active-bg: #4c1d95;
+
+  --vp-code-block-bg: #f6f1ff;
+  --vp-code-line-highlight-color: rgba(124, 58, 237, 0.1);
+  --vp-c-text-code: var(--ptywright-violet-deep);
+}
+
+.dark {
+  --vp-c-brand-1: var(--ptywright-violet-soft);
+  --vp-c-brand-2: var(--ptywright-violet);
+  --vp-c-brand-3: var(--ptywright-violet-deep);
+  --vp-c-brand-soft: rgba(167, 139, 250, 0.14);
+
+  --vp-c-bg: #100d17;
+  --vp-c-bg-alt: var(--ptywright-ink);
+  --vp-c-bg-soft: #1d1728;
+  --vp-c-bg-elv: #221a30;
+
+  --vp-button-brand-text: #120d1c;
+  --vp-button-brand-bg: var(--ptywright-violet-soft);
+  --vp-button-brand-border: var(--ptywright-violet-soft);
+  --vp-button-brand-hover-text: #120d1c;
+  --vp-button-brand-hover-bg: #8b5cf6;
+  --vp-button-brand-hover-border: #8b5cf6;
+
+  --vp-code-block-bg: #171120;
+  --vp-c-text-code: var(--ptywright-violet-soft);
+}
+
+.vp-doc div[class*='language-'] {
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 16%, transparent);
+}
+
+.vp-doc div[class*='language-']::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(
+    180deg,
+    var(--ptywright-violet-soft) 0%,
+    var(--ptywright-violet-deep) 100%
+  );
+  z-index: 2;
+  pointer-events: none;
+}
+
+.VPFeature {
+  border-radius: 14px;
+  border-color: color-mix(in srgb, var(--vp-c-brand-2) 18%, transparent);
+  background: color-mix(in srgb, var(--vp-c-brand-2) 3%, var(--vp-c-bg-soft));
+  transition:
+    transform 0.2s ease,
+    box-shadow 0.2s ease,
+    border-color 0.2s ease;
+}
+
+.VPFeature:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--vp-c-brand-2) 45%, transparent);
+  box-shadow: 0 14px 28px rgba(23, 19, 31, 0.08);
+}
+
+.terminal {
+  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 20%, transparent);
+  border-radius: 12px;
+  padding: 1rem;
+  background: var(--vp-code-block-bg);
+  font-family: var(--vp-font-family-mono);
+  overflow-x: auto;
+}
+
+.terminal .prompt {
+  color: var(--vp-c-brand-1);
+  font-weight: 700;
+}
+
+.terminal .comment {
+  color: var(--vp-c-text-2);
+}

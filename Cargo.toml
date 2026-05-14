@@ -1,0 +1,17 @@
+[package]
+name = "ptywright"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+authors = ["James Brink <brink.james@gmail.com>"]
+description = "A Rust CLI and library for driving interactive terminal applications through PTYs"
+homepage = "https://utensils.io/ptywright/"
+documentation = "https://utensils.io/ptywright/"
+repository = "https://github.com/utensils/ptywright"
+readme = "README.md"
+keywords = ["pty", "tui", "cli", "automation", "terminal"]
+categories = ["command-line-utilities", "development-tools", "api-bindings"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }

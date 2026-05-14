@@ -1,0 +1,20 @@
+*~
+.agents/
+.cache/
+.direnv/
+.DS_Store
+.env
+.idea/
+.vscode/
+*.swo
+*.swp
+/target
+**/target
+/result
+tmp/
+
+# Coverage artifacts (cargo-llvm-cov)
+*.profraw
+*.profdata
+lcov.info
+target/coverage/
