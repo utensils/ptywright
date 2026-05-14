@@ -282,18 +282,27 @@ fn run_command(mut command: Vec<String>, size: TerminalSize) -> ptywright::Resul
 
     let _input_thread = thread::spawn(move || -> io::Result<()> {
         let mut stdin = io::stdin().lock();
+        let mut filter = TerminalInputFilter::new();
         let mut buf = [0_u8; 8192];
         loop {
             match stdin.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    let pending = filter.finish();
+                    if !pending.is_empty() {
+                        writer.write_all(&pending)?;
+                        writer.flush()?;
+                    }
+                    break;
+                }
                 Ok(n) => {
-                    let input = if interactive_terminal {
-                        filter_terminal_generated_input(&buf[..n])
+                    if interactive_terminal {
+                        let input = filter.filter(&buf[..n]);
+                        if !input.is_empty() {
+                            writer.write_all(&input)?;
+                            writer.flush()?;
+                        }
                     } else {
-                        Cow::Borrowed(&buf[..n])
-                    };
-                    if !input.is_empty() {
-                        writer.write_all(&input)?;
+                        writer.write_all(&buf[..n])?;
                         writer.flush()?;
                     }
                 }
@@ -338,26 +347,122 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn filter_terminal_generated_input(input: &[u8]) -> Cow<'_, [u8]> {
-    let mut index = 0;
-    let mut output = Vec::new();
-    let mut changed = false;
+struct TerminalInputFilter {
+    pending: Vec<u8>,
+}
 
-    while index < input.len() {
-        if let Some(len) = terminal_generated_sequence_len(&input[index..]) {
-            changed = true;
-            index += len;
-        } else {
-            output.push(input[index]);
-            index += 1;
+impl TerminalInputFilter {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
         }
     }
 
-    if changed {
-        Cow::Owned(output)
-    } else {
-        Cow::Borrowed(input)
+    fn filter<'a>(&mut self, input: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.pending.is_empty() {
+            let mut index = 0;
+            while index < input.len() {
+                match terminal_generated_sequence_status(&input[index..]) {
+                    SequenceStatus::Complete(_) | SequenceStatus::Incomplete => {
+                        let filtered = filter_terminal_generated_input_with_pending(input);
+                        self.pending = filtered.pending;
+                        return Cow::Owned(filtered.output);
+                    }
+                    SequenceStatus::NotGenerated => index += 1,
+                }
+            }
+            Cow::Borrowed(input)
+        } else {
+            self.pending.extend_from_slice(input);
+            let data = std::mem::take(&mut self.pending);
+            let filtered = filter_terminal_generated_input_with_pending(&data);
+            self.pending = filtered.pending;
+            Cow::Owned(filtered.output)
+        }
     }
+
+    fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+struct FilteredInput {
+    output: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+#[cfg(test)]
+fn filter_terminal_generated_input(input: &[u8]) -> Cow<'_, [u8]> {
+    let mut index = 0;
+    while index < input.len() {
+        match terminal_generated_sequence_status(&input[index..]) {
+            SequenceStatus::Complete(_) | SequenceStatus::Incomplete => {
+                let filtered = filter_terminal_generated_input_with_pending(input);
+                let mut output = filtered.output;
+                output.extend_from_slice(&filtered.pending);
+                return Cow::Owned(output);
+            }
+            SequenceStatus::NotGenerated => index += 1,
+        }
+    }
+    Cow::Borrowed(input)
+}
+
+fn filter_terminal_generated_input_with_pending(input: &[u8]) -> FilteredInput {
+    let mut index = 0;
+    let mut output: Option<Vec<u8>> = None;
+
+    while index < input.len() {
+        match terminal_generated_sequence_status(&input[index..]) {
+            SequenceStatus::Complete(len) => {
+                output.get_or_insert_with(|| input[..index].to_vec());
+                index += len;
+            }
+            SequenceStatus::Incomplete => {
+                return FilteredInput {
+                    output: output.unwrap_or_else(|| input[..index].to_vec()),
+                    pending: input[index..].to_vec(),
+                };
+            }
+            SequenceStatus::NotGenerated => {
+                if let Some(output) = &mut output {
+                    output.push(input[index]);
+                }
+                index += 1;
+            }
+        }
+    }
+
+    FilteredInput {
+        output: output.unwrap_or_else(|| input.to_vec()),
+        pending: Vec::new(),
+    }
+}
+
+enum SequenceStatus {
+    Complete(usize),
+    Incomplete,
+    NotGenerated,
+}
+
+fn terminal_generated_sequence_status(input: &[u8]) -> SequenceStatus {
+    if input_starts_incomplete_generated_sequence(input) {
+        return SequenceStatus::Incomplete;
+    }
+    match terminal_generated_sequence_len(input) {
+        Some(len) => SequenceStatus::Complete(len),
+        None => SequenceStatus::NotGenerated,
+    }
+}
+
+fn input_starts_incomplete_generated_sequence(input: &[u8]) -> bool {
+    matches!(
+        input,
+        [0x1b, b'['] | [0x1b, b'[', b'?'] | [0x1b, b'P'] | [0x9b] | [0x9b, b'?'] | [0x90]
+    ) || matches!(input, [0x1b, b'[', b'?', rest @ ..] if csi_final_len(rest).is_none())
+        || matches!(input, [0x1b, b'P', rest @ ..] if dcs_final_len(rest).is_none())
+        || matches!(input, [0x9b, b'?', rest @ ..] if csi_final_len(rest).is_none())
+        || matches!(input, [0x90, rest @ ..] if dcs_final_len(rest).is_none())
 }
 
 fn terminal_generated_sequence_len(input: &[u8]) -> Option<usize> {
@@ -444,6 +549,23 @@ mod tests {
         let input = b"\x1b[?25h\x1bPunterminated";
 
         assert_eq!(filter_terminal_generated_input(input).as_ref(), input);
+    }
+
+    #[test]
+    fn stateful_filter_handles_split_generated_sequences() {
+        let mut filter = TerminalInputFilter::new();
+
+        assert_eq!(filter.filter(b"hello\x1bP>|ghost").as_ref(), b"hello");
+        assert_eq!(filter.filter(b"ty\x1b\\world").as_ref(), b"world");
+        assert!(filter.finish().is_empty());
+    }
+
+    #[test]
+    fn stateful_filter_flushes_incomplete_pending_input() {
+        let mut filter = TerminalInputFilter::new();
+
+        assert_eq!(filter.filter(b"\x1bPunterminated").as_ref(), b"");
+        assert_eq!(filter.finish(), b"\x1bPunterminated");
     }
 
     #[test]
