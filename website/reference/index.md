@@ -1,6 +1,6 @@
 # Reference
 
-ptywright exposes an early CLI, Rust library, and JSON-RPC automation protocol.
+ptywright exposes an early CLI, Rust library, JSON-RPC automation protocol, and shell completion generation.
 
 ## Crate metadata
 

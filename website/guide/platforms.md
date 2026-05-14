@@ -17,7 +17,7 @@ The initial PTY implementation uses `portable-pty`, which maps to Unix PTYs on m
 - Unix PTY behavior has deterministic tests for simple command output.
 - Windows ConPTY support is compiled in, but command-output fixtures are temporarily gated while deterministic Windows PTY test commands are developed.
 - The `run` command currently waits for process exit and then prints the retained transcript; live terminal bridging is planned.
-- JSON-RPC control is planned and will be separate from raw terminal output.
+- JSON-RPC control is available through `serve --stdio` and is separate from raw terminal output.
 
 ## Development environments
 

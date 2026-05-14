@@ -76,6 +76,7 @@ The first implementation uses:
 - Event-driven matcher waits using a condition variable, not sleep polling.
 - JSON-RPC 2.0 over stdio with NDJSON framing for external automation clients.
 - Plugin manifest and permission types for future trusted extensions.
+- Dynamic shell completion generation through `clap_complete`.
 
 The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later.
 

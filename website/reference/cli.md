@@ -66,9 +66,37 @@ Rules:
 
 See [JSON-RPC](./json-rpc.md) for methods and payloads.
 
+## `ptywright completions`
+
+Generate shell completion registration scripts.
+
+```bash
+ptywright completions bash
+ptywright completions zsh
+ptywright completions fish
+ptywright completions elvish
+ptywright completions powershell
+```
+
+Setup examples:
+
+```bash
+# zsh, add to ~/.zshrc
+source <(ptywright completions zsh)
+
+# bash, add to ~/.bashrc
+source <(ptywright completions bash)
+
+# fish, persist to completions dir
+ptywright completions fish > ~/.config/fish/completions/ptywright.fish
+```
+
+Supported shells are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.
+
 ## Exit behavior
 
 - Help and version output exit with status `0`.
 - `run` exits with the child process status when available.
 - `serve --stdio` exits with status `0` when stdin reaches EOF without an unrecoverable I/O error.
+- `completions <shell>` exits with status `0` for supported shells and non-zero for unknown shells.
 - Unknown flags are rejected by clap and exit non-zero.

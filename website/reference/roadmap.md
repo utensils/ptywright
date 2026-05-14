@@ -4,7 +4,7 @@ ptywright is early-stage. This roadmap captures the intended shape without promi
 
 ## Foundation
 
-- Package metadata, CLI skeleton, tests, Nix flake, docs, CI, and release workflows.
+- Package metadata, CLI commands, tests, Nix flake, docs, CI, and release workflows.
 - Cross-platform CI for Linux, macOS, and Windows.
 - Documentation structure for install, architecture, platforms, and reference.
 
@@ -27,6 +27,12 @@ ptywright is early-stage. This roadmap captures the intended shape without promi
 - Wait for screen/output matchers.
 - Model turn boundaries.
 - Return structured success, timeout, and failure results.
+
+## Protocol and CLI ergonomics
+
+- JSON-RPC over stdio for external automation clients.
+- Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
+- Plugin manifests and host capability reporting.
 
 ## Adapters
 

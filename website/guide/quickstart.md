@@ -35,6 +35,21 @@ printf '{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}\n' | \
 
 `serve --stdio` uses stdin/stdout for NDJSON-framed JSON-RPC. stdout is protocol-only in this mode.
 
+## Enable shell completions
+
+```bash
+# zsh
+source <(ptywright completions zsh)
+
+# bash
+source <(ptywright completions bash)
+
+# fish
+ptywright completions fish > ~/.config/fish/completions/ptywright.fish
+```
+
+Supported shells are bash, zsh, fish, elvish, and PowerShell.
+
 ## Development checks
 
 Inside the Nix devshell:

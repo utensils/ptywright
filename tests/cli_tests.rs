@@ -68,6 +68,98 @@ fn serve_stdio_returns_json_rpc_response() {
     );
 }
 
+fn dynamic_completions(shell: &str, index: &str, words: &[&str]) -> String {
+    let output = bin()
+        .env("COMPLETE", shell)
+        .env("_CLAP_COMPLETE_INDEX", index)
+        .args(["--"])
+        .args(words)
+        .output()
+        .expect("run dynamic completion");
+    assert!(output.status.success(), "completion failed: {output:?}");
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+#[test]
+fn dynamic_root_completions_include_run_and_serve() {
+    let stdout = dynamic_completions("bash", "1", &["ptywright", ""]);
+
+    assert!(
+        stdout.lines().any(|line| line == "run"),
+        "root completions should include run, got: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "serve"),
+        "root completions should include serve, got: {stdout}"
+    );
+}
+
+#[test]
+fn dynamic_completions_include_run_flags() {
+    let stdout = dynamic_completions("bash", "2", &["ptywright", "run", "--"]);
+
+    assert!(
+        stdout.lines().any(|line| line.starts_with("--rows")),
+        "run completions should include --rows, got: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("--cols")),
+        "run completions should include --cols, got: {stdout}"
+    );
+}
+
+#[test]
+fn completions_bash_outputs_script() {
+    let output = bin()
+        .args(["completions", "bash"])
+        .output()
+        .expect("run ptywright completions bash");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(
+        stdout.contains("COMPLETE") || stdout.contains("complete"),
+        "bash completions should contain registration, got: {stdout}"
+    );
+}
+
+#[test]
+fn completions_zsh_outputs_script() {
+    let output = bin()
+        .args(["completions", "zsh"])
+        .output()
+        .expect("run ptywright completions zsh");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.starts_with("#compdef ptywright"));
+    assert!(stdout.contains("_clap_dynamic_completer_ptywright"));
+}
+
+#[test]
+fn completions_fish_outputs_script() {
+    let output = bin()
+        .args(["completions", "fish"])
+        .output()
+        .expect("run ptywright completions fish");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("complete") && stdout.contains("ptywright"));
+}
+
+#[test]
+fn completions_unknown_shell_errors() {
+    let output = bin()
+        .args(["completions", "tcsh"])
+        .output()
+        .expect("run ptywright completions tcsh");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(stderr.contains("unknown shell 'tcsh'"));
+}
+
 #[test]
 fn prints_version() {
     let output = bin()
