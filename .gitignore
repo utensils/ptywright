@@ -12,6 +12,7 @@
 **/target
 /result
 tmp/
+/SPEC.md
 
 # Coverage artifacts (cargo-llvm-cov)
 *.profraw
