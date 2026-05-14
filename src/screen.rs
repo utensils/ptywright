@@ -78,15 +78,31 @@ trait TerminalEngine: Send {
     fn snapshot(&self, sequence: u64) -> ScreenSnapshot;
 }
 
+#[derive(Debug, Default)]
+struct TerminalCallbacks {
+    title: Option<String>,
+}
+
+impl vt100::Callbacks for TerminalCallbacks {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+}
+
 struct Vt100TerminalEngine {
-    parser: vt100::Parser,
+    parser: vt100::Parser<TerminalCallbacks>,
     size: TerminalSize,
 }
 
 impl Vt100TerminalEngine {
     fn new(size: TerminalSize) -> Self {
         Self {
-            parser: vt100::Parser::new(size.rows, size.cols, 1_000),
+            parser: vt100::Parser::new_with_callbacks(
+                size.rows,
+                size.cols,
+                1_000,
+                TerminalCallbacks::default(),
+            ),
             size,
         }
     }
@@ -140,7 +156,7 @@ impl TerminalEngine for Vt100TerminalEngine {
             alternate_screen: screen.alternate_screen(),
             application_cursor: screen.application_cursor(),
             application_keypad: screen.application_keypad(),
-            title: None,
+            title: self.parser.callbacks().title.clone(),
         }
     }
 }
@@ -227,5 +243,17 @@ mod tests {
         assert_eq!(snapshot.cells[1].text, "B");
         assert_eq!(snapshot.cells[1].style.foreground, "idx:1");
         assert!(!snapshot.alternate_screen);
+    }
+
+    #[test]
+    fn terminal_snapshot_tracks_window_title() {
+        let mut terminal = Terminal::new(TerminalSize::new(2, 10));
+
+        terminal.process(b"\x1b]2;ptywright test\x07");
+
+        assert_eq!(
+            terminal.snapshot(1).title.as_deref(),
+            Some("ptywright test")
+        );
     }
 }
