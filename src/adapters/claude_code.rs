@@ -357,10 +357,16 @@ mod tests {
         let Matcher::All(matchers) = matcher else {
             panic!("expected Lua wait matcher to require all conditions");
         };
+        let Some(Matcher::Any(boundary_matchers)) = matchers
+            .iter()
+            .find(|matcher| matches!(matcher, Matcher::Any(_)))
+        else {
+            panic!("expected Lua wait matcher to include boundary alternatives");
+        };
         assert!(
-            matchers
+            boundary_matchers
                 .iter()
-                .any(|matcher| matches!(matcher, Matcher::Any(_)))
+                .any(|matcher| matcher == &Matcher::ContainsText("Total cost:".to_string()))
         );
         assert!(matchers.iter().any(|matcher| matches!(
             matcher,
@@ -471,6 +477,22 @@ mod tests {
     }
 
     #[test]
+    fn classifier_detects_usage_screen_as_completed_turn() {
+        let state = classify_state(
+            &claude_plugin().expect("load plugin"),
+            include_str!("../../tests/fixtures/claude_code/usage.txt"),
+            "",
+            8,
+            Some(ClaudeCodeState::PromptSubmitted),
+            Some(COMPLETED_TURN_STABLE_MS),
+        )
+        .expect("classify usage fixture via Lua plugin");
+
+        assert_eq!(state.state, ClaudeCodeState::CompletedTurn);
+        assert_eq!(state.evidence, "stable usage screen detected");
+    }
+
+    #[test]
     fn classifier_requires_stable_prompt_for_completed_turn() {
         let state = classify_state(
             &claude_plugin().expect("load plugin"),
@@ -575,6 +597,12 @@ mod tests {
                 None,
                 ClaudeCodeState::WaitingForPlanApproval,
                 "plan approval text detected",
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/usage.txt"),
+                Some(ClaudeCodeState::PromptSubmitted),
+                ClaudeCodeState::CompletedTurn,
+                "stable usage screen detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/error.txt"),

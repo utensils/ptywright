@@ -1,0 +1,33 @@
+ ▐▛███▜▌   Claude Code v2.1.141
+▝▜█████▛▘  Opus 4.7 (1M context) · Claude Max
+  ▘▘ ▝▝    ~/Projects/utensils/ptywright
+
+❯ /usage
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Settings  Status   Config   Usage   Stats
+
+  Session
+
+  Total cost:            $0.0000
+  Total duration (API):  0s
+  Total duration (wall): 4s
+  Total code changes:    0 lines added, 0 lines removed
+  Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+
+  Current session
+  █                                                  2% used
+  Resets 12:40pm (America/Phoenix)
+
+  Current week (all models)
+  █████████████████████████████████████████████████  98% used
+  Resets May 15 at 1am (America/Phoenix)
+
+  Current week (Sonnet only)
+  ████▌                                              9% used
+  Resets May 15 at 1am (America/Phoenix)
+
+  Extra usage
+  Extra usage not enabled · /extra-usage to enable
+
+  Esc to cancel

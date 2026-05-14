@@ -60,9 +60,9 @@ Every state response includes:
 - `evidence`
 - `sequence`
 
-The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Sanitized fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, interrupted, completed, and error-like screens.
+The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Sanitized fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, interrupted, completed, usage, and error-like screens.
 
-`claude.wait_turn` now waits for both a turn-boundary indicator and a stable screen interval before classifying a submitted prompt as `completed_turn`. A plain prompt glyph without stable-screen evidence is classified as `waiting_for_user_input`.
+`claude.wait_turn` waits for both a turn-boundary indicator and a stable screen interval before classifying a submitted prompt as `completed_turn`. Turn-boundary indicators include prompt lines, permission/approval prompts, and stable slash-command output such as `/usage`. A plain prompt glyph without stable-screen evidence is classified as `waiting_for_user_input`.
 
 ## JSON-RPC methods
 

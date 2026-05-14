@@ -101,6 +101,12 @@ local function has_plan_indicator(text)
   })
 end
 
+local function has_usage_screen(text)
+  return contains(text, "total cost:")
+    and contains(text, "usage:")
+    and contains_any(text, { "current session", "current week", "total duration" })
+end
+
 function M.classify(input)
   local screen = input.screen or ""
   local transcript = input.transcript or ""
@@ -129,6 +135,10 @@ function M.classify(input)
 
   if has_error_indicator(screen) then
     return state_snapshot("error", 0.72, "visible error banner detected", sequence)
+  end
+
+  if has_usage_screen(screen_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
+    return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence)
   end
 
   if contains_any(screen_text, { "what would you like", "how can i help", "type a message" }) then
@@ -162,6 +172,7 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("Do you want to proceed"),
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
+      matcher.contains_text("Total cost:"),
       matcher.screen_regex("(?m)^\\s*(?:>|❯)\\s*$"),
     }),
     matcher.screen_stable(completed_turn_stable_ms),
