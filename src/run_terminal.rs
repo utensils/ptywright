@@ -6,9 +6,13 @@ use std::thread;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ptywright::{Target, TerminalSize};
 
-pub fn run_command(mut command: Vec<String>, size: TerminalSize) -> ptywright::Result<ExitCode> {
-    let program = command.remove(0);
-    let target = Target::new(program).args(command).size(size);
+pub fn run_command(command: Vec<String>, size: TerminalSize) -> ptywright::Result<ExitCode> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| ptywright::Error::Rpc("run requires a command after `--`".to_string()))?;
+    let target = Target::new(program.clone())
+        .args(args.iter().cloned())
+        .size(size);
     let interactive_terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
     let _raw_mode = RawModeGuard::enable_if(interactive_terminal)?;
 
@@ -338,5 +342,13 @@ mod tests {
         let guard = RawModeGuard::enable_if(false).expect("disabled raw mode guard");
 
         assert!(!guard.enabled);
+    }
+
+    #[test]
+    fn run_command_rejects_empty_command() {
+        let error = run_command(Vec::new(), TerminalSize::new(24, 80)).expect_err("empty command");
+
+        assert!(matches!(error, ptywright::Error::Rpc(_)));
+        assert!(error.to_string().contains("requires a command"));
     }
 }
