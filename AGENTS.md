@@ -95,6 +95,28 @@ cargo run -- --help
 - `.github/workflows/` — CI, docs deploy, and release packaging.
 - `flake.nix` — Nix package, app, formatter, and devshell.
 
+## Git workflow
+
+Use normal branch-and-PR development moving forward.
+
+- Start each task from an up-to-date `main` and create a focused branch.
+- Branch names must use a Conventional Commit-style prefix and short kebab-case description:
+  - `feat/<short-description>` for features.
+  - `fix/<short-description>` for bug fixes.
+  - `docs/<short-description>` for documentation-only changes.
+  - `chore/<short-description>` for maintenance/tooling/workflow changes.
+  - `test/<short-description>` for test-only changes.
+  - `refactor/<short-description>` for behavior-preserving code restructuring.
+- Do not use ad-hoc branch names like `wip`, `update`, `changes`, or personal initials.
+- Do not push directly to `main` unless the user explicitly requests an emergency direct push.
+- Keep commits small and use Conventional Commits: `<type>(optional-scope): <summary>`.
+- Commit types should match the branch purpose where practical: `feat`, `fix`, `docs`, `chore`, `test`, `refactor`, `ci`, `perf`, or `build`.
+- Push the branch and open a pull request with a concise summary and test results.
+- Let CI run on the PR and address failures with additional commits on the same branch.
+- Prefer merge commits or squash merges through GitHub; never force-push `main`.
+- If a feature branch must be rebased after review starts, use `--force-with-lease` and mention it in the PR.
+- Keep docs, README, `AGENTS.md`, and the `CLAUDE.md` symlink target synchronized in the same PR when behavior or workflow changes.
+
 ## Dependency upkeep
 
 When asked to update dependencies:
