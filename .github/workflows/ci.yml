@@ -62,13 +62,6 @@ jobs:
       - name: Check
         if: runner.os != 'macOS'
         run: rustup run stable cargo check --locked
-      - name: Clippy (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          export RUSTC="$(rustup which rustc --toolchain stable)"
-          CARGO_BIN="$(rustup which cargo --toolchain stable)"
-          "$CARGO_BIN" clippy --locked -- -D warnings
       - name: Clippy
         if: runner.os != 'macOS'
         run: rustup run stable cargo clippy --locked -- -D warnings
