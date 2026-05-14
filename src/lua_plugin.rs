@@ -165,15 +165,31 @@ fn lua_manifest_error(error: PluginManifestError) -> Error {
 fn trusted_entrypoint_path(root: &Path, entrypoint: &str) -> Result<PathBuf> {
     let entrypoint = Path::new(entrypoint);
     if entrypoint.is_absolute()
-        || entrypoint
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || entrypoint.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
     {
         return Err(Error::Lua(
             "trusted Lua plugin entrypoint must be a relative path inside the plugin root".into(),
         ));
     }
-    Ok(root.join(entrypoint))
+
+    let root = fs::canonicalize(root)
+        .map_err(|error| Error::Lua(format!("failed to resolve Lua plugin root: {error}")))?;
+    let path = fs::canonicalize(root.join(entrypoint)).map_err(|error| {
+        Error::Lua(format!(
+            "failed to resolve trusted Lua plugin entrypoint: {error}"
+        ))
+    })?;
+    if !path.starts_with(&root) {
+        return Err(Error::Lua(
+            "trusted Lua plugin entrypoint resolved outside the plugin root".into(),
+        ));
+    }
+    Ok(path)
 }
 
 fn lua_error(name: &str, error: mlua::Error) -> Error {
@@ -448,6 +464,38 @@ mod tests {
 
         assert!(matches!(error, Error::Lua(_)));
         assert!(error.to_string().contains("relative path inside"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn trusted_entrypoint_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("ptywright-lua-plugin-test-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::write(outside.join("main.lua"), "return {}").expect("write outside plugin");
+        symlink(&outside, root.join("link")).expect("create symlink");
+
+        let manifest = PluginManifest {
+            name: "escape".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: Some(PluginRuntime::Lua),
+            entrypoint: Some("link/main.lua".to_string()),
+            permissions: Vec::new(),
+        };
+
+        let error = LuaPlugin::load_trusted(&root, &manifest).expect_err("symlink rejected");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        assert!(matches!(error, Error::Lua(_)));
+        assert!(error.to_string().contains("outside the plugin root"));
     }
 
     #[test]
