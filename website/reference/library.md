@@ -108,6 +108,20 @@ Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and 
 
 `wait_for` returns `MatchResult` with elapsed time, final snapshot, transcript tail, and sequence evidence.
 
+## Claude Code adapter
+
+`ClaudeCodeAdapter` starts `claude` interactively in a PTY and classifies coarse TUI state from screen/transcript evidence. The adapter does not use `claude -p`.
+
+```rust
+use ptywright::{ClaudeCodeAdapter, ClaudeCodeConfig};
+
+let mut claude = ClaudeCodeAdapter::start(ClaudeCodeConfig::default())?;
+let state = claude.send_prompt("help")?;
+# Ok::<(), ptywright::Error>(())
+```
+
+See [Claude Code adapter](../guide/claude-code.md) for state and limitation details.
+
 ## JSON-RPC
 
 `RpcServer` handles one NDJSON-framed JSON-RPC message at a time, and `serve_ndjson` runs the same protocol over arbitrary `Read`/`Write` streams.
@@ -129,6 +143,5 @@ The CLI exposes this through `ptywright serve --stdio`.
 
 Next public APIs should grow around these reusable concepts:
 
-- Turn orchestration for request/response workflows.
-- Interactive Claude Code adapter built on the generic session/screen/action/matcher layers.
+- Turn orchestration refinements for request/response workflows.
 - Extension/plugin host APIs for trusted local adapters.

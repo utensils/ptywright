@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::action::Action;
+use crate::adapters::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use crate::error::{Error, Result};
 use crate::matcher::Matcher;
 use crate::session::{Session, SessionConfig};
@@ -18,7 +19,9 @@ const JSONRPC_VERSION: &str = "2.0";
 /// Stateful JSON-RPC handler for ptywright sessions.
 pub struct RpcServer {
     sessions: HashMap<String, Session>,
+    claude_adapters: HashMap<String, ClaudeCodeAdapter>,
     next_session: u64,
+    next_claude_adapter: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +73,37 @@ struct WaitParams {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClaudeStartParams {
+    program: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    pixel_width: Option<u16>,
+    pixel_height: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeParams {
+    claude: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudePromptParams {
+    claude: String,
+    prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeWaitParams {
+    claude: String,
+    timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RpcErrorCode {
     ParseError,
@@ -101,7 +135,9 @@ impl RpcServer {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            claude_adapters: HashMap::new(),
             next_session: 1,
+            next_claude_adapter: 1,
         }
     }
 
@@ -169,7 +205,14 @@ impl RpcServer {
                     "session.input",
                     "session.snapshot",
                     "session.transcript",
-                    "session.wait"
+                    "session.wait",
+                    "claude.start",
+                    "claude.send_prompt",
+                    "claude.wait_turn",
+                    "claude.approve",
+                    "claude.deny",
+                    "claude.cancel",
+                    "claude.state"
                 ],
                 "notifications": []
             })),
@@ -182,6 +225,13 @@ impl RpcServer {
             "session.snapshot" => self.session_snapshot(request.params),
             "session.transcript" => self.session_transcript(request.params),
             "session.wait" => self.session_wait(request.params),
+            "claude.start" => self.claude_start(request.params),
+            "claude.send_prompt" => self.claude_send_prompt(request.params),
+            "claude.wait_turn" => self.claude_wait_turn(request.params),
+            "claude.approve" => self.claude_approve(request.params),
+            "claude.deny" => self.claude_deny(request.params),
+            "claude.cancel" => self.claude_cancel(request.params),
+            "claude.state" => self.claude_state(request.params),
             _ => Err((
                 RpcErrorCode::MethodNotFound,
                 format!("unknown method: {method}"),
@@ -308,6 +358,120 @@ impl RpcServer {
         }))
     }
 
+    fn claude_start(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeStartParams = parse_params(params)?;
+        let config = ClaudeCodeConfig {
+            program: params.program.unwrap_or_else(|| "claude".to_string()),
+            args: params.args,
+            cwd: params.cwd,
+            env: params.env,
+            size: TerminalSize {
+                rows: params.rows.unwrap_or(40),
+                cols: params.cols.unwrap_or(120),
+                pixel_width: params.pixel_width.unwrap_or(0),
+                pixel_height: params.pixel_height.unwrap_or(0),
+            },
+        };
+        let adapter = ClaudeCodeAdapter::start(config).map_err(rpc_error_from_error)?;
+        let state = adapter.state();
+        let id = self.allocate_claude_adapter_id();
+        self.claude_adapters.insert(id.clone(), adapter);
+        Ok(json!({ "claude": id, "state": state }))
+    }
+
+    fn claude_send_prompt(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudePromptParams = parse_params(params)?;
+        let state = self
+            .claude_adapter_mut(&params.claude)?
+            .send_prompt(params.prompt)
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "state": state }))
+    }
+
+    fn claude_wait_turn(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeWaitParams = parse_params(params)?;
+        let state = self
+            .claude_adapter(&params.claude)?
+            .wait_turn(Duration::from_millis(params.timeout_ms.unwrap_or(120_000)))
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "state": state }))
+    }
+
+    fn claude_approve(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeParams = parse_params(params)?;
+        self.claude_adapter(&params.claude)?
+            .approve()
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "approved": true }))
+    }
+
+    fn claude_deny(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeParams = parse_params(params)?;
+        self.claude_adapter(&params.claude)?
+            .deny()
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "denied": true }))
+    }
+
+    fn claude_cancel(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeParams = parse_params(params)?;
+        let state = self
+            .claude_adapter_mut(&params.claude)?
+            .cancel()
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "state": state }))
+    }
+
+    fn claude_state(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeParams = parse_params(params)?;
+        Ok(json!({ "state": self.claude_adapter(&params.claude)?.state() }))
+    }
+
+    fn claude_adapter(
+        &self,
+        id: &str,
+    ) -> std::result::Result<&ClaudeCodeAdapter, (RpcErrorCode, String)> {
+        self.claude_adapters.get(id).ok_or_else(|| {
+            (
+                RpcErrorCode::InvalidParams,
+                format!("unknown Claude Code adapter: {id}"),
+            )
+        })
+    }
+
+    fn claude_adapter_mut(
+        &mut self,
+        id: &str,
+    ) -> std::result::Result<&mut ClaudeCodeAdapter, (RpcErrorCode, String)> {
+        self.claude_adapters.get_mut(id).ok_or_else(|| {
+            (
+                RpcErrorCode::InvalidParams,
+                format!("unknown Claude Code adapter: {id}"),
+            )
+        })
+    }
+
     fn session(&self, id: &str) -> std::result::Result<&Session, (RpcErrorCode, String)> {
         self.sessions.get(id).ok_or_else(|| {
             (
@@ -320,6 +484,12 @@ impl RpcServer {
     fn allocate_session_id(&mut self) -> String {
         let id = format!("s{}", self.next_session);
         self.next_session += 1;
+        id
+    }
+
+    fn allocate_claude_adapter_id(&mut self) -> String {
+        let id = format!("c{}", self.next_claude_adapter);
+        self.next_claude_adapter += 1;
         id
     }
 }
@@ -415,12 +585,9 @@ mod tests {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["framing"], "ndjson");
-        assert!(
-            response["result"]["methods"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("session.create"))
-        );
+        let methods = response["result"]["methods"].as_array().unwrap();
+        assert!(methods.contains(&json!("session.create")));
+        assert!(methods.contains(&json!("claude.start")));
     }
 
     #[test]
@@ -452,6 +619,17 @@ mod tests {
 
         assert_eq!(response["error"]["code"], -32601);
         assert_eq!(response["id"], "x");
+    }
+
+    #[test]
+    fn claude_state_for_unknown_adapter_returns_invalid_params() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":9,"method":"claude.state","params":{"claude":"missing"}}"#,
+        );
+
+        assert_eq!(response["error"]["code"], -32602);
     }
 
     #[test]

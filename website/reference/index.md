@@ -20,5 +20,6 @@ ptywright exposes an early CLI, Rust library, and JSON-RPC automation protocol.
 - `Matcher` and `MatchResult` for event-driven waits.
 - `Transcript` and `TranscriptConfig` for bounded output retention.
 - `RpcServer` and `serve_ndjson` for JSON-RPC automation.
+- `ClaudeCodeAdapter`, `ClaudeCodeConfig`, and Claude state types for interactive Claude Code automation.
 
-See the dedicated CLI, library, and JSON-RPC reference pages for details.
+See the dedicated CLI, library, JSON-RPC reference, and Claude Code guide pages for details.

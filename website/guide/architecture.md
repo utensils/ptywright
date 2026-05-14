@@ -1,6 +1,6 @@
 # Architecture
 
-ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior, including the future interactive Claude Code adapter, sits above reusable terminal primitives.
+ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior, including the interactive Claude Code adapter, sits above reusable terminal primitives.
 
 ## Repository layout
 
@@ -8,6 +8,7 @@ ptywright is an early PTY/TUI automation runtime. The core is intentionally gene
 ptywright/
 ├── src/
 │   ├── action.rs      # serializable input/lifecycle actions
+│   ├── adapters/      # app-specific adapters such as Claude Code
 │   ├── error.rs       # public error/result types
 │   ├── lib.rs         # public library surface
 │   ├── main.rs        # clap CLI entrypoint
@@ -46,7 +47,7 @@ Action + Matcher
   │ deterministic input and event-driven waits
   ▼
 Turn orchestration / adapters
-  │ future shell, REPL, full-screen TUI, and Claude Code workflows
+  │ shell, REPL, full-screen TUI, and Claude Code workflows
 ```
 
 ## Abstraction boundaries
@@ -77,17 +78,17 @@ The first implementation uses:
 
 The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later.
 
-## Interactive Claude Code direction
+## Interactive Claude Code adapter
 
-ptywright will target interactive Claude Code through the terminal TUI. It will not optimize around `claude -p` or non-interactive Agent SDK flows.
+ptywright targets interactive Claude Code through the terminal TUI. It does not optimize around `claude -p` or non-interactive Agent SDK flows.
 
-The future Claude Code adapter should use only generic primitives:
+The Claude Code adapter uses only generic primitives:
 
 - spawn `claude` in a PTY-backed `Session`;
 - observe `ScreenSnapshot` and transcript evidence;
 - send `Action` values for prompts, approval keys, interrupts, and resize;
 - wait with `Matcher` predicates;
-- expose Claude-specific state only in adapter APIs.
+- expose Claude-specific state only in adapter APIs and `claude.*` RPC methods.
 
 This keeps the core useful for shells, REPLs, full-screen TUIs, and other long-running terminal programs.
 

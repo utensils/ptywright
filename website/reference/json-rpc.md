@@ -144,6 +144,24 @@ Matcher payloads:
 {"type":"all","value":[{"type":"contains_text","value":"rea"},{"type":"contains_text","value":"dy"}]}
 ```
 
+### Claude Code convenience methods
+
+Claude methods drive interactive Claude Code through a PTY. They do not use `claude -p`.
+
+| Method               | Params                                        | Result                             |
+| -------------------- | --------------------------------------------- | ---------------------------------- |
+| `claude.start`       | `{ "cwd": "/repo", "rows": 40, "cols": 120 }` | `{ "claude": "c1", "state": ... }` |
+| `claude.send_prompt` | `{ "claude": "c1", "prompt": "..." }`         | `{ "state": ... }`                 |
+| `claude.wait_turn`   | `{ "claude": "c1", "timeout_ms": 120000 }`    | `{ "state": ... }`                 |
+| `claude.approve`     | `{ "claude": "c1" }`                          | `{ "approved": true }`             |
+| `claude.deny`        | `{ "claude": "c1" }`                          | `{ "denied": true }`               |
+| `claude.cancel`      | `{ "claude": "c1" }`                          | `{ "state": ... }`                 |
+| `claude.state`       | `{ "claude": "c1" }`                          | `{ "state": ... }`                 |
+
+`claude.start` accepts optional `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, and `pixel_height` fields. The default program is `claude`; default args are empty.
+
+See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics and limitations.
+
 ### Other session methods
 
 | Method               | Params                                         | Result                         |

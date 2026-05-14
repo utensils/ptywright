@@ -6,6 +6,7 @@
 //! target, session, screen, action, matcher, and transcript primitives.
 
 pub mod action;
+pub mod adapters;
 pub mod error;
 pub mod matcher;
 pub mod rpc;
@@ -15,6 +16,7 @@ pub mod target;
 pub mod transcript;
 
 pub use action::{Action, Key};
+pub use adapters::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeState, ClaudeCodeStateSnapshot};
 pub use error::{Error, Result};
 pub use matcher::{MatchResult, Matcher};
 pub use rpc::{RpcServer, serve_ndjson};
