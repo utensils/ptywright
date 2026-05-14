@@ -1,4 +1,5 @@
-use std::io::{self, Read, Write};
+use std::borrow::Cow;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
@@ -243,6 +244,8 @@ fn serve_socket(path: &Path, _framing: RpcFraming) -> ptywright::Result<()> {
 fn run_command(mut command: Vec<String>, size: TerminalSize) -> ptywright::Result<ExitCode> {
     let program = command.remove(0);
     let target = Target::new(program).args(command).size(size);
+    let interactive_terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let _raw_mode = RawModeGuard::enable_if(interactive_terminal)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -284,8 +287,15 @@ fn run_command(mut command: Vec<String>, size: TerminalSize) -> ptywright::Resul
             match stdin.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    writer.write_all(&buf[..n])?;
-                    writer.flush()?;
+                    let input = if interactive_terminal {
+                        filter_terminal_generated_input(&buf[..n])
+                    } else {
+                        Cow::Borrowed(&buf[..n])
+                    };
+                    if !input.is_empty() {
+                        writer.write_all(&input)?;
+                        writer.flush()?;
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
@@ -304,5 +314,121 @@ fn run_command(mut command: Vec<String>, size: TerminalSize) -> ptywright::Resul
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(status.exit_code().min(u8::MAX as u32) as u8))
+    }
+}
+
+struct RawModeGuard {
+    enabled: bool,
+}
+
+impl RawModeGuard {
+    fn enable_if(enabled: bool) -> io::Result<Self> {
+        if enabled {
+            crossterm::terminal::enable_raw_mode()?;
+        }
+        Ok(Self { enabled })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+fn filter_terminal_generated_input(input: &[u8]) -> Cow<'_, [u8]> {
+    let mut index = 0;
+    let mut output = Vec::new();
+    let mut changed = false;
+
+    while index < input.len() {
+        if let Some(len) = terminal_generated_sequence_len(&input[index..]) {
+            changed = true;
+            index += len;
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+
+fn terminal_generated_sequence_len(input: &[u8]) -> Option<usize> {
+    match input {
+        [0x1b, b'[', b'I', ..] | [0x1b, b'[', b'O', ..] => Some(3),
+        [0x1b, b'[', b'?', rest @ ..] => csi_final_len(rest).and_then(|len| {
+            if rest.get(len - 1) == Some(&b'c') {
+                Some(3 + len)
+            } else {
+                None
+            }
+        }),
+        [0x1b, b'P', rest @ ..] => dcs_final_len(rest).map(|len| 2 + len),
+        [0x9b, b'I', ..] | [0x9b, b'O', ..] => Some(2),
+        [0x9b, b'?', rest @ ..] => csi_final_len(rest).and_then(|len| {
+            if rest.get(len - 1) == Some(&b'c') {
+                Some(2 + len)
+            } else {
+                None
+            }
+        }),
+        [0x90, rest @ ..] => dcs_final_len(rest).map(|len| 1 + len),
+        _ => None,
+    }
+}
+
+fn csi_final_len(input: &[u8]) -> Option<usize> {
+    input
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+        .map(|index| index + 1)
+}
+
+fn dcs_final_len(input: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index < input.len() {
+        match input[index] {
+            0x07 | 0x9c => return Some(index + 1),
+            0x1b if input.get(index + 1) == Some(&b'\\') => return Some(index + 2),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_terminal_focus_events() {
+        assert_eq!(
+            filter_terminal_generated_input(b"a\x1b[Ib\x1b[Oc").as_ref(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn filters_terminal_capability_responses() {
+        let input = b"hello\x1bP>|ghostty 1.3.1\x1b\\\x1b[?62;22;52cworld";
+
+        assert_eq!(
+            filter_terminal_generated_input(input).as_ref(),
+            b"helloworld"
+        );
+    }
+
+    #[test]
+    fn preserves_user_navigation_sequences() {
+        let input = b"\x1b[A\x1b[B\x1b[200~paste\x1b[201~";
+
+        assert_eq!(filter_terminal_generated_input(input).as_ref(), input);
     }
 }
