@@ -231,20 +231,11 @@ fn classify_state(
         );
     }
 
-    if contains_any(
-        &lower,
-        &[
-            "error:",
-            "request failed",
-            "failed to",
-            "try again",
-            "retry",
-        ],
-    ) {
+    if has_error_indicator(screen) {
         return state_snapshot(
             ClaudeCodeState::Error,
-            0.7,
-            "error or retry text detected",
+            0.72,
+            "visible error banner detected",
             sequence,
         );
     }
@@ -297,6 +288,16 @@ fn state_snapshot(
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
+}
+
+fn has_error_indicator(screen: &str) -> bool {
+    screen.lines().any(|line| {
+        let lower = line.trim().to_lowercase();
+        lower.starts_with("error:")
+            || lower.starts_with("request failed")
+            || lower.contains("please retry")
+            || lower.contains("press r to retry")
+    })
 }
 
 #[cfg(test)]
@@ -358,41 +359,49 @@ mod tests {
                 include_str!("../../tests/fixtures/claude_code/ready.txt"),
                 None,
                 ClaudeCodeState::Ready,
+                "ready prompt text detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/thinking.txt"),
                 None,
                 ClaudeCodeState::Thinking,
+                "thinking indicator detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/permission.txt"),
                 None,
                 ClaudeCodeState::WaitingForPermission,
+                "permission or approval prompt text detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/plan_approval.txt"),
                 None,
                 ClaudeCodeState::WaitingForPlanApproval,
+                "plan approval text detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/completed.txt"),
                 Some(ClaudeCodeState::PromptSubmitted),
                 ClaudeCodeState::CompletedTurn,
+                "input prompt glyph detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/error.txt"),
                 None,
                 ClaudeCodeState::Error,
+                "visible error banner detected",
             ),
         ];
 
-        for (index, (fixture, last_intent, expected)) in fixtures.into_iter().enumerate() {
+        for (index, (fixture, last_intent, expected, evidence)) in fixtures.into_iter().enumerate()
+        {
             let state = classify_state(fixture, "", index as u64, last_intent);
             assert_eq!(
                 state.state, expected,
                 "fixture {index} classified with evidence: {}",
                 state.evidence
             );
+            assert_eq!(state.evidence, evidence);
             assert!(state.confidence >= 0.6);
         }
     }
