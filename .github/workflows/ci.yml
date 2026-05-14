@@ -52,10 +52,46 @@ jobs:
         with:
           key: ${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: rustup run stable cargo check --locked
-      - run: rustup run stable cargo clippy --locked -- -D warnings
-      - run: rustup run stable cargo test --locked
-      - run: rustup run stable cargo build --release --locked
+      - name: Check (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" check --locked
+      - name: Check
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo check --locked
+      - name: Clippy (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" clippy --locked -- -D warnings
+      - name: Clippy
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo clippy --locked -- -D warnings
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" test --locked
+      - name: Test
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo test --locked
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" build --release --locked
+      - name: Build
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo build --release --locked
 
   coverage:
     runs-on: ubuntu-latest

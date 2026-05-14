@@ -58,7 +58,16 @@ jobs:
           key: release-${{ matrix.target }}
           cache-on-failure: true
 
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" build --release --target ${{ matrix.target }} --locked
+
       - name: Build
+        if: runner.os != 'macOS'
         run: rustup run stable cargo build --release --target ${{ matrix.target }} --locked
 
       - name: Strip binary
