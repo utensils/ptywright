@@ -14,7 +14,7 @@ Implemented:
 - `PluginPermission`
 - `PluginHostCapabilities`
 - trusted embedded Lua execution for built-in plugins
-- built-in `claude-code` Lua adapter plugin
+- built-in `claude-code` Lua adapter plugin surfaced via `PluginHostCapabilities.builtin_plugins`
 - manifest validation
 - JSON-RPC methods:
   - `plugin.capabilities`

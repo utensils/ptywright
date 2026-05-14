@@ -113,6 +113,8 @@ impl Matcher {
 }
 
 fn cached_regex_is_match(pattern: &str, text: &str) -> bool {
+    const MAX_REGEX_CACHE_ENTRIES: usize = 128;
+
     static REGEX_CACHE: OnceLock<Mutex<HashMap<String, Option<Regex>>>> = OnceLock::new();
     let cache = REGEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().expect("regex cache lock poisoned");
@@ -122,6 +124,9 @@ fn cached_regex_is_match(pattern: &str, text: &str) -> bool {
 
     let regex = Regex::new(pattern).ok();
     let matched = regex.as_ref().is_some_and(|regex| regex.is_match(text));
+    if cache.len() >= MAX_REGEX_CACHE_ENTRIES {
+        cache.clear();
+    }
     cache.insert(pattern.to_string(), regex);
     matched
 }
@@ -170,7 +175,14 @@ mod tests {
     #[test]
     fn invalid_regex_does_not_match() {
         assert!(!Matcher::ScreenRegex("[".into()).is_match(&snapshot("text"), ""));
-        assert!(!Matcher::ScreenRegex("[".into()).is_match(&snapshot("text"), ""));
+    }
+
+    #[test]
+    fn repeated_regex_uses_cached_result() {
+        let matcher = Matcher::ScreenRegex("rea.y".into());
+
+        assert!(matcher.is_match(&snapshot("ready"), ""));
+        assert!(matcher.is_match(&snapshot("ready"), ""));
     }
 
     #[test]

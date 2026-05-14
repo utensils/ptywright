@@ -128,6 +128,8 @@ let state = claude.send_prompt("help")?;
 # Ok::<(), ptywright::Error>(())
 ```
 
+`ClaudeCodeAdapter::from_session(session)` is also fallible because it loads the built-in Lua plugin before wrapping externally managed sessions.
+
 See [Claude Code adapter](../guide/claude-code.md) for state and limitation details.
 
 ## Redaction

@@ -228,7 +228,7 @@ fn classify_state(
             screen,
             transcript,
             sequence,
-            last_intent: last_intent.map(state_name),
+            last_intent: last_intent.map(state_name).transpose()?,
         },
     )
 }
@@ -252,7 +252,7 @@ struct ClassifyInput<'a> {
     screen: &'a str,
     transcript: &'a str,
     sequence: u64,
-    last_intent: Option<&'static str>,
+    last_intent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,21 +269,11 @@ fn claude_plugin() -> Result<LuaPlugin> {
     )
 }
 
-const fn state_name(state: ClaudeCodeState) -> &'static str {
-    match state {
-        ClaudeCodeState::Starting => "starting",
-        ClaudeCodeState::Ready => "ready",
-        ClaudeCodeState::PromptSubmitted => "prompt_submitted",
-        ClaudeCodeState::Thinking => "thinking",
-        ClaudeCodeState::WaitingForPermission => "waiting_for_permission",
-        ClaudeCodeState::WaitingForPlanApproval => "waiting_for_plan_approval",
-        ClaudeCodeState::WaitingForUserInput => "waiting_for_user_input",
-        ClaudeCodeState::CompletedTurn => "completed_turn",
-        ClaudeCodeState::Cancelling => "cancelling",
-        ClaudeCodeState::Exited => "exited",
-        ClaudeCodeState::Error => "error",
-        ClaudeCodeState::PluginError => "plugin_error",
-    }
+fn state_name(state: ClaudeCodeState) -> Result<String> {
+    serde_json::to_value(state)?
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| crate::Error::Lua("Claude Code state did not serialize to a string".into()))
 }
 
 #[cfg(test)]
@@ -351,6 +341,31 @@ mod tests {
             .expect("load wait matcher from Lua");
 
         assert!(matches!(matcher, Matcher::Any(_)));
+    }
+
+    #[test]
+    fn lua_turn_wait_matcher_matches_prompt_line() {
+        let matcher: Matcher = claude_plugin()
+            .expect("load built-in Claude Code Lua plugin")
+            .call("wait_turn_matcher", &serde_json::json!({}))
+            .expect("load wait matcher from Lua");
+        let snapshot = crate::ScreenSnapshot {
+            size: TerminalSize::new(3, 20),
+            cursor: crate::CursorState {
+                row: 1,
+                col: 2,
+                visible: true,
+            },
+            sequence: 1,
+            plain_text: "work complete\n > \r\n".to_string(),
+            cells: Vec::new(),
+            alternate_screen: false,
+            application_cursor: false,
+            application_keypad: false,
+            title: None,
+        };
+
+        assert!(matcher.is_match(&snapshot, ""));
     }
 
     #[test]
