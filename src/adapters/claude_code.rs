@@ -305,6 +305,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn adapter_from_session_executes_lua_action_plans() -> Result<()> {
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "cat"]))?;
+        let mut adapter = ClaudeCodeAdapter::from_session(session)?;
+
+        let _ = adapter.send_prompt("hello from lua")?;
+        adapter.session().wait_for(
+            &Matcher::TranscriptContains("hello from lua".to_string()),
+            Duration::from_secs(2),
+        )?;
+        adapter.approve()?;
+        adapter.deny()?;
+        let _ = adapter.cancel()?;
+        let _ = adapter.session().kill();
+
+        Ok(())
+    }
+
+    #[test]
     fn lua_plugin_supplies_prompt_action_plan() {
         let plan: ActionPlan = claude_plugin()
             .expect("load built-in Claude Code Lua plugin")
