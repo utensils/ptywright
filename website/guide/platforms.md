@@ -18,7 +18,7 @@ The initial PTY implementation uses `portable-pty`, which maps to Unix PTYs on m
 - Windows ConPTY support is compiled in, but command-output fixtures are temporarily gated while deterministic Windows PTY test commands are developed.
 - `ptywright run` bridges stdin/stdout live for local debugging.
 - JSON-RPC control is available through `serve --stdio` on all platforms and Unix sockets on macOS/Linux.
-- Windows named-pipe server mode is not implemented yet; use `serve --stdio` as the supported Windows automation transport for now.
+- Windows named-pipe server mode is not implemented yet; `serve --stdio` is the documented Windows equivalent for local automation transport for now.
 
 ## Development environments
 

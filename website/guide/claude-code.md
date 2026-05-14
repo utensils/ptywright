@@ -62,6 +62,8 @@ Every state response includes:
 
 The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Sanitized fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, interrupted, completed, usage, and error-like screens.
 
+Current fixtures are based on sanitized captures from Claude Code v2.1.141 on Ghostty/macOS with Sonnet 4.6 and Opus 4.7 displays. Treat the exact labels, footer content, and slash-command layouts as versioned UI assumptions; update the Lua plugin and fixtures together when Claude Code changes its TUI.
+
 `claude.wait_turn` waits for both a turn-boundary indicator and a stable screen interval before classifying a submitted prompt as `completed_turn`. Turn-boundary indicators include prompt lines, permission/approval prompts, and stable slash-command output such as `/usage`. A plain prompt glyph without stable-screen evidence is classified as `waiting_for_user_input`.
 
 ## JSON-RPC methods

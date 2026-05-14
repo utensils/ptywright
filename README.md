@@ -68,9 +68,9 @@ nix run github:utensils/ptywright -- --help
 
 ## Planned layers
 
-1. More Claude Code real-world fixtures and transition tests.
-2. Windows named-pipe or equivalent local IPC parity.
-3. Stronger Lua runtime limits and diagnostics.
+1. More Claude Code real-world fixtures and transition tests as upstream Claude Code UI changes.
+2. Windows named-pipe server mode if stdio is not sufficient for Windows local automation.
+3. Optional WASM only if untrusted marketplace-style plugins become a concrete priority.
 
 ## Development
 
