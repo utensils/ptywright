@@ -12,6 +12,9 @@ pub enum Error {
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    /// JSON parsing or encoding error.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     /// Timed out waiting for a matcher.
     #[error("timed out waiting for matcher")]
     Timeout,
@@ -21,4 +24,7 @@ pub enum Error {
     /// Child process has already exited or closed its PTY.
     #[error("session is closed")]
     Closed,
+    /// RPC protocol error.
+    #[error("rpc error: {0}")]
+    Rpc(String),
 }

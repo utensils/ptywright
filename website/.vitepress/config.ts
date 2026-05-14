@@ -88,6 +88,7 @@ export default defineConfig({
             { text: 'Overview', link: '/reference/' },
             { text: 'CLI', link: '/reference/cli' },
             { text: 'Library', link: '/reference/library' },
+            { text: 'JSON-RPC', link: '/reference/json-rpc' },
             { text: 'Roadmap', link: '/reference/roadmap' },
           ],
         },

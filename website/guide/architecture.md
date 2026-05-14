@@ -12,6 +12,7 @@ ptywright/
 │   ├── lib.rs         # public library surface
 │   ├── main.rs        # clap CLI entrypoint
 │   ├── matcher.rs     # screen/transcript predicates
+│   ├── rpc.rs         # NDJSON JSON-RPC server
 │   ├── screen.rs      # terminal parser and snapshots
 │   ├── session.rs     # PTY-backed process lifecycle
 │   ├── target.rs      # spawn configuration
@@ -26,11 +27,14 @@ ptywright/
 ## Runtime model
 
 ```text
-caller / CLI / future JSON-RPC client
+caller / CLI / JSON-RPC client
   │
   ▼
 Target
   │ program, args, cwd, env, terminal size
+  ▼
+JSON-RPC server (optional stdio automation boundary)
+  │ protocol parsing, session registry, method dispatch
   ▼
 Session
   │ PTY process lifecycle, reader, writer, resize, kill, wait
@@ -55,6 +59,7 @@ Turn orchestration / adapters
 | Transcript | Bounded retained PTY output text                           | Terminal rendering decisions  |
 | Action     | Keys, writes, paste, resize, interrupt, EOF, kill          | App-specific success rules    |
 | Matcher    | Screen/transcript predicates and timeout evidence          | Owning the process            |
+| RPC        | Protocol framing, session registry, method dispatch        | Human output on stdout        |
 | Turn       | Send input, wait for completion, capture transcript        | Hard-coded app names          |
 | Adapter    | App-specific workflows                                     | Reimplementing PTY primitives |
 
@@ -68,6 +73,7 @@ The first implementation uses:
 - A monotonic sequence number for screen/transcript changes.
 - A bounded in-memory transcript to avoid unbounded output growth.
 - Event-driven matcher waits using a condition variable, not sleep polling.
+- JSON-RPC 2.0 over stdio with NDJSON framing for external automation clients.
 
 The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later.
 

@@ -92,7 +92,7 @@ session.send(Action::Interrupt)?;
 # Ok::<(), ptywright::Error>(())
 ```
 
-Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and Ctrl-D.
+Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and Ctrl-D. `Action`, `Key`, `Matcher`, `Target`, `TerminalSize`, and `ScreenSnapshot` are serializable for JSON-RPC use.
 
 ## Matchers
 
@@ -108,11 +108,27 @@ Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and 
 
 `wait_for` returns `MatchResult` with elapsed time, final snapshot, transcript tail, and sequence evidence.
 
+## JSON-RPC
+
+`RpcServer` handles one NDJSON-framed JSON-RPC message at a time, and `serve_ndjson` runs the same protocol over arbitrary `Read`/`Write` streams.
+
+```rust
+use ptywright::RpcServer;
+
+let mut server = RpcServer::new();
+let response = server.handle_line(
+    r#"{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}"#,
+)?;
+assert!(response.is_some());
+# Ok::<(), ptywright::Error>(())
+```
+
+The CLI exposes this through `ptywright serve --stdio`.
+
 ## Planned API families
 
 Next public APIs should grow around these reusable concepts:
 
-- JSON-RPC server over stdio for external automation clients.
 - Turn orchestration for request/response workflows.
 - Interactive Claude Code adapter built on the generic session/screen/action/matcher layers.
 - Extension/plugin host APIs for trusted local adapters.

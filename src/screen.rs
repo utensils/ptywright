@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 use crate::target::TerminalSize;
 
 /// Cursor position and visibility from the rendered terminal state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorState {
     /// Zero-based row.
     pub row: u16,
@@ -12,7 +14,7 @@ pub struct CursorState {
 }
 
 /// A rendered terminal snapshot suitable for automation decisions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenSnapshot {
     /// Terminal dimensions.
     pub size: TerminalSize,

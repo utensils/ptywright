@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::screen::ScreenSnapshot;
 
@@ -20,7 +21,8 @@ pub struct MatchResult {
 }
 
 /// Predicate for screen/transcript state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Matcher {
     /// Visible screen contains the provided text.
     ContainsText(String),

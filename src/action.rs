@@ -1,7 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 use crate::target::TerminalSize;
 
 /// Named terminal keys encoded by ptywright.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Key {
     /// Enter / carriage return.
     Enter,
@@ -45,7 +48,8 @@ impl Key {
 }
 
 /// Input or lifecycle action sent to a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Action {
     /// Write text bytes to the PTY.
     Text(String),

@@ -8,7 +8,7 @@
 
 ptywright is an early general-purpose PTY/TUI automation toolkit. It is designed to drive interactive terminal applications from code without coupling the core abstractions to any one program.
 
-The library now includes initial target, session, screen, action, matcher, and transcript primitives backed by real PTYs. The CLI includes a small `run` command for executing a program in a headless PTY and printing the captured transcript when it exits.
+The library now includes initial target, session, screen, action, matcher, transcript, and JSON-RPC primitives backed by real PTYs. The CLI includes `run` for executing a program in a headless PTY and `serve --stdio` for NDJSON-framed JSON-RPC automation.
 
 Docs: <https://utensils.io/ptywright/>
 
@@ -18,6 +18,7 @@ Docs: <https://utensils.io/ptywright/>
 ptywright --help
 ptywright --version
 ptywright run -- /bin/sh -lc 'printf ready'
+printf '{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}\n' | ptywright serve --stdio
 ```
 
 ## Install from source
@@ -53,13 +54,13 @@ nix run github:utensils/ptywright -- --help
 4. Input actions and key sequences.
 5. Matchers and waits.
 6. Bounded transcript capture.
+7. JSON-RPC over stdio for external automation clients.
 
 ## Planned layers
 
-1. JSON-RPC over stdio for external automation clients.
-2. Turn orchestration.
-3. Interactive Claude Code adapter built on the generic PTY layers.
-4. Extension/plugin APIs for trusted local adapters.
+1. Turn orchestration.
+2. Interactive Claude Code adapter built on the generic PTY layers.
+3. Extension/plugin APIs for trusted local adapters.
 
 ## Development
 

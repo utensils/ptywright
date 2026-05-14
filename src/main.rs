@@ -2,14 +2,14 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use ptywright::{DESCRIPTION, NAME, Session, Target, TerminalSize};
+use ptywright::{DESCRIPTION, NAME, Session, Target, TerminalSize, serve_ndjson};
 
 #[derive(Debug, Parser)]
 #[command(
     name = NAME,
     version,
     about = DESCRIPTION,
-    long_about = "ptywright is a cross-platform Rust CLI and library for driving interactive terminal applications through PTYs.\n\nThe library now exposes early PTY session, screen snapshot, action, matcher, and transcript primitives. App-specific automation, including interactive Claude Code support, will be layered on top of those generic pieces."
+    long_about = "ptywright is a cross-platform Rust CLI and library for driving interactive terminal applications through PTYs.\n\nThe library now exposes early PTY session, screen snapshot, action, matcher, transcript, and JSON-RPC primitives. App-specific automation, including interactive Claude Code support, will be layered on top of those generic pieces."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,6 +29,12 @@ enum Commands {
         /// Command and arguments to run after `--`.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Serve JSON-RPC 2.0 over stdio using newline-delimited JSON framing.
+    Serve {
+        /// Use stdin/stdout for JSON-RPC. Stdout is protocol-only in this mode.
+        #[arg(long)]
+        stdio: bool,
     },
 }
 
@@ -50,6 +56,7 @@ fn run() -> ptywright::Result<ExitCode> {
             cols,
             command,
         }) => run_command(command, TerminalSize::new(rows, cols)),
+        Some(Commands::Serve { stdio }) => serve_command(stdio),
         None => {
             let mut command = Cli::command();
             command.print_help()?;
@@ -57,6 +64,16 @@ fn run() -> ptywright::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn serve_command(stdio: bool) -> ptywright::Result<ExitCode> {
+    if !stdio {
+        return Err(ptywright::Error::Rpc(
+            "serve currently requires --stdio".to_string(),
+        ));
+    }
+    serve_ndjson(io::stdin().lock(), io::stdout().lock())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_command(mut command: Vec<String>, size: TerminalSize) -> ptywright::Result<ExitCode> {

@@ -1,6 +1,6 @@
 # Reference
 
-ptywright currently exposes a minimal CLI and library skeleton.
+ptywright exposes an early CLI, Rust library, and JSON-RPC automation protocol.
 
 ## Crate metadata
 
@@ -11,17 +11,14 @@ ptywright currently exposes a minimal CLI and library skeleton.
 - Repository: <https://github.com/utensils/ptywright>
 - Docs site: <https://utensils.io/ptywright/>
 
-## Current public API
+## Current public API families
 
-```rust
-pub const NAME: &str;
-pub const VERSION: &str;
-pub const DESCRIPTION: &str;
+- `Target` and `TerminalSize` for spawn configuration.
+- `Session` and `SessionConfig` for PTY-backed process lifecycle.
+- `Terminal`, `ScreenSnapshot`, and `CursorState` for rendered terminal observation.
+- `Action` and `Key` for deterministic input.
+- `Matcher` and `MatchResult` for event-driven waits.
+- `Transcript` and `TranscriptConfig` for bounded output retention.
+- `RpcServer` and `serve_ndjson` for JSON-RPC automation.
 
-pub struct Target {
-    pub program: String,
-    pub args: Vec<String>,
-}
-```
-
-This will grow into PTY session management, screen observation, input actions, matchers, turn orchestration, and adapters.
+See the dedicated CLI, library, and JSON-RPC reference pages for details.

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// Size of the terminal visible area.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSize {
     /// Number of terminal rows.
     pub rows: u16,
@@ -34,7 +36,7 @@ impl Default for TerminalSize {
 }
 
 /// A terminal program target that ptywright can spawn in a PTY.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     /// Executable name or path.
     pub program: String,
