@@ -10,6 +10,7 @@ use crate::action::Action;
 use crate::adapters::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use crate::error::{Error, Result};
 use crate::matcher::Matcher;
+use crate::plugin::{PluginHostCapabilities, PluginManifest};
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
 use crate::{NAME, VERSION};
@@ -102,6 +103,11 @@ struct ClaudePromptParams {
 struct ClaudeWaitParams {
     claude: String,
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginManifestParams {
+    manifest: PluginManifest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,7 +218,9 @@ impl RpcServer {
                     "claude.approve",
                     "claude.deny",
                     "claude.cancel",
-                    "claude.state"
+                    "claude.state",
+                    "plugin.capabilities",
+                    "plugin.validate_manifest"
                 ],
                 "notifications": []
             })),
@@ -232,6 +240,8 @@ impl RpcServer {
             "claude.deny" => self.claude_deny(request.params),
             "claude.cancel" => self.claude_cancel(request.params),
             "claude.state" => self.claude_state(request.params),
+            "plugin.capabilities" => Ok(json!(PluginHostCapabilities::current())),
+            "plugin.validate_manifest" => self.plugin_validate_manifest(request.params),
             _ => Err((
                 RpcErrorCode::MethodNotFound,
                 format!("unknown method: {method}"),
@@ -448,6 +458,18 @@ impl RpcServer {
         Ok(json!({ "state": self.claude_adapter(&params.claude)?.state() }))
     }
 
+    fn plugin_validate_manifest(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: PluginManifestParams = parse_params(params)?;
+        params
+            .manifest
+            .validate()
+            .map_err(|error| (RpcErrorCode::InvalidParams, error.to_string()))?;
+        Ok(json!({ "valid": true }))
+    }
+
     fn claude_adapter(
         &self,
         id: &str,
@@ -588,6 +610,7 @@ mod tests {
         let methods = response["result"]["methods"].as_array().unwrap();
         assert!(methods.contains(&json!("session.create")));
         assert!(methods.contains(&json!("claude.start")));
+        assert!(methods.contains(&json!("plugin.validate_manifest")));
     }
 
     #[test]
@@ -630,6 +653,17 @@ mod tests {
         );
 
         assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn plugin_validate_manifest_accepts_valid_manifest() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":10,"method":"plugin.validate_manifest","params":{"manifest":{"name":"demo","kind":"adapter","version":"0.1.0","permissions":["session.spawn","screen.read"]}}}"#,
+        );
+
+        assert_eq!(response["result"]["valid"], true);
     }
 
     #[test]

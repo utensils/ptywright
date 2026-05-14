@@ -162,6 +162,15 @@ Claude methods drive interactive Claude Code through a PTY. They do not use `cla
 
 See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics and limitations.
 
+### Plugin methods
+
+| Method                     | Params                    | Result                    |
+| -------------------------- | ------------------------- | ------------------------- |
+| `plugin.capabilities`      | none                      | Host plugin capabilities. |
+| `plugin.validate_manifest` | `{ "manifest": { ... } }` | `{ "valid": true }`.      |
+
+See [Plugins and extensions](./plugins.md) for manifest fields and permission names.
+
 ### Other session methods
 
 | Method               | Params                                         | Result                         |

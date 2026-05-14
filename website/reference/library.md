@@ -139,6 +139,25 @@ assert!(response.is_some());
 
 The CLI exposes this through `ptywright serve --stdio`.
 
+## Plugin manifests
+
+The first extension surface is declarative. `PluginManifest` records plugin kind, version, and explicit permissions; `PluginHostCapabilities` reports the permissions this build understands.
+
+```rust
+use ptywright::{PluginManifest, PluginPermission};
+
+let manifest: PluginManifest = serde_json::from_str(r#"{
+  "name":"demo",
+  "kind":"adapter",
+  "version":"0.1.0",
+  "permissions":["session.spawn","screen.read"]
+}"#)?;
+manifest.validate().expect("valid manifest");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+No embedded Lua/Luau or WASM runtime is enabled yet.
+
 ## Planned API families
 
 Next public APIs should grow around these reusable concepts:

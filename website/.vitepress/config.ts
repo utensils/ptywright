@@ -90,6 +90,7 @@ export default defineConfig({
             { text: 'CLI', link: '/reference/cli' },
             { text: 'Library', link: '/reference/library' },
             { text: 'JSON-RPC', link: '/reference/json-rpc' },
+            { text: 'Plugins', link: '/reference/plugins' },
             { text: 'Roadmap', link: '/reference/roadmap' },
           ],
         },

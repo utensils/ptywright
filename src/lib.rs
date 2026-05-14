@@ -9,6 +9,7 @@ pub mod action;
 pub mod adapters;
 pub mod error;
 pub mod matcher;
+pub mod plugin;
 pub mod rpc;
 pub mod screen;
 pub mod session;
@@ -19,6 +20,9 @@ pub use action::{Action, Key};
 pub use adapters::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeState, ClaudeCodeStateSnapshot};
 pub use error::{Error, Result};
 pub use matcher::{MatchResult, Matcher};
+pub use plugin::{
+    PluginHostCapabilities, PluginKind, PluginManifest, PluginManifestError, PluginPermission,
+};
 pub use rpc::{RpcServer, serve_ndjson};
 pub use screen::{CursorState, ScreenSnapshot, Terminal};
 pub use session::{Session, SessionConfig, SessionExitStatus};
