@@ -59,7 +59,7 @@ ptywright serve --socket /tmp/ptywright.sock
 Rules:
 
 - `--stdio` uses stdin/stdout. stdout is protocol-only; stderr is reserved for diagnostics.
-- `--socket PATH` listens on a local Unix socket on macOS/Linux. Windows named-pipe support is planned.
+- `--socket PATH` listens on a local Unix socket on macOS/Linux. On Windows, use `--stdio`; named-pipe support remains planned.
 - Default framing is `ndjson`: each input line is one complete JSON-RPC request or notification, and each response/notification is one compact JSON object per line.
 - `--framing lsp` uses `Content-Length: N\r\n\r\n<json>` frames.
 

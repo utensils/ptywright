@@ -39,7 +39,7 @@ enum Commands {
         /// Use stdin/stdout for JSON-RPC. Stdout is protocol-only in this mode.
         #[arg(long)]
         stdio: bool,
-        /// Listen on a local Unix socket path. Unix-only; Windows named-pipe support is planned.
+        /// Listen on a local Unix socket path. Unix-only; use --stdio on Windows for now.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// JSON-RPC message framing to use.

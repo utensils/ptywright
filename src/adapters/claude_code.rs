@@ -2,12 +2,15 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+const COMPLETED_TURN_STABLE_MS: u64 = 300;
+
 use serde::{Deserialize, Serialize};
 
 use crate::action::Action;
 use crate::error::Result;
 use crate::lua_plugin::LuaPlugin;
 use crate::matcher::Matcher;
+use crate::plugin::claude_code_manifest;
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
 
@@ -150,6 +153,7 @@ impl ClaudeCodeAdapter {
             &transcript,
             snapshot.sequence,
             self.last_intent,
+            None,
         )
     }
 
@@ -175,6 +179,7 @@ impl ClaudeCodeAdapter {
             &result.transcript_tail,
             result.sequence,
             self.last_intent,
+            Some(COMPLETED_TURN_STABLE_MS),
         )
     }
 
@@ -221,6 +226,7 @@ fn classify_state(
     transcript: &str,
     sequence: u64,
     last_intent: Option<ClaudeCodeState>,
+    stable_ms: Option<u64>,
 ) -> Result<ClaudeCodeStateSnapshot> {
     plugin.call(
         "classify",
@@ -229,6 +235,7 @@ fn classify_state(
             transcript,
             sequence,
             last_intent: last_intent.map(state_name).transpose()?,
+            stable_ms,
         },
     )
 }
@@ -253,6 +260,7 @@ struct ClassifyInput<'a> {
     transcript: &'a str,
     sequence: u64,
     last_intent: Option<String>,
+    stable_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,8 +271,8 @@ struct ActionPlan {
 }
 
 fn claude_plugin() -> Result<LuaPlugin> {
-    LuaPlugin::builtin(
-        "claude-code",
+    LuaPlugin::trusted(
+        &claude_code_manifest(),
         include_str!("../../plugins/claude-code/main.lua"),
     )
 }
@@ -340,7 +348,20 @@ mod tests {
             .call("wait_turn_matcher", &serde_json::json!({}))
             .expect("load wait matcher from Lua");
 
-        assert!(matches!(matcher, Matcher::Any(_)));
+        let Matcher::All(matchers) = matcher else {
+            panic!("expected Lua wait matcher to require all conditions");
+        };
+        assert!(
+            matchers
+                .iter()
+                .any(|matcher| matches!(matcher, Matcher::Any(_)))
+        );
+        assert!(matchers.iter().any(|matcher| matches!(
+            matcher,
+            Matcher::ScreenStable {
+                min_ms: COMPLETED_TURN_STABLE_MS
+            }
+        )));
     }
 
     #[test]
@@ -365,7 +386,14 @@ mod tests {
             title: None,
         };
 
-        assert!(matcher.is_match(&snapshot, ""));
+        assert!(matcher.is_match_with_context(
+            &snapshot,
+            "",
+            crate::matcher::MatcherContext {
+                stable_for: Duration::from_millis(COMPLETED_TURN_STABLE_MS),
+                process_exited: false,
+            },
+        ));
     }
 
     #[test]
@@ -375,6 +403,7 @@ mod tests {
             "Do you want to proceed? Allow tool use",
             "",
             3,
+            None,
             None,
         )
         .expect("classify via Lua plugin");
@@ -391,6 +420,7 @@ mod tests {
             "",
             4,
             None,
+            None,
         )
         .expect("classify via Lua plugin");
 
@@ -404,6 +434,7 @@ mod tests {
             "Thinking... Esc to interrupt",
             "",
             5,
+            None,
             None,
         )
         .expect("classify via Lua plugin");
@@ -419,10 +450,58 @@ mod tests {
             "",
             6,
             Some(ClaudeCodeState::PromptSubmitted),
+            Some(COMPLETED_TURN_STABLE_MS),
         )
         .expect("classify via Lua plugin");
 
         assert_eq!(state.state, ClaudeCodeState::CompletedTurn);
+        assert_eq!(
+            state.evidence,
+            "stable input prompt after prompt submission"
+        );
+    }
+
+    #[test]
+    fn classifier_requires_stable_prompt_for_completed_turn() {
+        let state = classify_state(
+            &claude_plugin().expect("load plugin"),
+            "work completed\n>",
+            "",
+            6,
+            Some(ClaudeCodeState::PromptSubmitted),
+            None,
+        )
+        .expect("classify via Lua plugin");
+
+        assert_eq!(state.state, ClaudeCodeState::WaitingForUserInput);
+        assert_eq!(state.evidence, "input prompt glyph detected");
+    }
+
+    #[test]
+    fn classifier_prefers_active_work_over_prompt_glyph() {
+        let state = classify_state(
+            &claude_plugin().expect("load plugin"),
+            "Thinking... Esc to interrupt\n>",
+            "",
+            7,
+            Some(ClaudeCodeState::PromptSubmitted),
+            Some(COMPLETED_TURN_STABLE_MS),
+        )
+        .expect("classify via Lua plugin");
+
+        assert_eq!(state.state, ClaudeCodeState::Thinking);
+        assert_eq!(state.evidence, "active work indicator detected");
+    }
+
+    #[test]
+    fn lua_cancel_sets_cancelling_intent() {
+        let plan: ActionPlan = claude_plugin()
+            .expect("load built-in Claude Code Lua plugin")
+            .call("cancel", &serde_json::json!({}))
+            .expect("load cancel action plan from Lua");
+
+        assert_eq!(plan.actions, vec![Action::Interrupt]);
+        assert_eq!(plan.last_intent, Some(ClaudeCodeState::Cancelling));
     }
 
     #[test]
@@ -438,7 +517,7 @@ mod tests {
                 include_str!("../../tests/fixtures/claude_code/thinking.txt"),
                 None,
                 ClaudeCodeState::Thinking,
-                "thinking indicator detected",
+                "active work indicator detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/permission.txt"),
@@ -456,7 +535,37 @@ mod tests {
                 include_str!("../../tests/fixtures/claude_code/completed.txt"),
                 Some(ClaudeCodeState::PromptSubmitted),
                 ClaudeCodeState::CompletedTurn,
+                "stable input prompt after prompt submission",
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/tool_use.txt"),
+                None,
+                ClaudeCodeState::Thinking,
+                "active work indicator detected",
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/streaming_response.txt"),
+                None,
+                ClaudeCodeState::Thinking,
+                "active work indicator detected",
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/interrupted.txt"),
+                Some(ClaudeCodeState::Cancelling),
+                ClaudeCodeState::WaitingForUserInput,
                 "input prompt glyph detected",
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/permission_bash.txt"),
+                None,
+                ClaudeCodeState::WaitingForPermission,
+                "permission or approval prompt text detected",
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/plan_variant.txt"),
+                None,
+                ClaudeCodeState::WaitingForPlanApproval,
+                "plan approval text detected",
             ),
             (
                 include_str!("../../tests/fixtures/claude_code/error.txt"),
@@ -474,6 +583,7 @@ mod tests {
                 "",
                 index as u64,
                 last_intent,
+                Some(COMPLETED_TURN_STABLE_MS),
             )
             .expect("classify fixture via Lua plugin");
             assert_eq!(

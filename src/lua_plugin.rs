@@ -1,19 +1,24 @@
+use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use mlua::LuaSerdeExt;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::plugin::{PluginManifest, PluginManifestError, PluginPermission, PluginRuntime};
 
 /// Trusted Lua plugin runtime used for adapter/orchestration code.
 ///
 /// The runtime is intentionally invoked only for explicit adapter calls. PTY byte
 /// reading, terminal parsing, screen mutation, and matcher polling remain in Rust.
 pub struct LuaPlugin {
-    name: &'static str,
+    name: String,
     lua: mlua::Lua,
     exports: mlua::RegistryKey,
+    permissions: BTreeSet<PluginPermission>,
 }
 
 impl fmt::Debug for LuaPlugin {
@@ -21,24 +26,55 @@ impl fmt::Debug for LuaPlugin {
         formatter
             .debug_struct("LuaPlugin")
             .field("name", &self.name)
+            .field("permissions", &self.permissions)
             .finish_non_exhaustive()
     }
 }
 
 impl LuaPlugin {
     /// Create a trusted built-in Lua plugin from embedded source.
-    pub fn builtin(name: &'static str, source: &'static str) -> Result<Self> {
-        let lua = mlua::Lua::new();
-        install_host_api(&lua).map_err(|error| lua_error(name, error))?;
-        let exports: mlua::Table = lua
-            .load(source)
-            .set_name(name)
-            .eval()
-            .map_err(|error| lua_error(name, error))?;
-        let exports = lua
-            .create_registry_value(exports)
-            .map_err(|error| lua_error(name, error))?;
-        Ok(Self { name, lua, exports })
+    pub fn builtin(name: impl Into<String>, source: &str) -> Result<Self> {
+        Self::from_source(
+            name.into(),
+            source,
+            all_host_permissions().into_iter().collect(),
+        )
+    }
+
+    /// Create a trusted Lua plugin from a validated manifest and source string.
+    ///
+    /// This is intended for explicit local trusted plugin loading. It is not a
+    /// sandbox for untrusted code.
+    pub fn trusted(manifest: &PluginManifest, source: &str) -> Result<Self> {
+        validate_lua_manifest(manifest)?;
+        Self::from_source(
+            manifest.name.clone(),
+            source,
+            manifest.permissions.iter().cloned().collect(),
+        )
+    }
+
+    /// Load a trusted Lua plugin from a local plugin root and manifest.
+    ///
+    /// Entrypoints must be relative paths inside the plugin root. Parent
+    /// components and absolute paths are rejected to avoid surprising file reads.
+    pub fn load_trusted(root: impl AsRef<Path>, manifest: &PluginManifest) -> Result<Self> {
+        validate_lua_manifest(manifest)?;
+        let entrypoint = manifest.entrypoint.as_deref().ok_or_else(|| {
+            Error::Lua(format!(
+                "lua plugin `{}` has no entrypoint after validation",
+                manifest.name
+            ))
+        })?;
+        let path = trusted_entrypoint_path(root.as_ref(), entrypoint)?;
+        let source = fs::read_to_string(&path).map_err(|error| {
+            Error::Lua(format!(
+                "lua plugin `{}` failed to read entrypoint `{}`: {error}",
+                manifest.name,
+                path.display()
+            ))
+        })?;
+        Self::trusted(manifest, &source)
     }
 
     /// Call an exported Lua function with a serializable input value and decode
@@ -70,53 +106,131 @@ impl LuaPlugin {
         self.call(function, input)
     }
 
-    fn error(&self, error: mlua::Error) -> Error {
-        lua_error(self.name, error)
+    /// Whether this plugin declared a given permission.
+    #[must_use]
+    pub fn has_permission(&self, permission: &PluginPermission) -> bool {
+        self.permissions.contains(permission)
     }
+
+    fn from_source(
+        name: String,
+        source: &str,
+        permissions: BTreeSet<PluginPermission>,
+    ) -> Result<Self> {
+        let lua = new_lua().map_err(|error| lua_error(&name, error))?;
+        install_host_api(&lua, &permissions).map_err(|error| lua_error(&name, error))?;
+        let exports: mlua::Table = lua
+            .load(source)
+            .set_name(&name)
+            .eval()
+            .map_err(|error| lua_error(&name, error))?;
+        let exports = lua
+            .create_registry_value(exports)
+            .map_err(|error| lua_error(&name, error))?;
+        Ok(Self {
+            name,
+            lua,
+            exports,
+            permissions,
+        })
+    }
+
+    fn error(&self, error: mlua::Error) -> Error {
+        lua_error(&self.name, error)
+    }
+}
+
+fn new_lua() -> mlua::Result<mlua::Lua> {
+    mlua::Lua::new_with(
+        mlua::StdLib::TABLE | mlua::StdLib::STRING | mlua::StdLib::MATH | mlua::StdLib::UTF8,
+        mlua::LuaOptions::new(),
+    )
+}
+
+fn validate_lua_manifest(manifest: &PluginManifest) -> Result<()> {
+    manifest.validate().map_err(lua_manifest_error)?;
+    if manifest.runtime != Some(PluginRuntime::Lua) {
+        return Err(Error::Lua(format!(
+            "plugin `{}` is not a Lua plugin",
+            manifest.name
+        )));
+    }
+    Ok(())
+}
+
+fn lua_manifest_error(error: PluginManifestError) -> Error {
+    Error::Lua(format!("invalid Lua plugin manifest: {error}"))
+}
+
+fn trusted_entrypoint_path(root: &Path, entrypoint: &str) -> Result<PathBuf> {
+    let entrypoint = Path::new(entrypoint);
+    if entrypoint.is_absolute()
+        || entrypoint
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(Error::Lua(
+            "trusted Lua plugin entrypoint must be a relative path inside the plugin root".into(),
+        ));
+    }
+    Ok(root.join(entrypoint))
 }
 
 fn lua_error(name: &str, error: mlua::Error) -> Error {
     Error::Lua(format!("lua plugin `{name}` failed: {error}"))
 }
 
-fn install_host_api(lua: &mlua::Lua) -> mlua::Result<()> {
+fn install_host_api(lua: &mlua::Lua, permissions: &BTreeSet<PluginPermission>) -> mlua::Result<()> {
     let ptywright = lua.create_table()?;
-    ptywright.set("action", action_api(lua)?)?;
-    ptywright.set("matcher", matcher_api(lua)?)?;
+    ptywright.set("action", action_api(lua, permissions)?)?;
+    ptywright.set("matcher", matcher_api(lua, permissions)?)?;
     lua.globals().set("ptywright", ptywright)
 }
 
-fn action_api(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
+fn action_api(
+    lua: &mlua::Lua,
+    permissions: &BTreeSet<PluginPermission>,
+) -> mlua::Result<mlua::Table> {
     let action = lua.create_table()?;
-    action.set(
-        "text",
-        lua.create_function(|lua, value: String| tagged_value(lua, "text", value))?,
-    )?;
-    action.set(
-        "paste",
-        lua.create_function(|lua, value: String| tagged_value(lua, "paste", value))?,
-    )?;
-    action.set(
-        "key",
-        lua.create_function(|lua, value: String| tagged_value(lua, "key", value))?,
-    )?;
-    action.set(
-        "interrupt",
-        lua.create_function(|lua, _: ()| tagged_unit(lua, "interrupt"))?,
-    )?;
-    action.set(
-        "eof",
-        lua.create_function(|lua, _: ()| tagged_unit(lua, "eof"))?,
-    )?;
-    action.set(
-        "kill",
-        lua.create_function(|lua, _: ()| tagged_unit(lua, "kill"))?,
-    )?;
+    if permissions.contains(&PluginPermission::InputWrite) {
+        action.set(
+            "text",
+            lua.create_function(|lua, value: String| tagged_value(lua, "text", value))?,
+        )?;
+        action.set(
+            "paste",
+            lua.create_function(|lua, value: String| tagged_value(lua, "paste", value))?,
+        )?;
+        action.set(
+            "key",
+            lua.create_function(|lua, value: String| tagged_value(lua, "key", value))?,
+        )?;
+        action.set(
+            "interrupt",
+            lua.create_function(|lua, _: ()| tagged_unit(lua, "interrupt"))?,
+        )?;
+        action.set(
+            "eof",
+            lua.create_function(|lua, _: ()| tagged_unit(lua, "eof"))?,
+        )?;
+    }
+    if permissions.contains(&PluginPermission::SessionKill) {
+        action.set(
+            "kill",
+            lua.create_function(|lua, _: ()| tagged_unit(lua, "kill"))?,
+        )?;
+    }
     Ok(action)
 }
 
-fn matcher_api(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
+fn matcher_api(
+    lua: &mlua::Lua,
+    permissions: &BTreeSet<PluginPermission>,
+) -> mlua::Result<mlua::Table> {
     let matcher = lua.create_table()?;
+    if !permissions.contains(&PluginPermission::MatcherWait) {
+        return Ok(matcher);
+    }
     matcher.set(
         "contains_text",
         lua.create_function(|lua, value: String| tagged_value(lua, "contains_text", value))?,
@@ -156,6 +270,18 @@ fn matcher_api(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     Ok(matcher)
 }
 
+fn all_host_permissions() -> [PluginPermission; 7] {
+    [
+        PluginPermission::SessionSpawn,
+        PluginPermission::SessionKill,
+        PluginPermission::SessionResize,
+        PluginPermission::ScreenRead,
+        PluginPermission::TranscriptRead,
+        PluginPermission::InputWrite,
+        PluginPermission::MatcherWait,
+    ]
+}
+
 fn tagged_value(
     lua: &mlua::Lua,
     tag: &'static str,
@@ -176,6 +302,8 @@ fn tagged_unit(lua: &mlua::Lua, tag: &'static str) -> mlua::Result<mlua::Table> 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::plugin::{PluginKind, PluginPermission};
 
     use super::*;
 
@@ -253,6 +381,76 @@ mod tests {
     }
 
     #[test]
+    fn trusted_manifest_limits_host_helpers_to_declared_permissions() {
+        let manifest = PluginManifest {
+            name: "limited".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: Some(PluginRuntime::Lua),
+            entrypoint: Some("main.lua".to_string()),
+            permissions: vec![PluginPermission::MatcherWait],
+        };
+        let plugin = LuaPlugin::trusted(
+            &manifest,
+            r#"
+            return {
+              has_helpers = function(_input)
+                return {
+                  action_text = ptywright.action.text ~= nil,
+                  matcher_text = ptywright.matcher.contains_text ~= nil,
+                }
+              end
+            }
+            "#,
+        )
+        .expect("load limited plugin");
+
+        assert!(!plugin.has_permission(&PluginPermission::InputWrite));
+        assert!(plugin.has_permission(&PluginPermission::MatcherWait));
+        let value = plugin
+            .call_value("has_helpers", &json!({}))
+            .expect("call limited plugin");
+
+        assert_eq!(value["action_text"], false);
+        assert_eq!(value["matcher_text"], true);
+    }
+
+    #[test]
+    fn trusted_manifest_rejects_non_lua_runtime() {
+        let manifest = PluginManifest {
+            name: "wasm".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: Some(PluginRuntime::Wasm),
+            entrypoint: Some("main.wasm".to_string()),
+            permissions: Vec::new(),
+        };
+
+        let error = LuaPlugin::trusted(&manifest, "return {}").expect_err("runtime rejected");
+
+        assert!(matches!(error, Error::Lua(_)));
+        assert!(error.to_string().contains("not a Lua plugin"));
+    }
+
+    #[test]
+    fn trusted_entrypoint_must_stay_inside_plugin_root() {
+        let manifest = PluginManifest {
+            name: "escape".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: Some(PluginRuntime::Lua),
+            entrypoint: Some("../main.lua".to_string()),
+            permissions: Vec::new(),
+        };
+
+        let error =
+            LuaPlugin::load_trusted("plugins/escape", &manifest).expect_err("path rejected");
+
+        assert!(matches!(error, Error::Lua(_)));
+        assert!(error.to_string().contains("relative path inside"));
+    }
+
+    #[test]
     fn lua_plugin_load_and_call_failures_are_lua_errors() {
         let error = LuaPlugin::builtin("bad", "not valid lua").expect_err("load should fail");
         assert!(matches!(error, Error::Lua(_)));
@@ -260,7 +458,7 @@ mod tests {
         let plugin = LuaPlugin::builtin("missing", "return {}").expect("load plugin");
         let error = plugin
             .call_value("missing", &json!({}))
-            .expect_err("missing function should fail");
+            .expect_err("call should fail");
         assert!(matches!(error, Error::Lua(_)));
     }
 }

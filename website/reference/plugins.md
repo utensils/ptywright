@@ -16,15 +16,17 @@ Implemented:
 - trusted embedded Lua execution for built-in plugins
 - built-in `claude-code` Lua adapter plugin surfaced via `PluginHostCapabilities.builtin_plugins`
 - manifest validation
+- Rust APIs for loading explicitly trusted local Lua plugins from a manifest and plugin root
 - JSON-RPC methods:
   - `plugin.capabilities`
   - `plugin.validate_manifest`
 
 Not implemented yet:
 
-- Loading third-party Lua plugins from disk.
+- JSON-RPC or CLI commands that load third-party plugins dynamically.
+- A sandbox for untrusted third-party plugins.
 - WASM plugin execution.
-- Filesystem, process, or network capabilities for plugins.
+- Filesystem, process, or network capabilities for plugin host APIs.
 
 ## Manifest example
 
@@ -93,6 +95,7 @@ Validation checks:
 - name is non-empty;
 - version is non-empty;
 - executable runtime declarations include a non-empty entrypoint;
+- entrypoints without a runtime are rejected;
 - permissions are known;
 - permissions are not duplicated.
 
@@ -106,8 +109,11 @@ Embedded Lua is available for trusted built-in adapter/orchestration logic. It i
 - Lua receives explicit screen/transcript snapshots or action inputs;
 - Lua uses the injected `ptywright.action.*` and `ptywright.matcher.*` helper APIs to build control plans;
 - Lua returns generic `Action`, `Matcher`, and state values;
-- Rust enforces permissions, owns session IO, and applies redaction at RPC read boundaries.
+- Rust installs host helper constructors according to manifest permissions;
+- Rust owns session IO and applies redaction at RPC read/error boundaries.
 
 The built-in Claude Code plugin lives at `plugins/claude-code/main.lua` and is embedded into the single binary with `include_str!`. The public `claude.*` methods are compatibility wrappers over that Lua adapter.
+
+Library callers can load an explicitly trusted local Lua plugin with `LuaPlugin::load_trusted(root, manifest)`. The entrypoint must be a relative path inside the provided plugin root. This is intended for trusted local adapters only; it is not an untrusted plugin sandbox.
 
 WASM remains reserved for a future untrusted plugin model.

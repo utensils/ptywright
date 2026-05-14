@@ -705,6 +705,7 @@ fn success_response(id: Option<Value>, result: Value) -> Value {
 }
 
 fn error_response(id: Option<Value>, code: RpcErrorCode, message: String) -> Value {
+    let message = RedactionPolicy::default().redact(&message);
     json!({
         "jsonrpc": JSONRPC_VERSION,
         "id": id.unwrap_or(Value::Null),
@@ -850,6 +851,20 @@ mod tests {
         );
 
         assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn rpc_error_messages_are_redacted() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":11,"method":"token=super-secret-value"}"#,
+        );
+
+        assert_eq!(response["error"]["code"], -32601);
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("token=[REDACTED]"));
+        assert!(!message.contains("super-secret-value"));
     }
 
     #[test]
