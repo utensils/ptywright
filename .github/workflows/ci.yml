@@ -52,10 +52,10 @@ jobs:
         with:
           key: ${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --locked
-      - run: cargo clippy --locked -- -D warnings
-      - run: cargo test --locked
-      - run: cargo build --release --locked
+      - run: rustup run stable cargo check --locked
+      - run: rustup run stable cargo clippy --locked -- -D warnings
+      - run: rustup run stable cargo test --locked
+      - run: rustup run stable cargo build --release --locked
 
   coverage:
     runs-on: ubuntu-latest

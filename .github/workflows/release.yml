@@ -59,7 +59,7 @@ jobs:
           cache-on-failure: true
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --locked
+        run: rustup run stable cargo build --release --target ${{ matrix.target }} --locked
 
       - name: Strip binary
         if: runner.os != 'Windows'

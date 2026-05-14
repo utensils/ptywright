@@ -18,6 +18,14 @@ ptywright --version
 
 With no arguments, `ptywright` prints the help menu.
 
+## Run a command in a headless PTY
+
+```bash
+ptywright run -- /bin/sh -lc 'printf ready'
+```
+
+`run` starts the command behind a real PTY, waits for it to exit, and prints the retained transcript. It is an early debugging surface for the same PTY/session primitives exposed by the library; live interactive bridging and JSON-RPC control are planned next.
+
 ## Development checks
 
 Inside the Nix devshell:

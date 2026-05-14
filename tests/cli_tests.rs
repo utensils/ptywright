@@ -18,6 +18,23 @@ fn prints_help_by_default() {
 }
 
 #[test]
+fn run_executes_command_in_pty() {
+    let mut command = bin();
+    command.arg("run").arg("--");
+    if cfg!(windows) {
+        command.args(["cmd.exe", "/C", "echo cli-ready"]);
+    } else {
+        command.args(["/bin/sh", "-lc", "printf cli-ready"]);
+    }
+
+    let output = command.output().expect("run ptywright run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("cli-ready"));
+}
+
+#[test]
 fn prints_version() {
     let output = bin()
         .arg("--version")

@@ -6,9 +6,9 @@
 
 **A cross-platform Rust CLI and library for driving interactive terminal applications through PTYs.**
 
-ptywright is a fresh skeleton for a general-purpose PTY/TUI automation toolkit. It is designed to drive interactive terminal applications from code without coupling the core abstractions to any one program.
+ptywright is an early general-purpose PTY/TUI automation toolkit. It is designed to drive interactive terminal applications from code without coupling the core abstractions to any one program.
 
-The binary currently only prints help and version output. The project already includes the important plumbing: Cargo package metadata, Nix flake, devshell commands, GitHub CI, release workflow, install script, and VitePress documentation site.
+The library now includes initial target, session, screen, action, matcher, and transcript primitives backed by real PTYs. The CLI includes a small `run` command for executing a program in a headless PTY and printing the captured transcript when it exits.
 
 Docs: <https://utensils.io/ptywright/>
 
@@ -17,6 +17,7 @@ Docs: <https://utensils.io/ptywright/>
 ```bash
 ptywright --help
 ptywright --version
+ptywright run -- /bin/sh -lc 'printf ready'
 ```
 
 ## Install from source
@@ -44,14 +45,21 @@ nix run github:utensils/ptywright -- --help
 - Keep a clean CLI surface while exposing reusable library primitives.
 - Preserve a small, auditable, local-first implementation.
 
-## Planned layers
+## Current layers
 
 1. Target configuration.
 2. PTY session lifecycle.
 3. Terminal screen observation.
 4. Input actions and key sequences.
-5. Matchers, waits, and turn orchestration.
-6. App-specific adapters.
+5. Matchers and waits.
+6. Bounded transcript capture.
+
+## Planned layers
+
+1. JSON-RPC over stdio for external automation clients.
+2. Turn orchestration.
+3. Interactive Claude Code adapter built on the generic PTY layers.
+4. Extension/plugin APIs for trusted local adapters.
 
 ## Development
 

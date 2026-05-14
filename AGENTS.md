@@ -35,6 +35,16 @@ Guidelines:
 - Expose library APIs first; keep CLI commands thin and scriptable.
 - Make new behavior observable and testable through transcripts, screen snapshots, or explicit result types.
 
+## TDD requirements
+
+Use test-driven development for behavior changes wherever practical:
+
+- Add or update a failing unit/integration test before implementing new behavior.
+- Prefer tests around public primitives: `Target`, `Session`, `Screen`, `Action`, `Matcher`, transcripts, CLI behavior, and future RPC methods.
+- For PTY behavior, use deterministic fixture commands and platform-aware test helpers instead of sleeps or host-specific shell assumptions.
+- Keep tests cross-platform unless a test is explicitly gated with `#[cfg(...)]` and the limitation is documented.
+- Do not mark a milestone complete until tests and docs for that milestone are updated.
+
 ## Cross-platform requirements
 
 ptywright should target macOS, Linux, and Windows.
@@ -78,9 +88,9 @@ cargo run -- --help
 
 ## Current architecture
 
-- `src/main.rs` — clap CLI. With no args it prints help; `--version` prints package version.
-- `src/lib.rs` — minimal public library surface and placeholder abstractions.
-- `tests/cli_tests.rs` — end-to-end checks for help/version output.
+- `src/main.rs` — clap CLI. With no args it prints help; `--version` prints package version; `run` executes a command in a headless PTY and prints the captured transcript.
+- `src/lib.rs` plus modules in `src/` — public library surface for target configuration, PTY sessions, screen snapshots, actions, matchers, and transcripts.
+- `tests/cli_tests.rs` — end-to-end checks for help/version output and basic PTY command execution.
 - `website/` — VitePress docs site.
 - `.github/workflows/` — CI, docs deploy, and release packaging.
 - `flake.nix` — Nix package, app, formatter, and devshell.
@@ -105,8 +115,8 @@ NIX_CONFIG="access-tokens = github.com=$TOKEN" nix flake update
 ## Documentation rules
 
 - Keep docs current when changing public behavior.
-- Document the intended architecture while the implementation is still skeletal.
-- Mark planned capabilities as planned; do not imply unimplemented PTY driving works today.
+- Document implemented PTY/session behavior as it lands.
+- Mark planned capabilities as planned; do not imply unimplemented live bridging, JSON-RPC, plugins, or Claude Code adapter behavior works today.
 - Keep install and release docs honest about platform support.
 
 ## Conventions
