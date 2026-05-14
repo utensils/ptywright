@@ -208,8 +208,25 @@ mod tests {
             return {
               plan = function(_input)
                 return {
-                  action = ptywright.action.key("enter"),
-                  matcher = ptywright.matcher.contains_text("ready"),
+                  actions = {
+                    ptywright.action.text("hello"),
+                    ptywright.action.paste("world"),
+                    ptywright.action.key("enter"),
+                    ptywright.action.interrupt(),
+                    ptywright.action.eof(),
+                    ptywright.action.kill(),
+                  },
+                  matcher = ptywright.matcher.all({
+                    ptywright.matcher.contains_text("ready"),
+                    ptywright.matcher.screen_regex("rea.y"),
+                    ptywright.matcher.transcript_contains("tail"),
+                    ptywright.matcher.transcript_regex("ta.l"),
+                    ptywright.matcher.screen_stable(250),
+                    ptywright.matcher.process_exited(),
+                    ptywright.matcher.any({
+                      ptywright.matcher.contains_text("fallback"),
+                    }),
+                  }),
                 }
               end
             }
@@ -222,11 +239,28 @@ mod tests {
             .expect("call lua plugin with host helpers");
 
         assert_eq!(
-            value,
-            json!({
-                "action": { "type": "key", "value": "enter" },
-                "matcher": { "type": "contains_text", "value": "ready" }
-            })
+            value["actions"],
+            json!([
+                { "type": "text", "value": "hello" },
+                { "type": "paste", "value": "world" },
+                { "type": "key", "value": "enter" },
+                { "type": "interrupt" },
+                { "type": "eof" },
+                { "type": "kill" }
+            ])
         );
+        assert_eq!(value["matcher"]["type"], "all");
+    }
+
+    #[test]
+    fn lua_plugin_load_and_call_failures_are_lua_errors() {
+        let error = LuaPlugin::builtin("bad", "not valid lua").expect_err("load should fail");
+        assert!(matches!(error, Error::Lua(_)));
+
+        let plugin = LuaPlugin::builtin("missing", "return {}").expect("load plugin");
+        let error = plugin
+            .call_value("missing", &json!({}))
+            .expect_err("missing function should fail");
+        assert!(matches!(error, Error::Lua(_)));
     }
 }
