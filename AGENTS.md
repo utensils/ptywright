@@ -1,10 +1,53 @@
 # ptywright — Agent Instructions
 
-ptywright is a Rust CLI and library for driving interactive terminal applications through PTYs. It starts as a small skeleton with package, docs, Nix, CI, and release plumbing already in place. The product direction is general-purpose TUI automation with application-specific adapters layered above reusable PTY primitives.
+ptywright is a Rust CLI and library for driving interactive terminal applications through PTYs. The project is intentionally early, but the direction is a cross-platform automation toolkit with a generic core and application-specific adapters layered above it.
+
+## Product intent
+
+Build a local, scriptable driver for terminal software:
+
+- Spawn or attach to PTY-backed processes.
+- Observe terminal state as a user would see it.
+- Send deterministic input actions.
+- Wait for prompts, screen states, turn boundaries, and failures.
+- Layer shell, REPL, full-screen TUI, and app-specific adapters above reusable primitives.
+
+The core must stay generic. Do not bake a single target application into core names, traits, modules, or docs unless the code is explicitly adapter-specific.
+
+## Abstraction rules
+
+Prefer small, explicit layers:
+
+1. **Target** — executable, arguments, environment, cwd, attach/spawn intent.
+2. **Session** — PTY process lifecycle, dimensions, signals, exit status.
+3. **Screen** — terminal parser output, cursor state, scrollback, alternate screen.
+4. **Action** — key sequences, paste/write, resize, waits, interrupts.
+5. **Matcher** — prompt detection, output predicates, timeout policies, error states.
+6. **Turn** — request/response orchestration and transcript capture.
+7. **Adapter** — app-specific workflows implemented over the generic layers.
+
+Guidelines:
+
+- Keep public types named after terminal automation concepts, not current demos.
+- Prefer traits only when there are at least two realistic implementations or a clear testing boundary.
+- Prefer plain structs/enums for data models and command configuration.
+- Keep async/runtime choices isolated so the library can evolve without rewriting callers.
+- Expose library APIs first; keep CLI commands thin and scriptable.
+- Make new behavior observable and testable through transcripts, screen snapshots, or explicit result types.
+
+## Cross-platform requirements
+
+ptywright should target macOS, Linux, and Windows.
+
+- Avoid Unix-only APIs in public abstractions unless they are behind platform-specific modules or feature gates.
+- Keep path, newline, shell invocation, and executable-extension behavior platform-aware.
+- CI should exercise at least Linux, macOS, and Windows for core Rust checks.
+- Nix support is for Unix development and packaging; Windows support should rely on Cargo/GitHub Actions release artifacts.
+- Document platform limitations early rather than hiding them in implementation details.
 
 ## Build and development
 
-Prefer Nix:
+Prefer Nix on macOS/Linux:
 
 ```bash
 nix develop
@@ -42,20 +85,34 @@ cargo run -- --help
 - `.github/workflows/` — CI, docs deploy, and release packaging.
 - `flake.nix` — Nix package, app, formatter, and devshell.
 
-## Direction
+## Dependency upkeep
 
-Keep the core generic. Avoid naming abstractions after one target application unless they are adapter-specific. Prefer layers like:
+When asked to update dependencies:
 
-1. PTY process/session management.
-2. Terminal screen observation.
-3. Input actions and key sequences.
-4. Prompt/turn orchestration.
-5. App-specific adapters for shells, REPLs, full-screen TUIs, and other terminal applications.
+```bash
+cargo update
+cd website && bun update
+nix flake update
+```
+
+Use an authenticated GitHub token for `nix flake update` if unauthenticated API rate limits are hit:
+
+```bash
+TOKEN=$(gh auth token)
+NIX_CONFIG="access-tokens = github.com=$TOKEN" nix flake update
+```
+
+## Documentation rules
+
+- Keep docs current when changing public behavior.
+- Document the intended architecture while the implementation is still skeletal.
+- Mark planned capabilities as planned; do not imply unimplemented PTY driving works today.
+- Keep install and release docs honest about platform support.
 
 ## Conventions
 
 - Use Conventional Commits.
 - Prefer small, direct Rust modules with explicit types.
-- Keep the CLI boring and scriptable.
-- Keep docs current when changing public behavior.
-- Run `ci-local` before handing off substantial changes.
+- Keep the CLI boring and composable.
+- Prefer minimal diffs that fit the existing project style.
+- Run `ci-local` or the direct equivalent before handing off substantial changes.

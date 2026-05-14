@@ -5,58 +5,62 @@ hero:
   name: ptywright
   text: Drive terminal apps from Rust
   tagline:
-    A Rust CLI and library for automating interactive TUI programs through
-    PTYs. Built around general-purpose terminal automation primitives instead
-    of one target application.
+    A cross-platform Rust CLI and library for automating interactive terminal
+    programs through PTYs. Built around reusable session, screen, action, matcher,
+    and adapter layers instead of one target application.
+  image:
+    src: /favicon.svg
+    alt: ptywright terminal mark
   actions:
     - theme: brand
-      text: Get Started →
+      text: Get Started
       link: /guide/
     - theme: alt
-      text: CLI Reference
-      link: /reference/cli
+      text: Architecture
+      link: /guide/architecture
     - theme: alt
       text: GitHub
       link: https://github.com/utensils/ptywright
 
 features:
-  - title: PTY-first
+  - title: PTY-first core
     details:
-      The core abstraction is a terminal session, not an API provider. Spawn,
-      observe, write, and eventually replay interactive programs as they appear
-      in a real terminal.
-  - title: App-agnostic core
-    details:
-      Shells, REPLs, full-screen TUIs, and long-running processes should all fit
-      through the same lower-level primitives.
+      Model terminal behavior through spawn, observe, write, resize, wait, and
+      transcript primitives that match how a real terminal behaves.
   - title: Adapter-ready
     details:
-      Application-specific behavior belongs in adapters layered above reusable
-      PTY session, screen, input, wait, and matcher types.
-  - title: Scriptable CLI
+      Shells, REPLs, full-screen TUIs, and app-specific workflows belong above
+      the generic PTY/session/screen/action layers.
+  - title: Cross-platform target
     details:
-      The binary starts with help and version only. Future commands should stay
-      predictable, machine-readable, and easy to compose.
-  - title: Rust library surface
-    details: The crate is set up for reusable target, session, action, screen
-      observation, matcher, and turn orchestration primitives.
-  - title: Batteries included plumbing
+      The project is shaped for macOS, Linux, and Windows, with Nix as a Unix
+      devshell and Cargo/GitHub Actions for portable Rust checks.
+  - title: Deterministic orchestration
     details:
-      Nix flake, devshell, CI, docs, release packaging, install script, and tests
-      are already wired up so implementation work can start cleanly.
+      Future turn APIs should use explicit matchers, timeout policies, screen
+      snapshots, and transcripts instead of fragile sleeps.
+  - title: Library plus CLI
+    details:
+      Reusable Rust abstractions live in the crate while the binary stays boring,
+      composable, and script-friendly.
+  - title: Ready plumbing
+    details:
+      Cargo metadata, Nix flake, CI, release packaging, docs deploy, install
+      script, and tests are in place so implementation work can start cleanly.
 ---
 
-## Today
+## Status
 
-```bash
-$ ptywright --help
-$ ptywright --version
-```
+ptywright is intentionally a fresh skeleton today.
 
-The current release is intentionally a skeleton. It establishes the crate,
-binary, documentation site, and release plumbing.
+<div class="terminal">
+<span class="prompt">$</span> ptywright --help<br>
+<span class="prompt">$</span> ptywright --version
+</div>
 
-## Intended shape
+The first release establishes the package, binary, documentation site, cross-platform CI direction, and release plumbing. PTY process control and terminal observation APIs are planned next.
+
+## Intended library shape
 
 ```rust
 use ptywright::Target;
@@ -64,16 +68,15 @@ use ptywright::Target;
 let target = Target::new("python").arg("-i");
 ```
 
-Future versions will add PTY process management, terminal observation, input
-actions, and adapter-level turn orchestration.
+Future versions will expand this into session lifecycle, screen observation, input actions, matchers, turn orchestration, and app-specific adapters.
 
-## Install from a local checkout
+## Local development
 
 ```bash
 git clone https://github.com/utensils/ptywright
 cd ptywright
 nix develop
-cargo run -- --help
+ci-local
 ```
 
-See [Quickstart](/guide/quickstart) for the current development workflow.
+Start with the [Quickstart](/guide/quickstart) or review the [architecture](/guide/architecture).

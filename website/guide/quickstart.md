@@ -30,10 +30,10 @@ Equivalent direct commands:
 
 ```bash
 cargo fmt --all -- --check
-cargo check
-cargo clippy -- -D warnings
-cargo test
-cargo build --release
+cargo check --locked
+cargo clippy --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
 ```
 
 ## Documentation
@@ -42,4 +42,12 @@ cargo build --release
 docs-dev      # local VitePress dev server
 docs-build    # static docs build
 docs-preview  # preview built docs
+```
+
+Or without the devshell:
+
+```bash
+cd website
+bun install
+bun run build
 ```

@@ -2,8 +2,9 @@
 //!
 //! The crate is intentionally small today: it establishes the package, CLI,
 //! documentation, release, and Nix plumbing for a future PTY/TUI automation
-//! toolkit. The long-term shape is a general-purpose driver that can control
-//! interactive terminal applications without being coupled to any one TUI.
+//! toolkit. The long-term shape is a cross-platform, general-purpose driver
+//! that can control interactive terminal applications without being coupled to
+//! any one TUI.
 
 /// Crate and binary name.
 pub const NAME: &str = "ptywright";

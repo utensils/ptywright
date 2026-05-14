@@ -11,7 +11,7 @@ fn prints_help_by_default() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     assert!(stdout.contains(
-        "A Rust CLI and library for driving interactive terminal applications through PTYs"
+        "A cross-platform Rust CLI and library for driving interactive terminal applications through PTYs"
     ));
     assert!(stdout.contains("Usage: ptywright"));
     assert!(stdout.contains("--version"));

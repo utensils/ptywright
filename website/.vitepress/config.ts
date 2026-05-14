@@ -1,10 +1,12 @@
 import { defineConfig } from 'vitepress'
 import tailwindcss from '@tailwindcss/vite'
 
+const description =
+  'A cross-platform Rust CLI and library for driving interactive terminal applications through PTYs.'
+
 export default defineConfig({
   title: 'ptywright',
-  description:
-    'A Rust CLI and library for driving interactive terminal applications through PTYs.',
+  description,
   base: '/ptywright/',
 
   vite: {
@@ -19,17 +21,10 @@ export default defineConfig({
       'link',
       { rel: 'icon', href: '/ptywright/favicon.svg', type: 'image/svg+xml' },
     ],
-    ['meta', { name: 'theme-color', content: '#7C3AED' }],
+    ['meta', { name: 'theme-color', content: '#0891B2' }],
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'ptywright' }],
-    [
-      'meta',
-      {
-        property: 'og:description',
-        content:
-          'A Rust CLI and library for driving interactive terminal applications through PTYs.',
-      },
-    ],
+    ['meta', { property: 'og:description', content: description }],
   ],
 
   lastUpdated: true,
@@ -42,7 +37,7 @@ export default defineConfig({
   },
 
   sitemap: {
-    hostname: 'https://utensils.github.io/ptywright/',
+    hostname: 'https://utensils.io/ptywright/',
   },
 
   themeConfig: {
@@ -73,8 +68,16 @@ export default defineConfig({
           text: 'Getting Started',
           items: [
             { text: 'What is ptywright?', link: '/guide/' },
+            { text: 'Installation', link: '/guide/installation' },
             { text: 'Quickstart', link: '/guide/quickstart' },
+          ],
+        },
+        {
+          text: 'Design',
+          items: [
             { text: 'Architecture', link: '/guide/architecture' },
+            { text: 'Design principles', link: '/guide/design-principles' },
+            { text: 'Platforms', link: '/guide/platforms' },
           ],
         },
       ],
@@ -84,6 +87,8 @@ export default defineConfig({
           items: [
             { text: 'Overview', link: '/reference/' },
             { text: 'CLI', link: '/reference/cli' },
+            { text: 'Library', link: '/reference/library' },
+            { text: 'Roadmap', link: '/reference/roadmap' },
           ],
         },
       ],

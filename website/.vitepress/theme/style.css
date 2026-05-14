@@ -1,84 +1,95 @@
 @import 'tailwindcss';
 
+/*
+ * ptywright — terminal blueprint palette
+ *
+ * Cyan models PTY/screen observation, amber models user input, and deep ink
+ * keeps the docs feeling like a terminal without sacrificing readability.
+ */
+
 :root {
-  --ptywright-violet: #7c3aed;
-  --ptywright-violet-soft: #a78bfa;
-  --ptywright-violet-deep: #5b21b6;
-  --ptywright-ink: #17131f;
-  --ptywright-paper: #f7f4ff;
+  --pty-cyan: #0891b2;
+  --pty-cyan-soft: #67e8f9;
+  --pty-cyan-deep: #155e75;
+  --pty-amber: #f59e0b;
+  --pty-amber-soft: #fde68a;
+  --pty-ink: #0f172a;
+  --pty-ink-soft: #1e293b;
+  --pty-paper: #f8fafc;
+  --pty-paper-blue: #eef8fb;
 
-  --vp-c-brand-1: var(--ptywright-violet-deep);
-  --vp-c-brand-2: var(--ptywright-violet);
-  --vp-c-brand-3: #4c1d95;
-  --vp-c-brand-soft: rgba(124, 58, 237, 0.14);
+  --vp-c-brand-1: var(--pty-cyan-deep);
+  --vp-c-brand-2: var(--pty-cyan);
+  --vp-c-brand-3: #164e63;
+  --vp-c-brand-soft: rgba(8, 145, 178, 0.14);
 
-  --vp-c-bg: #fbfaff;
-  --vp-c-bg-alt: var(--ptywright-paper);
-  --vp-c-bg-soft: #f1ecff;
+  --vp-c-bg: #fbfdff;
+  --vp-c-bg-alt: var(--pty-paper-blue);
+  --vp-c-bg-soft: #f0f9ff;
   --vp-c-bg-elv: #ffffff;
 
   --vp-home-hero-name-color: transparent;
   --vp-home-hero-name-background: linear-gradient(
     120deg,
-    #4c1d95 0%,
-    #7c3aed 52%,
-    #a78bfa 100%
+    #155e75 0%,
+    #0891b2 48%,
+    #f59e0b 100%
   );
   --vp-home-hero-image-background-image:
     radial-gradient(
-      circle at 30% 30%,
-      rgba(124, 58, 237, 0.28) 0%,
+      circle at 28% 24%,
+      rgba(8, 145, 178, 0.28) 0%,
       transparent 55%
     ),
     radial-gradient(
-      circle at 70% 70%,
-      rgba(91, 33, 182, 0.22) 0%,
-      transparent 60%
+      circle at 74% 68%,
+      rgba(245, 158, 11, 0.22) 0%,
+      transparent 58%
     );
-  --vp-home-hero-image-filter: blur(52px);
+  --vp-home-hero-image-filter: blur(54px);
 
-  --vp-button-brand-border: var(--ptywright-violet-deep);
+  --vp-button-brand-border: var(--pty-cyan-deep);
   --vp-button-brand-text: #ffffff;
-  --vp-button-brand-bg: var(--ptywright-violet-deep);
-  --vp-button-brand-hover-border: #4c1d95;
+  --vp-button-brand-bg: var(--pty-cyan-deep);
+  --vp-button-brand-hover-border: #164e63;
   --vp-button-brand-hover-text: #ffffff;
-  --vp-button-brand-hover-bg: #4c1d95;
-  --vp-button-brand-active-border: #4c1d95;
+  --vp-button-brand-hover-bg: #164e63;
+  --vp-button-brand-active-border: #164e63;
   --vp-button-brand-active-text: #ffffff;
-  --vp-button-brand-active-bg: #4c1d95;
+  --vp-button-brand-active-bg: #164e63;
 
-  --vp-code-block-bg: #f6f1ff;
-  --vp-code-line-highlight-color: rgba(124, 58, 237, 0.1);
-  --vp-c-text-code: var(--ptywright-violet-deep);
+  --vp-code-block-bg: #ecfeff;
+  --vp-code-line-highlight-color: rgba(8, 145, 178, 0.11);
+  --vp-c-text-code: var(--pty-cyan-deep);
 }
 
 .dark {
-  --vp-c-brand-1: var(--ptywright-violet-soft);
-  --vp-c-brand-2: var(--ptywright-violet);
-  --vp-c-brand-3: var(--ptywright-violet-deep);
-  --vp-c-brand-soft: rgba(167, 139, 250, 0.14);
+  --vp-c-brand-1: var(--pty-cyan-soft);
+  --vp-c-brand-2: #22d3ee;
+  --vp-c-brand-3: var(--pty-cyan);
+  --vp-c-brand-soft: rgba(103, 232, 249, 0.14);
 
-  --vp-c-bg: #100d17;
-  --vp-c-bg-alt: var(--ptywright-ink);
-  --vp-c-bg-soft: #1d1728;
-  --vp-c-bg-elv: #221a30;
+  --vp-c-bg: #08111f;
+  --vp-c-bg-alt: var(--pty-ink);
+  --vp-c-bg-soft: #111c2f;
+  --vp-c-bg-elv: var(--pty-ink-soft);
 
-  --vp-button-brand-text: #120d1c;
-  --vp-button-brand-bg: var(--ptywright-violet-soft);
-  --vp-button-brand-border: var(--ptywright-violet-soft);
-  --vp-button-brand-hover-text: #120d1c;
-  --vp-button-brand-hover-bg: #8b5cf6;
-  --vp-button-brand-hover-border: #8b5cf6;
+  --vp-button-brand-text: #07111f;
+  --vp-button-brand-bg: var(--pty-cyan-soft);
+  --vp-button-brand-border: var(--pty-cyan-soft);
+  --vp-button-brand-hover-text: #07111f;
+  --vp-button-brand-hover-bg: #22d3ee;
+  --vp-button-brand-hover-border: #22d3ee;
 
-  --vp-code-block-bg: #171120;
-  --vp-c-text-code: var(--ptywright-violet-soft);
+  --vp-code-block-bg: #0c1a2b;
+  --vp-c-text-code: var(--pty-cyan-soft);
 }
 
 .vp-doc div[class*='language-'] {
   position: relative;
   border-radius: 10px;
   overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 18%, transparent);
 }
 
 .vp-doc div[class*='language-']::before {
@@ -88,17 +99,32 @@
   width: 3px;
   background: linear-gradient(
     180deg,
-    var(--ptywright-violet-soft) 0%,
-    var(--ptywright-violet-deep) 100%
+    var(--pty-cyan-soft) 0%,
+    var(--pty-amber) 100%
   );
   z-index: 2;
   pointer-events: none;
 }
 
+.vp-code-group .tabs {
+  border-radius: 10px 10px 0 0;
+  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 16%, transparent);
+  background: color-mix(in srgb, var(--vp-c-brand-2) 5%, var(--vp-c-bg-soft));
+}
+
+.vp-code-group .tabs input:checked + label {
+  color: #06111f;
+  background: var(--pty-amber-soft);
+}
+
 .VPFeature {
-  border-radius: 14px;
+  border-radius: 16px;
   border-color: color-mix(in srgb, var(--vp-c-brand-2) 18%, transparent);
-  background: color-mix(in srgb, var(--vp-c-brand-2) 3%, var(--vp-c-bg-soft));
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--vp-c-brand-2) 4%, var(--vp-c-bg-soft)) 0%,
+    color-mix(in srgb, var(--pty-amber) 3%, var(--vp-c-bg)) 100%
+  );
   transition:
     transform 0.2s ease,
     box-shadow 0.2s ease,
@@ -108,12 +134,117 @@
 .VPFeature:hover {
   transform: translateY(-2px);
   border-color: color-mix(in srgb, var(--vp-c-brand-2) 45%, transparent);
-  box-shadow: 0 14px 28px rgba(23, 19, 31, 0.08);
+  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.09);
+}
+
+.dark .VPFeature:hover {
+  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.42);
+}
+
+.VPFeature .icon {
+  background: color-mix(in srgb, var(--pty-amber) 16%, transparent);
+  border-radius: 10px;
+}
+
+.VPHero .main .platform-strip {
+  width: 100%;
+  max-width: 34rem;
+  margin: 1.25rem 0 0;
+}
+
+.VPHero .main .actions {
+  margin-top: 1.15rem;
+}
+
+.platform-strip {
+  padding: 1rem 1.1rem;
+  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 18%, transparent);
+  border-radius: 18px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--vp-c-brand-2) 10%, transparent) 0%,
+      color-mix(in srgb, var(--pty-amber) 8%, transparent) 100%
+    ),
+    var(--vp-c-bg-soft);
+}
+
+.platform-strip-label {
+  display: inline-block;
+  margin-bottom: 0.85rem;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--vp-c-text-2);
+}
+
+.platform-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+}
+
+.platform-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.35rem;
+  padding: 0.55rem 0.85rem;
+  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 16%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--vp-c-bg) 88%, transparent);
+  color: var(--vp-c-text-1);
+  font-family: var(--vp-font-family-mono);
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.platform-pill::before {
+  content: '●';
+  margin-right: 0.5rem;
+  color: var(--pty-amber);
+  font-size: 0.65rem;
+}
+
+.platform-pill-muted {
+  color: var(--vp-c-text-2);
+}
+
+.vp-doc a {
+  text-decoration-color: color-mix(
+    in srgb,
+    var(--vp-c-brand-2) 55%,
+    transparent
+  );
+  text-underline-offset: 2px;
+}
+
+.vp-doc a:hover {
+  text-decoration-color: var(--vp-c-brand-2);
+}
+
+.vp-doc table {
+  display: table;
+  width: 100%;
+}
+
+.vp-doc table th {
+  background: color-mix(in srgb, var(--vp-c-brand-2) 9%, var(--vp-c-bg-soft));
+  font-weight: 700;
+}
+
+.vp-doc table tr:nth-child(2n) {
+  background: color-mix(in srgb, var(--vp-c-brand-2) 3%, transparent);
+}
+
+.vp-doc .custom-block.tip {
+  border-color: var(--vp-c-brand-2);
+  background: color-mix(in srgb, var(--vp-c-brand-2) 8%, transparent);
 }
 
 .terminal {
   border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 20%, transparent);
-  border-radius: 12px;
+  border-radius: 14px;
   padding: 1rem;
   background: var(--vp-code-block-bg);
   font-family: var(--vp-font-family-mono);
@@ -122,9 +253,17 @@
 
 .terminal .prompt {
   color: var(--vp-c-brand-1);
-  font-weight: 700;
+  font-weight: 800;
 }
 
 .terminal .comment {
   color: var(--vp-c-text-2);
+}
+
+@media (max-width: 640px) {
+  .platform-pill {
+    width: 100%;
+    justify-content: center;
+    border-radius: 14px;
+  }
 }

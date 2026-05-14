@@ -9,10 +9,9 @@ ptywright currently exposes a minimal CLI and library skeleton.
 - Current version: `0.1.0`
 - License: MIT
 - Repository: <https://github.com/utensils/ptywright>
+- Docs site: <https://utensils.io/ptywright/>
 
-## Library surface
-
-The current public API is intentionally small:
+## Current public API
 
 ```rust
 pub const NAME: &str;
@@ -25,4 +24,4 @@ pub struct Target {
 }
 ```
 
-This will grow into PTY session management, screen observation, input actions, matchers, and adapters.
+This will grow into PTY session management, screen observation, input actions, matchers, turn orchestration, and adapters.

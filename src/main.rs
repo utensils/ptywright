@@ -6,7 +6,7 @@ use ptywright::{DESCRIPTION, NAME};
     name = NAME,
     version,
     about = DESCRIPTION,
-    long_about = "ptywright is a Rust CLI and library skeleton for driving interactive terminal applications through PTYs.\n\nToday the binary only exposes help and version output. The library is reserved for general-purpose PTY/TUI automation primitives that can later drive shells, REPLs, full-screen TUIs, and other terminal applications."
+    long_about = "ptywright is a cross-platform Rust CLI and library skeleton for driving interactive terminal applications through PTYs.\n\nToday the binary only exposes help and version output. The library is reserved for general-purpose PTY/TUI automation primitives that can later drive shells, REPLs, full-screen TUIs, and other terminal applications."
 )]
 struct Cli {}
 

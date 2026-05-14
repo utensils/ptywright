@@ -4,11 +4,13 @@
 [![Deploy Docs](https://github.com/utensils/ptywright/actions/workflows/pages.yml/badge.svg)](https://github.com/utensils/ptywright/actions/workflows/pages.yml)
 [![codecov](https://codecov.io/gh/utensils/ptywright/graph/badge.svg)](https://codecov.io/gh/utensils/ptywright)
 
-**A Rust CLI and library for driving interactive terminal applications through PTYs.**
+**A cross-platform Rust CLI and library for driving interactive terminal applications through PTYs.**
 
 ptywright is a fresh skeleton for a general-purpose PTY/TUI automation toolkit. It is designed to drive interactive terminal applications from code without coupling the core abstractions to any one program.
 
 The binary currently only prints help and version output. The project already includes the important plumbing: Cargo package metadata, Nix flake, devshell commands, GitHub CI, release workflow, install script, and VitePress documentation site.
+
+Docs: <https://utensils.io/ptywright/>
 
 ## Quickstart
 
@@ -27,7 +29,7 @@ cargo build --release
 ./target/release/ptywright --help
 ```
 
-Or run through Nix:
+Or run through Nix on macOS/Linux:
 
 ```bash
 nix run github:utensils/ptywright -- --help
@@ -37,9 +39,19 @@ nix run github:utensils/ptywright -- --help
 
 - Provide Rust abstractions for spawning, attaching to, and driving PTY-backed terminal applications.
 - Keep application-specific adapters separate from the core architecture.
-- Support deterministic turn execution, transcript capture, prompt injection, and output parsing.
+- Support deterministic turn execution, transcript capture, prompt detection, and output parsing.
+- Target macOS, Linux, and Windows.
 - Keep a clean CLI surface while exposing reusable library primitives.
 - Preserve a small, auditable, local-first implementation.
+
+## Planned layers
+
+1. Target configuration.
+2. PTY session lifecycle.
+3. Terminal screen observation.
+4. Input actions and key sequences.
+5. Matchers, waits, and turn orchestration.
+6. App-specific adapters.
 
 ## Development
 
@@ -53,9 +65,9 @@ Useful direct commands:
 
 ```bash
 cargo fmt --all -- --check
-cargo check
-cargo clippy -- -D warnings
-cargo test
+cargo check --locked
+cargo clippy --locked -- -D warnings
+cargo test --locked
 cargo run -- --help
 ```
 
