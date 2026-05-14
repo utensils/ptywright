@@ -1,0 +1,8 @@
+Claude Code
+
+Plan ready:
+1. Update tests
+2. Implement fix
+3. Run checks
+
+Approve plan to proceed?
