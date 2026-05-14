@@ -1,6 +1,6 @@
 # Reference
 
-ptywright exposes an early CLI, Rust library, JSON-RPC automation protocol, and shell completion generation.
+ptywright exposes an early CLI, Rust library, JSON-RPC automation protocol, trusted Lua plugin runtime, and shell completion generation.
 
 ## Crate metadata
 
@@ -20,7 +20,7 @@ ptywright exposes an early CLI, Rust library, JSON-RPC automation protocol, and 
 - `Matcher` and `MatchResult` for event-driven waits.
 - `Transcript` and `TranscriptConfig` for bounded output retention.
 - `RpcServer` and `serve_ndjson` for JSON-RPC automation.
-- `ClaudeCodeAdapter`, `ClaudeCodeConfig`, and Claude state types for interactive Claude Code automation.
-- `PluginManifest`, `PluginPermission`, and host capability types for extension planning.
+- `ClaudeCodeAdapter`, `ClaudeCodeConfig`, and Claude state types for Lua-backed interactive Claude Code automation.
+- `LuaPlugin`, `PluginManifest`, `PluginRuntime`, `PluginPermission`, and host capability types for trusted extension planning.
 
 See the dedicated CLI, library, JSON-RPC, plugin reference, and Claude Code guide pages for details.

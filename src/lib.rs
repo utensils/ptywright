@@ -8,6 +8,7 @@
 pub mod action;
 pub mod adapters;
 pub mod error;
+pub mod lua_plugin;
 pub mod matcher;
 pub mod plugin;
 pub mod redaction;
@@ -20,9 +21,11 @@ pub mod transcript;
 pub use action::{Action, Key};
 pub use adapters::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeState, ClaudeCodeStateSnapshot};
 pub use error::{Error, Result};
+pub use lua_plugin::LuaPlugin;
 pub use matcher::{MatchResult, Matcher, MatcherContext};
 pub use plugin::{
     PluginHostCapabilities, PluginKind, PluginManifest, PluginManifestError, PluginPermission,
+    PluginRuntime, claude_code_manifest,
 };
 pub use redaction::RedactionPolicy;
 pub use rpc::{RpcServer, serve_lsp, serve_ndjson};
