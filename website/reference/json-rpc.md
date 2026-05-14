@@ -178,7 +178,7 @@ Matcher payloads:
 
 ### Claude Code convenience methods
 
-Claude methods drive interactive Claude Code through a PTY. They do not use `claude -p`.
+Claude methods drive interactive Claude Code through a PTY. They do not use `claude -p`. The `claude.*` surface is backed by the built-in `claude-code` Lua plugin, while Rust executes PTY/session/action/matcher controls.
 
 | Method               | Params                                        | Result                             |
 | -------------------- | --------------------------------------------- | ---------------------------------- |
@@ -201,7 +201,7 @@ See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics
 | `plugin.capabilities`      | none                      | Host plugin capabilities. |
 | `plugin.validate_manifest` | `{ "manifest": { ... } }` | `{ "valid": true }`.      |
 
-See [Plugins and extensions](./plugins.md) for manifest fields and permission names.
+`plugin.capabilities` reports `embedded_lua: true` and includes built-in plugin manifests in `builtin_plugins`, including the `claude-code` Lua adapter. See [Plugins and extensions](./plugins.md) for manifest fields, runtime names, and permission names.
 
 ### Other session methods
 

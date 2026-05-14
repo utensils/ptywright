@@ -1,18 +1,18 @@
 # Claude Code adapter
 
-ptywright includes an initial interactive Claude Code adapter built on the generic PTY/session/screen/action/matcher layers.
+ptywright includes an interactive Claude Code adapter built on the generic PTY/session/screen/action/matcher layers.
 
-This adapter is intentionally scoped to the terminal TUI. It does not use or optimize for `claude -p`.
+This adapter is intentionally scoped to the terminal TUI. It does not use or optimize for `claude -p`. Claude Code-specific decisions now live in the built-in Lua plugin at `plugins/claude-code/main.lua`; Rust provides the PTY controls and executes the generic action/matcher plans returned by Lua.
 
 ## Scope
 
 Implemented now:
 
-- Spawn `claude` interactively in a real PTY.
-- Send prompts as terminal input.
-- Classify coarse TUI states from screen/transcript evidence.
-- Detect common permission, approval, thinking, and input prompt text.
-- Approve, deny, or cancel with terminal key actions.
+- Spawn `claude` interactively in a real PTY from Rust.
+- Send prompts as terminal input through Lua-provided action plans.
+- Classify coarse TUI states from screen/transcript evidence in Lua.
+- Detect common permission, approval, thinking, and input prompt text in Lua.
+- Approve, deny, or cancel with Lua-provided terminal key actions.
 - Expose convenience JSON-RPC methods under the `claude.*` namespace.
 
 Still evolving:
@@ -59,11 +59,11 @@ Every state response includes:
 - `evidence`
 - `sequence`
 
-The classifier is heuristic and deliberately isolated so Claude Code UI changes can be handled in one adapter module. Sanitized fixture tests cover ready, thinking, permission, plan approval, completed, and error-like screens.
+The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Sanitized fixture tests cover ready, thinking, permission, plan approval, completed, and error-like screens.
 
 ## JSON-RPC methods
 
-Claude methods are convenience wrappers. Generic `session.*` methods remain sufficient for clients that want full control.
+Claude methods are compatibility/convenience wrappers around the built-in Lua adapter. Generic `session.*` methods remain sufficient for clients that want full control.
 
 ```json
 {
@@ -102,5 +102,6 @@ Other methods:
 ## Safety and limitations
 
 - The adapter drives whatever `claude` executable is found on `PATH` unless `program` is overridden.
-- Approval and denial are terminal key actions; verify behavior against your installed Claude Code version.
+- Approval and denial are terminal key actions selected by the Lua adapter; verify behavior against your installed Claude Code version.
+- Lua runs only on explicit adapter calls, not per PTY byte.
 - Screen/transcript evidence may contain sensitive project data. Avoid logging responses blindly.

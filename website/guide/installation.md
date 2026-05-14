@@ -4,6 +4,8 @@ ptywright is not published as a full automation tool yet. For now, install from 
 
 ## From source
 
+The default build embeds Lua 5.4 for trusted adapter plugins, so source builds need a working C compiler in addition to Rust.
+
 ```bash
 git clone https://github.com/utensils/ptywright
 cd ptywright

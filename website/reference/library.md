@@ -118,7 +118,7 @@ Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and 
 
 ## Claude Code adapter
 
-`ClaudeCodeAdapter` starts `claude` interactively in a PTY and classifies coarse TUI state from screen/transcript evidence. The adapter does not use `claude -p`.
+`ClaudeCodeAdapter` starts `claude` interactively in a PTY and classifies coarse TUI state from screen/transcript evidence. The adapter does not use `claude -p`. Claude-specific action plans, wait matchers, and classification rules live in the built-in Lua plugin at `plugins/claude-code/main.lua`; Rust executes the generic PTY controls.
 
 ```rust
 use ptywright::{ClaudeCodeAdapter, ClaudeCodeConfig};
@@ -127,6 +127,8 @@ let mut claude = ClaudeCodeAdapter::start(ClaudeCodeConfig::default())?;
 let state = claude.send_prompt("help")?;
 # Ok::<(), ptywright::Error>(())
 ```
+
+`ClaudeCodeAdapter::from_session(session)` is also fallible because it loads the built-in Lua plugin before wrapping externally managed sessions.
 
 See [Claude Code adapter](../guide/claude-code.md) for state and limitation details.
 
@@ -158,9 +160,9 @@ assert!(response.is_some());
 
 The CLI exposes this through `ptywright serve --stdio` and `ptywright serve --stdio --framing lsp`. `RpcServer::handle_line_messages` returns a direct response plus opt-in coalesced notifications when enabled with `server.set_notifications`.
 
-## Plugin manifests
+## Plugin manifests and Lua plugins
 
-The first extension surface is declarative. `PluginManifest` records plugin kind, version, and explicit permissions; `PluginHostCapabilities` reports the permissions this build understands.
+The extension surface is declarative and includes a trusted embedded Lua runtime for built-in adapter orchestration. `PluginManifest` records plugin kind, version, optional runtime/entrypoint, and explicit permissions; `PluginHostCapabilities` reports the permissions this build understands and built-in plugin manifests.
 
 ```rust
 use ptywright::{PluginManifest, PluginPermission};
@@ -169,13 +171,17 @@ let manifest: PluginManifest = serde_json::from_str(r#"{
   "name":"demo",
   "kind":"adapter",
   "version":"0.1.0",
+  "runtime":"lua",
+  "entrypoint":"main.lua",
   "permissions":["session.spawn","screen.read"]
 }"#)?;
 manifest.validate().expect("valid manifest");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-No embedded Lua/Luau or WASM runtime is enabled yet.
+`LuaPlugin` is available for trusted embedded plugins and is called only on explicit adapter/orchestration boundaries. PTY byte processing, terminal parsing, screen mutation, and matcher polling remain in Rust.
+
+WASM and third-party plugin loading are not enabled yet.
 
 ## Planned API families
 

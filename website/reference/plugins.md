@@ -1,8 +1,8 @@
 # Plugins and extensions
 
-ptywright now includes the first extension surface: declarative manifests, explicit host permissions, and JSON-RPC helpers for manifest validation.
+ptywright includes a trusted extension surface: declarative manifests, explicit host permissions, JSON-RPC helpers for manifest validation, and an embedded Lua runtime for built-in adapter/orchestration code.
 
-There is not yet an embedded plugin runtime. External JSON-RPC clients remain the recommended extension mechanism for early development.
+The first embedded plugin is the Claude Code adapter. Rust still owns PTY IO, terminal parsing, screen mutation, actions, matchers, redaction, and RPC framing; Lua is only called for explicit adapter decisions.
 
 ## Current model
 
@@ -10,8 +10,11 @@ Implemented:
 
 - `PluginManifest`
 - `PluginKind`
+- `PluginRuntime`
 - `PluginPermission`
 - `PluginHostCapabilities`
+- trusted embedded Lua execution for built-in plugins
+- built-in `claude-code` Lua adapter plugin surfaced via `PluginHostCapabilities.builtin_plugins`
 - manifest validation
 - JSON-RPC methods:
   - `plugin.capabilities`
@@ -19,10 +22,9 @@ Implemented:
 
 Not implemented yet:
 
-- Embedded Lua/Luau execution.
+- Loading third-party Lua plugins from disk.
 - WASM plugin execution.
 - Filesystem, process, or network capabilities for plugins.
-- Loading manifests from disk.
 
 ## Manifest example
 
@@ -31,6 +33,8 @@ Not implemented yet:
   "name": "claude-code",
   "kind": "adapter",
   "version": "0.1.0",
+  "runtime": "lua",
+  "entrypoint": "plugins/claude-code/main.lua",
   "permissions": ["session.spawn", "screen.read", "input.write", "session.kill"]
 }
 ```
@@ -40,6 +44,11 @@ Kinds:
 - `adapter`
 - `macro`
 - `matcher`
+
+Runtimes:
+
+- `lua`
+- `wasm` is reserved for future work
 
 Permissions:
 
@@ -71,6 +80,8 @@ Validate a manifest:
       "name": "demo",
       "kind": "adapter",
       "version": "0.1.0",
+      "runtime": "lua",
+      "entrypoint": "main.lua",
       "permissions": ["session.spawn", "screen.read"]
     }
   }
@@ -81,15 +92,22 @@ Validation checks:
 
 - name is non-empty;
 - version is non-empty;
+- executable runtime declarations include a non-empty entrypoint;
 - permissions are known;
 - permissions are not duplicated.
 
 Unknown permissions fail during JSON deserialization and return `Invalid params`.
 
-## Runtime direction
+## Runtime model
 
-Phase 1 is external JSON-RPC clients. This is available now and keeps extension code out of the PTY hot path.
+Embedded Lua is available for trusted built-in adapter/orchestration logic. It is not part of the PTY hot path:
 
-Phase 2 may add embedded Lua/Luau for trusted local adapters and macros. Lua must not run per PTY byte or mutate the terminal grid directly.
+- no Lua callbacks run per PTY byte;
+- Lua receives explicit screen/transcript snapshots or action inputs;
+- Lua uses the injected `ptywright.action.*` and `ptywright.matcher.*` helper APIs to build control plans;
+- Lua returns generic `Action`, `Matcher`, and state values;
+- Rust enforces permissions, owns session IO, and applies redaction at RPC read boundaries.
 
-Phase 3 may add WASM only if untrusted marketplace plugins become important.
+The built-in Claude Code plugin lives at `plugins/claude-code/main.lua` and is embedded into the single binary with `include_str!`. The public `claude.*` methods are compatibility wrappers over that Lua adapter.
+
+WASM remains reserved for a future untrusted plugin model.

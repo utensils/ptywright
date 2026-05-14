@@ -12,12 +12,14 @@ ptywright/
 │   ├── error.rs       # public error/result types
 │   ├── lib.rs         # public library surface
 │   ├── main.rs        # clap CLI entrypoint
+│   ├── lua_plugin.rs  # trusted Lua plugin runtime for adapter orchestration
 │   ├── matcher.rs     # screen/transcript predicates
 │   ├── rpc.rs         # JSON-RPC server and framing helpers
 │   ├── screen.rs      # terminal engine seam, parser, and snapshots
 │   ├── session.rs     # PTY-backed process lifecycle
 │   ├── target.rs      # spawn configuration
 │   └── transcript.rs  # bounded output transcript
+├── plugins/           # built-in trusted Lua plugins embedded in the binary
 ├── tests/             # CLI integration tests
 ├── website/           # VitePress docs
 ├── flake.nix          # Nix package, app, devshell, formatter
@@ -78,7 +80,8 @@ The first implementation uses:
 - JSON-RPC 2.0 over stdio with NDJSON and LSP-style `Content-Length` framing for external automation clients.
 - Local Unix socket serving on macOS/Linux for longer-lived local automation processes.
 - Opt-in coalesced JSON-RPC notifications for session changes and exits.
-- Plugin manifest and permission types for future trusted extensions.
+- Plugin manifest, permission, and runtime types for trusted extensions.
+- Embedded Lua for built-in adapter orchestration, currently used by the Claude Code adapter.
 - Dynamic shell completion generation through `clap_complete`.
 
 The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later. Screen snapshots expose portable cell/style/mode metadata instead of `vt100` types.
@@ -89,13 +92,14 @@ ptywright targets interactive Claude Code through the terminal TUI. It does not 
 
 The Claude Code adapter uses only generic primitives:
 
-- spawn `claude` in a PTY-backed `Session`;
-- observe `ScreenSnapshot` and transcript evidence;
-- send `Action` values for prompts, approval keys, interrupts, and resize;
-- wait with `Matcher` predicates;
-- expose Claude-specific state only in adapter APIs and `claude.*` RPC methods.
+- Rust spawns `claude` in a PTY-backed `Session`;
+- Rust observes `ScreenSnapshot` and transcript evidence;
+- the built-in Lua plugin classifies Claude Code screen states;
+- the Lua plugin returns generic `Action` values for prompts, approvals, denials, and interrupts;
+- the Lua plugin returns generic `Matcher` values for turn waits;
+- Rust executes actions, waits, redaction, lifecycle, and RPC responses.
 
-This keeps the core useful for shells, REPLs, full-screen TUIs, and other long-running terminal programs.
+This keeps Claude Code UI specifics in `plugins/claude-code/main.lua` while the core remains useful for shells, REPLs, full-screen TUIs, and other long-running terminal programs.
 
 ## Testing direction
 

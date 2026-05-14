@@ -14,6 +14,16 @@ pub enum PluginKind {
     Matcher,
 }
 
+/// Trusted plugin runtime declared by a manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntime {
+    /// Embedded Lua runtime for trusted local adapter/orchestration code.
+    Lua,
+    /// WebAssembly runtime. Reserved for future untrusted plugin work.
+    Wasm,
+}
+
 /// Host capability requested by an extension manifest.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PluginPermission {
@@ -49,6 +59,12 @@ pub struct PluginManifest {
     pub kind: PluginKind,
     /// Plugin version string.
     pub version: String,
+    /// Trusted runtime used by the plugin, if it is executable.
+    #[serde(default)]
+    pub runtime: Option<PluginRuntime>,
+    /// Entrypoint path relative to the plugin root, if it is executable.
+    #[serde(default)]
+    pub entrypoint: Option<String>,
     /// Requested host permissions.
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
@@ -62,6 +78,17 @@ impl PluginManifest {
         }
         if self.version.trim().is_empty() {
             return Err(PluginManifestError::EmptyVersion);
+        }
+        let has_runtime = self.runtime.is_some();
+        let has_entrypoint = self
+            .entrypoint
+            .as_deref()
+            .is_some_and(|entrypoint| !entrypoint.trim().is_empty());
+        if has_runtime && !has_entrypoint {
+            return Err(PluginManifestError::MissingEntrypoint);
+        }
+        if !has_runtime && has_entrypoint {
+            return Err(PluginManifestError::EntrypointWithoutRuntime);
         }
 
         let mut seen = BTreeSet::new();
@@ -86,6 +113,8 @@ pub struct PluginHostCapabilities {
     pub embedded_lua: bool,
     /// Whether WASM plugins are available.
     pub wasm: bool,
+    /// Built-in plugins embedded in this single binary.
+    pub builtin_plugins: Vec<PluginManifest>,
 }
 
 impl PluginHostCapabilities {
@@ -102,8 +131,9 @@ impl PluginHostCapabilities {
                 PluginPermission::InputWrite,
                 PluginPermission::MatcherWait,
             ],
-            embedded_lua: false,
+            embedded_lua: true,
             wasm: false,
+            builtin_plugins: vec![claude_code_manifest()],
         }
     }
 
@@ -123,9 +153,36 @@ pub enum PluginManifestError {
     /// Plugin version is empty.
     #[error("plugin version must not be empty")]
     EmptyVersion,
+    /// Executable plugin has no entrypoint.
+    #[error("plugin runtime requires an entrypoint")]
+    MissingEntrypoint,
+    /// Plugin declares an entrypoint but no runtime.
+    #[error("plugin entrypoint requires a runtime")]
+    EntrypointWithoutRuntime,
     /// Permission appears more than once.
     #[error("duplicate plugin permission: {0}")]
     DuplicatePermission(String),
+}
+
+/// Manifest for the built-in Lua Claude Code adapter.
+#[must_use]
+pub fn claude_code_manifest() -> PluginManifest {
+    PluginManifest {
+        name: "claude-code".to_string(),
+        kind: PluginKind::Adapter,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        runtime: Some(PluginRuntime::Lua),
+        entrypoint: Some("plugins/claude-code/main.lua".to_string()),
+        permissions: vec![
+            PluginPermission::SessionSpawn,
+            PluginPermission::SessionKill,
+            PluginPermission::SessionResize,
+            PluginPermission::ScreenRead,
+            PluginPermission::TranscriptRead,
+            PluginPermission::InputWrite,
+            PluginPermission::MatcherWait,
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +197,8 @@ mod tests {
             "name": "claude-code",
             "kind": "adapter",
             "version": "0.1.0",
+            "runtime": "lua",
+            "entrypoint": "main.lua",
             "permissions": ["session.spawn", "screen.read", "input.write"]
         }))
         .expect("parse manifest");
@@ -155,6 +214,8 @@ mod tests {
             name: " ".to_string(),
             kind: PluginKind::Adapter,
             version: "0.1.0".to_string(),
+            runtime: None,
+            entrypoint: None,
             permissions: Vec::new(),
         };
 
@@ -167,6 +228,8 @@ mod tests {
             name: "dup".to_string(),
             kind: PluginKind::Macro,
             version: "0.1.0".to_string(),
+            runtime: None,
+            entrypoint: None,
             permissions: vec![PluginPermission::InputWrite, PluginPermission::InputWrite],
         };
 
@@ -177,11 +240,48 @@ mod tests {
     }
 
     #[test]
-    fn host_capabilities_are_explicit_and_do_not_enable_embedded_runtimes() {
+    fn executable_manifest_requires_entrypoint() {
+        let manifest = PluginManifest {
+            name: "missing-entrypoint".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: Some(PluginRuntime::Lua),
+            entrypoint: None,
+            permissions: Vec::new(),
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(PluginManifestError::MissingEntrypoint)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_entrypoint_without_runtime() {
+        let manifest = PluginManifest {
+            name: "missing-runtime".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: None,
+            entrypoint: Some("main.lua".to_string()),
+            permissions: Vec::new(),
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(PluginManifestError::EntrypointWithoutRuntime)
+        );
+    }
+
+    #[test]
+    fn host_capabilities_expose_embedded_lua_and_builtin_claude_plugin() {
         let capabilities = PluginHostCapabilities::current();
 
         assert!(capabilities.allows(&PluginPermission::SessionSpawn));
-        assert!(!capabilities.embedded_lua);
+        assert!(capabilities.embedded_lua);
         assert!(!capabilities.wasm);
+        assert!(capabilities.builtin_plugins.iter().any(
+            |plugin| plugin.name == "claude-code" && plugin.runtime == Some(PluginRuntime::Lua)
+        ));
     }
 }

@@ -24,6 +24,9 @@ pub enum Error {
     /// Child process has already exited or closed its PTY.
     #[error("session is closed")]
     Closed,
+    /// Lua plugin runtime error.
+    #[error("lua plugin error: {0}")]
+    Lua(String),
     /// RPC protocol error.
     #[error("rpc error: {0}")]
     Rpc(String),

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use regex::Regex;
@@ -79,13 +81,9 @@ impl Matcher {
     ) -> bool {
         match self {
             Self::ContainsText(text) => snapshot.plain_text.contains(text),
-            Self::ScreenRegex(pattern) => Regex::new(pattern)
-                .map(|regex| regex.is_match(&snapshot.plain_text))
-                .unwrap_or(false),
+            Self::ScreenRegex(pattern) => cached_regex_is_match(pattern, &snapshot.plain_text),
             Self::TranscriptContains(text) => transcript.contains(text),
-            Self::TranscriptRegex(pattern) => Regex::new(pattern)
-                .map(|regex| regex.is_match(transcript))
-                .unwrap_or(false),
+            Self::TranscriptRegex(pattern) => cached_regex_is_match(pattern, transcript),
             Self::CursorAt { row, col } => {
                 snapshot.cursor.row == *row && snapshot.cursor.col == *col
             }
@@ -112,6 +110,25 @@ impl Matcher {
             _ => None,
         }
     }
+}
+
+fn cached_regex_is_match(pattern: &str, text: &str) -> bool {
+    const MAX_REGEX_CACHE_ENTRIES: usize = 128;
+
+    static REGEX_CACHE: OnceLock<Mutex<HashMap<String, Option<Regex>>>> = OnceLock::new();
+    let cache = REGEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("regex cache lock poisoned");
+    if let Some(regex) = cache.get(pattern) {
+        return regex.as_ref().is_some_and(|regex| regex.is_match(text));
+    }
+
+    let regex = Regex::new(pattern).ok();
+    let matched = regex.as_ref().is_some_and(|regex| regex.is_match(text));
+    if cache.len() >= MAX_REGEX_CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), regex);
+    matched
 }
 
 impl From<&str> for Matcher {
@@ -158,6 +175,14 @@ mod tests {
     #[test]
     fn invalid_regex_does_not_match() {
         assert!(!Matcher::ScreenRegex("[".into()).is_match(&snapshot("text"), ""));
+    }
+
+    #[test]
+    fn repeated_regex_uses_cached_result() {
+        let matcher = Matcher::ScreenRegex("rea.y".into());
+
+        assert!(matcher.is_match(&snapshot("ready"), ""));
+        assert!(matcher.is_match(&snapshot("ready"), ""));
     }
 
     #[test]
