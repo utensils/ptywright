@@ -233,6 +233,24 @@ fn classify_state(
 
     if contains_any(
         &lower,
+        &[
+            "error:",
+            "request failed",
+            "failed to",
+            "try again",
+            "retry",
+        ],
+    ) {
+        return state_snapshot(
+            ClaudeCodeState::Error,
+            0.7,
+            "error or retry text detected",
+            sequence,
+        );
+    }
+
+    if contains_any(
+        &lower,
         &["what would you like", "how can i help", "type a message"],
     ) {
         return state_snapshot(
@@ -331,5 +349,51 @@ mod tests {
         );
 
         assert_eq!(state.state, ClaudeCodeState::CompletedTurn);
+    }
+
+    #[test]
+    fn classifier_matches_sanitized_claude_code_fixtures() {
+        let fixtures = [
+            (
+                include_str!("../../tests/fixtures/claude_code/ready.txt"),
+                None,
+                ClaudeCodeState::Ready,
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/thinking.txt"),
+                None,
+                ClaudeCodeState::Thinking,
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/permission.txt"),
+                None,
+                ClaudeCodeState::WaitingForPermission,
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/plan_approval.txt"),
+                None,
+                ClaudeCodeState::WaitingForPlanApproval,
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/completed.txt"),
+                Some(ClaudeCodeState::PromptSubmitted),
+                ClaudeCodeState::CompletedTurn,
+            ),
+            (
+                include_str!("../../tests/fixtures/claude_code/error.txt"),
+                None,
+                ClaudeCodeState::Error,
+            ),
+        ];
+
+        for (index, (fixture, last_intent, expected)) in fixtures.into_iter().enumerate() {
+            let state = classify_state(fixture, "", index as u64, last_intent);
+            assert_eq!(
+                state.state, expected,
+                "fixture {index} classified with evidence: {}",
+                state.evidence
+            );
+            assert!(state.confidence >= 0.6);
+        }
     }
 }

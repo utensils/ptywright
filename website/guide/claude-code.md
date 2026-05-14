@@ -20,7 +20,7 @@ Still evolving:
 - Robust turn boundary detection across Claude Code UI changes.
 - More detailed permission and plan prompt parsing.
 - Event subscriptions for state transitions.
-- Golden screen fixtures from real Claude Code sessions.
+- Broader golden screen fixtures from real Claude Code sessions.
 
 ## Rust API
 
@@ -59,7 +59,7 @@ Every state response includes:
 - `evidence`
 - `sequence`
 
-The classifier is heuristic and deliberately isolated so Claude Code UI changes can be handled in one adapter module.
+The classifier is heuristic and deliberately isolated so Claude Code UI changes can be handled in one adapter module. Sanitized fixture tests cover ready, thinking, permission, plan approval, completed, and error-like screens.
 
 ## JSON-RPC methods
 

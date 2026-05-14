@@ -1,0 +1,5 @@
+Claude Code
+
+Do you want to proceed?
+Allow Bash command: cargo test
+[Enter] Approve  [Esc] Deny
