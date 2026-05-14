@@ -60,7 +60,7 @@ pub struct SessionExitStatus {
 
 /// A running PTY-backed terminal session.
 pub struct Session {
-    master: Box<dyn MasterPty + Send>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     shared: Arc<SharedState>,
@@ -91,7 +91,7 @@ impl Session {
         let shared = Arc::new(SharedState {
             state: Mutex::new(SessionState {
                 terminal: Terminal::new(size),
-                transcript: Transcript::new(config.transcript),
+                transcript: Transcript::new(config.transcript)?,
                 reader_open: true,
             }),
             changed: Condvar::new(),
@@ -105,7 +105,7 @@ impl Session {
         });
 
         Ok(Self {
-            master: pair.master,
+            master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             shared,
@@ -184,7 +184,10 @@ impl Session {
 
     /// Resize the PTY and terminal parser.
     pub fn resize(&self, size: TerminalSize) -> Result<()> {
-        self.master.resize(to_pty_size(size))?;
+        self.master
+            .lock()
+            .expect("pty master lock poisoned")
+            .resize(to_pty_size(size))?;
         let mut state = self.shared.state.lock().expect("session state poisoned");
         state.terminal.resize(size);
         let next = self.shared.sequence.fetch_add(1, Ordering::SeqCst) + 1;
@@ -304,7 +307,11 @@ fn read_loop(reader: &mut Box<dyn Read + Send>, shared: &SharedState) {
             Ok(n) => {
                 let mut state = shared.state.lock().expect("session state poisoned");
                 state.terminal.process(&buf[..n]);
-                state.transcript.push_bytes(&buf[..n]);
+                if let Err(error) = state.transcript.push_bytes(&buf[..n]) {
+                    let message = RedactionPolicy::default().redact(&error.to_string());
+                    eprintln!("ptywright: transcript write error: {message}");
+                    break;
+                }
                 shared.sequence.fetch_add(1, Ordering::SeqCst);
                 drop(state);
                 shared.changed.notify_all();

@@ -110,8 +110,8 @@ Embedded Lua is available for trusted built-in adapter/orchestration logic. It i
 - Lua uses the injected `ptywright.action.*` and `ptywright.matcher.*` helper APIs to build control plans;
 - Lua returns generic `Action`, `Matcher`, and state values;
 - Rust installs host helper constructors according to manifest permissions;
-- Rust interrupts runaway Lua calls with an instruction-count limit;
-- No wall-clock timeout is currently applied to Lua calls because plugins do not receive blocking host callbacks; add one before exposing blocking host calls;
+- Rust interrupts runaway Lua calls with instruction-count and wall-clock limits;
+- No blocking filesystem/process/network host callbacks are exposed to Lua;
 - Rust owns session IO and applies redaction at RPC read/error boundaries.
 
 The built-in Claude Code plugin lives at `plugins/claude-code/main.lua` and is embedded into the single binary with `include_str!`. The public `claude.*` methods are compatibility wrappers over that Lua adapter.

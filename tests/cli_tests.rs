@@ -180,6 +180,80 @@ fn serve_unix_socket_returns_json_rpc_response() {
     assert_eq!(response["result"]["sessions"], serde_json::json!([]));
 }
 
+#[test]
+#[cfg(unix)]
+fn serve_unix_socket_shares_sessions_across_connections() {
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket = std::env::temp_dir().join(format!(
+        "ptywright-test-{}-{unique}.sock",
+        std::process::id()
+    ));
+
+    let mut child = bin()
+        .args(["serve", "--socket"])
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ptywright serve --socket");
+
+    let connect = || {
+        for _ in 0..100 {
+            match UnixStream::connect(&socket) {
+                Ok(connected) => return connected,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("connect to socket")
+    };
+
+    let mut first = connect();
+    first
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session.create\",\"params\":{\"program\":\"/bin/sh\",\"args\":[\"-lc\",\"sleep 1\"]}}\n")
+        .expect("write create");
+    first
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown first write");
+    let mut create_stdout = String::new();
+    first
+        .read_to_string(&mut create_stdout)
+        .expect("read create response");
+    let create: serde_json::Value =
+        serde_json::from_str(create_stdout.trim()).expect("json create response");
+    let session = create["result"]["session"].as_str().expect("session id");
+
+    let mut second = connect();
+    second
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.list\"}\n")
+        .expect("write list");
+    second
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown second write");
+    let mut list_stdout = String::new();
+    second
+        .read_to_string(&mut list_stdout)
+        .expect("read list response");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&socket);
+
+    let list: serde_json::Value = serde_json::from_str(list_stdout.trim()).expect("json list");
+    assert!(
+        list["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(session))
+    );
+}
+
 fn dynamic_completions(shell: &str, index: &str, words: &[&str]) -> String {
     let output = bin()
         .env("COMPLETE", shell)

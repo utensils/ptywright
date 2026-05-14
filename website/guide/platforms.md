@@ -6,19 +6,18 @@ ptywright is intended to work across macOS, Linux, and Windows.
 
 The initial PTY implementation uses `portable-pty`, which maps to Unix PTYs on macOS/Linux and ConPTY on Windows. The crate is built and checked on all three operating systems in CI.
 
-| Platform | Status            | Notes                                                                                                            |
-| -------- | ----------------- | ---------------------------------------------------------------------------------------------------------------- |
-| macOS    | Initial PTY path  | CI runs check, clippy, tests, and release build.                                                                 |
-| Linux    | Initial PTY path  | CI runs check, clippy, tests, and release build.                                                                 |
-| Windows  | Compile validated | CI builds/checks the PTY code. Use `serve --stdio` for automation transport while named-pipe parity is designed. |
+| Platform | Status            | Notes                                                                                                               |
+| -------- | ----------------- | ------------------------------------------------------------------------------------------------------------------- |
+| macOS    | Initial PTY path  | CI runs check, clippy, tests, and release build.                                                                    |
+| Linux    | Initial PTY path  | CI runs check, clippy, tests, and release build.                                                                    |
+| Windows  | Compile validated | CI builds/checks the PTY code. Use `serve --stdio` or named-pipe local IPC via `serve --socket \\.\pipe\ptywright`. |
 
 ## Current limitations
 
 - Unix PTY behavior has deterministic tests for simple command output.
 - Windows ConPTY support is compiled in, but command-output fixtures are temporarily gated while deterministic Windows PTY test commands are developed.
 - `ptywright run` bridges stdin/stdout live for local debugging.
-- JSON-RPC control is available through `serve --stdio` on all platforms and Unix sockets on macOS/Linux.
-- Windows named-pipe server mode is not implemented yet; `serve --stdio` is the documented Windows equivalent for local automation transport for now.
+- JSON-RPC control is available through `serve --stdio` on all platforms, multi-client Unix sockets on macOS/Linux, and Windows named pipes through `serve --socket \\.\pipe\ptywright`-style paths.
 
 ## Development environments
 

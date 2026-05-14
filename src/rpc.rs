@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -14,15 +15,35 @@ use crate::plugin::{PluginHostCapabilities, PluginManifest};
 use crate::redaction::RedactionPolicy;
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
+use crate::transcript::TranscriptFileConfig;
 use crate::{NAME, VERSION};
 
 const JSONRPC_VERSION: &str = "2.0";
 
-/// Stateful JSON-RPC handler for ptywright sessions.
-pub struct RpcServer {
-    sessions: HashMap<String, Session>,
-    claude_adapters: HashMap<String, ClaudeCodeAdapter>,
+/// Shared JSON-RPC session registry used by multi-client local IPC transports.
+#[derive(Clone, Default)]
+pub struct RpcServerState {
+    inner: Arc<Mutex<RpcSharedState>>,
+}
+
+struct RpcSharedState {
+    sessions: HashMap<String, Arc<Session>>,
     next_session: u64,
+}
+
+impl Default for RpcSharedState {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            next_session: 1,
+        }
+    }
+}
+
+/// Stateful JSON-RPC handler for one client connection.
+pub struct RpcServer {
+    shared: RpcServerState,
+    claude_adapters: HashMap<String, ClaudeCodeAdapter>,
     next_claude_adapter: u64,
     notifications_enabled: bool,
     last_notified_sequences: HashMap<String, u64>,
@@ -49,6 +70,9 @@ struct CreateParams {
     cols: Option<u16>,
     pixel_width: Option<u16>,
     pixel_height: Option<u16>,
+    transcript_max_chars: Option<usize>,
+    raw_transcript_path: Option<PathBuf>,
+    raw_transcript_append: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +85,8 @@ struct SessionReadParams {
     session: String,
     /// Whether to redact sensitive-looking output fields. Defaults to true.
     redact: Option<bool>,
+    /// Optional caller-supplied redaction additions/replacement for this read.
+    redaction: Option<RedactionPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,14 +177,27 @@ impl RpcErrorCode {
     }
 }
 
-impl RpcServer {
-    /// Create an empty JSON-RPC server state.
+impl RpcServerState {
+    /// Create an empty shared JSON-RPC server state.
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl RpcServer {
+    /// Create an empty JSON-RPC server with private state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_state(RpcServerState::new())
+    }
+
+    /// Create a JSON-RPC handler for one client over shared server state.
+    #[must_use]
+    pub fn with_state(shared: RpcServerState) -> Self {
         Self {
-            sessions: HashMap::new(),
+            shared,
             claude_adapters: HashMap::new(),
-            next_session: 1,
             next_claude_adapter: 1,
             notifications_enabled: false,
             last_notified_sequences: HashMap::new(),
@@ -212,13 +251,18 @@ impl RpcServer {
 
     fn poll_notifications(&mut self) -> Result<Vec<String>> {
         let mut messages = Vec::new();
-        let mut ids = self.sessions.keys().cloned().collect::<Vec<_>>();
-        ids.sort();
+        let mut sessions = self
+            .shared
+            .inner
+            .lock()
+            .expect("rpc shared state poisoned")
+            .sessions
+            .iter()
+            .map(|(id, session)| (id.clone(), Arc::clone(session)))
+            .collect::<Vec<_>>();
+        sessions.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        for id in ids {
-            let Some(session) = self.sessions.get(&id) else {
-                continue;
-            };
+        for (id, session) in sessions {
             let sequence = session.sequence();
             if self.last_notified_sequences.get(&id).copied() != Some(sequence) {
                 self.last_notified_sequences.insert(id.clone(), sequence);
@@ -341,14 +385,43 @@ impl RpcServer {
         let mut target = Target::new(params.program).args(params.args).size(size);
         target.cwd = params.cwd;
         target.env = params.env;
-        let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
+        let mut config = SessionConfig::new(target);
+        if let Some(max_chars) = params.transcript_max_chars {
+            config.transcript.max_chars = max_chars;
+        }
+        if params.raw_transcript_append == Some(true) && params.raw_transcript_path.is_none() {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "raw_transcript_append requires raw_transcript_path".to_string(),
+            ));
+        }
+        if let Some(path) = params.raw_transcript_path {
+            config.transcript.raw_file = Some(
+                TranscriptFileConfig::new(path)
+                    .append(params.raw_transcript_append.unwrap_or(false)),
+            );
+        }
+        let session = Arc::new(Session::spawn(config).map_err(rpc_error_from_error)?);
         let id = self.allocate_session_id();
-        self.sessions.insert(id.clone(), session);
+        self.shared
+            .inner
+            .lock()
+            .expect("rpc shared state poisoned")
+            .sessions
+            .insert(id.clone(), session);
         Ok(json!({ "session": id }))
     }
 
     fn session_list(&self) -> Value {
-        let mut sessions = self.sessions.keys().cloned().collect::<Vec<_>>();
+        let mut sessions = self
+            .shared
+            .inner
+            .lock()
+            .expect("rpc shared state poisoned")
+            .sessions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         sessions.sort();
         json!({ "sessions": sessions })
     }
@@ -358,7 +431,14 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: SessionParams = parse_params(params)?;
-        if let Some(session) = self.sessions.remove(&params.session) {
+        let session = self
+            .shared
+            .inner
+            .lock()
+            .expect("rpc shared state poisoned")
+            .sessions
+            .remove(&params.session);
+        if let Some(session) = session {
             let _ = session.kill();
             self.last_notified_sequences.remove(&params.session);
             self.notified_exits.remove(&params.session);
@@ -414,9 +494,14 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: SessionReadParams = parse_params(params)?;
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
         let mut snapshot = self.session(&params.session)?.snapshot();
-        if params.redact.unwrap_or(true) {
-            snapshot = snapshot.redacted(&RedactionPolicy::default());
+        if let Some(policy) = policy {
+            snapshot = snapshot.redacted(&policy);
         }
         serde_json::to_value(snapshot)
             .map_err(|error| (RpcErrorCode::InternalError, error.to_string()))
@@ -427,9 +512,14 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: SessionReadParams = parse_params(params)?;
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
         let session = self.session(&params.session)?;
-        let text = if params.redact.unwrap_or(true) {
-            session.redacted_transcript(&RedactionPolicy::default())
+        let text = if let Some(policy) = policy {
+            session.redacted_transcript(&policy)
         } else {
             session.transcript()
         };
@@ -583,18 +673,26 @@ impl RpcServer {
         })
     }
 
-    fn session(&self, id: &str) -> std::result::Result<&Session, (RpcErrorCode, String)> {
-        self.sessions.get(id).ok_or_else(|| {
-            (
-                RpcErrorCode::InvalidParams,
-                format!("unknown session: {id}"),
-            )
-        })
+    fn session(&self, id: &str) -> std::result::Result<Arc<Session>, (RpcErrorCode, String)> {
+        self.shared
+            .inner
+            .lock()
+            .expect("rpc shared state poisoned")
+            .sessions
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    RpcErrorCode::InvalidParams,
+                    format!("unknown session: {id}"),
+                )
+            })
     }
 
     fn allocate_session_id(&mut self) -> String {
-        let id = format!("s{}", self.next_session);
-        self.next_session += 1;
+        let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        let id = format!("s{}", shared.next_session);
+        shared.next_session += 1;
         id
     }
 
@@ -612,8 +710,26 @@ impl Default for RpcServer {
 }
 
 /// Run an NDJSON-framed JSON-RPC server over arbitrary input/output streams.
-pub fn serve_ndjson(input: impl Read, mut output: impl Write) -> Result<()> {
+pub fn serve_ndjson(input: impl Read, output: impl Write) -> Result<()> {
     let mut server = RpcServer::new();
+    serve_ndjson_with_server(input, output, &mut server)
+}
+
+/// Run an NDJSON-framed JSON-RPC server over shared state.
+pub fn serve_ndjson_with_state(
+    input: impl Read,
+    output: impl Write,
+    state: RpcServerState,
+) -> Result<()> {
+    let mut server = RpcServer::with_state(state);
+    serve_ndjson_with_server(input, output, &mut server)
+}
+
+fn serve_ndjson_with_server(
+    input: impl Read,
+    mut output: impl Write,
+    server: &mut RpcServer,
+) -> Result<()> {
     let reader = BufReader::new(input);
     for line in reader.lines() {
         let line = line?;
@@ -630,8 +746,26 @@ pub fn serve_ndjson(input: impl Read, mut output: impl Write) -> Result<()> {
 }
 
 /// Run an LSP-style `Content-Length` framed JSON-RPC server over arbitrary streams.
-pub fn serve_lsp(input: impl Read, mut output: impl Write) -> Result<()> {
+pub fn serve_lsp(input: impl Read, output: impl Write) -> Result<()> {
     let mut server = RpcServer::new();
+    serve_lsp_with_server(input, output, &mut server)
+}
+
+/// Run an LSP-style `Content-Length` framed JSON-RPC server over shared state.
+pub fn serve_lsp_with_state(
+    input: impl Read,
+    output: impl Write,
+    state: RpcServerState,
+) -> Result<()> {
+    let mut server = RpcServer::with_state(state);
+    serve_lsp_with_server(input, output, &mut server)
+}
+
+fn serve_lsp_with_server(
+    input: impl Read,
+    mut output: impl Write,
+    server: &mut RpcServer,
+) -> Result<()> {
     let mut reader = BufReader::new(input);
     while let Some(payload) = read_lsp_payload(&mut reader)? {
         if payload.trim().is_empty() {
@@ -694,6 +828,17 @@ where
 {
     serde_json::from_value(params.unwrap_or_else(|| json!({})))
         .map_err(|error| (RpcErrorCode::InvalidParams, error.to_string()))
+}
+
+fn redaction_policy_for_read(
+    policy: Option<RedactionPolicy>,
+) -> std::result::Result<RedactionPolicy, (RpcErrorCode, String)> {
+    let mut policy = policy.unwrap_or_default();
+    policy.enabled = true;
+    policy
+        .validate()
+        .map_err(|error| (RpcErrorCode::InvalidParams, error))?;
+    Ok(policy)
 }
 
 fn success_response(id: Option<Value>, result: Value) -> Value {
@@ -796,6 +941,56 @@ mod tests {
         assert_eq!(messages.len(), 1);
         let response: Value = serde_json::from_str(&messages[0]).expect("json response");
         assert_eq!(response["result"]["enabled"], true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shared_state_shares_sessions_across_connection_handlers() {
+        let state = RpcServerState::new();
+        let mut first = RpcServer::with_state(state.clone());
+        let mut second = RpcServer::with_state(state);
+
+        let create = handle(
+            &mut first,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","sleep 1"]}}"#,
+        );
+        let session = create["result"]["session"].as_str().expect("session id");
+        let list = handle(
+            &mut second,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session.list"}"#,
+        );
+
+        assert!(
+            list["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(session))
+        );
+        let close = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session.close","params":{{"session":"{session}"}}}}"#
+        );
+        let _ = handle(&mut second, &close);
+    }
+
+    #[test]
+    fn notification_subscriptions_are_per_connection_handler() {
+        let state = RpcServerState::new();
+        let mut first = RpcServer::with_state(state.clone());
+        let mut second = RpcServer::with_state(state);
+
+        let first_messages = first
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+            )
+            .expect("enable first notifications");
+        let second_messages = second
+            .handle_line_messages(r#"{"jsonrpc":"2.0","id":2,"method":"session.list"}"#)
+            .expect("second list without notifications");
+
+        assert_eq!(first_messages.len(), 1);
+        assert_eq!(second_messages.len(), 1);
+        let response: Value = serde_json::from_str(&second_messages[0]).expect("json response");
+        assert_eq!(response["id"], 2);
     }
 
     #[test]
@@ -909,6 +1104,101 @@ mod tests {
 
         assert_eq!(redacted["result"]["text"], "token=[REDACTED]");
         assert_eq!(raw["result"]["text"], "token=super-secret");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_create_can_stream_raw_transcript_to_explicit_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ptywright-rpc-transcript-{}-{}.log",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let mut server = RpcServer::new();
+        let path_json = serde_json::to_string(&path).expect("serialize path");
+        let create = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"session.create","params":{{"program":"/bin/sh","args":["-lc","printf 'token=super-secret'"],"raw_transcript_path":{path_json}}}}}"#
+            ),
+        );
+        let session = create["result"]["session"].as_str().unwrap();
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"session.wait","params":{{"session":"{session}","matcher":{{"type":"process_exited"}},"timeout_ms":5000}}}}"#,
+            ),
+        );
+
+        let bytes = std::fs::read(&path).expect("read raw transcript");
+        assert_eq!(bytes, b"token=super-secret");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transcript_reads_accept_custom_redaction_policy() {
+        let mut server = RpcServer::new();
+        let create = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","printf 'internal-123 public'"]}}"#,
+        );
+        let session = create["result"]["session"].as_str().unwrap();
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"session.wait","params":{{"session":"{session}","matcher":{{"type":"contains_text","value":"internal-123"}},"timeout_ms":5000}}}}"#,
+            ),
+        );
+        let redacted = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"session.transcript","params":{{"session":"{session}","redaction":{{"enabled":false,"replacement":"[X]","extra_regexes":["internal-[0-9]+"]}}}}}}"#,
+            ),
+        );
+
+        assert_eq!(redacted["result"]["text"], "[X] public");
+    }
+
+    #[test]
+    fn transcript_reads_reject_invalid_custom_redaction_regex() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.transcript","params":{"session":"missing","redaction":{"enabled":true,"replacement":"[REDACTED]","extra_regexes":["("]}}}"#,
+        );
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid redaction regex")
+        );
+    }
+
+    #[test]
+    fn session_create_rejects_append_without_raw_transcript_path() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"program":"ptywright-test-missing","raw_transcript_append":true}}"#,
+        );
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("requires raw_transcript_path")
+        );
+    }
+
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos()
     }
 
     #[test]

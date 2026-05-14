@@ -28,11 +28,14 @@ pub use plugin::{
     PluginRuntime, claude_code_manifest,
 };
 pub use redaction::RedactionPolicy;
-pub use rpc::{RpcServer, serve_lsp, serve_ndjson};
+pub use rpc::{
+    RpcServer, RpcServerState, serve_lsp, serve_lsp_with_state, serve_ndjson,
+    serve_ndjson_with_state,
+};
 pub use screen::{CursorState, ScreenCell, ScreenCellStyle, ScreenSnapshot, Terminal};
 pub use session::{Session, SessionConfig, SessionExitStatus};
 pub use target::{Target, TerminalSize};
-pub use transcript::{Transcript, TranscriptConfig};
+pub use transcript::{Transcript, TranscriptConfig, TranscriptFileConfig};
 
 /// Crate and binary name.
 pub const NAME: &str = "ptywright";

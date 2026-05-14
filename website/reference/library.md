@@ -37,7 +37,7 @@ Important fields:
 
 ## Sessions
 
-`Session` owns a PTY-backed child process and keeps terminal state up to date from a background reader thread.
+`Session` owns a PTY-backed child process and keeps terminal state up to date from a background reader thread. Transcript retention is bounded in memory by default; callers can explicitly opt into raw transcript file streaming through `TranscriptFileConfig`.
 
 ```rust
 use std::time::Duration;
@@ -66,6 +66,18 @@ Key methods:
 | `wait_for`     | Wait for a `Matcher` with a timeout.               |
 | `wait`         | Wait for child process exit.                       |
 | `kill`         | Kill the child process.                            |
+
+```rust
+use ptywright::{Session, SessionConfig, Target, TranscriptFileConfig};
+
+let mut config = SessionConfig::new(Target::new("/bin/sh"));
+config.transcript.raw_file = Some(TranscriptFileConfig::new("raw-session.log"));
+let session = Session::spawn(config)?;
+# session.kill()?;
+# Ok::<(), ptywright::Error>(())
+```
+
+Raw transcript files are unredacted and explicit opt-in. By default ptywright creates a new file and refuses to overwrite it; use `TranscriptFileConfig::append(true)` only for trusted local workflows that intentionally append.
 
 ## Screen snapshots
 
@@ -134,7 +146,7 @@ See [Claude Code adapter](../guide/claude-code.md) for state and limitation deta
 
 ## Redaction
 
-`RedactionPolicy` redacts sensitive-looking values such as `token=...`, `password=...`, bearer tokens, and common API key shapes from strings. RPC read methods redact transcript and snapshot text by default, while in-process `Session::transcript()` remains raw and `Session::redacted_transcript()` applies an explicit policy.
+`RedactionPolicy` redacts sensitive-looking values such as `token=...`, `password=...`, bearer tokens, and common API key shapes from strings. Policies also accept trusted-local `extra_literals` and `extra_regexes` additions. RPC read methods redact transcript and snapshot text by default, while in-process `Session::transcript()` remains raw and `Session::redacted_transcript()` applies an explicit policy.
 
 ```rust
 use ptywright::RedactionPolicy;
@@ -145,7 +157,7 @@ assert_eq!(safe, "token=[REDACTED]");
 
 ## JSON-RPC
 
-`RpcServer` handles JSON-RPC messages, `serve_ndjson` runs newline-delimited JSON framing over arbitrary `Read`/`Write` streams, and `serve_lsp` runs LSP-style `Content-Length` framing.
+`RpcServer` handles JSON-RPC messages, `RpcServerState` shares sessions across multiple connection handlers, `serve_ndjson` runs newline-delimited JSON framing over arbitrary `Read`/`Write` streams, and `serve_lsp` runs LSP-style `Content-Length` framing.
 
 ```rust
 use ptywright::RpcServer;
@@ -158,7 +170,7 @@ assert!(response.is_some());
 # Ok::<(), ptywright::Error>(())
 ```
 
-The CLI exposes this through `ptywright serve --stdio` and `ptywright serve --stdio --framing lsp`. `RpcServer::handle_line_messages` returns a direct response plus opt-in coalesced notifications when enabled with `server.set_notifications`.
+The CLI exposes this through `ptywright serve --stdio`, `ptywright serve --stdio --framing lsp`, and multi-client local IPC via `ptywright serve --socket PATH` (Unix sockets on macOS/Linux and named pipes on Windows). `RpcServer::handle_line_messages` returns a direct response plus opt-in coalesced notifications when enabled with `server.set_notifications`; notification subscriptions are per `RpcServer` connection handler, while sessions can be shared through `RpcServerState`.
 
 ## Plugin manifests and Lua plugins
 

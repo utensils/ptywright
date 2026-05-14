@@ -1,6 +1,6 @@
 # JSON-RPC reference
 
-`ptywright serve --stdio` exposes JSON-RPC 2.0 over stdin/stdout using newline-delimited JSON by default, or LSP-style `Content-Length` frames with `--framing lsp`. On macOS/Linux, `ptywright serve --socket PATH` serves the same protocol on a local Unix socket.
+`ptywright serve --stdio` exposes JSON-RPC 2.0 over stdin/stdout using newline-delimited JSON by default, or LSP-style `Content-Length` frames with `--framing lsp`. `ptywright serve --socket PATH` serves the same protocol over local IPC: Unix sockets on macOS/Linux and Windows named pipes for `\\.\pipe\...` paths.
 
 This is the first automation protocol. It is intentionally separate from `ptywright run` so protocol responses never mix with raw terminal output.
 
@@ -10,8 +10,7 @@ This is the first automation protocol. It is intentionally separate from `ptywri
 - stderr is diagnostics only.
 - `--framing ndjson` default: stdin accepts one complete JSON-RPC request or notification per line; stdout writes one compact JSON-RPC response or notification per line.
 - `--framing lsp`: messages are framed as `Content-Length: N\r\n\r\n<json>`.
-- `--socket PATH`: macOS/Linux local Unix socket transport.
-- Windows: use `--stdio` for local automation transport; named-pipe parity remains planned.
+- `--socket PATH`: local IPC transport. On macOS/Linux this is a Unix socket path. On Windows this is a named-pipe path such as `\\.\pipe\ptywright`. Each connection gets its own notification subscription state while sharing one server session registry, so multiple clients can inspect/control the same sessions.
 
 ## Example
 
@@ -59,15 +58,18 @@ Result:
 
 Params:
 
-| Field          | Required | Meaning                               |
-| -------------- | -------- | ------------------------------------- |
-| `program`      | yes      | Executable name or path.              |
-| `args`         | no       | Argument list.                        |
-| `cwd`          | no       | Working directory.                    |
-| `env`          | no       | Environment overrides.                |
-| `rows`/`cols`  | no       | Initial terminal size, default 24x80. |
-| `pixel_width`  | no       | Optional pixel width.                 |
-| `pixel_height` | no       | Optional pixel height.                |
+| Field                   | Required | Meaning                                                                    |
+| ----------------------- | -------- | -------------------------------------------------------------------------- |
+| `program`               | yes      | Executable name or path.                                                   |
+| `args`                  | no       | Argument list.                                                             |
+| `cwd`                   | no       | Working directory.                                                         |
+| `env`                   | no       | Environment overrides.                                                     |
+| `rows`/`cols`           | no       | Initial terminal size, default 24x80.                                      |
+| `pixel_width`           | no       | Optional pixel width.                                                      |
+| `pixel_height`          | no       | Optional pixel height.                                                     |
+| `transcript_max_chars`  | no       | Bounded in-memory transcript retention; default is 128 KiB of UTF-8 chars. |
+| `raw_transcript_path`   | no       | Explicit trusted-local path for raw/unredacted transcript byte streaming.  |
+| `raw_transcript_append` | no       | Append to an existing raw transcript file; default refuses overwrites.     |
 
 ### `session.list`
 
@@ -214,13 +216,15 @@ See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics
 | `session.kill`       | `{ "session": "s1" }`                          | `{ "killed": true }`.          |
 | `session.close`      | `{ "session": "s1" }`                          | Kills and removes the session. |
 
-`session.snapshot` and `session.transcript` redact sensitive-looking text by default. Pass `"redact": false` in params to opt into raw output for trusted local debugging.
+`session.snapshot` and `session.transcript` redact sensitive-looking text by default. Pass `"redact": false` in params to opt into raw output for trusted local debugging. Callers may also pass a `redaction` object with `enabled`, `replacement`, `extra_literals`, and `extra_regexes` fields to add trusted-local redaction rules for a single read.
+
+`raw_transcript_path` streams raw PTY bytes directly to a file and is always explicit opt-in. The default mode creates a new file and refuses to overwrite; `raw_transcript_append: true` appends to an existing file. Raw transcript files are unredacted sensitive data and should be protected by the caller.
 
 RPC error messages are redacted with the default policy before they are serialized. CLI-level diagnostics printed by ptywright also redact through the default policy.
 
 ## Notifications
 
-The server accepts JSON-RPC notifications. Server-originated notifications are opt-in through `server.set_notifications` and are currently emitted after request/notification handling rather than from a fully asynchronous event loop.
+The server accepts JSON-RPC notifications. Server-originated notifications are opt-in per connection through `server.set_notifications` and are currently emitted after request/notification handling rather than from a fully asynchronous event loop.
 
 ## Error codes
 
