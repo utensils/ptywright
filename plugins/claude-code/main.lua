@@ -6,8 +6,6 @@ local M = {}
 local action = ptywright.action
 local matcher = ptywright.matcher
 
-local COMPLETED_TURN_STABLE_MS = 300
-
 local function contains(text, needle)
   return string.find(text, needle, 1, true) ~= nil
 end
@@ -109,23 +107,23 @@ function M.classify(input)
   local sequence = input.sequence or 0
   local last_intent = input.last_intent
   local stable_ms = tonumber(input.stable_ms) or 0
-  local combined = screen .. "\n" .. transcript
-  local text = lower(combined)
+  local text = lower(screen .. "\n" .. transcript)
   local screen_text = lower(screen)
+  local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
 
   if trim(text) == "" then
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
   end
 
-  if has_plan_indicator(text) then
+  if has_plan_indicator(screen_text) then
     return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence)
   end
 
-  if has_permission_indicator(text) then
+  if has_permission_indicator(screen_text) then
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence)
   end
 
-  if has_active_work_indicator(text) then
+  if has_active_work_indicator(screen_text) then
     return state_snapshot("thinking", 0.76, "active work indicator detected", sequence)
   end
 
@@ -133,12 +131,12 @@ function M.classify(input)
     return state_snapshot("error", 0.72, "visible error banner detected", sequence)
   end
 
-  if contains_any(text, { "what would you like", "how can i help", "type a message" }) then
+  if contains_any(screen_text, { "what would you like", "how can i help", "type a message" }) then
     return state_snapshot("ready", 0.74, "ready prompt text detected", sequence)
   end
 
   if has_input_prompt(screen) then
-    if last_intent == "prompt_submitted" and stable_ms >= COMPLETED_TURN_STABLE_MS and not has_active_work_indicator(screen_text) then
+    if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms and not has_active_work_indicator(screen_text) then
       return state_snapshot("completed_turn", 0.78, "stable input prompt after prompt submission", sequence)
     end
     return state_snapshot("waiting_for_user_input", 0.62, "input prompt glyph detected", sequence)
@@ -157,7 +155,8 @@ function M.send_prompt(input)
   }
 end
 
-function M.wait_turn_matcher(_input)
+function M.wait_turn_matcher(input)
+  local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
   return matcher.all({
     matcher.any({
       matcher.contains_text("Do you want to proceed"),
@@ -165,7 +164,7 @@ function M.wait_turn_matcher(_input)
       matcher.contains_text("Allow"),
       matcher.screen_regex("(?m)^\\s*(?:>|❯)\\s*$"),
     }),
-    matcher.screen_stable(COMPLETED_TURN_STABLE_MS),
+    matcher.screen_stable(completed_turn_stable_ms),
   })
 end
 

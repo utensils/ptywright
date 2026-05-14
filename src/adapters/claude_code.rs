@@ -169,9 +169,10 @@ impl ClaudeCodeAdapter {
 
     /// Wait until Claude appears to need user input, approval, or has completed a turn.
     pub fn wait_turn(&self, timeout: Duration) -> Result<ClaudeCodeStateSnapshot> {
-        let matcher: Matcher = self
-            .plugin
-            .call("wait_turn_matcher", &serde_json::json!({}))?;
+        let matcher: Matcher = self.plugin.call(
+            "wait_turn_matcher",
+            &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+        )?;
         let result = self.session.wait_for(&matcher, timeout)?;
         classify_state(
             &self.plugin,
@@ -236,6 +237,7 @@ fn classify_state(
             sequence,
             last_intent: last_intent.map(state_name).transpose()?,
             stable_ms,
+            completed_turn_stable_ms: COMPLETED_TURN_STABLE_MS,
         },
     )
 }
@@ -261,6 +263,7 @@ struct ClassifyInput<'a> {
     sequence: u64,
     last_intent: Option<String>,
     stable_ms: Option<u64>,
+    completed_turn_stable_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,7 +348,10 @@ mod tests {
     fn lua_plugin_supplies_turn_wait_matcher() {
         let matcher: Matcher = claude_plugin()
             .expect("load built-in Claude Code Lua plugin")
-            .call("wait_turn_matcher", &serde_json::json!({}))
+            .call(
+                "wait_turn_matcher",
+                &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+            )
             .expect("load wait matcher from Lua");
 
         let Matcher::All(matchers) = matcher else {
@@ -368,7 +374,10 @@ mod tests {
     fn lua_turn_wait_matcher_matches_prompt_line() {
         let matcher: Matcher = claude_plugin()
             .expect("load built-in Claude Code Lua plugin")
-            .call("wait_turn_matcher", &serde_json::json!({}))
+            .call(
+                "wait_turn_matcher",
+                &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+            )
             .expect("load wait matcher from Lua");
         let snapshot = crate::ScreenSnapshot {
             size: TerminalSize::new(3, 20),
