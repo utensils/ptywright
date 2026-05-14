@@ -1,7 +1,9 @@
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use mlua::LuaSerdeExt;
 use serde::{Serialize, de::DeserializeOwned};
@@ -9,6 +11,9 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::plugin::{PluginManifest, PluginManifestError, PluginPermission, PluginRuntime};
+
+const LUA_INSTRUCTION_HOOK_INTERVAL: u32 = 10_000;
+const LUA_INSTRUCTION_LIMIT: u64 = 5_000_000;
 
 /// Trusted Lua plugin runtime used for adapter/orchestration code.
 ///
@@ -19,6 +24,8 @@ pub struct LuaPlugin {
     lua: mlua::Lua,
     exports: mlua::RegistryKey,
     permissions: BTreeSet<PluginPermission>,
+    instruction_count: Rc<Cell<u64>>,
+    instruction_limit: u64,
 }
 
 impl fmt::Debug for LuaPlugin {
@@ -27,6 +34,7 @@ impl fmt::Debug for LuaPlugin {
             .debug_struct("LuaPlugin")
             .field("name", &self.name)
             .field("permissions", &self.permissions)
+            .field("instruction_limit", &self.instruction_limit)
             .finish_non_exhaustive()
     }
 }
@@ -84,6 +92,7 @@ impl LuaPlugin {
         I: Serialize,
         O: DeserializeOwned,
     {
+        self.instruction_count.set(0);
         let exports: mlua::Table = self
             .lua
             .registry_value(&self.exports)
@@ -118,7 +127,10 @@ impl LuaPlugin {
         permissions: BTreeSet<PluginPermission>,
     ) -> Result<Self> {
         let lua = new_lua().map_err(|error| lua_error(&name, error))?;
+        let instruction_count = install_instruction_limit(&lua, LUA_INSTRUCTION_LIMIT)
+            .map_err(|error| lua_error(&name, error))?;
         install_host_api(&lua, &permissions).map_err(|error| lua_error(&name, error))?;
+        instruction_count.set(0);
         let exports: mlua::Table = lua
             .load(source)
             .set_name(&name)
@@ -132,6 +144,8 @@ impl LuaPlugin {
             lua,
             exports,
             permissions,
+            instruction_count,
+            instruction_limit: LUA_INSTRUCTION_LIMIT,
         })
     }
 
@@ -145,6 +159,30 @@ fn new_lua() -> mlua::Result<mlua::Lua> {
         mlua::StdLib::TABLE | mlua::StdLib::STRING | mlua::StdLib::MATH | mlua::StdLib::UTF8,
         mlua::LuaOptions::new(),
     )
+}
+
+fn install_instruction_limit(
+    lua: &mlua::Lua,
+    instruction_limit: u64,
+) -> mlua::Result<Rc<Cell<u64>>> {
+    let instruction_count = Rc::new(Cell::new(0_u64));
+    let hook_count = Rc::clone(&instruction_count);
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(LUA_INSTRUCTION_HOOK_INTERVAL),
+        move |_lua, _debug| {
+            let next = hook_count
+                .get()
+                .saturating_add(u64::from(LUA_INSTRUCTION_HOOK_INTERVAL));
+            hook_count.set(next);
+            if next > instruction_limit {
+                return Err(mlua::Error::RuntimeError(
+                    "Lua plugin instruction limit exceeded".to_string(),
+                ));
+            }
+            Ok(mlua::VmState::Continue)
+        },
+    )?;
+    Ok(instruction_count)
 }
 
 fn validate_lua_manifest(manifest: &PluginManifest) -> Result<()> {
@@ -508,5 +546,27 @@ mod tests {
             .call_value("missing", &json!({}))
             .expect_err("call should fail");
         assert!(matches!(error, Error::Lua(_)));
+    }
+
+    #[test]
+    fn lua_plugin_calls_have_instruction_limit() {
+        let plugin = LuaPlugin::builtin(
+            "loop",
+            r#"
+            return {
+              run = function(_input)
+                while true do end
+              end
+            }
+            "#,
+        )
+        .expect("load plugin");
+
+        let error = plugin
+            .call_value("run", &json!({}))
+            .expect_err("loop should be interrupted");
+
+        assert!(matches!(error, Error::Lua(_)));
+        assert!(error.to_string().contains("instruction limit exceeded"));
     }
 }
