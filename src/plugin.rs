@@ -79,13 +79,16 @@ impl PluginManifest {
         if self.version.trim().is_empty() {
             return Err(PluginManifestError::EmptyVersion);
         }
-        if self.runtime.is_some()
-            && self
-                .entrypoint
-                .as_deref()
-                .is_none_or(|entrypoint| entrypoint.trim().is_empty())
-        {
+        let has_runtime = self.runtime.is_some();
+        let has_entrypoint = self
+            .entrypoint
+            .as_deref()
+            .is_some_and(|entrypoint| !entrypoint.trim().is_empty());
+        if has_runtime && !has_entrypoint {
             return Err(PluginManifestError::MissingEntrypoint);
+        }
+        if !has_runtime && has_entrypoint {
+            return Err(PluginManifestError::EntrypointWithoutRuntime);
         }
 
         let mut seen = BTreeSet::new();
@@ -153,6 +156,9 @@ pub enum PluginManifestError {
     /// Executable plugin has no entrypoint.
     #[error("plugin runtime requires an entrypoint")]
     MissingEntrypoint,
+    /// Plugin declares an entrypoint but no runtime.
+    #[error("plugin entrypoint requires a runtime")]
+    EntrypointWithoutRuntime,
     /// Permission appears more than once.
     #[error("duplicate plugin permission: {0}")]
     DuplicatePermission(String),
@@ -247,6 +253,23 @@ mod tests {
         assert_eq!(
             manifest.validate(),
             Err(PluginManifestError::MissingEntrypoint)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_entrypoint_without_runtime() {
+        let manifest = PluginManifest {
+            name: "missing-runtime".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: None,
+            entrypoint: Some("main.lua".to_string()),
+            permissions: Vec::new(),
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            Err(PluginManifestError::EntrypointWithoutRuntime)
         );
     }
 

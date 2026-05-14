@@ -1,3 +1,5 @@
+use std::fmt;
+
 use mlua::LuaSerdeExt;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -8,17 +10,35 @@ use crate::error::{Error, Result};
 ///
 /// The runtime is intentionally invoked only for explicit adapter calls. PTY byte
 /// reading, terminal parsing, screen mutation, and matcher polling remain in Rust.
-#[derive(Debug, Clone, Copy)]
 pub struct LuaPlugin {
     name: &'static str,
-    source: &'static str,
+    lua: mlua::Lua,
+    exports: mlua::RegistryKey,
+}
+
+impl fmt::Debug for LuaPlugin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LuaPlugin")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LuaPlugin {
     /// Create a trusted built-in Lua plugin from embedded source.
-    #[must_use]
-    pub const fn builtin(name: &'static str, source: &'static str) -> Self {
-        Self { name, source }
+    pub fn builtin(name: &'static str, source: &'static str) -> Result<Self> {
+        let lua = mlua::Lua::new();
+        install_host_api(&lua).map_err(|error| lua_error(name, error))?;
+        let exports: mlua::Table = lua
+            .load(source)
+            .set_name(name)
+            .eval()
+            .map_err(|error| lua_error(name, error))?;
+        let exports = lua
+            .create_registry_value(exports)
+            .map_err(|error| lua_error(name, error))?;
+        Ok(Self { name, lua, exports })
     }
 
     /// Call an exported Lua function with a serializable input value and decode
@@ -28,28 +48,35 @@ impl LuaPlugin {
         I: Serialize,
         O: DeserializeOwned,
     {
-        let lua = mlua::Lua::new();
-        install_host_api(&lua).map_err(|error| self.error(error))?;
-        let exports: mlua::Table = lua
-            .load(self.source)
-            .set_name(self.name)
-            .eval()
+        let exports: mlua::Table = self
+            .lua
+            .registry_value(&self.exports)
             .map_err(|error| self.error(error))?;
         let function: mlua::Function = exports.get(function).map_err(|error| self.error(error))?;
-        let input = lua.to_value(input).map_err(|error| self.error(error))?;
+        let input = self
+            .lua
+            .to_value(input)
+            .map_err(|error| self.error(error))?;
         let output: mlua::Value = function.call(input).map_err(|error| self.error(error))?;
-        lua.from_value(output).map_err(|error| self.error(error))
+        self.lua
+            .from_value(output)
+            .map_err(|error| self.error(error))
     }
 
     /// Call an exported Lua function and return raw JSON for tests and generic
-    /// future plugin dispatch.
+    /// future plugin dispatch. Lua numbers are converted through serde JSON's
+    /// numeric model; use typed `call` when integer/float distinctions matter.
     pub fn call_value(&self, function: &str, input: &Value) -> Result<Value> {
         self.call(function, input)
     }
 
     fn error(&self, error: mlua::Error) -> Error {
-        Error::Rpc(format!("lua plugin `{}` failed: {error}", self.name))
+        lua_error(self.name, error)
     }
+}
+
+fn lua_error(name: &str, error: mlua::Error) -> Error {
+    Error::Lua(format!("lua plugin `{name}` failed: {error}"))
 }
 
 fn install_host_api(lua: &mlua::Lua) -> mlua::Result<()> {
@@ -163,7 +190,8 @@ mod tests {
               end
             }
             "#,
-        );
+        )
+        .expect("load lua plugin");
 
         let value = plugin
             .call_value("echo", &json!({ "message": "hello" }))
@@ -186,7 +214,8 @@ mod tests {
               end
             }
             "#,
-        );
+        )
+        .expect("load lua plugin");
 
         let value = plugin
             .call_value("plan", &json!({}))

@@ -26,6 +26,8 @@ source <(ptywright completions zsh)
 
 ## Install from source
 
+The default build embeds Lua 5.4 for trusted adapter plugins, so source builds need a working C compiler in addition to Rust. The Nix dev shell provides the expected toolchain on macOS/Linux.
+
 ```bash
 git clone https://github.com/utensils/ptywright
 cd ptywright

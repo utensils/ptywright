@@ -1,3 +1,7 @@
+assert(ptywright, "ptywright host API not installed")
+assert(ptywright.action, "ptywright action host API not installed")
+assert(ptywright.matcher, "ptywright matcher host API not installed")
+
 local M = {}
 local action = ptywright.action
 local matcher = ptywright.matcher
@@ -117,8 +121,7 @@ function M.wait_turn_matcher(_input)
     matcher.contains_text("Do you want to proceed"),
     matcher.contains_text("Approve"),
     matcher.contains_text("Allow"),
-    matcher.contains_text("❯"),
-    matcher.contains_text(">"),
+    matcher.screen_regex("(?m)^\\s*(?:>|❯)\\s*$"),
   })
 end
 

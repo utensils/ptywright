@@ -77,6 +77,8 @@ pub enum ClaudeCodeState {
     Exited,
     /// State could not be classified.
     Error,
+    /// The built-in Lua adapter failed before Claude Code state could be read.
+    PluginError,
 }
 
 /// State classification with evidence and confidence.
@@ -95,6 +97,7 @@ pub struct ClaudeCodeStateSnapshot {
 /// Interactive Claude Code adapter backed by a generic ptywright session.
 pub struct ClaudeCodeAdapter {
     session: Session,
+    plugin: LuaPlugin,
     last_intent: Option<ClaudeCodeState>,
 }
 
@@ -104,6 +107,7 @@ impl ClaudeCodeAdapter {
         let session = Session::spawn(SessionConfig::new(config.target()))?;
         Ok(Self {
             session,
+            plugin: claude_plugin()?,
             last_intent: Some(ClaudeCodeState::Starting),
         })
     }
@@ -113,6 +117,7 @@ impl ClaudeCodeAdapter {
     pub fn from_session(session: Session) -> Self {
         Self {
             session,
+            plugin: claude_plugin().expect("built-in Claude Code Lua plugin must load"),
             last_intent: None,
         }
     }
@@ -128,7 +133,7 @@ impl ClaudeCodeAdapter {
     pub fn state(&self) -> ClaudeCodeStateSnapshot {
         self.try_state().unwrap_or_else(|error| {
             state_snapshot(
-                ClaudeCodeState::Error,
+                ClaudeCodeState::PluginError,
                 0.0,
                 format!("Claude Code Lua plugin failed: {error}"),
                 self.session.sequence(),
@@ -150,17 +155,19 @@ impl ClaudeCodeAdapter {
 
     /// Send a prompt to the interactive Claude Code TUI.
     pub fn send_prompt(&mut self, prompt: impl AsRef<str>) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = claude_plugin().call(
+        let plan: ActionPlan = self.plugin.call(
             "send_prompt",
             &serde_json::json!({ "prompt": prompt.as_ref() }),
         )?;
-        self.apply_plan(&plan)?;
+        self.apply_plan_with_required_intent(&plan, "send_prompt")?;
         self.try_state()
     }
 
     /// Wait until Claude appears to need user input, approval, or has completed a turn.
     pub fn wait_turn(&self, timeout: Duration) -> Result<ClaudeCodeStateSnapshot> {
-        let matcher: Matcher = claude_plugin().call("wait_turn_matcher", &serde_json::json!({}))?;
+        let matcher: Matcher = self
+            .plugin
+            .call("wait_turn_matcher", &serde_json::json!({}))?;
         let result = self.session.wait_for(&matcher, timeout)?;
         classify_state(
             &result.snapshot.plain_text,
@@ -172,28 +179,30 @@ impl ClaudeCodeAdapter {
 
     /// Approve the current Claude Code prompt using the Lua adapter's action plan.
     pub fn approve(&self) -> Result<()> {
-        let plan: ActionPlan = claude_plugin().call("approve", &serde_json::json!({}))?;
+        let plan: ActionPlan = self.plugin.call("approve", &serde_json::json!({}))?;
         self.apply_actions(&plan.actions)
     }
 
     /// Deny the current Claude Code prompt using the Lua adapter's action plan.
     pub fn deny(&self) -> Result<()> {
-        let plan: ActionPlan = claude_plugin().call("deny", &serde_json::json!({}))?;
+        let plan: ActionPlan = self.plugin.call("deny", &serde_json::json!({}))?;
         self.apply_actions(&plan.actions)
     }
 
     /// Cancel the current turn with the Lua adapter's action plan.
     pub fn cancel(&mut self) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = claude_plugin().call("cancel", &serde_json::json!({}))?;
-        self.apply_plan(&plan)?;
+        let plan: ActionPlan = self.plugin.call("cancel", &serde_json::json!({}))?;
+        self.apply_plan_with_required_intent(&plan, "cancel")?;
         self.try_state()
     }
 
-    fn apply_plan(&mut self, plan: &ActionPlan) -> Result<()> {
+    fn apply_plan_with_required_intent(&mut self, plan: &ActionPlan, method: &str) -> Result<()> {
         self.apply_actions(&plan.actions)?;
-        if let Some(intent) = plan.last_intent {
-            self.last_intent = Some(intent);
-        }
+        self.last_intent = Some(plan.last_intent.ok_or_else(|| {
+            crate::Error::Lua(format!(
+                "Claude Code Lua method `{method}` did not return last_intent"
+            ))
+        })?);
         Ok(())
     }
 
@@ -211,7 +220,7 @@ fn classify_state(
     sequence: u64,
     last_intent: Option<ClaudeCodeState>,
 ) -> Result<ClaudeCodeStateSnapshot> {
-    claude_plugin().call(
+    claude_plugin()?.call(
         "classify",
         &ClassifyInput {
             screen,
@@ -251,7 +260,7 @@ struct ActionPlan {
     last_intent: Option<ClaudeCodeState>,
 }
 
-fn claude_plugin() -> LuaPlugin {
+fn claude_plugin() -> Result<LuaPlugin> {
     LuaPlugin::builtin(
         "claude-code",
         include_str!("../../plugins/claude-code/main.lua"),
@@ -271,6 +280,7 @@ const fn state_name(state: ClaudeCodeState) -> &'static str {
         ClaudeCodeState::Cancelling => "cancelling",
         ClaudeCodeState::Exited => "exited",
         ClaudeCodeState::Error => "error",
+        ClaudeCodeState::PluginError => "plugin_error",
     }
 }
 
@@ -295,6 +305,7 @@ mod tests {
     #[test]
     fn lua_plugin_supplies_prompt_action_plan() {
         let plan: ActionPlan = claude_plugin()
+            .expect("load built-in Claude Code Lua plugin")
             .call(
                 "send_prompt",
                 &serde_json::json!({ "prompt": "hello Claude" }),
@@ -314,6 +325,7 @@ mod tests {
     #[test]
     fn lua_plugin_supplies_turn_wait_matcher() {
         let matcher: Matcher = claude_plugin()
+            .expect("load built-in Claude Code Lua plugin")
             .call("wait_turn_matcher", &serde_json::json!({}))
             .expect("load wait matcher from Lua");
 
