@@ -113,13 +113,12 @@ impl ClaudeCodeAdapter {
     }
 
     /// Wrap an existing session. Useful for tests or externally managed sessions.
-    #[must_use]
-    pub fn from_session(session: Session) -> Self {
-        Self {
+    pub fn from_session(session: Session) -> Result<Self> {
+        Ok(Self {
             session,
-            plugin: claude_plugin().expect("built-in Claude Code Lua plugin must load"),
+            plugin: claude_plugin()?,
             last_intent: None,
-        }
+        })
     }
 
     /// Access the underlying generic session.
@@ -146,6 +145,7 @@ impl ClaudeCodeAdapter {
         let snapshot = self.session.snapshot();
         let transcript = self.session.transcript();
         classify_state(
+            &self.plugin,
             &snapshot.plain_text,
             &transcript,
             snapshot.sequence,
@@ -170,6 +170,7 @@ impl ClaudeCodeAdapter {
             .call("wait_turn_matcher", &serde_json::json!({}))?;
         let result = self.session.wait_for(&matcher, timeout)?;
         classify_state(
+            &self.plugin,
             &result.snapshot.plain_text,
             &result.transcript_tail,
             result.sequence,
@@ -215,12 +216,13 @@ impl ClaudeCodeAdapter {
 }
 
 fn classify_state(
+    plugin: &LuaPlugin,
     screen: &str,
     transcript: &str,
     sequence: u64,
     last_intent: Option<ClaudeCodeState>,
 ) -> Result<ClaudeCodeStateSnapshot> {
-    claude_plugin()?.call(
+    plugin.call(
         "classify",
         &ClassifyInput {
             screen,
@@ -334,8 +336,14 @@ mod tests {
 
     #[test]
     fn classifier_detects_permission_prompt() {
-        let state = classify_state("Do you want to proceed? Allow tool use", "", 3, None)
-            .expect("classify via Lua plugin");
+        let state = classify_state(
+            &claude_plugin().expect("load plugin"),
+            "Do you want to proceed? Allow tool use",
+            "",
+            3,
+            None,
+        )
+        .expect("classify via Lua plugin");
 
         assert_eq!(state.state, ClaudeCodeState::WaitingForPermission);
         assert!(state.confidence > 0.8);
@@ -343,16 +351,28 @@ mod tests {
 
     #[test]
     fn classifier_detects_plan_approval() {
-        let state = classify_state("Plan ready. Approve plan to proceed", "", 4, None)
-            .expect("classify via Lua plugin");
+        let state = classify_state(
+            &claude_plugin().expect("load plugin"),
+            "Plan ready. Approve plan to proceed",
+            "",
+            4,
+            None,
+        )
+        .expect("classify via Lua plugin");
 
         assert_eq!(state.state, ClaudeCodeState::WaitingForPlanApproval);
     }
 
     #[test]
     fn classifier_detects_thinking() {
-        let state = classify_state("Thinking... Esc to interrupt", "", 5, None)
-            .expect("classify via Lua plugin");
+        let state = classify_state(
+            &claude_plugin().expect("load plugin"),
+            "Thinking... Esc to interrupt",
+            "",
+            5,
+            None,
+        )
+        .expect("classify via Lua plugin");
 
         assert_eq!(state.state, ClaudeCodeState::Thinking);
     }
@@ -360,6 +380,7 @@ mod tests {
     #[test]
     fn classifier_detects_completed_turn_after_prompt_submission() {
         let state = classify_state(
+            &claude_plugin().expect("load plugin"),
             "work completed\n>",
             "",
             6,
@@ -413,8 +434,14 @@ mod tests {
 
         for (index, (fixture, last_intent, expected, evidence)) in fixtures.into_iter().enumerate()
         {
-            let state = classify_state(fixture, "", index as u64, last_intent)
-                .expect("classify fixture via Lua plugin");
+            let state = classify_state(
+                &claude_plugin().expect("load plugin"),
+                fixture,
+                "",
+                index as u64,
+                last_intent,
+            )
+            .expect("classify fixture via Lua plugin");
             assert_eq!(
                 state.state, expected,
                 "fixture {index} classified with evidence: {}",
