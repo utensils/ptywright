@@ -11,13 +11,13 @@ Implemented now:
 - Spawn `claude` interactively in a real PTY from Rust.
 - Send prompts as terminal input through Lua-provided action plans.
 - Classify coarse TUI states from screen/transcript evidence in Lua.
-- Detect common permission, approval, thinking, and input prompt text in Lua.
+- Detect common permission, approval, thinking/tool-use, streaming, and input prompt text in Lua.
 - Approve, deny, or cancel with Lua-provided terminal key actions.
 - Expose convenience JSON-RPC methods under the `claude.*` namespace.
 
 Still evolving:
 
-- Robust turn boundary detection across Claude Code UI changes.
+- Even stronger turn boundary detection across Claude Code UI changes.
 - More detailed permission and plan prompt parsing.
 - Event subscriptions for state transitions.
 - Broader golden screen fixtures from real Claude Code sessions.
@@ -51,6 +51,7 @@ The current state classifier returns:
 - `cancelling`
 - `exited`
 - `error`
+- `plugin_error`
 
 Every state response includes:
 
@@ -59,7 +60,9 @@ Every state response includes:
 - `evidence`
 - `sequence`
 
-The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Sanitized fixture tests cover ready, thinking, permission, plan approval, completed, and error-like screens.
+The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Sanitized fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, interrupted, completed, and error-like screens.
+
+`claude.wait_turn` now waits for both a turn-boundary indicator and a stable screen interval before classifying a submitted prompt as `completed_turn`. A plain prompt glyph without stable-screen evidence is classified as `waiting_for_user_input`.
 
 ## JSON-RPC methods
 

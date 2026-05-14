@@ -10,7 +10,8 @@ This is the first automation protocol. It is intentionally separate from `ptywri
 - stderr is diagnostics only.
 - `--framing ndjson` default: stdin accepts one complete JSON-RPC request or notification per line; stdout writes one compact JSON-RPC response or notification per line.
 - `--framing lsp`: messages are framed as `Content-Length: N\r\n\r\n<json>`.
-- `--socket PATH`: macOS/Linux local Unix socket transport; Windows named-pipe support remains planned.
+- `--socket PATH`: macOS/Linux local Unix socket transport.
+- Windows: use `--stdio` for local automation transport; named-pipe parity remains planned.
 
 ## Example
 
@@ -214,6 +215,8 @@ See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics
 | `session.close`      | `{ "session": "s1" }`                          | Kills and removes the session. |
 
 `session.snapshot` and `session.transcript` redact sensitive-looking text by default. Pass `"redact": false` in params to opt into raw output for trusted local debugging.
+
+RPC error messages are redacted with the default policy before they are serialized.
 
 ## Notifications
 

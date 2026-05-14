@@ -1,0 +1,6 @@
+Claude Code
+
+● Running tool: Edit
+  Updating src/lib.rs
+
+Esc to interrupt

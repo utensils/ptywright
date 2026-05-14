@@ -1,0 +1,7 @@
+Claude Code
+
+Plan
+  1. Update tests
+  2. Refine matcher
+
+Looks good? Approve plan to proceed.
