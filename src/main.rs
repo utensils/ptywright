@@ -431,4 +431,25 @@ mod tests {
 
         assert_eq!(filter_terminal_generated_input(input).as_ref(), input);
     }
+
+    #[test]
+    fn filters_8_bit_terminal_generated_sequences() {
+        let input = b"a\x9bIb\x9bOc\x9b?62;22;52cd\x90>|term\x9ce";
+
+        assert_eq!(filter_terminal_generated_input(input).as_ref(), b"abcde");
+    }
+
+    #[test]
+    fn preserves_incomplete_or_user_csi_dcs_sequences() {
+        let input = b"\x1b[?25h\x1bPunterminated";
+
+        assert_eq!(filter_terminal_generated_input(input).as_ref(), input);
+    }
+
+    #[test]
+    fn raw_mode_guard_noops_when_disabled() {
+        let guard = RawModeGuard::enable_if(false).expect("disabled raw mode guard");
+
+        assert!(!guard.enabled);
+    }
 }
