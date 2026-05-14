@@ -25,7 +25,7 @@ Not implemented yet:
 
 - JSON-RPC or CLI commands that load third-party plugins dynamically.
 - A sandbox for untrusted third-party plugins.
-- WASM plugin execution.
+- WASM plugin execution. This has been re-evaluated and intentionally deferred until untrusted marketplace-style plugins become a concrete priority.
 - Filesystem, process, or network capabilities for plugin host APIs.
 
 ## Manifest example
@@ -111,10 +111,11 @@ Embedded Lua is available for trusted built-in adapter/orchestration logic. It i
 - Lua returns generic `Action`, `Matcher`, and state values;
 - Rust installs host helper constructors according to manifest permissions;
 - Rust interrupts runaway Lua calls with an instruction-count limit;
+- no wall-clock timeout is currently applied to Lua calls because plugins do not receive blocking host callbacks; add one before exposing blocking host calls;
 - Rust owns session IO and applies redaction at RPC read/error boundaries.
 
 The built-in Claude Code plugin lives at `plugins/claude-code/main.lua` and is embedded into the single binary with `include_str!`. The public `claude.*` methods are compatibility wrappers over that Lua adapter.
 
 Library callers can load an explicitly trusted local Lua plugin with `LuaPlugin::load_trusted(root, manifest)`. The entrypoint must be a relative path inside the provided plugin root and is resolved after canonicalization to prevent symlink escapes. This is intended for trusted local adapters only; it is not an untrusted plugin sandbox.
 
-WASM remains reserved for a future untrusted plugin model.
+WASM remains reserved for a future untrusted plugin model. Until then, prefer out-of-process JSON-RPC clients for untrusted or experimental automation code.

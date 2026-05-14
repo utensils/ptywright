@@ -88,7 +88,8 @@ cargo run -- --help
 
 ## Current architecture
 
-- `src/main.rs` — clap CLI. With no args it prints help; `--version` prints package version; `run` executes a command in a headless PTY with live stdin/stdout bridging; `serve --stdio` exposes JSON-RPC with NDJSON or LSP-style framing; `serve --socket` exposes a Unix socket on macOS/Linux; `completions` generates shell completions.
+- `src/main.rs` — clap CLI wiring. With no args it prints help; `--version` prints package version; `serve --stdio` exposes JSON-RPC with NDJSON or LSP-style framing; `serve --socket` exposes a Unix socket on macOS/Linux; `completions` generates shell completions.
+- `src/run_terminal.rs` — `ptywright run` implementation for live stdin/stdout PTY bridging, raw-mode handling, and terminal-generated input filtering.
 - `src/lib.rs` plus modules in `src/` — public library surface for target configuration, PTY sessions, rich screen snapshots, actions, matchers, transcripts, redaction, JSON-RPC, Claude Code adapter primitives, and plugin manifests.
 - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
 - `website/` — VitePress docs site.
@@ -148,4 +149,6 @@ NIX_CONFIG="access-tokens = github.com=$TOKEN" nix flake update
 - Prefer small, direct Rust modules with explicit types.
 - Keep the CLI boring and composable.
 - Prefer minimal diffs that fit the existing project style.
+- Avoid god files: when a module starts mixing unrelated responsibilities or growing hard to review, refactor into focused modules as part of the same behavior change.
+- Keep refactors behavior-preserving unless the PR explicitly changes behavior; preserve or improve test coverage while moving code.
 - Run `ci-local` or the direct equivalent before handing off substantial changes.

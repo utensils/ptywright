@@ -216,7 +216,7 @@ See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics
 
 `session.snapshot` and `session.transcript` redact sensitive-looking text by default. Pass `"redact": false` in params to opt into raw output for trusted local debugging.
 
-RPC error messages are redacted with the default policy before they are serialized.
+RPC error messages are redacted with the default policy before they are serialized. CLI-level diagnostics printed by ptywright also redact through the default policy.
 
 ## Notifications
 
