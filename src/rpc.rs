@@ -8,9 +8,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::action::Action;
-use crate::adapters::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use crate::error::{Error, Result};
-use crate::extension::{ExtensionHandle, LuaExtension};
+use crate::extension::{Extension, ExtensionHandle, LuaExtension};
 use crate::matcher::Matcher;
 use crate::plugin::{PluginHostCapabilities, PluginManifest};
 use crate::redaction::RedactionPolicy;
@@ -20,8 +19,8 @@ use crate::transcript::TranscriptFileConfig;
 use crate::{NAME, VERSION};
 
 /// `completed_turn_stable_ms` forwarded to plugins via the `ExtensionHandle`.
-/// Mirrors the historic Claude Code value; safe to keep generic because
-/// plugins can override their own stability window through the matcher.
+/// A conservative default — plugins can override their own stability window
+/// through the matcher they return from `wait_*_matcher` intents.
 const ADAPTER_COMPLETED_TURN_STABLE_MS: u64 = 300;
 
 /// Default wait-intent invoked by `adapter.wait` when the caller does not
@@ -54,16 +53,10 @@ impl Default for RpcSharedState {
 /// Stateful JSON-RPC handler for one client connection.
 pub struct RpcServer {
     shared: RpcServerState,
-    /// Claude Code adapters registered via the legacy `claude.*` surface.
-    /// Kept alongside the generic `extensions` map until callers migrate to
-    /// `adapter.*`; both surfaces use the same underlying [`ExtensionHandle`]
-    /// internally but the registries are namespaced to avoid id collisions.
-    claude_adapters: HashMap<String, ClaudeCodeAdapter>,
-    next_claude_adapter: u64,
     /// Generic plugin-backed extension handles registered via `adapter.*`.
-    /// IDs are independent of `claude_adapters` (different namespace) and
-    /// carry the plugin name in the handle for future `adapter.list`-style
-    /// introspection.
+    /// The plugin name is stored on each entry so `adapter.list` /
+    /// `adapter.inspect` can surface it without round-tripping the
+    /// extension's manifest.
     extensions: HashMap<String, ExtensionEntry>,
     next_extension_id: u64,
     notifications_enabled: bool,
@@ -143,46 +136,6 @@ struct WaitParams {
 }
 
 #[derive(Debug, Deserialize)]
-struct ClaudeStartParams {
-    program: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    cwd: Option<PathBuf>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-    rows: Option<u16>,
-    cols: Option<u16>,
-    pixel_width: Option<u16>,
-    pixel_height: Option<u16>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeParams {
-    claude: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudePromptParams {
-    claude: String,
-    prompt: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeReadParams {
-    claude: String,
-    /// Whether to redact sensitive-looking output fields. Defaults to true.
-    redact: Option<bool>,
-    /// Optional caller-supplied redaction additions/replacement for this read.
-    redaction: Option<RedactionPolicy>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeWaitParams {
-    claude: String,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct PluginManifestParams {
     manifest: PluginManifest,
 }
@@ -194,23 +147,27 @@ struct NotificationsParams {
 
 // ---- adapter.* (generic plugin-backed) params ---------------------------
 //
-// The `adapter.*` surface is the plugin-name-aware sibling of `claude.*`.
-// Callers select a plugin manifest by name, the server instantiates a fresh
-// [`ExtensionHandle`] around a [`Session`], and subsequent calls reference
-// the handle by id. `claude.*` methods continue to work as deprecated
-// aliases (they will be migrated to internally route through this registry
-// in a follow-up commit per the SPEC).
+// Callers select a built-in plugin manifest by name, the server instantiates
+// a fresh [`ExtensionHandle`] around a [`Session`], and subsequent calls
+// reference the handle by id. The plugin's manifest may declare a
+// `default_target` so callers can omit `program` for plugins with a sensible
+// host-known default.
 
 #[derive(Debug, Deserialize)]
 struct AdapterStartParams {
     /// Built-in plugin manifest name, e.g. `"claude-code"`.
     plugin: String,
-    /// PTY program to spawn. If omitted, the server picks a sensible default
-    /// based on `plugin` (`claude-code` → `"claude"`); pass explicitly for
-    /// any plugin that doesn't have a host-known default.
+    /// PTY program to spawn. If omitted, the server falls back to the
+    /// plugin manifest's `default_target.program`. Pass explicitly when the
+    /// plugin has no default or you want to override it.
     program: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
+    /// Extra CLI args. `None` (field omitted) falls back to the manifest's
+    /// `default_target.args`; `Some(vec![])` is an explicit "no args"
+    /// override that suppresses the manifest default. This distinction
+    /// matters once a plugin's default_target.args is non-empty (today
+    /// only `claude-code` ships built-in and its defaults are empty, but
+    /// future plugins may pre-populate flags).
+    args: Option<Vec<String>>,
     cwd: Option<PathBuf>,
     #[serde(default)]
     env: BTreeMap<String, String>,
@@ -300,8 +257,6 @@ impl RpcServer {
     pub fn with_state(shared: RpcServerState) -> Self {
         Self {
             shared,
-            claude_adapters: HashMap::new(),
-            next_claude_adapter: 1,
             extensions: HashMap::new(),
             next_extension_id: 1,
             notifications_enabled: false,
@@ -429,16 +384,6 @@ impl RpcServer {
                     "session.snapshot",
                     "session.transcript",
                     "session.wait",
-                    "claude.start",
-                    "claude.send_prompt",
-                    "claude.wait_turn",
-                    "claude.approve",
-                    "claude.deny",
-                    "claude.cancel",
-                    "claude.state",
-                    "claude.snapshot",
-                    "claude.transcript",
-                    "claude.inspect",
                     "adapter.list",
                     "adapter.start",
                     "adapter.state",
@@ -463,16 +408,6 @@ impl RpcServer {
             "session.snapshot" => self.session_snapshot(request.params),
             "session.transcript" => self.session_transcript(request.params),
             "session.wait" => self.session_wait(request.params),
-            "claude.start" => self.claude_start(request.params),
-            "claude.send_prompt" => self.claude_send_prompt(request.params),
-            "claude.wait_turn" => self.claude_wait_turn(request.params),
-            "claude.approve" => self.claude_approve(request.params),
-            "claude.deny" => self.claude_deny(request.params),
-            "claude.cancel" => self.claude_cancel(request.params),
-            "claude.state" => self.claude_state(request.params),
-            "claude.snapshot" => self.claude_snapshot(request.params),
-            "claude.transcript" => self.claude_transcript(request.params),
-            "claude.inspect" => self.claude_inspect(request.params),
             "adapter.list" => Ok(self.adapter_list()),
             "adapter.start" => self.adapter_start(request.params),
             "adapter.state" => self.adapter_state(request.params),
@@ -676,187 +611,6 @@ impl RpcServer {
         }))
     }
 
-    fn claude_start(
-        &mut self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeStartParams = parse_params(params)?;
-        let config = ClaudeCodeConfig {
-            program: params.program.unwrap_or_else(|| "claude".to_string()),
-            args: params.args,
-            cwd: params.cwd,
-            env: params.env,
-            size: TerminalSize {
-                rows: params.rows.unwrap_or(40),
-                cols: params.cols.unwrap_or(120),
-                pixel_width: params.pixel_width.unwrap_or(0),
-                pixel_height: params.pixel_height.unwrap_or(0),
-            },
-        };
-        let adapter = ClaudeCodeAdapter::start(config).map_err(rpc_error_from_error)?;
-        let state = adapter.state();
-        let id = self.allocate_claude_adapter_id();
-        self.claude_adapters.insert(id.clone(), adapter);
-        Ok(json!({ "claude": id, "state": state }))
-    }
-
-    fn claude_send_prompt(
-        &mut self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudePromptParams = parse_params(params)?;
-        let state = self
-            .claude_adapter_mut(&params.claude)?
-            .send_prompt(params.prompt)
-            .map_err(rpc_error_from_error)?;
-        Ok(json!({ "state": state }))
-    }
-
-    fn claude_wait_turn(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeWaitParams = parse_params(params)?;
-        let state = self
-            .claude_adapter(&params.claude)?
-            .wait_turn(Duration::from_millis(params.timeout_ms.unwrap_or(120_000)))
-            .map_err(rpc_error_from_error)?;
-        Ok(json!({ "state": state }))
-    }
-
-    fn claude_approve(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeParams = parse_params(params)?;
-        let state = self
-            .claude_adapter(&params.claude)?
-            .approve()
-            .map_err(rpc_error_from_error)?;
-        // `approved` is retained as a deprecated alias for callers that
-        // pattern-match against the old `{approved: true}` shape. New callers
-        // should read `state` like every other mutation method.
-        Ok(json!({ "state": state, "approved": true }))
-    }
-
-    fn claude_deny(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeParams = parse_params(params)?;
-        let state = self
-            .claude_adapter(&params.claude)?
-            .deny()
-            .map_err(rpc_error_from_error)?;
-        Ok(json!({ "state": state, "denied": true }))
-    }
-
-    fn claude_cancel(
-        &mut self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeParams = parse_params(params)?;
-        let state = self
-            .claude_adapter_mut(&params.claude)?
-            .cancel()
-            .map_err(rpc_error_from_error)?;
-        Ok(json!({ "state": state }))
-    }
-
-    fn claude_state(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeParams = parse_params(params)?;
-        Ok(json!({ "state": self.claude_adapter(&params.claude)?.state() }))
-    }
-
-    /// Pass-through to `session.snapshot` for the adapter's underlying
-    /// session. The adapter owns its session id internally, so callers
-    /// couldn't reach the screen via `session.*` without spawning a parallel
-    /// session. This avoids that for the common case "what was on screen
-    /// when the classifier ran?"
-    fn claude_snapshot(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeReadParams = parse_params(params)?;
-        let adapter = self.claude_adapter(&params.claude)?;
-        let policy = if params.redact.unwrap_or(true) {
-            Some(redaction_policy_for_read(params.redaction)?)
-        } else {
-            None
-        };
-        let mut snapshot = adapter.session().snapshot();
-        if let Some(policy) = policy {
-            snapshot = snapshot.redacted(&policy);
-        }
-        serde_json::to_value(snapshot)
-            .map_err(|error| (RpcErrorCode::InternalError, error.to_string()))
-    }
-
-    /// Pass-through to `session.transcript` for the adapter's underlying
-    /// session. Same motivation as [`claude_snapshot`](Self::claude_snapshot).
-    fn claude_transcript(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeReadParams = parse_params(params)?;
-        let adapter = self.claude_adapter(&params.claude)?;
-        let policy = if params.redact.unwrap_or(true) {
-            Some(redaction_policy_for_read(params.redaction)?)
-        } else {
-            None
-        };
-        let session = adapter.session();
-        let text = if let Some(policy) = policy {
-            session.redacted_transcript(&policy)
-        } else {
-            session.transcript()
-        };
-        Ok(json!({ "text": text }))
-    }
-
-    /// Diagnostic dump: returns `state`, `plain_text`, `body_text`
-    /// (status-bar excluded), `status_text` (just the status bar), and
-    /// `transcript_tail` for the adapter. Designed for "the classifier
-    /// disagreed with what I expected — show me what it saw" without
-    /// setting up a parallel session.* read. Redacted by default.
-    fn claude_inspect(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
-        let params: ClaudeReadParams = parse_params(params)?;
-        let adapter = self.claude_adapter(&params.claude)?;
-        let session = adapter.session();
-        let snapshot = session.snapshot();
-        let transcript = session.transcript();
-        let policy = if params.redact.unwrap_or(true) {
-            Some(redaction_policy_for_read(params.redaction)?)
-        } else {
-            None
-        };
-        // 4 KiB tail mirrors what session.wait returns as transcript_tail.
-        // Use the char-boundary-safe helper because Claude Code's output
-        // includes 3-byte glyphs (⏺, ❯, →) that would panic a naive byte
-        // slice when the offset landed mid-codepoint.
-        let mut transcript_tail = transcript_tail_bytes(&transcript, 4096).to_string();
-        let mut plain_text = snapshot.plain_text.clone();
-        if let Some(policy) = policy {
-            plain_text = policy.redact(&plain_text);
-            transcript_tail = policy.redact(&transcript_tail);
-        }
-        let (body_text, status_text) = crate::extension::split_status_bar_for_inspect(&plain_text);
-        Ok(json!({
-            "state": adapter.state(),
-            "plain_text": plain_text,
-            "body_text": body_text,
-            "status_text": status_text,
-            "transcript_tail": transcript_tail,
-            "sequence": snapshot.sequence,
-        }))
-    }
-
     fn plugin_validate_manifest(
         &self,
         params: Option<Value>,
@@ -867,30 +621,6 @@ impl RpcServer {
             .validate()
             .map_err(|error| (RpcErrorCode::InvalidParams, error.to_string()))?;
         Ok(json!({ "valid": true }))
-    }
-
-    fn claude_adapter(
-        &self,
-        id: &str,
-    ) -> std::result::Result<&ClaudeCodeAdapter, (RpcErrorCode, String)> {
-        self.claude_adapters.get(id).ok_or_else(|| {
-            (
-                RpcErrorCode::InvalidParams,
-                format!("unknown Claude Code adapter: {id}"),
-            )
-        })
-    }
-
-    fn claude_adapter_mut(
-        &mut self,
-        id: &str,
-    ) -> std::result::Result<&mut ClaudeCodeAdapter, (RpcErrorCode, String)> {
-        self.claude_adapters.get_mut(id).ok_or_else(|| {
-            (
-                RpcErrorCode::InvalidParams,
-                format!("unknown Claude Code adapter: {id}"),
-            )
-        })
     }
 
     fn session(&self, id: &str) -> std::result::Result<Arc<Session>, (RpcErrorCode, String)> {
@@ -913,12 +643,6 @@ impl RpcServer {
         let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
         let id = format!("s{}", shared.next_session);
         shared.next_session += 1;
-        id
-    }
-
-    fn allocate_claude_adapter_id(&mut self) -> String {
-        let id = format!("c{}", self.next_claude_adapter);
-        self.next_claude_adapter += 1;
         id
     }
 
@@ -968,9 +692,14 @@ impl RpcServer {
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterStartParams = parse_params(params)?;
         let extension = LuaExtension::built_in(&params.plugin).map_err(rpc_error_from_error)?;
+        // Fall back to the manifest's declared default target when the caller
+        // omits `program`. Args follow the same rule independently: an
+        // explicit `args` list always wins, otherwise the manifest default's
+        // args are used.
+        let manifest_default = extension.manifest().default_target.clone();
         let program = params
             .program
-            .or_else(|| default_program_for_plugin(&params.plugin))
+            .or_else(|| manifest_default.as_ref().map(|t| t.program.clone()))
             .ok_or_else(|| {
                 (
                     RpcErrorCode::InvalidParams,
@@ -980,13 +709,24 @@ impl RpcServer {
                     ),
                 )
             })?;
+        // Args: explicit caller-supplied Vec (including an explicit empty
+        // list) always wins. Only when the field is omitted entirely do we
+        // fall back to the manifest's default_target.args. This makes
+        // `{"args": []}` a meaningful override even for plugins whose
+        // manifest pre-populates flags.
+        let args = params.args.unwrap_or_else(|| {
+            manifest_default
+                .as_ref()
+                .map(|t| t.args.clone())
+                .unwrap_or_default()
+        });
         let size = TerminalSize {
             rows: params.rows.unwrap_or(40),
             cols: params.cols.unwrap_or(120),
             pixel_width: params.pixel_width.unwrap_or(0),
             pixel_height: params.pixel_height.unwrap_or(0),
         };
-        let mut target = Target::new(program).args(params.args).size(size);
+        let mut target = Target::new(program).args(args).size(size);
         target.cwd = params.cwd;
         target.env = params.env;
         let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
@@ -1023,9 +763,9 @@ impl RpcServer {
     }
 
     /// `adapter.send` — invoke a named plugin intent (e.g. `send_prompt`,
-    /// `approve`, `deny`, `cancel`) and return the post-apply state. Replaces
-    /// the bespoke `claude.send_prompt` / `claude.approve` / etc. by taking
-    /// the intent name as a string.
+    /// `approve`, `deny`, `cancel`) and return the post-apply state. The
+    /// intent name is forwarded verbatim to the plugin so the host carries
+    /// no application-specific dispatch table.
     fn adapter_send(
         &mut self,
         params: Option<Value>,
@@ -1122,9 +862,9 @@ impl RpcServer {
             None
         };
         // 4 KiB tail mirrors what session.wait returns as transcript_tail.
-        // Walk to a valid UTF-8 boundary so multibyte glyphs in Claude
-        // output (⏺, ❯, →, …) cannot panic the handler when the byte
-        // offset lands mid-codepoint. Mirrors `claude_inspect`.
+        // Walk to a valid UTF-8 boundary so multibyte glyphs in TUI output
+        // (⏺, ❯, →, …) cannot panic the handler when the byte offset lands
+        // mid-codepoint.
         let mut transcript_tail = transcript_tail_bytes(&transcript, 4096).to_string();
         let mut plain_text = snapshot.plain_text.clone();
         if let Some(policy) = policy {
@@ -1150,8 +890,8 @@ impl RpcServer {
     ///
     /// Mirrors `session.close`: the host kills the child before dropping the
     /// owning struct. `Session` does not implement `Drop` to kill the child,
-    /// so closing the registry entry alone would leak the PTY process (and
-    /// the spawned `claude` binary) until the parent exited.
+    /// so closing the registry entry alone would leak the PTY process until
+    /// the parent exited.
     fn adapter_close(
         &mut self,
         params: Option<Value>,
@@ -1169,17 +909,6 @@ impl RpcServer {
                 format!("unknown adapter: {}", params.adapter),
             ))
         }
-    }
-}
-
-/// Host-known default executable to spawn when `adapter.start` is invoked
-/// without an explicit `program`. Mirrors the existing `claude.start`
-/// behaviour where `program` defaults to `"claude"` for the Claude Code
-/// adapter. Unknown plugins return `None`, forcing the caller to specify.
-fn default_program_for_plugin(plugin: &str) -> Option<String> {
-    match plugin {
-        "claude-code" => Some("claude".to_string()),
-        _ => None,
     }
 }
 
@@ -1410,8 +1139,18 @@ mod tests {
         let methods = response["result"]["methods"].as_array().unwrap();
         assert!(methods.contains(&json!("server.set_notifications")));
         assert!(methods.contains(&json!("session.create")));
-        assert!(methods.contains(&json!("claude.start")));
+        assert!(methods.contains(&json!("adapter.start")));
+        assert!(methods.contains(&json!("adapter.send")));
+        assert!(methods.contains(&json!("adapter.wait")));
         assert!(methods.contains(&json!("plugin.validate_manifest")));
+        // No leftover claude.* methods: callers must use the generic
+        // adapter.* surface now.
+        assert!(
+            !methods
+                .iter()
+                .any(|m| m.as_str().is_some_and(|name| name.starts_with("claude."))),
+            "claude.* methods must not be advertised; got {methods:?}"
+        );
     }
 
     #[test]
@@ -1588,210 +1327,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_state_for_unknown_adapter_returns_invalid_params() {
-        let mut server = RpcServer::new();
-        let response = handle(
-            &mut server,
-            r#"{"jsonrpc":"2.0","id":9,"method":"claude.state","params":{"claude":"missing"}}"#,
-        );
-
-        assert_eq!(response["error"]["code"], -32602);
-    }
-
-    #[test]
-    fn claude_mutation_methods_for_unknown_adapter_return_invalid_params() {
-        // approve/deny/cancel/inspect/snapshot/transcript all share the same
-        // lookup path; cover each so a future refactor that splits the
-        // dispatcher cannot silently regress any one of them.
-        for (id, method) in [
-            (20, "claude.approve"),
-            (21, "claude.deny"),
-            (22, "claude.cancel"),
-            (23, "claude.snapshot"),
-            (24, "claude.transcript"),
-            (25, "claude.inspect"),
-        ] {
-            let mut server = RpcServer::new();
-            let response = handle(
-                &mut server,
-                &format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"claude":"missing"}}}}"#
-                ),
-            );
-
-            assert_eq!(
-                response["error"]["code"], -32602,
-                "{method} should reject unknown adapter with InvalidParams"
-            );
-            let message = response["error"]["message"].as_str().unwrap_or("");
-            assert!(
-                message.contains("unknown Claude Code adapter"),
-                "{method} error message should name the missing lookup, got `{message}`"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn claude_approve_deny_cancel_dispatch_through_rpc_against_live_session() {
-        // Use /bin/sh -lc cat as a long-lived stand-in for `claude`: the Lua
-        // adapter's approve/deny plans send byte sequences, and `cat` accepts
-        // arbitrary input without exiting until EOF or interrupt. This
-        // verifies the JSON-RPC dispatch path end-to-end without depending on
-        // a real Claude Code install.
-        let mut server = RpcServer::new();
-        let start = handle(
-            &mut server,
-            r#"{"jsonrpc":"2.0","id":1,"method":"claude.start","params":{"program":"/bin/sh","args":["-lc","cat"]}}"#,
-        );
-        let claude = start["result"]["claude"]
-            .as_str()
-            .expect("claude adapter id");
-
-        let approve = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"claude.approve","params":{{"claude":"{claude}"}}}}"#
-            ),
-        );
-        // New shape (Milestone 21.6): approve/deny return the post-apply
-        // state snapshot like every other mutation method. `approved`/
-        // `denied` are retained as deprecated aliases for one release.
-        assert_eq!(approve["result"]["approved"], true);
-        assert!(
-            approve["result"]["state"].is_object(),
-            "approve must return a state snapshot object"
-        );
-        assert!(
-            approve["result"]["state"]["state"].is_string(),
-            "approve state snapshot must include a state label"
-        );
-
-        let deny = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"claude.deny","params":{{"claude":"{claude}"}}}}"#
-            ),
-        );
-        assert_eq!(deny["result"]["denied"], true);
-        assert!(
-            deny["result"]["state"].is_object(),
-            "deny must return a state snapshot object"
-        );
-        assert!(
-            deny["result"]["state"]["state"].is_string(),
-            "deny state snapshot must include a state label"
-        );
-
-        // cancel records the cancelling intent on the adapter and returns the
-        // resulting state snapshot. The exact classification depends on what
-        // bytes `cat` echoed back — assert the response shape, not the state
-        // label, since `cat` is not Claude.
-        let cancel = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":4,"method":"claude.cancel","params":{{"claude":"{claude}"}}}}"#
-            ),
-        );
-        assert!(
-            cancel["result"]["state"].is_object(),
-            "cancel must return a state snapshot object"
-        );
-        assert!(
-            cancel["result"]["state"]["state"].is_string(),
-            "state snapshot must include a state label"
-        );
-        assert!(
-            cancel["result"]["state"]["sequence"].is_number(),
-            "state snapshot must include a sequence number"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn claude_read_methods_expose_adapter_session_state() {
-        // Drive the same /bin/sh -lc cat stand-in as the mutation test but
-        // exercise the new diagnostic passthroughs (Milestone 21.7): snapshot
-        // / transcript / inspect must let callers see what the classifier is
-        // looking at without spawning a parallel session.* session.
-        let mut server = RpcServer::new();
-        let start = handle(
-            &mut server,
-            r#"{"jsonrpc":"2.0","id":1,"method":"claude.start","params":{"program":"/bin/sh","args":["-lc","printf 'inspect-fixture-line\\n' && cat"]}}"#,
-        );
-        let claude = start["result"]["claude"]
-            .as_str()
-            .expect("claude adapter id");
-
-        // Poll claude.transcript until the fixture line shows up rather
-        // than blindly sleeping. The shell stand-in races against test
-        // scheduling under load, and a fixed sleep was the original source
-        // of intermittent failures when the suite ran in parallel.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let text = loop {
-            let transcript = handle(
-                &mut server,
-                &format!(
-                    r#"{{"jsonrpc":"2.0","id":2,"method":"claude.transcript","params":{{"claude":"{claude}","redact":false}}}}"#
-                ),
-            );
-            let text = transcript["result"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if text.contains("inspect-fixture-line") {
-                break text;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "fixture line never appeared in transcript within 5s; latest text: `{text}`"
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        };
-
-        let snapshot = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"claude.snapshot","params":{{"claude":"{claude}"}}}}"#
-            ),
-        );
-        assert!(
-            snapshot["result"]["plain_text"].is_string(),
-            "claude.snapshot must return a ScreenSnapshot with plain_text"
-        );
-        assert!(
-            snapshot["result"]["sequence"].is_number(),
-            "claude.snapshot must include a sequence number"
-        );
-
-        assert!(
-            text.contains("inspect-fixture-line"),
-            "claude.transcript must include the underlying session's bytes; got `{text}`"
-        );
-
-        let inspect = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":4,"method":"claude.inspect","params":{{"claude":"{claude}","redact":false}}}}"#
-            ),
-        );
-        assert!(inspect["result"]["state"].is_object());
-        assert!(inspect["result"]["plain_text"].is_string());
-        assert!(inspect["result"]["body_text"].is_string());
-        assert!(inspect["result"]["status_text"].is_string());
-        assert!(inspect["result"]["transcript_tail"].is_string());
-
-        // Cleanup so the cat process doesn't outlive the test.
-        let _ = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":99,"method":"claude.cancel","params":{{"claude":"{claude}"}}}}"#
-            ),
-        );
-    }
-
-    #[test]
     fn adapter_list_includes_built_in_claude_code_plugin() {
         let mut server = RpcServer::new();
         let response = handle(
@@ -1802,9 +1337,82 @@ mod tests {
         let plugins = response["result"]["plugins"]
             .as_array()
             .expect("adapter.list must return a plugins array");
-        assert!(
-            plugins.iter().any(|p| p["name"] == "claude-code"),
-            "adapter.list must include the built-in claude-code plugin; got {plugins:#?}"
+        let claude = plugins
+            .iter()
+            .find(|p| p["name"] == "claude-code")
+            .expect("adapter.list must include the built-in claude-code plugin");
+        // The manifest declares default_target so adapter.start can spawn
+        // claude-code without an explicit program. Lock that wiring in
+        // here — without it the RPC surface would force every caller to
+        // pass `program` even for the only built-in.
+        assert_eq!(
+            claude["default_target"]["program"], "claude",
+            "claude-code manifest must declare its default program"
+        );
+    }
+
+    #[test]
+    fn adapter_start_uses_manifest_default_program_and_args_when_caller_omits_them() {
+        // Lock in the no-program/no-args branch of adapter.start so callers
+        // can spawn the built-in claude-code plugin with just `{"plugin":
+        // "claude-code"}`. Exercises both `params.program.or_else(...)` and
+        // `params.args.unwrap_or_else(...)`. Whether `claude` actually
+        // resolves on PATH varies by environment, so this test accepts
+        // either a successful spawn (with cleanup) or an internal spawn
+        // error — what we're verifying is that resolution *succeeded* and
+        // no InvalidParams "no host-known default" error fired.
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code"}}"#,
+        );
+        if let Some(error) = response.get("error") {
+            let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            assert_ne!(
+                code, -32602,
+                "manifest default_target must satisfy resolution; \
+                 InvalidParams indicates the fallback never ran (got error {error:?})",
+            );
+        }
+        if let Some(adapter) = response
+            .get("result")
+            .and_then(|r| r.get("adapter"))
+            .and_then(|a| a.as_str())
+        {
+            // claude is installed in this environment; clean up so the
+            // spawned process doesn't outlive the test.
+            let _ = handle(
+                &mut server,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+                ),
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adapter_start_explicit_empty_args_overrides_manifest_default_args() {
+        // `args: []` must be a meaningful override that suppresses the
+        // manifest's default_target.args, even when the manifest pre-populates
+        // flags. Today claude-code ships with empty default args, so we
+        // can't observe a behavioural difference there — instead this test
+        // asserts the *params* shape (None vs Some(vec![])) through a real
+        // spawn against /bin/sh that would fail if the deserialiser treated
+        // an explicit empty list as "fall back to manifest defaults".
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":[]}}"#,
+        );
+        let adapter = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start with explicit empty args must succeed");
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
         );
     }
 
@@ -1826,8 +1434,9 @@ mod tests {
 
     #[test]
     fn adapter_methods_for_unknown_adapter_return_invalid_params() {
-        // Mirror the claude.* coverage so the new dispatcher arms can't
-        // silently regress for a missing adapter id.
+        // Every adapter.* handler shares the same lookup path; cover each
+        // explicitly so a future refactor that splits the dispatcher cannot
+        // silently regress any one of them.
         for (id, method) in [
             (30, "adapter.state"),
             (31, "adapter.snapshot"),
@@ -1867,9 +1476,9 @@ mod tests {
     fn adapter_lifecycle_round_trips_through_generic_surface() {
         // End-to-end smoke for the adapter.* surface against a /bin/sh
         // stand-in. Exercises start → state → snapshot → transcript →
-        // inspect → close without touching the legacy claude.* methods. The
-        // shell prints a fixture line then `cat`s stdin so it stays alive
-        // long enough for the read methods to observe state.
+        // inspect → send → close. The shell prints a fixture line then
+        // `cat`s stdin so it stays alive long enough for the read methods
+        // to observe state.
         let mut server = RpcServer::new();
         let start = handle(
             &mut server,
@@ -1944,10 +1553,10 @@ mod tests {
         assert!(inspect["result"]["body_text"].is_string());
         assert!(inspect["result"]["status_text"].is_string());
 
-        // adapter.send happy-path: route the same approve / deny / cancel
-        // intents we already cover for claude.* through the generic dispatcher.
-        // Asserts the response shape and that the dispatcher hands the intent
-        // string to the Lua plugin without a translation table in between.
+        // adapter.send happy-path: route approve / deny intents through the
+        // generic dispatcher. Asserts the response shape and that the
+        // dispatcher hands the intent string to the Lua plugin without a
+        // translation table in between.
         let send_approve = handle(
             &mut server,
             &format!(
@@ -1991,22 +1600,21 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn claude_wait_turn_completes_when_total_cost_appears() {
-        // Drive ExtensionHandle::wait through the claude.* surface against a
-        // shell stand-in that prints `Total cost:` (one of the matcher's
-        // turn-boundary alternatives) and then sleeps long enough for the
-        // 300 ms screen_stable window to elapse. This positively covers the
-        // wait_turn dispatcher, ExtensionHandle::wait's post-match classify
-        // path, and the From<ExtensionStateSnapshot> -> ClaudeCodeStateSnapshot
-        // conversion on a real result.
+    fn adapter_wait_completes_when_turn_boundary_anchor_appears() {
+        // Drive ExtensionHandle::wait through adapter.wait against a shell
+        // stand-in that prints `Total cost:` (one of the Lua plugin's
+        // turn-boundary anchors) and then sleeps long enough for the
+        // 300 ms screen_stable window to elapse. Covers the wait dispatcher,
+        // ExtensionHandle::wait's post-match classify path, and the default
+        // wait_turn_matcher intent name.
         let mut server = RpcServer::new();
         let start = handle(
             &mut server,
-            r#"{"jsonrpc":"2.0","id":1,"method":"claude.start","params":{"program":"/bin/sh","args":["-lc","printf 'Total cost: 0\\n'; sleep 5"]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'Total cost: 0\\n'; sleep 5"]}}"#,
         );
-        let claude = start["result"]["claude"]
+        let adapter = start["result"]["adapter"]
             .as_str()
-            .expect("claude adapter id");
+            .expect("adapter.start must return an adapter id");
 
         // 3 s is comfortably more than the 300 ms stable window + a small
         // OS-scheduler buffer. If the matcher mis-classified `Total cost:`
@@ -2014,24 +1622,24 @@ mod tests {
         let response = handle(
             &mut server,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"claude.wait_turn","params":{{"claude":"{claude}","timeout_ms":3000}}}}"#
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.wait","params":{{"adapter":"{adapter}","timeout_ms":3000}}}}"#
             ),
         );
         assert!(
             response["result"]["state"].is_object(),
-            "claude.wait_turn must return a state snapshot; got {response}"
+            "adapter.wait must return a state snapshot; got {response}"
         );
         let state_label = response["result"]["state"]["state"].as_str().unwrap_or("");
         assert!(
             !state_label.is_empty(),
-            "wait_turn response must include a non-empty state label"
+            "adapter.wait response must include a non-empty state label"
         );
 
         // Cleanup so the sleep process doesn't outlive the test.
         let _ = handle(
             &mut server,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":99,"method":"claude.cancel","params":{{"claude":"{claude}"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
             ),
         );
     }

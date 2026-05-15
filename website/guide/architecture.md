@@ -1,6 +1,6 @@
 # Architecture
 
-ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior, including the interactive Claude Code adapter, sits above reusable terminal primitives. The generic `Extension` trait is the seam between those primitives and any specific TUI's classifier and intents.
+ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior lives in trusted Lua plugins under `plugins/<name>/`, on top of reusable terminal primitives. The generic `Extension` trait is the seam between those primitives and any specific TUI's classifier and intents.
 
 ## Repository layout
 
@@ -8,18 +8,19 @@ ptywright is an early PTY/TUI automation runtime. The core is intentionally gene
 ptywright/
 ├── src/
 │   ├── action.rs      # serializable input/lifecycle actions
-│   ├── adapters/      # app-specific adapter shims (currently claude_code.rs)
 │   ├── config.rs      # ~/.ptywright/config.toml loader
 │   ├── error.rs       # public error/result types
-│   ├── extension.rs   # Extension trait, ExtensionHandle, ExtensionStateSnapshot
+│   ├── extension.rs   # Extension trait, ExtensionHandle, ExtensionStateSnapshot,
+│   │                  #   LuaExtension, built-in source registry
 │   ├── lib.rs         # public library surface
 │   ├── logging.rs     # tracing init with rotation, retention, and redaction
 │   ├── main.rs        # clap CLI entrypoint
-│   ├── lua_plugin.rs  # trusted Lua plugin runtime for adapter orchestration
+│   ├── lua_plugin.rs  # trusted Lua plugin runtime
 │   ├── matcher.rs     # screen/transcript predicates
 │   ├── paths.rs       # ~/.ptywright runtime directory resolution
-│   ├── plugin.rs      # plugin manifest, permissions, host capabilities
-│   ├── rpc.rs         # JSON-RPC server and framing helpers
+│   ├── plugin.rs      # plugin manifest, permissions, default_target,
+│   │                  #   built-in manifest registry
+│   ├── rpc.rs         # JSON-RPC server (adapter.* + session.* + plugin.*)
 │   ├── screen.rs      # terminal engine seam, parser, and snapshots
 │   ├── session.rs     # PTY-backed process lifecycle
 │   ├── target.rs      # spawn configuration
@@ -77,9 +78,9 @@ The `Extension` layer lives in `src/extension.rs` and is the boundary between th
 - [`Extension`](https://github.com/utensils/ptywright/blob/main/src/extension.rs) — three-method trait: `classify(ctx)`, `plan(intent, params)`, `wait_matcher(intent, params)`. Plugin runtimes implement it; the generic core consumes it.
 - [`LuaExtension`] — the only implementor shipped today. Wraps a trusted embedded `LuaPlugin` and exposes it through the trait. A future WASM or external-process runtime would slot in here without changing the rest of the core.
 - [`ExtensionHandle`] — owns a [`Session`] plus a boxed [`Extension`]. Drives the host loop (classify, apply intent action plans, wait on intent matchers) and forwards `last_intent` plus a stability threshold into each classify call.
-- [`ExtensionStateSnapshot`] — `{state, confidence, evidence, sequence, candidates}` where `state` is a plugin-defined string. Adapter shims translate it into their own typed enum (e.g. `ClaudeCodeStateSnapshot`).
+- [`ExtensionStateSnapshot`] — `{state, confidence, evidence, sequence, candidates}` where `state` is a plugin-defined string. The Rust core does not interpret it; Rust callers that want a typed enum should define one locally and convert from the plugin's state string.
 
-Classifier context split by region: `ExtensionHandle` splits the rendered screen into `body_text` (everything above the status bar) and `status_text` (the bottom `STATUS_BAR_ROWS = 3` lines) before handing it to `Extension::classify`. Body classifiers run against `body_text` so a benign status string like `⏵⏵ bypass permissions on` cannot false-positive on substring matches in the body. Short screens (heights at or below `STATUS_BAR_ROWS * 2`) are returned as body-only so small fixtures and small windows don't lose all their content to the status bucket. The same split is reused by `claude.inspect` / `adapter.inspect` for diagnostic dumps.
+Classifier context split by region: `ExtensionHandle` splits the rendered screen into `body_text` (everything above the status bar) and `status_text` (the bottom `STATUS_BAR_ROWS = 3` lines) before handing it to `Extension::classify`. Body classifiers run against `body_text` so a benign status string like `⏵⏵ bypass permissions on` cannot false-positive on substring matches in the body. Short screens (heights at or below `STATUS_BAR_ROWS * 2`) are returned as body-only so small fixtures and small windows don't lose all their content to the status bucket. The same split is reused by `adapter.inspect` for diagnostic dumps.
 
 ## Current implementation
 
@@ -96,27 +97,30 @@ The first implementation uses:
 - Local Unix socket serving on macOS/Linux for longer-lived local automation processes.
 - Opt-in coalesced JSON-RPC notifications for session changes and exits.
 - Plugin manifest, permission, and runtime types for trusted extensions.
-- Embedded Lua for built-in adapter orchestration, currently used by the Claude Code adapter.
+- Embedded Lua for trusted plugin code, currently used by the built-in claude-code plugin.
 - Dynamic shell completion generation through `clap_complete`.
 - A per-user runtime directory at `~/.ptywright/` for config and rotated log files. See [Runtime directory](./runtime-directory.md).
 - Structured logging through `tracing` with daily-rotated files, configurable retention, and per-record redaction so ptywright-owned diagnostics never leak secrets to disk or stderr.
 
 The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later. Screen snapshots expose portable cell/style/mode metadata instead of `vt100` types.
 
-## Interactive Claude Code adapter
+## Built-in claude-code plugin
 
-ptywright targets interactive Claude Code through the terminal TUI. It does not optimize around `claude -p` or non-interactive Agent SDK flows.
+ptywright ships with one built-in plugin: `plugins/claude-code/main.lua`. It targets interactive Claude Code through the terminal TUI and does not optimize around `claude -p` or non-interactive Agent SDK flows.
 
-The Claude Code adapter at `src/adapters/claude_code.rs` is a thin typed façade over `ExtensionHandle`:
+The integration is intentionally thin:
 
-- Rust spawns `claude` in a PTY-backed `Session`;
-- Rust constructs an `ExtensionHandle` with `LuaExtension::built_in("claude-code")`;
-- the built-in Lua plugin at `plugins/claude-code/main.lua` classifies Claude Code screen states;
-- the Lua plugin returns generic `Action` values for prompts, approvals, denials, interrupts, and the trust-dialog numeric selections;
-- the Lua plugin returns generic `Matcher` values for turn waits;
-- the adapter shim translates the plugin's state strings into the typed `ClaudeCodeState` enum.
+- Rust spawns `claude` in a PTY-backed `Session` (the manifest declares `default_target.program = "claude"` so `adapter.start` doesn't require the caller to pass it).
+- Rust constructs an `ExtensionHandle` with `LuaExtension::built_in("claude-code")`.
+- The Lua plugin classifies Claude Code screen states, returns generic `Action` values for prompts/approvals/denials/interrupts and the trust-dialog numeric selections, and returns generic `Matcher` values for turn waits.
 
-The Rust core has no Claude-specific identifiers outside `src/adapters/`. Generic modules under `src/` do not import from `src/adapters/`, and the `Extension` trait surface is plugin-name-agnostic. New TUIs land as additional Lua plugins (with an optional typed adapter shim alongside `claude_code.rs`) and reuse the same `ExtensionHandle` host loop.
+There is **no Rust shim** wrapping the plugin. The Rust core has no Claude-specific identifiers anywhere outside the entry in `src/plugin.rs::BUILTIN_PLUGINS` — registration, not behaviour. The `Extension` trait surface is plugin-name-agnostic. Adding a new TUI plugin is:
+
+1. Write `plugins/<name>/main.lua` exporting `classify` and the intent functions you want callers to invoke through `adapter.send`.
+2. Add a manifest constructor next to `claude_code_manifest()` in `src/plugin.rs`.
+3. Register both the manifest and the embedded Lua source in `BUILTIN_PLUGINS` with a single `BuiltinPlugin { manifest: foo_manifest, source: include_str!("../plugins/foo/main.lua") }` entry. `LuaExtension::built_in(name)` looks both up from that slice in one step.
+
+Callers reach the new plugin through `adapter.*` JSON-RPC or `LuaExtension::built_in("<name>")` from Rust.
 
 ## Testing direction
 

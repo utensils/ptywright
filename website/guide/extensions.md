@@ -128,10 +128,10 @@ The pieces a second adapter would need are exactly what the Claude Code plugin a
    return M
    ```
 
-3. Either register the manifest in `builtin_plugins` for an embedded build, or hand-load it from Rust with `LuaPlugin::load_trusted(root, manifest)` followed by `LuaExtension::new(plugin, manifest)`. The entrypoint must resolve to a relative path inside the plugin root after canonicalization.
+3. For an embedded build, add a single `BuiltinPlugin { manifest: foo_manifest, source: include_str!("../plugins/foo/main.lua") }` entry to `BUILTIN_PLUGINS` in `src/plugin.rs`. The manifest constructor and the embedded Lua source travel together, so `LuaExtension::built_in(name)` resolves both in one step — no second registration to keep in sync. Alternatively, hand-load from Rust with `LuaPlugin::load_trusted(root, manifest)` followed by `LuaExtension::new(plugin, manifest)`; the entrypoint must resolve to a relative path inside the plugin root after canonicalization. Declaring `default_target = { program = "...", args = [...] }` on the manifest lets `adapter.start` callers omit `program`.
 
-4. Optionally wrap the resulting `ExtensionHandle` in a typed adapter shim under `src/adapters/<name>.rs` if callers want a typed state enum and method-per-intent surface. Claude Code's `ClaudeCodeAdapter` is the reference pattern: the shim translates plugin state strings to a typed enum and exposes named methods over the handle.
+4. Add recorded screen fixtures under `tests/fixtures/<name>/` with sibling `.expected.json` files. If you wire the same auto-enrolling pattern `tests/lua_classifier_tests.rs` uses for claude-code, fixture additions become single-file changes.
 
-5. Add recorded screen fixtures under `tests/fixtures/<name>/` with sibling `.expected.json` files. If you wire the same auto-enrolling pattern the Claude Code test uses, fixture additions become single-file changes.
+There is no per-plugin Rust shim. Application-specific state vocabulary, intent verbs, and evidence strings stay entirely in Lua. Rust callers that want a typed state enum can define one locally and convert from the plugin's state string — that translation is application-specific and intentionally not part of the library surface.
 
 Drivers reach the new plugin through the generic surface: `adapter.start {plugin: "<name>"}`, `adapter.send {adapter, intent, params}`, `adapter.wait {adapter, intent, params, timeout_ms}`. The host loop, body/status split, `last_intent` tracking, and timeout policy are reused unchanged.

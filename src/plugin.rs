@@ -50,6 +50,21 @@ pub enum PluginPermission {
     MatcherWait,
 }
 
+/// Default PTY target a plugin expects when callers omit the program.
+///
+/// Plugins declare this in their manifest so the host can wire
+/// `adapter.start` to a sensible default without baking application-specific
+/// mappings into the RPC layer. Callers may still override by passing
+/// `program` / `args` explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultTarget {
+    /// PTY program to spawn when the caller does not specify one.
+    pub program: String,
+    /// Extra CLI arguments appended to the default program.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
 /// Declarative extension manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -68,6 +83,11 @@ pub struct PluginManifest {
     /// Requested host permissions.
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Default PTY target used by `adapter.start` when the caller omits
+    /// `program`. Optional — plugins without a sensible default leave it
+    /// `None`, forcing callers to pass `program` explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<DefaultTarget>,
 }
 
 impl PluginManifest {
@@ -133,7 +153,7 @@ impl PluginHostCapabilities {
             ],
             embedded_lua: true,
             wasm: false,
-            builtin_plugins: vec![claude_code_manifest()],
+            builtin_plugins: builtin_manifests(),
         }
     }
 
@@ -164,7 +184,45 @@ pub enum PluginManifestError {
     DuplicatePermission(String),
 }
 
+/// Built-in plugin registry entry: pairs a manifest constructor with the
+/// embedded Lua source for that plugin.
+///
+/// Co-locating the two in a single registry guarantees every registered
+/// plugin has a loadable source — there is no defensive "manifest exists
+/// but source is missing" branch to maintain.
+pub(crate) struct BuiltinPlugin {
+    pub manifest: fn() -> PluginManifest,
+    pub source: &'static str,
+}
+
+/// Every Lua plugin embedded in this binary. Adding a new built-in plugin
+/// is a single struct-literal entry here — the manifest constructor and the
+/// embedded source travel together so the registry can't be partially
+/// populated.
+pub(crate) const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[BuiltinPlugin {
+    manifest: claude_code_manifest,
+    source: include_str!("../plugins/claude-code/main.lua"),
+}];
+
+/// Manifests for every Lua plugin embedded in this binary.
+///
+/// Thin convenience wrapper over [`BUILTIN_PLUGINS`] for callers that only
+/// need the manifest metadata (e.g. `adapter.list`,
+/// `plugin.capabilities`). To load a plugin by name use
+/// [`crate::extension::LuaExtension::built_in`], which consults the same
+/// registry and pairs the manifest with the embedded source in one step.
+#[must_use]
+pub fn builtin_manifests() -> Vec<PluginManifest> {
+    BUILTIN_PLUGINS
+        .iter()
+        .map(|entry| (entry.manifest)())
+        .collect()
+}
+
 /// Manifest for the built-in Lua Claude Code adapter.
+///
+/// One entry in the built-in plugin registry — kept as a named function so
+/// the manifest is readable rather than buried inside the registry builder.
 #[must_use]
 pub fn claude_code_manifest() -> PluginManifest {
     PluginManifest {
@@ -182,6 +240,10 @@ pub fn claude_code_manifest() -> PluginManifest {
             PluginPermission::InputWrite,
             PluginPermission::MatcherWait,
         ],
+        default_target: Some(DefaultTarget {
+            program: "claude".to_string(),
+            args: Vec::new(),
+        }),
     }
 }
 
@@ -217,6 +279,7 @@ mod tests {
             runtime: None,
             entrypoint: None,
             permissions: Vec::new(),
+            default_target: None,
         };
 
         assert_eq!(manifest.validate(), Err(PluginManifestError::EmptyName));
@@ -231,6 +294,7 @@ mod tests {
             runtime: None,
             entrypoint: None,
             permissions: vec![PluginPermission::InputWrite, PluginPermission::InputWrite],
+            default_target: None,
         };
 
         assert!(matches!(
@@ -248,6 +312,7 @@ mod tests {
             runtime: Some(PluginRuntime::Lua),
             entrypoint: None,
             permissions: Vec::new(),
+            default_target: None,
         };
 
         assert_eq!(
@@ -265,6 +330,7 @@ mod tests {
             runtime: None,
             entrypoint: Some("main.lua".to_string()),
             permissions: Vec::new(),
+            default_target: None,
         };
 
         assert_eq!(
@@ -274,14 +340,72 @@ mod tests {
     }
 
     #[test]
-    fn host_capabilities_expose_embedded_lua_and_builtin_claude_plugin() {
+    fn host_capabilities_expose_embedded_lua_and_builtin_plugins() {
         let capabilities = PluginHostCapabilities::current();
 
         assert!(capabilities.allows(&PluginPermission::SessionSpawn));
         assert!(capabilities.embedded_lua);
         assert!(!capabilities.wasm);
-        assert!(capabilities.builtin_plugins.iter().any(
-            |plugin| plugin.name == "claude-code" && plugin.runtime == Some(PluginRuntime::Lua)
-        ));
+        // The registry must include claude-code (the only built-in today) and
+        // surface its default_target so adapter.start can spawn without an
+        // explicit program. New built-ins should add a similar assertion.
+        let claude = capabilities
+            .builtin_plugins
+            .iter()
+            .find(|plugin| plugin.name == "claude-code")
+            .expect("claude-code is registered as a built-in plugin");
+        assert_eq!(claude.runtime, Some(PluginRuntime::Lua));
+        let default_target = claude
+            .default_target
+            .as_ref()
+            .expect("claude-code declares a default spawn target");
+        assert_eq!(default_target.program, "claude");
+        // Locking in "interactive only": the default args must stay empty
+        // so a future edit can't silently add `-p` / `--print` and break
+        // every caller that relies on the interactive TUI.
+        assert!(
+            default_target.args.is_empty(),
+            "claude-code default_target.args must stay empty (no `-p`/`--print`); got {:?}",
+            default_target.args,
+        );
+    }
+
+    #[test]
+    fn manifest_default_target_round_trips_through_serde() {
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "name": "demo",
+            "kind": "adapter",
+            "version": "0.1.0",
+            "default_target": { "program": "demo-bin", "args": ["--interactive"] }
+        }))
+        .expect("parse manifest with default_target");
+        let target = manifest
+            .default_target
+            .as_ref()
+            .expect("default_target present");
+        assert_eq!(target.program, "demo-bin");
+        assert_eq!(target.args, vec!["--interactive".to_string()]);
+
+        // Round-trip back to JSON; the empty-args variant should be omitted
+        // so manifests stay tidy when callers don't need extra arguments.
+        let manifest = PluginManifest {
+            name: "demo".to_string(),
+            kind: PluginKind::Adapter,
+            version: "0.1.0".to_string(),
+            runtime: None,
+            entrypoint: None,
+            permissions: Vec::new(),
+            default_target: Some(DefaultTarget {
+                program: "x".to_string(),
+                args: Vec::new(),
+            }),
+        };
+        let value = serde_json::to_value(&manifest).expect("serialize manifest");
+        let target = value
+            .get("default_target")
+            .and_then(|v| v.as_object())
+            .expect("default_target serialised");
+        assert_eq!(target.get("program"), Some(&json!("x")));
+        assert!(target.get("args").is_none(), "empty args should be skipped");
     }
 }

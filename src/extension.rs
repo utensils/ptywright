@@ -2,15 +2,15 @@
 //! small, runtime-agnostic trait.
 //!
 //! The [`Extension`] trait abstracts whatever produces classifier output and
-//! action plans for an interactive TUI. The Claude Code adapter is the first
-//! consumer ([`LuaExtension`] is the only implementor shipped today), but a
-//! future WASM or external-process plugin can drop in by implementing this
-//! trait without changing the rest of the core.
+//! action plans for an interactive TUI. [`LuaExtension`] is the only
+//! implementor shipped today; a future WASM or external-process plugin can
+//! drop in by implementing this trait without changing the rest of the core.
 //!
 //! Everything here is intentionally application-agnostic: no Claude-specific
-//! state names, no Claude-specific intents. The adapter shim in
-//! `src/adapters/claude_code.rs` translates between this generic surface and
-//! its public [`ClaudeCodeState`](crate::ClaudeCodeState) enum.
+//! state names, no Claude-specific intents. Application-specific behaviour
+//! lives entirely in Lua plugins under `plugins/<name>/` — ptywright does
+//! not carry typed Rust shims per TUI. Callers in Rust that want a typed
+//! enum can convert plugin state strings on their own.
 
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use crate::action::Action;
 use crate::error::{Error, Result};
 use crate::lua_plugin::LuaPlugin;
 use crate::matcher::Matcher;
-use crate::plugin::{PluginManifest, claude_code_manifest};
+use crate::plugin::{BUILTIN_PLUGINS, PluginManifest};
 use crate::session::Session;
 
 /// Bottom rows of a rendered screen treated as the status bar.
@@ -34,8 +34,10 @@ pub const STATUS_BAR_ROWS: usize = 3;
 /// Snapshot of an extension's classified state.
 ///
 /// The `state` field is a plugin-defined string so the generic core does not
-/// have to know any specific adapter's vocabulary. Confidence, evidence, and
-/// sequence follow the Milestone 16 convention from the Claude Code adapter.
+/// have to know any specific plugin's vocabulary. Plugins return a
+/// confidence score in `[0.0, 1.0]`, a human-readable `evidence` string, the
+/// session `sequence` observed at classification time, and an optional list
+/// of ranked runner-up `candidates`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionStateSnapshot {
     /// Plugin-defined classification, e.g. `"ready"`, `"thinking"`, etc.
@@ -125,9 +127,6 @@ pub struct ClassifyContext<'a> {
 }
 
 /// Action plan returned by extension intents (e.g. `send_prompt`, `approve`).
-///
-/// Generic version of the per-adapter `ActionPlan` types that previously
-/// lived in `src/adapters/claude_code.rs`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ActionPlan {
     /// Ordered actions to apply to the session after the intent fires.
@@ -164,11 +163,11 @@ pub trait Extension {
 
 /// Trusted Lua [`Extension`] implementation backed by a [`LuaPlugin`].
 ///
-/// The plugin must export `classify`, the intent functions named by the
-/// adapter shim, and matcher constructors named by the adapter shim (e.g.
-/// `wait_turn_matcher`). Exported function names are caller-driven so the
-/// generic Extension contract does not bake in any specific adapter's
-/// vocabulary.
+/// The plugin must export `classify` plus any intent functions and
+/// `wait_*_matcher` functions it wants callers to be able to invoke through
+/// [`ExtensionHandle::send`] / [`ExtensionHandle::wait`]. Exported function
+/// names are caller-driven; the generic Extension contract does not bake in
+/// any specific plugin's vocabulary.
 pub struct LuaExtension {
     plugin: LuaPlugin,
     manifest: PluginManifest,
@@ -184,23 +183,24 @@ impl LuaExtension {
     /// Load the built-in Lua plugin with the given manifest name from the set
     /// of plugins bundled into the binary. Returns an error if the requested
     /// built-in is not known.
+    ///
+    /// Looks up the manifest + embedded source in
+    /// [`BUILTIN_PLUGINS`](crate::plugin::BUILTIN_PLUGINS). Adding a new
+    /// built-in is a one-line addition to that slice — no per-plugin Rust
+    /// code is required here.
     pub fn built_in(name: &str) -> Result<Self> {
-        match name {
-            "claude-code" => {
-                let manifest = claude_code_manifest();
-                let plugin =
-                    LuaPlugin::trusted(&manifest, include_str!("../plugins/claude-code/main.lua"))?;
-                Ok(Self::new(plugin, manifest))
-            }
-            other => Err(Error::Lua(format!(
-                "no built-in Lua extension named `{other}`"
-            ))),
-        }
+        let entry = BUILTIN_PLUGINS
+            .iter()
+            .find(|entry| (entry.manifest)().name == name)
+            .ok_or_else(|| Error::Lua(format!("no built-in Lua extension named `{name}`")))?;
+        let manifest = (entry.manifest)();
+        let plugin = LuaPlugin::trusted(&manifest, entry.source)?;
+        Ok(Self::new(plugin, manifest))
     }
 
-    /// Borrow the underlying [`LuaPlugin`]. Adapter shims sometimes need to
-    /// call functions that aren't part of the [`Extension`] trait surface
-    /// during tests.
+    /// Borrow the underlying [`LuaPlugin`]. Tests and downstream callers
+    /// sometimes need to invoke plugin functions that aren't part of the
+    /// [`Extension`] trait surface.
     #[must_use]
     pub fn plugin(&self) -> &LuaPlugin {
         &self.plugin
@@ -227,11 +227,10 @@ impl Extension for LuaExtension {
 
 /// Owns a PTY [`Session`] plus an [`Extension`] and orchestrates intents.
 ///
-/// This is the generic version of the per-adapter "session + plugin" handle
-/// that previously lived in `src/adapters/claude_code.rs`. The same
-/// state-after-apply semantics from Milestone 21.6 apply: mutating intents
-/// (those whose plan supplies `last_intent`) update the recorded intent
-/// before the next classify call.
+/// Mutating intents (those whose plan supplies `last_intent`) update the
+/// recorded intent before the next classify call, so plugins can use the
+/// transition for stable-state detection (e.g. "completed turn requires that
+/// `last_intent == prompt_submitted`").
 pub struct ExtensionHandle {
     session: Session,
     extension: Box<dyn Extension>,
@@ -271,15 +270,15 @@ impl ExtensionHandle {
         self.extension.as_ref()
     }
 
-    /// Last intent the host applied through this handle, if any. Adapter shims
-    /// use this to seed their own typed `last_intent` field.
+    /// Last intent the host applied through this handle, if any.
     #[must_use]
     pub fn last_intent(&self) -> Option<&str> {
         self.last_intent.as_deref()
     }
 
-    /// Replace the recorded last intent. Adapter shims that wrap an existing
-    /// session may need to seed this on construction.
+    /// Replace the recorded last intent. Callers wrapping an existing
+    /// session may need to seed this on construction (e.g. to mark the
+    /// session as "just spawned, classifier should see the starting state").
     pub fn set_last_intent(&mut self, intent: Option<String>) {
         self.last_intent = intent;
     }
@@ -310,8 +309,9 @@ impl ExtensionHandle {
     ///
     /// If the plugin's action plan reports a `last_intent`, the handle records
     /// it before re-classifying. Plans without `last_intent` are treated as
-    /// non-mutating (the recorded intent is left as-is) and behave like
-    /// `approve`/`deny` in the Claude Code adapter.
+    /// non-mutating (the recorded intent is left as-is), which is the
+    /// conventional pattern for read-only or idempotent actions like
+    /// approve/deny dialogs.
     pub fn send(&mut self, intent: &str, params: Value) -> Result<ExtensionStateSnapshot> {
         let params = ensure_params_object(params);
         let plan = self.extension.plan(intent, &params)?;
@@ -347,8 +347,10 @@ impl ExtensionHandle {
     }
 
     /// Apply an action plan, requiring that the plan supply `last_intent` and
-    /// recording it as this handle's most recent intent. Intended for the
-    /// adapter shim's mutating intents (e.g. `send_prompt`, `cancel`).
+    /// recording it as this handle's most recent intent. Use this for
+    /// mutating intents that must update the classifier's intent tracking
+    /// (e.g. `send_prompt`, `cancel`); fall back to [`send`](Self::send) for
+    /// intents where the plan supplies `last_intent` opportunistically.
     pub fn apply_plan_with_required_intent(
         &mut self,
         plan: &ActionPlan,
@@ -402,8 +404,6 @@ impl ExtensionHandle {
     }
 }
 
-/// Split a rendered screen into `(body, status)` halves.
-///
 /// Coerce intent params into a JSON object so plugin handlers can index
 /// into them without crashing the runtime.
 ///
@@ -468,7 +468,7 @@ pub fn split_status_bar(screen: &str, status_rows: usize) -> (String, String) {
 }
 
 /// Apply the body/status split that the classifier uses, for diagnostic RPC
-/// methods like `claude.inspect` that want to surface what the classifier
+/// methods like `adapter.inspect` that want to surface what the classifier
 /// would have seen.
 #[must_use]
 pub fn split_status_bar_for_inspect(screen: &str) -> (String, String) {
@@ -535,6 +535,20 @@ mod tests {
             Ok(_) => panic!("unknown built-in should not load"),
             Err(error) => assert!(matches!(error, Error::Lua(_))),
         }
+    }
+
+    #[test]
+    fn plugin_accessor_exposes_underlying_lua_plugin() {
+        // Downstream callers (and integration tests) need access to the
+        // wrapped LuaPlugin for permission introspection and direct
+        // function calls that aren't part of the Extension trait surface.
+        let extension = LuaExtension::built_in("claude-code").expect("built-in claude-code");
+        assert!(
+            extension
+                .plugin()
+                .has_permission(&crate::plugin::PluginPermission::SessionSpawn),
+            "claude-code manifest declares session.spawn",
+        );
     }
 
     /// Regression: serialising a [`ClassifyContext`] with `last_intent = None`

@@ -15,7 +15,7 @@ use ptywright::{
     name = NAME,
     version,
     about = DESCRIPTION,
-    long_about = "ptywright is a cross-platform Rust CLI and library for driving interactive terminal applications through PTYs.\n\nThe library exposes early PTY session, screen snapshot, action, matcher, transcript, JSON-RPC, Claude Code adapter, plugin manifest, and shell completion primitives."
+    long_about = "ptywright is a cross-platform Rust CLI and library for driving interactive terminal applications through PTYs.\n\nThe library exposes early PTY session, screen snapshot, action, matcher, transcript, JSON-RPC, generic plugin-backed extension, plugin manifest, and shell completion primitives. Application-specific TUI behaviour lives in trusted Lua plugins under plugins/<name>/."
 )]
 struct Cli {
     #[command(subcommand)]
