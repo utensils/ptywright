@@ -665,21 +665,14 @@ fn dispatch_dsl(
         }
         "send.intent" => send_intent(call, client, ctx, timeout),
         "send.text" => {
-            // Plugin convention: `send_prompt` reads `input.prompt`. Match
-            // that so the REPL DSL doesn't end up paste-ing empty strings
-            // because of a wire-shape mismatch.
             let text = expect_one_string(&call, "send.text")?;
-            send_named_intent(
-                client,
-                ctx,
-                "send_prompt",
-                json!({ "prompt": text }),
-                timeout,
-            )
+            let (intent, params) = send_text_payload(text);
+            send_named_intent(client, ctx, intent, params, timeout)
         }
         "send.key" => {
             let key = expect_one_string(&call, "send.key")?;
-            send_named_intent(client, ctx, "key", json!({ "key": key }), timeout)
+            let (intent, params) = send_key_payload(key);
+            send_named_intent(client, ctx, intent, params, timeout)
         }
         "wait" => wait_command(call, client, ctx, timeout),
         "wait.matches" => {
@@ -893,6 +886,22 @@ fn send_intent(
     let intent = expect_one_string(&call, "send.intent")?;
     let params = kwargs_to_json(&call.kwargs);
     send_named_intent(client, ctx, &intent, params, timeout)
+}
+
+/// Wire payload for `send.text("…")`. The claude-code plugin's
+/// `send_prompt` intent reads `input.prompt`; sending `{"text": …}`
+/// would silently bracketed-paste an empty string. Keeping this in
+/// its own helper makes the wire field name a contract that a unit
+/// test pins down rather than something easy to misname inside the
+/// dispatcher.
+fn send_text_payload(text: String) -> (&'static str, Value) {
+    ("send_prompt", json!({ "prompt": text }))
+}
+
+/// Wire payload for `send.key("…")`. Mirrors `send_text_payload` for
+/// the plugin's generic `key` intent, which reads `input.key`.
+fn send_key_payload(key: String) -> (&'static str, Value) {
+    ("key", json!({ "key": key }))
 }
 
 fn send_named_intent(
@@ -1450,6 +1459,25 @@ mod tests {
             panic!()
         };
         assert!(value["plugins"].is_array());
+    }
+
+    #[test]
+    fn send_text_payload_uses_prompt_wire_field() {
+        // Regression: previously the dispatcher sent `params: {text: …}`
+        // but the claude-code plugin reads `input.prompt`. Locking the
+        // helper output ensures a future rename of the DSL form
+        // doesn't silently drop the plugin contract.
+        let (intent, params) = send_text_payload("hello".to_string());
+        assert_eq!(intent, "send_prompt");
+        assert_eq!(params, json!({ "prompt": "hello" }));
+        assert!(params.get("text").is_none(), "must not use legacy `text`");
+    }
+
+    #[test]
+    fn send_key_payload_uses_key_wire_field() {
+        let (intent, params) = send_key_payload("enter".to_string());
+        assert_eq!(intent, "key");
+        assert_eq!(params, json!({ "key": "enter" }));
     }
 
     #[test]
