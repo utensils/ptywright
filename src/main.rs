@@ -49,6 +49,32 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RpcFraming::Ndjson)]
         framing: RpcFraming,
     },
+    /// Interactive REPL client for a running `ptywright serve`.
+    ///
+    /// Requires building with `--features repl`. With the feature off, the
+    /// subcommand is omitted from `--help` and parsing rejects it as
+    /// unknown.
+    #[cfg(feature = "repl")]
+    Repl {
+        /// Connect to a long-running `ptywright serve --socket <path>`.
+        #[arg(long, conflicts_with = "stdio", group = "transport")]
+        socket: Option<PathBuf>,
+        /// Spawn a child server and speak JSON-RPC over its stdio. Pass
+        /// the child command after `--`.
+        #[arg(long, group = "transport")]
+        stdio: bool,
+        /// JSON-RPC framing for the connection.
+        #[arg(long, value_enum, default_value_t = RpcFraming::Ndjson)]
+        framing: RpcFraming,
+        /// Child command and args. Required iff --stdio. Pass after `--`,
+        /// e.g. `ptywright repl --stdio -- ptywright serve --stdio`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            requires = "stdio"
+        )]
+        command: Vec<String>,
+    },
     /// Generate shell completions.
     #[command(after_long_help = "\
 Setup instructions:
@@ -129,6 +155,13 @@ fn run() -> ptywright::Result<ExitCode> {
             socket,
             framing,
         }) => serve_command(stdio, socket.as_deref(), framing),
+        #[cfg(feature = "repl")]
+        Some(Commands::Repl {
+            socket,
+            stdio,
+            framing,
+            command,
+        }) => repl_command(socket, stdio, framing, command),
         Some(Commands::Completions { shell }) => generate_completions(&shell),
         None => {
             let mut command = Cli::command();
@@ -157,6 +190,8 @@ fn init_logging_for(
                 init_for_oneshot(logging)
             }
         }
+        #[cfg(feature = "repl")]
+        Some(Commands::Repl { .. }) => init_for_oneshot(logging),
         Some(Commands::Completions { .. }) | None => init_for_oneshot(logging),
     }
 }
@@ -224,6 +259,42 @@ compdef _clap_dynamic_completer_ptywright ptywright
         &mut io::stdout(),
     )?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "repl")]
+fn repl_command(
+    socket: Option<PathBuf>,
+    stdio: bool,
+    framing: RpcFraming,
+    command: Vec<String>,
+) -> ptywright::Result<ExitCode> {
+    use ptywright::repl::{Framing, ReplArgs, Transport};
+    let transport = match (socket, stdio) {
+        (Some(path), false) => Transport::Socket(path),
+        (None, true) => {
+            if command.is_empty() {
+                return Err(ptywright::Error::Rpc(
+                    "ptywright repl --stdio requires a child command after `--`".to_string(),
+                ));
+            }
+            Transport::Stdio(command)
+        }
+        (Some(_), true) => {
+            return Err(ptywright::Error::Rpc(
+                "ptywright repl accepts only one transport: --socket or --stdio".to_string(),
+            ));
+        }
+        (None, false) => {
+            return Err(ptywright::Error::Rpc(
+                "ptywright repl requires --socket <path> or --stdio -- <cmd...>".to_string(),
+            ));
+        }
+    };
+    let framing = match framing {
+        RpcFraming::Ndjson => Framing::Ndjson,
+        RpcFraming::Lsp => Framing::Lsp,
+    };
+    ptywright::repl::run(ReplArgs { transport, framing })
 }
 
 fn serve_command(
