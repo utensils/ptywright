@@ -288,6 +288,26 @@ fn repl_command(
             // No transport flag → connect to the per-user default socket.
             // Matches `ptywright serve` running without --socket below.
             let path = Paths::from_env().default_socket_path();
+            // Pre-check for the most common first-run failure (no server
+            // running) so the operator gets a friendlier message than
+            // ENOENT bubbled up from inside the transport.
+            #[cfg(unix)]
+            if !path.exists() {
+                return Err(ptywright::Error::Rpc(format!(
+                    "no ptywright server is listening at {path} (the default socket).\n\
+                     \n\
+                     Start one in another terminal:\n  \
+                     ptywright serve\n\
+                     \n\
+                     …or pipe a child server through stdio in one command:\n  \
+                     ptywright repl --stdio -- ptywright serve --stdio\n\
+                     \n\
+                     To use a non-default path, pass --socket on both sides:\n  \
+                     ptywright serve --socket /tmp/p.sock &\n  \
+                     ptywright repl   --socket /tmp/p.sock",
+                    path = path.display(),
+                )));
+            }
             tracing::info!(socket = %path.display(), "ptywright repl: connecting to default socket");
             Transport::Socket(path)
         }

@@ -21,11 +21,32 @@ pub struct SocketTransport {
 pub fn connect(path: &Path) -> Result<SocketTransport> {
     use std::os::unix::net::UnixStream;
 
-    let stream = UnixStream::connect(path).map_err(|error| {
-        Error::Rpc(format!(
+    let stream = UnixStream::connect(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => Error::Rpc(format!(
+            "no ptywright server is listening at {path}.\n\
+             \n\
+             Start one in another terminal:\n  \
+             ptywright serve --socket {path} &\n\
+             \n\
+             …or pipe a child server through stdio in one command:\n  \
+             ptywright repl --stdio -- ptywright serve --stdio",
+            path = path.display(),
+        )),
+        std::io::ErrorKind::ConnectionRefused => Error::Rpc(format!(
+            "socket {path} exists but is not accepting connections — \
+             is a stale server file lingering? Remove it and re-run \
+             `ptywright serve --socket {path}`.",
+            path = path.display(),
+        )),
+        std::io::ErrorKind::PermissionDenied => Error::Rpc(format!(
+            "permission denied connecting to {path}. Was the server started \
+             by a different user?",
+            path = path.display(),
+        )),
+        _ => Error::Rpc(format!(
             "connect to ptywright serve socket {}: {error}",
             path.display()
-        ))
+        )),
     })?;
     // Use `try_clone` so the reader thread can own one handle while the
     // writer-side `Mutex<Box<dyn Write + Send>>` in `RpcClient` owns the
