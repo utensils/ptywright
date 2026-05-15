@@ -164,6 +164,7 @@ impl Session {
     pub fn send(&self, action: Action) -> Result<()> {
         match action {
             Action::Text(text) | Action::Paste(text) => self.write_all(text.as_bytes()),
+            Action::BracketedPaste(text) => self.write_bracketed_paste(text.as_bytes()),
             Action::Key(key) => self.send_key(key),
             Action::Resize(size) => self.resize(size),
             Action::Interrupt => self.send_key(Key::CtrlC),
@@ -172,6 +173,36 @@ impl Session {
         }
     }
 
+    /// Write `bytes` wrapped in bracketed-paste markers so the receiving
+    /// application can distinguish a paste from interactive typing.
+    ///
+    /// Only used by [`Action::BracketedPaste`]; the generic
+    /// [`Action::Paste`] writes raw bytes so callers driving programs that
+    /// have NOT enabled bracketed paste (cat, plain shells, generic
+    /// REPLs) don't get `ESC[200~` literals echoed back at them. Modern
+    /// TUIs (Claude Code v2.1+, vim, fish, …) set `CSI ? 2004 h` to opt
+    /// in, and the Claude Code Lua plugin uses the bracketed variant for
+    /// `send_prompt` so a trailing Enter is interpreted as a submit
+    /// rather than absorbed into the paste tokeniser.
+    fn write_bracketed_paste(&self, bytes: &[u8]) -> Result<()> {
+        self.write_all(&bracketed_paste_payload(bytes))
+    }
+}
+
+/// Wrap `bytes` in bracketed-paste START/END markers. Extracted from
+/// [`Session::write_bracketed_paste`] so the framing is unit-testable
+/// without spawning a PTY.
+fn bracketed_paste_payload(bytes: &[u8]) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut wrapped = Vec::with_capacity(START.len() + bytes.len() + END.len());
+    wrapped.extend_from_slice(START);
+    wrapped.extend_from_slice(bytes);
+    wrapped.extend_from_slice(END);
+    wrapped
+}
+
+impl Session {
     /// Write raw text bytes to the PTY master.
     pub fn write_text(&self, text: impl AsRef<str>) -> Result<()> {
         self.write_all(text.as_ref().as_bytes())
@@ -391,5 +422,103 @@ mod tests {
 
         assert!(result.snapshot.plain_text.contains("ready"));
         assert!(session.wait().expect("wait child").success);
+    }
+
+    #[test]
+    fn bracketed_paste_payload_wraps_input_with_csi_markers() {
+        // CSI 200~ / CSI 201~ are the standard bracketed-paste markers.
+        // Apps that have enabled bracketed paste (Claude Code v2.1+,
+        // vim, fish, …) use them to distinguish a paste from interactive
+        // typing — without the wrapper a paste followed by Enter races
+        // against the receiver's input tokeniser.
+        let bytes = bracketed_paste_payload(b"hello");
+        assert_eq!(&bytes[..6], b"\x1b[200~");
+        assert_eq!(&bytes[6..11], b"hello");
+        assert_eq!(&bytes[11..], b"\x1b[201~");
+    }
+
+    #[test]
+    fn bracketed_paste_payload_handles_empty_input() {
+        let bytes = bracketed_paste_payload(b"");
+        assert_eq!(bytes, b"\x1b[200~\x1b[201~".to_vec());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_paste_writes_raw_bytes_no_bracket_markers() {
+        // Generic `Action::Paste` must NOT inject bracketed-paste markers —
+        // callers driving programs that have not enabled bracketed paste
+        // (cat, plain shells, REPLs) would see literal `ESC[200~` bytes
+        // echoed back. The bracketed framing lives on `BracketedPaste`
+        // (used by the Claude Code Lua plugin's `send_prompt`).
+        //
+        // A POSIX shell `read` is line-buffered (canonical mode), so we
+        // send `Paste` + `Enter` together to flush. We then assert the
+        // PTY transcript carries the literal payload and never the
+        // wrapper bytes.
+        let target =
+            Target::new("/bin/sh").args(["-lc", "read line; printf 'GOT[%s]done' \"$line\""]);
+        let session = Session::spawn(SessionConfig::new(target)).expect("spawn shell");
+        session
+            .send(Action::Paste("plain".into()))
+            .expect("send paste");
+        session.send(Action::Key(Key::Enter)).expect("send enter");
+        let result = session
+            .wait_for(
+                &Matcher::ContainsText("GOT[plain]done".into()),
+                Duration::from_secs(5),
+            )
+            .expect("wait for done");
+        let transcript = result.transcript_tail;
+        assert!(
+            !transcript.contains("\x1b[200~"),
+            "Action::Paste must not emit bracketed-paste markers: {transcript:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_bracketed_paste_writes_csi_markers() {
+        // The bracketed variant must round-trip the wrapper sequences
+        // through the PTY so receivers that have opted in see a real
+        // paste boundary. Using `cat` to echo back without
+        // line-discipline canonicalisation, we feed the bytes and
+        // assert both the payload AND the brackets land in the
+        // transcript before exiting via Ctrl-D.
+        let target =
+            Target::new("/bin/sh").args(["-lc", "read line; printf 'GOT[%s]done' \"$line\""]);
+        let session = Session::spawn(SessionConfig::new(target)).expect("spawn shell");
+        session
+            .send(Action::BracketedPaste("plain".into()))
+            .expect("send bracketed paste");
+        session.send(Action::Key(Key::Enter)).expect("send enter");
+        let result = session
+            .wait_for(
+                &Matcher::ContainsText("done".into()),
+                Duration::from_secs(5),
+            )
+            .expect("wait for done");
+        let transcript = result.transcript_tail;
+        assert!(
+            transcript.contains("\x1b[200~"),
+            "Action::BracketedPaste must emit the CSI 200~ start marker: {transcript:?}"
+        );
+        assert!(
+            transcript.contains("\x1b[201~"),
+            "Action::BracketedPaste must emit the CSI 201~ end marker: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_payload_preserves_embedded_newlines() {
+        // Embedded newlines must NOT be split — bracketed paste mode tells
+        // the receiver the whole block is one paste, so the receiver's
+        // line tokeniser keeps it together rather than treating the newline
+        // as a submit.
+        let bytes = bracketed_paste_payload(b"line one\nline two");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("line one\nline two"));
+        assert!(s.starts_with("\x1b[200~"));
+        assert!(s.ends_with("\x1b[201~"));
     }
 }

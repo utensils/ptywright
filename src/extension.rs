@@ -41,6 +41,7 @@ pub struct ExtensionStateSnapshot {
     /// Plugin-defined classification, e.g. `"ready"`, `"thinking"`, etc.
     pub state: String,
     /// Confidence from 0.0 to 1.0.
+    #[serde(serialize_with = "serialize_confidence")]
     pub confidence: f32,
     /// Human-readable evidence used for the classification.
     pub evidence: String,
@@ -59,7 +60,28 @@ pub struct StateCandidate {
     /// Plugin-defined state name for the candidate.
     pub state: String,
     /// Candidate confidence from 0.0 to 1.0.
+    #[serde(serialize_with = "serialize_confidence")]
     pub confidence: f32,
+}
+
+/// Serialize a confidence value with 3-decimal precision so JSON wire
+/// output stays free of f32 representation noise.
+///
+/// The Lua plugin returns confidences like `0.62`, which lands in Rust as
+/// an f32 that promotes to `0.6200000047683716` when serialized through
+/// f64 — that's an artifact of the binary representation, not extra
+/// precision, and it leaks straight to the JSON-RPC wire. Three decimals
+/// is plenty for caller comparison; the classifier itself doesn't depend
+/// on more precision.
+pub(crate) fn serialize_confidence<S>(
+    value: &f32,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let rounded = (f64::from(*value) * 1000.0).round() / 1000.0;
+    serializer.serialize_f64(rounded)
 }
 
 /// Context handed to an [`Extension`]'s classifier on each call.
@@ -291,6 +313,7 @@ impl ExtensionHandle {
     /// non-mutating (the recorded intent is left as-is) and behave like
     /// `approve`/`deny` in the Claude Code adapter.
     pub fn send(&mut self, intent: &str, params: Value) -> Result<ExtensionStateSnapshot> {
+        let params = ensure_params_object(params);
         let plan = self.extension.plan(intent, &params)?;
         self.apply_plan(&plan, intent)?;
         self.try_state()
@@ -311,6 +334,7 @@ impl ExtensionHandle {
         params: Value,
         timeout: Duration,
     ) -> Result<ExtensionStateSnapshot> {
+        let params = merge_wait_defaults(params, self.completed_turn_stable_ms);
         let matcher = self.extension.wait_matcher(intent, &params)?;
         let result = self.session.wait_for(&matcher, timeout)?;
         let stable_ms = u64::try_from(result.stable_for.as_millis()).unwrap_or(u64::MAX);
@@ -380,6 +404,38 @@ impl ExtensionHandle {
 
 /// Split a rendered screen into `(body, status)` halves.
 ///
+/// Coerce intent params into a JSON object so plugin handlers can index
+/// into them without crashing the runtime.
+///
+/// Generic callers of `adapter.send` / `adapter.wait` typically omit the
+/// nested `params` field entirely, which deserialises to `Value::Null`.
+/// Forwarding that straight to a Lua plugin makes the plugin index a
+/// userdata-Null sentinel (mlua serde representation of a JSON null) and
+/// blow up at runtime. Promote Null to an empty object so the plugin
+/// always receives a table. Scalars and arrays are handed back verbatim
+/// for tests and future plugins that take non-object params.
+fn ensure_params_object(params: Value) -> Value {
+    match params {
+        Value::Null => Value::Object(serde_json::Map::new()),
+        other => other,
+    }
+}
+
+/// Like [`ensure_params_object`] but also injects the host's configured
+/// `completed_turn_stable_ms` if the caller did not already supply one.
+/// Used by [`ExtensionHandle::wait`] so generic callers don't need to
+/// know about plugin-side stability thresholds.
+fn merge_wait_defaults(params: Value, completed_turn_stable_ms: u64) -> Value {
+    let coerced = ensure_params_object(params);
+    let Value::Object(mut object) = coerced else {
+        return coerced;
+    };
+    object
+        .entry("completed_turn_stable_ms")
+        .or_insert_with(|| Value::from(completed_turn_stable_ms));
+    Value::Object(object)
+}
+
 /// The bottom `status_rows` lines are treated as the status bar. Short
 /// screens (where `lines.len() <= status_rows * 2`) are returned as
 /// body-only because they don't have a meaningful status bar to peel off.
@@ -542,5 +598,101 @@ mod tests {
             state.evidence
         );
         Ok(())
+    }
+
+    #[test]
+    fn merge_wait_defaults_coerces_null_and_injects_stable_ms() {
+        // Generic adapter.wait callers omit nested `params`, which serde
+        // deserialises as Value::Null. Forwarding Null to a Lua matcher
+        // function makes mlua's serde adapter produce a userdata sentinel
+        // that the plugin cannot index, so the host must coerce it to an
+        // object before calling the plugin.
+        let merged = merge_wait_defaults(Value::Null, 300);
+        assert_eq!(merged, serde_json::json!({"completed_turn_stable_ms": 300}));
+    }
+
+    #[test]
+    fn merge_wait_defaults_preserves_caller_supplied_stable_ms() {
+        // The host injects its configured threshold only when the caller
+        // did not already supply one. Callers that want a different
+        // stability window must still be able to override.
+        let merged = merge_wait_defaults(serde_json::json!({"completed_turn_stable_ms": 50}), 300);
+        assert_eq!(merged, serde_json::json!({"completed_turn_stable_ms": 50}));
+    }
+
+    #[test]
+    fn confidence_serializes_with_three_decimal_precision() {
+        // `0.62_f32` promotes to `0.6200000047683716_f64`, which used to
+        // land on the JSON-RPC wire as-is and looked like noise to
+        // callers. The custom serializer rounds to 3 decimals.
+        let snapshot = ExtensionStateSnapshot {
+            state: "thinking".into(),
+            confidence: 0.62,
+            evidence: "test".into(),
+            sequence: 0,
+            candidates: Vec::new(),
+        };
+        let wire = serde_json::to_string(&snapshot).expect("serialize");
+        assert!(
+            wire.contains("\"confidence\":0.62"),
+            "expected rounded confidence on the wire; got: {wire}",
+        );
+        assert!(
+            !wire.contains("0.62000000"),
+            "f32 noise leaked through: {wire}",
+        );
+    }
+
+    #[test]
+    fn candidate_confidence_also_rounded_on_wire() {
+        // Same fix applies to runner-up candidates so the wire shape is
+        // consistent whether the caller reads `state` or `candidates`.
+        let candidate = StateCandidate {
+            state: "thinking".into(),
+            confidence: 0.86,
+        };
+        let wire = serde_json::to_string(&candidate).expect("serialize");
+        assert!(
+            wire.contains("\"confidence\":0.86"),
+            "expected rounded candidate confidence; got: {wire}",
+        );
+    }
+
+    #[test]
+    fn ensure_params_object_promotes_null_to_empty_object() {
+        // mlua's serde adapter renders JSON null as a userdata sentinel
+        // that Lua handlers cannot index, so the host must promote Null
+        // to an empty object before calling any plugin function. Generic
+        // `adapter.send` callers that omit `params` rely on this.
+        assert_eq!(ensure_params_object(Value::Null), serde_json::json!({}));
+    }
+
+    #[test]
+    fn ensure_params_object_leaves_existing_objects_untouched() {
+        let v = serde_json::json!({"prompt": "hello"});
+        assert_eq!(ensure_params_object(v.clone()), v);
+    }
+
+    #[test]
+    fn ensure_params_object_passes_scalars_through() {
+        // Future plugins may legitimately accept non-object params (a
+        // single string, a number, …). The coercion only fixes Null; it
+        // does not force a particular shape on the caller.
+        assert_eq!(
+            ensure_params_object(Value::from("verbatim")),
+            Value::from("verbatim"),
+        );
+    }
+
+    #[test]
+    fn merge_wait_defaults_keeps_other_object_keys() {
+        // Future plugins may take additional params alongside the stability
+        // hint. The merge must only add the missing key, not rewrite the
+        // whole object.
+        let merged = merge_wait_defaults(serde_json::json!({"pattern": "ready"}), 300);
+        assert_eq!(
+            merged,
+            serde_json::json!({"pattern": "ready", "completed_turn_stable_ms": 300}),
+        );
     }
 }

@@ -153,7 +153,9 @@ The plugin-name-aware entry point. Pick this for new code: any built-in plugin (
 | `adapter.inspect` | `{adapter, redact?, redaction?}` | `{adapter, plugin, state, plain_text, body_text, status_text, transcript_tail, sequence}` |
 | `adapter.close` | `{adapter}` | `{closed: true}` |
 
-`adapter.start` requires `plugin` (e.g. `"claude-code"`). `program` is host-defaulted for known plugins (`claude-code` → `"claude"`) and must be supplied for plugins without a host default. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params` — for the Claude Code plugin the intents are `send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`. `adapter.inspect` applies the same body/status split the classifier uses, so you can reproduce a misclassification report without standing up a parallel `session.*` connection.
+`adapter.start` requires `plugin` (e.g. `"claude-code"`). `program` is host-defaulted for known plugins (`claude-code` → `"claude"`) and must be supplied for plugins without a host default. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params` — for the Claude Code plugin the intents are `send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`. `adapter.inspect` applies the same body/status split the classifier uses, so you can reproduce a misclassification report without standing up a parallel `session.*` connection.
+
+`adapter.wait` automatically injects the host's configured `completed_turn_stable_ms` (300 ms by default) into the matcher params if the caller does not supply one, so generic callers can omit `params` entirely and still get stable-screen turn boundaries — the matcher only fires after the screen has been quiet for the configured window. Earlier ptywright builds required callers to pass `params: {completed_turn_stable_ms: 300}` explicitly, or the Lua matcher would either crash or fire immediately on the idle `❯` glyph; this is fixed as of the bracketed-paste / classifier hardening pass.
 
 #### `claude.*` — Claude Code adapter aliases
 
@@ -174,6 +176,10 @@ The original Claude-specific surface. Still supported, identical underlying beha
 
 The adapter classifies states (`starting`, `ready`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine. `waiting_for_trust` is the workspace-trust dialog: send `intent: "approve_trust"` / `"deny_trust"` through `adapter.send` (they type `1`+Enter or `2`+Enter, since a bare Enter does not accept option 1 on the numbered list).
 
+After a fresh-launch `approve_trust`, Claude Code shows a welcome panel with "Welcome back …", "Tips for getting started", and "What's new". The classifier reports this as `starting` (evidence: `welcome screen visible`) rather than `waiting_for_user_input`, because Claude treats the first keypress on that panel as a dismissal rather than a prompt submission. Send `intent: "dismiss_welcome"` through `adapter.send` (or call `send_prompt` directly — bracketed-paste'd content dismisses the welcome and submits in one step) before treating the adapter as ready for prompts.
+
+`send_prompt` writes the prompt as a `bracketed_paste` action (`CSI 200 ~` … `CSI 201 ~`) so Claude Code v2.1+ treats the payload as a single paste and a trailing Enter as a real submit. Earlier ptywright builds wrote the prompt with a plain paste, which raced against Claude's input tokeniser and could leave longer prompts typed-but-not-submitted. The generic `paste` action still writes raw bytes — only use `bracketed_paste` against programs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …); against `cat` or a plain shell the wrapper bytes would land in the child as literal characters.
+
 > **Fixed in Milestone 21.4 (May 2026).** Earlier builds reported `waiting_for_permission` on the idle input screen because the status-bar string `⏵⏵ bypass permissions on (shift+tab to cycle)` contains the substring `permissions`. The classifier now runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status), and the `idle_bypass_permissions.txt` fixture under `tests/fixtures/claude_code/` locks the fix in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` (or `claude.inspect`) to dump the body/status view the classifier sees when investigating new misclassifications.
 
 #### `plugin.*`
@@ -191,6 +197,7 @@ The adapter classifies states (`starting`, `ready`, `thinking`, `waiting_for_per
 {"type":"text","value":"hello"}
 {"type":"key","value":"enter"}                         // enter|escape|tab|backspace|up|down|left|right|ctrl_c|ctrl_d
 {"type":"paste","value":"multiline\npaste"}
+{"type":"bracketed_paste","value":"goes wrapped in CSI 200~ ... CSI 201~"}
 {"type":"resize","value":{"rows":40,"cols":120,"pixel_width":0,"pixel_height":0}}
 {"type":"interrupt"}                                   // Ctrl-C
 {"type":"eof"}                                         // Ctrl-D
@@ -443,7 +450,7 @@ These are the scenarios worth driving repeatedly while the plugin is still harde
 | Permission approve | Prompt that triggers `Bash`/`Edit` permission UI | `waiting_for_permission` → `approve` → `completed_turn` |
 | Permission deny | Same setup, call `adapter.send {intent: "deny"}` | adapter recovers to `ready` or returns `completed_turn` with denial evidence |
 | Plan approve | Prompt that triggers plan mode | `waiting_for_plan_approval` → `approve` → `thinking` → `completed_turn` |
-| Mid-turn cancel | After `adapter.wait` returns `thinking`, call `adapter.send {intent: "cancel"}` | transitions through `cancelling`, ends with stable state |
+| Mid-turn cancel | After `adapter.wait` returns `thinking`, call `adapter.send {intent: "cancel"}` | transitions through `cancelling`, ends with stable state. `cancelling` is reported until `adapter.wait` returns with a stable-enough screen; `adapter.state` polling alone will stay on `cancelling` until the next mutating intent. |
 | Crash recovery | `adapter.start` with a bogus `program` | `error` / `plugin_error` returned with evidence; subsequent calls reject the dead adapter |
 | Long turn | Prompt that takes >60s; loop `adapter.wait` with `timeout_ms: 30000` | repeated `thinking` until `completed_turn`; no spurious `completed_turn` from premature stable-screen |
 

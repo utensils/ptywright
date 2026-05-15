@@ -55,8 +55,21 @@ pub enum Action {
     Text(String),
     /// Send a named key.
     Key(Key),
-    /// Paste text. Bracketed paste support can be added here later.
+    /// Paste text as raw bytes — identical wire shape to [`Action::Text`],
+    /// retained as a distinct variant so callers and plugins can express
+    /// intent ("this came from a paste") even when the bytes go straight
+    /// to the PTY. Use [`Action::BracketedPaste`] when the receiver has
+    /// enabled bracketed paste mode and a real paste boundary matters.
     Paste(String),
+    /// Paste text wrapped in bracketed-paste markers (`CSI 200 ~` …
+    /// `CSI 201 ~`). Use this for receivers that have set DECSET 2004
+    /// (Claude Code v2.1+, vim, fish, …) — the wrapper lets the
+    /// receiver treat the payload as a single paste so a subsequent
+    /// Enter key is interpreted as a submit rather than absorbed into
+    /// the paste tokeniser. Do not use against receivers that have not
+    /// enabled bracketed paste; the wrapper bytes would land in the
+    /// child as literal characters.
+    BracketedPaste(String),
     /// Resize the PTY and terminal parser.
     Resize(TerminalSize),
     /// Send Ctrl-C.

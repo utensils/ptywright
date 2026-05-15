@@ -47,7 +47,8 @@ The trusted Lua runtime in `src/lua_plugin.rs` installs a single global table, `
 Action constructors return tagged tables matching the JSON `Action` shape:
 
 - `ptywright.action.text(value)` — typed text input.
-- `ptywright.action.paste(value)` — bracketed-paste write.
+- `ptywright.action.paste(value)` — raw paste; writes `value` to the PTY as-is. Use against programs that have NOT enabled bracketed paste (cat, plain shells, generic REPLs).
+- `ptywright.action.bracketed_paste(value)` — bracketed paste; writes `value` wrapped in `CSI 200 ~` … `CSI 201 ~`. Use against TUIs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …) so a subsequent Enter is interpreted as a submit rather than absorbed into the paste tokeniser.
 - `ptywright.action.key(name)` — single-key input (e.g. `"enter"`, `"escape"`, `"tab"`).
 - `ptywright.action.interrupt()` — Ctrl-C.
 - `ptywright.action.eof()` — Ctrl-D.
@@ -104,7 +105,13 @@ The pieces a second adapter would need are exactly what the Claude Code plugin a
    function M.send_prompt(input)
      return {
        actions = {
-         action.paste(input.prompt),
+         -- Use `bracketed_paste` when the target TUI has enabled
+         -- bracketed paste (DECSET 2004) — that lets the trailing
+         -- Enter submit cleanly instead of being absorbed into the
+         -- paste tokeniser on longer prompts. Fall back to
+         -- `action.paste` when the target is a plain shell / REPL
+         -- that has not opted in.
+         action.bracketed_paste(input.prompt),
          action.key("enter"),
        },
        last_intent = "prompt_submitted",

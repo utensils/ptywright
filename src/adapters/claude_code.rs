@@ -96,6 +96,7 @@ pub struct ClaudeCodeStateSnapshot {
     /// Inferred state.
     pub state: ClaudeCodeState,
     /// Confidence from 0.0 to 1.0.
+    #[serde(serialize_with = "crate::extension::serialize_confidence")]
     pub confidence: f32,
     /// Human-readable evidence used for the classification.
     pub evidence: String,
@@ -355,6 +356,12 @@ mod tests {
 
     #[test]
     fn lua_plugin_supplies_prompt_action_plan() {
+        // Claude Code v2.1+ enables bracketed paste, so the plan must use
+        // the bracketed variant to keep the trailing Enter from being
+        // absorbed into the paste tokeniser on longer prompts. The plain
+        // `Action::Paste` variant still exists for callers driving
+        // programs that have not enabled bracketed paste — see the
+        // Codex review note that prompted this split.
         let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
         let plan = lua_call_plan(
             &extension,
@@ -365,7 +372,7 @@ mod tests {
         assert_eq!(
             plan.actions,
             vec![
-                Action::Paste("hello Claude".to_string()),
+                Action::BracketedPaste("hello Claude".to_string()),
                 Action::Key(crate::Key::Enter),
             ]
         );
@@ -397,6 +404,25 @@ mod tests {
             boundary_matchers
                 .iter()
                 .any(|matcher| matcher == &Matcher::ContainsText("Total cost:".to_string()))
+        );
+        // The classifier recognises Claude Code 2.1's `Accessing workspace`
+        // / `Yes, I trust this folder` dialog; the wait matcher must wake
+        // on the same dialog or callers waiting after `adapter.start`
+        // against a fresh untrusted directory will time out. Lock the
+        // anchor in here so a future Lua edit can't silently drop it.
+        assert!(
+            boundary_matchers
+                .iter()
+                .any(|matcher| matcher
+                    == &Matcher::ContainsText("Accessing workspace".to_string())),
+            "wait matcher missing v2 trust dialog anchor; boundary matchers were {boundary_matchers:?}",
+        );
+        assert!(
+            boundary_matchers
+                .iter()
+                .any(|matcher| matcher
+                    == &Matcher::ContainsText("Yes, I trust this folder".to_string())),
+            "wait matcher missing v2 trust confirmation anchor; boundary matchers were {boundary_matchers:?}",
         );
         assert!(matchers.iter().any(|matcher| matches!(
             matcher,
@@ -563,6 +589,61 @@ mod tests {
     }
 
     #[test]
+    fn classifier_reports_cancelling_while_screen_is_still_settling() {
+        // Right after `cancel` is sent the PTY needs a moment to render the
+        // post-interrupt state. If the classifier just falls through to its
+        // ordinary branches during that window it reports
+        // `waiting_for_user_input`, leaving callers with no signal that the
+        // cancel actually landed. Hold `cancelling` until the screen has
+        // been stable for `completed_turn_stable_ms` so polling drivers can
+        // observe the transition.
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let mid_cancel_screen = "❯ count to 10\n\n(interrupting…)\n\n────────\n❯\n";
+        let state = classify_state(
+            &extension,
+            mid_cancel_screen,
+            "",
+            42,
+            Some(ClaudeCodeState::Cancelling),
+            Some(50),
+        )
+        .expect("classify mid-cancel screen");
+        assert_eq!(state.state, ClaudeCodeState::Cancelling);
+        assert!(
+            state.evidence.contains("cancel intent recently applied"),
+            "evidence should mention recent cancel: {}",
+            state.evidence,
+        );
+    }
+
+    #[test]
+    fn classifier_releases_cancelling_once_screen_settles() {
+        // Once the screen has been stable for the configured window the
+        // classifier should fall through to whatever the post-cancel screen
+        // actually shows. For an idle prompt that means
+        // `waiting_for_user_input`; this lets the polling driver see cancel
+        // → cancelling → waiting_for_user_input as a clean sequence rather
+        // than getting stuck reporting `cancelling` forever.
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let post_cancel_idle = "❯ count to 10\n\n────────\n❯\n";
+        let state = classify_state(
+            &extension,
+            post_cancel_idle,
+            "",
+            43,
+            Some(ClaudeCodeState::Cancelling),
+            Some(COMPLETED_TURN_STABLE_MS + 100),
+        )
+        .expect("classify settled post-cancel screen");
+        assert_ne!(
+            state.state,
+            ClaudeCodeState::Cancelling,
+            "cancelling must release once the screen settles; got evidence {}",
+            state.evidence,
+        );
+    }
+
+    #[test]
     fn lua_approve_trust_types_numeric_option_one() {
         // The trust dialog requires typing "1" before Enter; a bare Enter
         // does not accept option 1 in the Claude Code TUI. Lock the action
@@ -590,6 +671,20 @@ mod tests {
                 Action::Text("2".to_string()),
                 Action::Key(crate::action::Key::Enter),
             ],
+        );
+    }
+
+    #[test]
+    fn lua_dismiss_welcome_sends_single_enter() {
+        // The first-launch welcome panel traps Enter; the plugin exposes
+        // `dismiss_welcome` as a single-Enter action so callers don't have
+        // to drop down to session.input to clear it.
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "dismiss_welcome", serde_json::json!({}));
+        assert_eq!(plan.actions, vec![Action::Key(crate::action::Key::Enter)]);
+        assert!(
+            plan.last_intent.is_none(),
+            "dismiss_welcome is non-mutating; last_intent must stay as-is"
         );
     }
 

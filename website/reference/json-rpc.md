@@ -97,12 +97,15 @@ Action payloads use `type` plus `value` where needed:
 ```json
 {"type":"text","value":"hello"}
 {"type":"paste","value":"multi\nline"}
+{"type":"bracketed_paste","value":"wrap me in CSI 200~ ... CSI 201~"}
 {"type":"key","value":"enter"}
 {"type":"resize","value":{"rows":40,"cols":120,"pixel_width":0,"pixel_height":0}}
 {"type":"interrupt"}
 {"type":"eof"}
 {"type":"kill"}
 ```
+
+`paste` writes the bytes verbatim — use it against programs that have not enabled bracketed paste (cat, plain shells, generic REPLs). `bracketed_paste` wraps the payload in the standard bracketed-paste markers (`CSI 200 ~` … `CSI 201 ~`) — use it against TUIs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …) so a subsequent Enter is interpreted as a submit rather than absorbed into the paste tokeniser.
 
 ### `server.set_notifications`
 

@@ -290,6 +290,10 @@ fn action_api(
             lua.create_function(|lua, value: String| tagged_value(lua, "paste", value))?,
         )?;
         action.set(
+            "bracketed_paste",
+            lua.create_function(|lua, value: String| tagged_value(lua, "bracketed_paste", value))?,
+        )?;
+        action.set(
             "key",
             lua.create_function(|lua, value: String| tagged_value(lua, "key", value))?,
         )?;
@@ -427,6 +431,7 @@ mod tests {
                   actions = {
                     ptywright.action.text("hello"),
                     ptywright.action.paste("world"),
+                    ptywright.action.bracketed_paste("paste me"),
                     ptywright.action.key("enter"),
                     ptywright.action.interrupt(),
                     ptywright.action.eof(),
@@ -459,6 +464,7 @@ mod tests {
             json!([
                 { "type": "text", "value": "hello" },
                 { "type": "paste", "value": "world" },
+                { "type": "bracketed_paste", "value": "paste me" },
                 { "type": "key", "value": "enter" },
                 { "type": "interrupt" },
                 { "type": "eof" },
