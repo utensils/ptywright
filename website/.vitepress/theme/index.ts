@@ -1,13 +1,15 @@
 import DefaultTheme from 'vitepress/theme'
-import { h } from 'vue'
-import PlatformStrip from './platform-strip.vue'
+import type { Theme } from 'vitepress'
+import OperatorHome from './OperatorHome.vue'
+import RuntimeSchematic from './RuntimeSchematic.vue'
 import './style.css'
 
-export default {
+const theme: Theme = {
   extends: DefaultTheme,
-  Layout() {
-    return h(DefaultTheme.Layout, null, {
-      'home-hero-info-after': () => h(PlatformStrip),
-    })
+  enhanceApp({ app }) {
+    app.component('OperatorHome', OperatorHome)
+    app.component('RuntimeSchematic', RuntimeSchematic)
   },
 }
+
+export default theme

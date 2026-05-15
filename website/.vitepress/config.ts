@@ -21,10 +21,29 @@ export default defineConfig({
       'link',
       { rel: 'icon', href: '/ptywright/favicon.svg', type: 'image/svg+xml' },
     ],
-    ['meta', { name: 'theme-color', content: '#0891B2' }],
+    ['meta', { name: 'theme-color', content: '#0a0b0d' }],
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'ptywright' }],
     ['meta', { property: 'og:description', content: description }],
+    [
+      'link',
+      { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
+    ],
+    [
+      'link',
+      {
+        rel: 'preconnect',
+        href: 'https://fonts.gstatic.com',
+        crossorigin: '',
+      },
+    ],
+    [
+      'link',
+      {
+        rel: 'stylesheet',
+        href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap',
+      },
+    ],
   ],
 
   lastUpdated: true,
