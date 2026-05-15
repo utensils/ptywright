@@ -1955,6 +1955,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_string_handles_every_named_escape() {
+        // Each `\X` escape lives in its own match arm; if a future
+        // contributor drops one, the parser silently lets the literal
+        // character through rather than producing the intended byte.
+        let cmd = parse(r#"send.text("\t\r\\\"\0")"#).unwrap();
+        let Cmd::Dsl(call) = cmd else { panic!() };
+        assert_eq!(call.positional, vec![Arg::String("\t\r\\\"\0".into())]);
+    }
+
+    #[test]
+    fn parse_unknown_string_escape_errors() {
+        let error = parse(r#"send.text("hi\q there")"#).unwrap_err();
+        assert!(error.to_string().contains("\\q"), "{error}");
+    }
+
+    #[test]
+    fn parse_unterminated_raw_string_errors() {
+        let error = parse(r#"wait(matches(r"^x"#).unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("unterminated"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_unexpected_character_errors() {
+        // `@` is not a legal token start; the lexer's catch-all branch
+        // must surface a friendly message instead of an opaque panic.
+        let error = parse("session.spawn(@)").unwrap_err();
+        assert!(error.to_string().contains('@'), "{error}");
+    }
+
+    #[test]
+    fn parse_meta_rpc_invalid_json_errors() {
+        let error = parse(r#":rpc adapter.send {not-json}"#).unwrap_err();
+        assert!(error.to_string().to_lowercase().contains("json"), "{error}");
+    }
+
+    #[test]
+    fn parse_dotted_path_missing_identifier_errors() {
+        // `foo.` with nothing after the dot — the path parser bails on
+        // the missing ident rather than emitting an empty segment.
+        let error = parse("foo.()").unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("identifier")
+                || error.to_string().contains("RParen"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_arg_list_with_missing_close_paren_errors() {
+        let error = parse("session.spawn(\"x\"").unwrap_err();
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
     fn dispatch_help_returns_help_outcome() {
         let (client, _server, mut ctx) = in_process_client();
         let outcome = dispatch(
