@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use super::ctx::ReplCtx;
 use super::transport::RpcClient;
 use crate::error::{Error, Result};
 
@@ -501,27 +502,12 @@ impl fmt::Display for Arg {
 
 // ---- dispatcher --------------------------------------------------------
 
-/// Mutable REPL state the dispatcher reads/writes. Keeps the surface tiny
-/// so unit tests can exercise commands without spinning up the full TUI.
-#[derive(Debug, Default, Clone)]
-pub struct DispatchCtx {
-    /// Adapter id that "implicit" commands like `send.text(...)` target.
-    pub focus: Option<String>,
-    /// Known adapter ids, in spawn order. Updated by `session.spawn` /
-    /// `session.close`.
-    pub adapters: Vec<String>,
-}
-
-impl DispatchCtx {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn focus(&self) -> Result<&str> {
-        self.focus.as_deref().ok_or_else(|| {
-            Error::Rpc("no focused adapter — spawn one with `session.spawn(...)` first".to_string())
-        })
-    }
+/// Borrow-only helper used by the dispatcher to demand a focused adapter
+/// and report a friendly error when there is none.
+fn focus_or_err(ctx: &ReplCtx) -> Result<&str> {
+    ctx.focus.as_deref().ok_or_else(|| {
+        Error::Rpc("no focused adapter — spawn one with `session.spawn(...)` first".to_string())
+    })
 }
 
 /// Dispatch a parsed [`Cmd`] against the JSON-RPC client and mutate the
@@ -529,7 +515,7 @@ impl DispatchCtx {
 pub fn dispatch(
     cmd: Cmd,
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     match cmd {
@@ -541,7 +527,7 @@ pub fn dispatch(
 fn dispatch_meta(
     meta: MetaCmd,
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     match meta {
@@ -553,12 +539,13 @@ fn dispatch_meta(
             } else {
                 ctx.adapters
                     .iter()
-                    .map(|id| {
-                        if ctx.focus.as_deref() == Some(id.as_str()) {
-                            format!("*{id}")
+                    .map(|tab| {
+                        let mark = if ctx.focus.as_deref() == Some(tab.id.as_str()) {
+                            "*"
                         } else {
-                            id.clone()
-                        }
+                            ""
+                        };
+                        format!("{mark}{}:{}", tab.id, tab.plugin)
                     })
                     .collect::<Vec<_>>()
                     .join("  ")
@@ -566,7 +553,7 @@ fn dispatch_meta(
             Ok(CmdOutcome::Line(line))
         }
         MetaCmd::Focus(id) => {
-            if !ctx.adapters.iter().any(|known| known == &id) {
+            if ctx.adapter(&id).is_none() {
                 return Err(Error::Rpc(format!("unknown adapter `{id}`")));
             }
             ctx.focus = Some(id.clone());
@@ -590,7 +577,7 @@ fn dispatch_meta(
 fn dispatch_dsl(
     call: DslCall,
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     match call.path.join(".").as_str() {
@@ -603,13 +590,17 @@ fn dispatch_dsl(
             let line = if ctx.adapters.is_empty() {
                 "(no adapters)".to_string()
             } else {
-                ctx.adapters.join(", ")
+                ctx.adapters
+                    .iter()
+                    .map(|tab| format!("{} ({})", tab.id, tab.plugin))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             Ok(CmdOutcome::Line(line))
         }
         "session.close" => session_close(call, client, ctx, timeout),
         "state" => {
-            let adapter = ctx.focus()?.to_string();
+            let adapter = focus_or_err(ctx)?.to_string();
             let result = client.call("adapter.state", json!({ "adapter": adapter }), timeout)?;
             Ok(CmdOutcome::Json(result))
         }
@@ -646,7 +637,7 @@ fn dispatch_dsl(
             )
         }
         "transcript.snapshot" => {
-            let adapter = ctx.focus()?.to_string();
+            let adapter = focus_or_err(ctx)?.to_string();
             let redact = bool_kwarg(&call, "redact").unwrap_or(true);
             let result = client.call(
                 "adapter.transcript",
@@ -656,12 +647,12 @@ fn dispatch_dsl(
             Ok(CmdOutcome::Json(result))
         }
         "screen.snapshot" => {
-            let adapter = ctx.focus()?.to_string();
+            let adapter = focus_or_err(ctx)?.to_string();
             let result = client.call("adapter.snapshot", json!({ "adapter": adapter }), timeout)?;
             Ok(CmdOutcome::Json(result))
         }
         "inspect" => {
-            let adapter = ctx.focus()?.to_string();
+            let adapter = focus_or_err(ctx)?.to_string();
             let result = client.call("adapter.inspect", json!({ "adapter": adapter }), timeout)?;
             Ok(CmdOutcome::Json(result))
         }
@@ -674,7 +665,7 @@ fn dispatch_dsl(
 fn session_spawn(
     call: DslCall,
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     let plugin = expect_one_string(&call, "session.spawn")?;
@@ -691,11 +682,12 @@ fn session_spawn(
     }
     let result = client.call("adapter.start", Value::Object(params), timeout)?;
     if let Some(adapter) = result.get("adapter").and_then(Value::as_str) {
-        let adapter = adapter.to_string();
-        if !ctx.adapters.iter().any(|known| known == &adapter) {
-            ctx.adapters.push(adapter.clone());
-        }
-        ctx.focus = Some(adapter);
+        let response_plugin = result
+            .get("plugin")
+            .and_then(Value::as_str)
+            .unwrap_or(&plugin);
+        ctx.upsert_adapter(adapter, response_plugin);
+        ctx.focus = Some(adapter.to_string());
     }
     Ok(CmdOutcome::Json(result))
 }
@@ -703,7 +695,7 @@ fn session_spawn(
 fn session_close(
     call: DslCall,
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     let adapter = if let Some(first) = call.positional.first() {
@@ -716,20 +708,17 @@ fn session_close(
             }
         }
     } else {
-        ctx.focus()?.to_string()
+        focus_or_err(ctx)?.to_string()
     };
     let result = client.call("adapter.close", json!({ "adapter": adapter }), timeout)?;
-    ctx.adapters.retain(|known| known != &adapter);
-    if ctx.focus.as_deref() == Some(adapter.as_str()) {
-        ctx.focus = ctx.adapters.last().cloned();
-    }
+    ctx.remove_adapter(&adapter);
     Ok(CmdOutcome::Json(result))
 }
 
 fn send_intent(
     call: DslCall,
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     let intent = expect_one_string(&call, "send.intent")?;
@@ -739,12 +728,12 @@ fn send_intent(
 
 fn send_named_intent(
     client: &RpcClient,
-    ctx: &DispatchCtx,
+    ctx: &ReplCtx,
     intent: &str,
     params: Value,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
-    let adapter = ctx.focus()?.to_string();
+    let adapter = focus_or_err(ctx)?.to_string();
     let result = client.call(
         "adapter.send",
         json!({
@@ -760,7 +749,7 @@ fn send_named_intent(
 fn wait_command(
     call: DslCall,
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     // `wait(matcher, timeout=2s)` — the first positional arg is either a
@@ -778,13 +767,13 @@ fn wait_command(
 
 fn wait_with_params(
     client: &RpcClient,
-    ctx: &mut DispatchCtx,
+    ctx: &mut ReplCtx,
     intent: &str,
     matcher_params: Value,
     timeout_override: Option<Duration>,
     fallback_timeout: Duration,
 ) -> Result<CmdOutcome> {
-    let adapter = ctx.focus()?.to_string();
+    let adapter = focus_or_err(ctx)?.to_string();
     let mut req = Map::new();
     req.insert("adapter".to_string(), Value::String(adapter));
     req.insert("intent".to_string(), Value::String(intent.to_string()));
@@ -1160,7 +1149,7 @@ mod tests {
     fn in_process_client() -> (
         std::sync::Arc<RpcClient>,
         std::thread::JoinHandle<()>,
-        DispatchCtx,
+        ReplCtx,
     ) {
         let (c2s_r, c2s_w) = pipe().expect("c2s pipe");
         let (s2c_r, s2c_w) = pipe().expect("s2c pipe");
@@ -1169,7 +1158,7 @@ mod tests {
             let _ = serve_ndjson_with_state(c2s_r, s2c_w, state);
         });
         let client = RpcClient::new(s2c_r, c2s_w, Framing::Ndjson);
-        (client, server, DispatchCtx::new())
+        (client, server, ReplCtx::new())
     }
 
     #[test]
@@ -1202,7 +1191,7 @@ mod tests {
         };
         let adapter = value["adapter"].as_str().expect("adapter id");
         assert_eq!(ctx.focus.as_deref(), Some(adapter));
-        assert!(ctx.adapters.iter().any(|known| known == adapter));
+        assert!(ctx.adapter(adapter).is_some());
 
         // Close it back out so the child PTY exits cleanly.
         let _ = dispatch(
@@ -1218,7 +1207,8 @@ mod tests {
     #[test]
     fn dispatch_meta_tabs_renders_focus_marker() {
         let (client, _server, mut ctx) = in_process_client();
-        ctx.adapters = vec!["e1".into(), "e2".into()];
+        ctx.upsert_adapter("e1", "claude-code");
+        ctx.upsert_adapter("e2", "claude-code");
         ctx.focus = Some("e2".into());
         let outcome = dispatch(
             parse(":tabs").unwrap(),

@@ -16,6 +16,11 @@ use std::process::ExitCode;
 use crate::error::Result;
 
 pub mod command;
+pub mod completer;
+pub mod ctx;
+pub mod highlighter;
+pub mod history;
+pub mod render;
 pub mod socket;
 pub mod spawn;
 pub mod transport;

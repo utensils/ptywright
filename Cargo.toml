@@ -24,9 +24,9 @@ default = []
 # `cargo build --features repl`.
 repl = [
     "dep:crossbeam-channel",
+    "dep:nu-ansi-term",
     "dep:ratatui",
     "dep:reedline",
-    "dep:syntect",
 ]
 
 [dependencies]
@@ -49,9 +49,9 @@ vt100 = "0.16.2"
 
 # Optional dependencies, only pulled in by the `repl` feature.
 crossbeam-channel = { version = "0.5", optional = true }
+nu-ansi-term = { version = "0.50", optional = true }
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
 reedline = { version = "0.47", optional = true, default-features = false }
-syntect = { version = "5", optional = true, default-features = false, features = ["default-fancy"] }
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"
