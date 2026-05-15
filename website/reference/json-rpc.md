@@ -221,11 +221,11 @@ Return the latest parsed terminal screen for a session. Redacts sensitive-lookin
 
 Result is a `ScreenSnapshot` with the same shape as `session.wait`'s `snapshot` field (size, cursor, sequence, plain_text, cells, alternate_screen, application_cursor, application_keypad, title).
 
-| Field       | Required | Meaning                                                                                                                              |
-| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `session`   | yes      | Session ID returned by `session.create`.                                                                                             |
-| `redact`    | no       | Default `true`. Set `false` to opt into raw, unredacted screen text for trusted-local debugging.                                     |
-| `redaction` | no       | Optional `{ enabled, replacement, extra_literals, extra_regexes }` object adding caller-supplied redaction rules for this read only. |
+| Field       | Required | Meaning                                                                                                                                                                                                                                                                                                                    |
+| ----------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session`   | yes      | Session ID returned by `session.create`.                                                                                                                                                                                                                                                                                   |
+| `redact`    | no       | Default `true`. Set `false` to opt into raw, unredacted screen text for trusted-local debugging.                                                                                                                                                                                                                           |
+| `redaction` | no       | Optional `{ enabled, replacement, extra_literals, extra_regexes }` object adding caller-supplied redaction rules for this read only. The top-level `redact` flag controls whether redaction runs; the embedded `enabled` field must be present in JSON but is forced to `true` by the server when this object is supplied. |
 
 ### `session.transcript`
 
@@ -317,7 +317,7 @@ Result:
 
 `session.snapshot` and `session.transcript` redact by default. Pass `"redact": false` for raw output, or `redaction: { ... }` to add per-call rules. See each method's params table.
 
-`raw_transcript_path` streams raw PTY bytes directly to a file and is always explicit opt-in. The default mode creates a new file and refuses to overwrite; `raw_transcript_append: true` appends to an existing file. On Unix, ptywright opens the file with mode `0o600` so only the owner can read it; Windows uses default ACLs. Raw transcript files are unredacted sensitive data and remain the caller's responsibility to protect.
+`raw_transcript_path` streams raw PTY bytes directly to a file and is always explicit opt-in. The default mode creates a new file and refuses to overwrite; `raw_transcript_append: true` appends to an existing file. On Unix, ptywright creates new raw transcript files with mode `0o600` so only the owner can read them; appending to a pre-existing file preserves whatever permissions that file already has, and Windows uses default ACLs in either mode. Raw transcript files are unredacted sensitive data and remain the caller's responsibility to protect.
 
 RPC error messages are redacted with the default policy before they are serialized. CLI-level diagnostics printed by ptywright also redact through the default policy.
 

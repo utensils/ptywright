@@ -19,10 +19,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Documented every `session.*` JSON-RPC method (`snapshot`, `transcript`, `resize`, `kill`, `close`) with full param tables and example responses, replacing the previous one-line table summary.
-- Strengthened the JSON-RPC reference's redaction notes to call out the on-disk `0o600` mode for raw transcript files on Unix.
-
-### Removed
-
-- Dropped the dangling `ptywright snapshot` CLI mention from `SPEC.md` — the snapshot capability remains available through the `session.snapshot` JSON-RPC method and does not require a dedicated subcommand.
+- Strengthened the JSON-RPC reference's redaction notes to call out the on-disk `0o600` mode used when creating new raw transcript files on Unix, and to explain that the embedded `RedactionPolicy.enabled` field is overridden server-side.
 
 [Unreleased]: https://github.com/utensils/ptywright/compare/v0.1.0...HEAD
