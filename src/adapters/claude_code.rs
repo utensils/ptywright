@@ -221,6 +221,34 @@ impl ClaudeCodeAdapter {
     }
 }
 
+/// Bottom rows of the rendered screen treated as the Claude Code status bar.
+///
+/// Used to split screen text into `body_text` (content area) and `status_text`
+/// (status bar) before handing it to the Lua classifier so that benign status
+/// strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` cannot
+/// false-positive on the `permissions` substring match in
+/// `plugins/claude-code/main.lua`.
+const STATUS_BAR_ROWS: usize = 3;
+
+fn split_status_bar(screen: &str, status_rows: usize) -> (String, String) {
+    let lines: Vec<&str> = screen.split('\n').collect();
+    if lines.is_empty() {
+        return (String::new(), String::new());
+    }
+    // Only split a screen that's tall enough to actually have a body + status
+    // bar. The Claude Code status bar pattern (separator + status rows at the
+    // bottom) only manifests on full-height TUI screens. Short fixtures and
+    // small windows are entirely body — splitting them would shove the only
+    // content into status_text and break classification.
+    if lines.len() <= status_rows * 2 {
+        return (screen.to_string(), String::new());
+    }
+    let cutoff = lines.len() - status_rows;
+    let body = lines[..cutoff].join("\n");
+    let status = lines[cutoff..].join("\n");
+    (body, status)
+}
+
 fn classify_state(
     plugin: &LuaPlugin,
     screen: &str,
@@ -229,10 +257,13 @@ fn classify_state(
     last_intent: Option<ClaudeCodeState>,
     stable_ms: Option<u64>,
 ) -> Result<ClaudeCodeStateSnapshot> {
+    let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
     plugin.call(
         "classify",
         &ClassifyInput {
             screen,
+            body_text: &body_text,
+            status_text: &status_text,
             transcript,
             sequence,
             last_intent: last_intent.map(state_name).transpose()?,
@@ -258,7 +289,16 @@ fn state_snapshot(
 
 #[derive(Debug, Serialize)]
 struct ClassifyInput<'a> {
+    /// Full visible screen text. Kept for backward compatibility with any Lua
+    /// classifier path that wants the unsegmented view.
     screen: &'a str,
+    /// Screen text with the bottom status-bar rows removed. Permission/plan
+    /// classification should match on `body_text` to avoid false-positives
+    /// from status strings like "bypass permissions on".
+    body_text: &'a str,
+    /// Only the bottom status-bar rows. Available for plugins that want to
+    /// inspect the status bar explicitly (e.g. detect "[ctx: 26% used]").
+    status_text: &'a str,
     transcript: &'a str,
     sequence: u64,
     last_intent: Option<String>,
@@ -525,6 +565,35 @@ mod tests {
     }
 
     #[test]
+    fn split_status_bar_partitions_screen_into_body_and_status() {
+        let screen =
+            "Claude Code v2.1.142\nHaiku 4.5\n\n────\n❯  \n────\nstatus line one\nstatus line two";
+        let (body, status) = split_status_bar(screen, 3);
+        assert!(body.contains("Claude Code v2.1.142"));
+        assert!(body.contains("❯  "));
+        assert!(!body.contains("status line one"));
+        assert!(!body.contains("status line two"));
+        assert!(status.contains("status line one"));
+        assert!(status.contains("status line two"));
+    }
+
+    #[test]
+    fn split_status_bar_handles_short_screens_without_panic() {
+        // Empty input — both halves empty.
+        assert_eq!(split_status_bar("", 3), (String::new(), String::new()));
+        // Short screens (<= status_rows * 2 lines) stay fully as body; we do
+        // not strip content from small fixtures that don't actually have a
+        // bottom status bar.
+        assert_eq!(
+            split_status_bar("only line", 3),
+            ("only line".to_string(), String::new()),
+        );
+        let (body, status) = split_status_bar("a\nb", 3);
+        assert_eq!(body, "a\nb");
+        assert_eq!(status, "");
+    }
+
+    #[test]
     fn lua_cancel_sets_cancelling_intent() {
         let plan: ActionPlan = claude_plugin()
             .expect("load built-in Claude Code Lua plugin")
@@ -610,6 +679,20 @@ mod tests {
                 ClaudeCodeState::Error,
                 "visible error banner detected",
             ),
+            // Regression: Claude Code 2.1.142 puts `⏵⏵ bypass permissions on
+            // (shift+tab to cycle)` in the bottom status bar on an idle input
+            // screen. Before status-bar splitting the classifier matched the
+            // `permission` substring and returned `WaitingForPermission` at
+            // 0.84 confidence on an idle screen. The fix in
+            // `split_status_bar` + body/status plumbing must keep this
+            // classified as `WaitingForUserInput` (idle prompt glyph) rather
+            // than a permission dialog.
+            (
+                include_str!("../../tests/fixtures/claude_code/idle_bypass_permissions.txt"),
+                None,
+                ClaudeCodeState::WaitingForUserInput,
+                "input prompt glyph detected",
+            ),
         ];
 
         for (index, (fixture, last_intent, expected, evidence)) in fixtures.into_iter().enumerate()
@@ -622,7 +705,11 @@ mod tests {
                 last_intent,
                 Some(COMPLETED_TURN_STABLE_MS),
             )
-            .expect("classify fixture via Lua plugin");
+            .unwrap_or_else(|err| {
+                panic!(
+                    "classify fixture {index} via Lua plugin: {err}\n--- fixture body ---\n{fixture}"
+                )
+            });
             assert_eq!(
                 state.state, expected,
                 "fixture {index} classified with evidence: {}",

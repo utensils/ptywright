@@ -109,11 +109,21 @@ end
 
 function M.classify(input)
   local screen = input.screen or ""
+  -- body_text excludes the bottom status-bar rows so that benign status
+  -- strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` do not
+  -- false-positive on substring matches such as `permission`. The host
+  -- (src/adapters/claude_code.rs::split_status_bar) computes the split with
+  -- STATUS_BAR_ROWS; if for any reason the host doesn't provide the split
+  -- (older callers, tests) fall back to the full screen so we degrade
+  -- gracefully rather than misclassifying everything as starting.
+  local body = input.body_text or screen
+  local status = input.status_text or ""
   local transcript = input.transcript or ""
   local sequence = input.sequence or 0
   local last_intent = input.last_intent
   local stable_ms = tonumber(input.stable_ms) or 0
-  local text = lower(screen .. "\n" .. transcript)
+  local text = lower(body .. "\n" .. transcript)
+  local body_text = lower(body)
   local screen_text = lower(screen)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
 
@@ -121,32 +131,39 @@ function M.classify(input)
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
   end
 
-  if has_plan_indicator(screen_text) then
+  -- Plan and permission dialogs in the Claude Code TUI sometimes straddle the
+  -- body/status split (the question line is in body, the answer hint sits in
+  -- the bottom rows). Look at body+status_text together for those classifier
+  -- branches, but keep the false-positive guard for status-bar-only matches
+  -- by requiring at least one body match too.
+  local body_and_status = body_text .. "\n" .. lower(status)
+
+  if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
     return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence)
   end
 
-  if has_permission_indicator(screen_text) then
+  if has_permission_indicator(body_text) then
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence)
   end
 
-  if has_active_work_indicator(screen_text) then
+  if has_active_work_indicator(body_text) then
     return state_snapshot("thinking", 0.76, "active work indicator detected", sequence)
   end
 
-  if has_error_indicator(screen) then
+  if has_error_indicator(body) then
     return state_snapshot("error", 0.72, "visible error banner detected", sequence)
   end
 
-  if has_usage_screen(screen_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
+  if has_usage_screen(body_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence)
   end
 
-  if contains_any(screen_text, { "what would you like", "how can i help", "type a message" }) then
+  if contains_any(body_text, { "what would you like", "how can i help", "type a message" }) then
     return state_snapshot("ready", 0.74, "ready prompt text detected", sequence)
   end
 
   if has_input_prompt(screen) then
-    if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms and not has_active_work_indicator(screen_text) then
+    if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms and not has_active_work_indicator(body_text) then
       return state_snapshot("completed_turn", 0.78, "stable input prompt after prompt submission", sequence)
     end
     return state_snapshot("waiting_for_user_input", 0.62, "input prompt glyph detected", sequence)

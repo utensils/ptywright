@@ -1,0 +1,9 @@
+ ▐▛███▜▌   Claude Code v2.1.142
+▝▜█████▛▘  Haiku 4.5 · Claude Max
+  ▘▘ ▝▝    ~/Projects/sample
+
+────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────
+  user @ host Projects/sample  main nix impure  [Haiku 4.5]
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
