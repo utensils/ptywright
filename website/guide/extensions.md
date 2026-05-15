@@ -128,7 +128,7 @@ The pieces a second adapter would need are exactly what the Claude Code plugin a
    return M
    ```
 
-3. Either register the manifest in `builtin_manifests()` (with a matching arm in `src/extension.rs::builtin_source_for` so the embedded Lua source can be loaded by name) for an embedded build, or hand-load it from Rust with `LuaPlugin::load_trusted(root, manifest)` followed by `LuaExtension::new(plugin, manifest)`. The entrypoint must resolve to a relative path inside the plugin root after canonicalization. Declaring `default_target = { program = "...", args = [...] }` on the manifest lets `adapter.start` callers omit `program`.
+3. For an embedded build, add a single `BuiltinPlugin { manifest: foo_manifest, source: include_str!("../plugins/foo/main.lua") }` entry to `BUILTIN_PLUGINS` in `src/plugin.rs`. The manifest constructor and the embedded Lua source travel together, so `LuaExtension::built_in(name)` resolves both in one step — no second registration to keep in sync. Alternatively, hand-load from Rust with `LuaPlugin::load_trusted(root, manifest)` followed by `LuaExtension::new(plugin, manifest)`; the entrypoint must resolve to a relative path inside the plugin root after canonicalization. Declaring `default_target = { program = "...", args = [...] }` on the manifest lets `adapter.start` callers omit `program`.
 
 4. Add recorded screen fixtures under `tests/fixtures/<name>/` with sibling `.expected.json` files. If you wire the same auto-enrolling pattern `tests/lua_classifier_tests.rs` uses for claude-code, fixture additions become single-file changes.
 

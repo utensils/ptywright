@@ -114,11 +114,11 @@ The integration is intentionally thin:
 - Rust constructs an `ExtensionHandle` with `LuaExtension::built_in("claude-code")`.
 - The Lua plugin classifies Claude Code screen states, returns generic `Action` values for prompts/approvals/denials/interrupts and the trust-dialog numeric selections, and returns generic `Matcher` values for turn waits.
 
-There is **no Rust shim** wrapping the plugin. The Rust core has no Claude-specific identifiers anywhere outside the manifest entry in `src/plugin.rs` and the embedded-source arm in `src/extension.rs::builtin_source_for` — both registration, not behaviour. The `Extension` trait surface is plugin-name-agnostic. Adding a new TUI plugin is:
+There is **no Rust shim** wrapping the plugin. The Rust core has no Claude-specific identifiers anywhere outside the entry in `src/plugin.rs::BUILTIN_PLUGINS` — registration, not behaviour. The `Extension` trait surface is plugin-name-agnostic. Adding a new TUI plugin is:
 
 1. Write `plugins/<name>/main.lua` exporting `classify` and the intent functions you want callers to invoke through `adapter.send`.
-2. Add a manifest constructor to `src/plugin.rs` and register it in `builtin_manifests()`.
-3. Add a matching arm in `src/extension.rs::builtin_source_for` so the embedded Lua source can be loaded by name.
+2. Add a manifest constructor next to `claude_code_manifest()` in `src/plugin.rs`.
+3. Register both the manifest and the embedded Lua source in `BUILTIN_PLUGINS` with a single `BuiltinPlugin { manifest: foo_manifest, source: include_str!("../plugins/foo/main.lua") }` entry. `LuaExtension::built_in(name)` looks both up from that slice in one step.
 
 Callers reach the new plugin through `adapter.*` JSON-RPC or `LuaExtension::built_in("<name>")` from Rust.
 

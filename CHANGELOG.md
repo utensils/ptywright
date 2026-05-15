@@ -19,7 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `dismiss_welcome` intent on the Claude Code adapter for clearing the first-launch welcome panel without dropping to `session.input`.
 - LSP back-to-back framing and `session.changed` notification integration tests in `tests/cli_tests.rs`.
 - `PluginManifest::default_target` (optional `{ program, args }`) for plugins to declare a sensible default spawn target. `adapter.start` falls back to this when callers omit `program`.
-- `builtin_manifests()` registry function and `builtin_source_for(name)` lookup so adding a new built-in Lua plugin is a one-line change in each instead of a hardcoded match arm.
+- `BUILTIN_PLUGINS` registry (a `&[BuiltinPlugin { manifest, source }]` slice) plus a thin `builtin_manifests()` accessor over it. Adding a new built-in Lua plugin is a single struct-literal entry — the manifest constructor and embedded Lua source travel together, replacing the previous hardcoded match arm in `LuaExtension::built_in`.
 - `tests/lua_classifier_tests.rs` and `tests/lua_plugin_intents.rs` integration tests covering the claude-code Lua plugin through the generic `Extension` / `ExtensionHandle` surface.
 
 ### Changed
