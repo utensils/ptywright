@@ -1,0 +1,17 @@
+ ▐▛███▜▌   Claude Code v2.1.142
+▝▜█████▛▘  ~/Projects/sample
+  ▘▘ ▝▝
+
+  Do you trust the files in this folder?
+
+  /Users/me/Projects/sample
+
+  Claude Code may read files in this folder. Reading files
+  won't affect anything outside this folder.
+
+  ❯ 1. Yes, proceed
+    2. No, exit
+
+────────────────────────────────────────────────────────────────────────────
+  Press 1 or 2 to choose, Enter to confirm · Esc to cancel
+────────────────────────────────────────────────────────────────────────────

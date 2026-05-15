@@ -67,6 +67,15 @@ pub enum ClaudeCodeState {
     WaitingForPermission,
     /// Claude appears to be waiting for plan approval.
     WaitingForPlanApproval,
+    /// Claude appears to be waiting for workspace-trust confirmation.
+    ///
+    /// Distinct from `WaitingForPermission` because the trust dialog uses a
+    /// numbered list (`1 = Yes, proceed` / `2 = No, exit`) rather than the
+    /// Bash/Edit-style "press Enter to approve" UI. Approving via Enter
+    /// alone does not accept option 1, so the Lua plugin exposes a
+    /// separate `approve_trust` / `deny_trust` intent that types the
+    /// numeric option first.
+    WaitingForTrust,
     /// Claude appears to be waiting for ordinary user input.
     WaitingForUserInput,
     /// A turn appears complete.
@@ -551,6 +560,37 @@ mod tests {
 
         assert_eq!(plan.actions, vec![Action::Interrupt]);
         assert_eq!(parse_last_intent(&plan), Some(ClaudeCodeState::Cancelling));
+    }
+
+    #[test]
+    fn lua_approve_trust_types_numeric_option_one() {
+        // The trust dialog requires typing "1" before Enter; a bare Enter
+        // does not accept option 1 in the Claude Code TUI. Lock the action
+        // sequence down so a future Lua edit can't silently regress it.
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "approve_trust", serde_json::json!({}));
+
+        assert_eq!(
+            plan.actions,
+            vec![
+                Action::Text("1".to_string()),
+                Action::Key(crate::action::Key::Enter),
+            ],
+        );
+    }
+
+    #[test]
+    fn lua_deny_trust_types_numeric_option_two() {
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "deny_trust", serde_json::json!({}));
+
+        assert_eq!(
+            plan.actions,
+            vec![
+                Action::Text("2".to_string()),
+                Action::Key(crate::action::Key::Enter),
+            ],
+        );
     }
 
     /// Auto-enrolling classifier regression test.

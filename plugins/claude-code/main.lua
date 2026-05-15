@@ -101,6 +101,18 @@ local function has_plan_indicator(text)
   })
 end
 
+local function has_trust_indicator(text)
+  -- Claude Code's workspace-trust dialog asks "Do you trust the files in
+  -- this folder?" with a numbered list (1. Yes, proceed / 2. No, exit).
+  -- Match the question + numbered options together so other prose
+  -- mentioning "trust" doesn't false-positive.
+  return contains(text, "do you trust the files")
+    or (contains(text, "trust the files") and contains_any(text, {
+      "yes, proceed",
+      "no, exit",
+    }))
+end
+
 local function has_usage_screen(text)
   return contains(text, "total cost:")
     and contains(text, "usage:")
@@ -137,6 +149,14 @@ function M.classify(input)
   -- branches, but keep the false-positive guard for status-bar-only matches
   -- by requiring at least one body match too.
   local body_and_status = body_text .. "\n" .. lower(status)
+
+  -- Workspace-trust dialog is checked before permission/plan because its
+  -- approve action differs (numbered selection, not a single Enter press).
+  -- Trust questions and answers live entirely in the dialog body; the
+  -- status bar carries only navigation hints.
+  if has_trust_indicator(body_text) then
+    return state_snapshot("waiting_for_trust", 0.86, "workspace trust dialog detected", sequence)
+  end
 
   if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
     return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence)
@@ -187,6 +207,7 @@ function M.wait_turn_matcher(input)
   return matcher.all({
     matcher.any({
       matcher.contains_text("Do you want to proceed"),
+      matcher.contains_text("Do you trust the files"),
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
@@ -208,6 +229,29 @@ function M.deny(_input)
   return {
     actions = {
       action.key("escape"),
+    },
+  }
+end
+
+-- Trust-dialog approval needs a numbered selection (1 = Yes, proceed)
+-- followed by Enter, since the TUI does not treat a bare Enter on the
+-- list as accepting option 1. Kept as a separate intent so callers can
+-- dispatch on `waiting_for_trust` explicitly instead of overloading
+-- `approve`.
+function M.approve_trust(_input)
+  return {
+    actions = {
+      action.text("1"),
+      action.key("enter"),
+    },
+  }
+end
+
+function M.deny_trust(_input)
+  return {
+    actions = {
+      action.text("2"),
+      action.key("enter"),
     },
   }
 end
