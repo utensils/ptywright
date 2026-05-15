@@ -12,6 +12,10 @@ repository = "https://github.com/utensils/ptywright"
 readme = "README.md"
 keywords = ["pty", "tui", "cli", "automation", "terminal"]
 categories = ["command-line-utilities", "development-tools", "api-bindings"]
+# Pin `cargo run` (and the devshell `ptywright` helper that wraps it) to the
+# main binary so the addition of test-only [[bin]] targets like
+# `ptywright-echo-tui` doesn't break interactive workflows.
+default-run = "ptywright"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -33,3 +37,10 @@ vt100 = "0.16.2"
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"
+
+[[bin]]
+name = "ptywright-echo-tui"
+path = "tests/fixtures/echo_tui/main.rs"
+test = false
+doctest = false
+bench = false

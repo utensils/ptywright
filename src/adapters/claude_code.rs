@@ -6,11 +6,8 @@ const COMPLETED_TURN_STABLE_MS: u64 = 300;
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::Action;
-use crate::error::Result;
-use crate::lua_plugin::LuaPlugin;
-use crate::matcher::Matcher;
-use crate::plugin::claude_code_manifest;
+use crate::error::{Error, Result};
+use crate::extension::{ExtensionHandle, ExtensionStateSnapshot, LuaExtension};
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
 
@@ -70,6 +67,15 @@ pub enum ClaudeCodeState {
     WaitingForPermission,
     /// Claude appears to be waiting for plan approval.
     WaitingForPlanApproval,
+    /// Claude appears to be waiting for workspace-trust confirmation.
+    ///
+    /// Distinct from `WaitingForPermission` because the trust dialog uses a
+    /// numbered list (`1 = Yes, proceed` / `2 = No, exit`) rather than the
+    /// Bash/Edit-style "press Enter to approve" UI. Approving via Enter
+    /// alone does not accept option 1, so the Lua plugin exposes a
+    /// separate `approve_trust` / `deny_trust` intent that types the
+    /// numeric option first.
+    WaitingForTrust,
     /// Claude appears to be waiting for ordinary user input.
     WaitingForUserInput,
     /// A turn appears complete.
@@ -97,199 +103,222 @@ pub struct ClaudeCodeStateSnapshot {
     pub sequence: u64,
 }
 
+impl From<ExtensionStateSnapshot> for ClaudeCodeStateSnapshot {
+    fn from(value: ExtensionStateSnapshot) -> Self {
+        let ExtensionStateSnapshot {
+            state,
+            confidence,
+            evidence,
+            sequence,
+            candidates: _,
+        } = value;
+        let (state_enum, evidence) = match state_from_name(&state) {
+            Some(parsed) => (parsed, evidence),
+            None => (
+                ClaudeCodeState::Error,
+                if evidence.is_empty() {
+                    format!("unknown extension state `{state}`")
+                } else {
+                    format!("unknown extension state `{state}`: {evidence}")
+                },
+            ),
+        };
+        Self {
+            state: state_enum,
+            confidence,
+            evidence,
+            sequence,
+        }
+    }
+}
+
 /// Interactive Claude Code adapter backed by a generic ptywright session.
 pub struct ClaudeCodeAdapter {
-    session: Session,
-    plugin: LuaPlugin,
-    last_intent: Option<ClaudeCodeState>,
+    handle: ExtensionHandle,
 }
 
 impl ClaudeCodeAdapter {
     /// Spawn interactive Claude Code in a PTY.
     pub fn start(config: ClaudeCodeConfig) -> Result<Self> {
         let session = Session::spawn(SessionConfig::new(config.target()))?;
-        Ok(Self {
-            session,
-            plugin: claude_plugin()?,
-            last_intent: Some(ClaudeCodeState::Starting),
-        })
+        Self::from_session_with_starting_intent(session)
     }
 
     /// Wrap an existing session. Useful for tests or externally managed sessions.
     pub fn from_session(session: Session) -> Result<Self> {
-        Ok(Self {
-            session,
-            plugin: claude_plugin()?,
-            last_intent: None,
-        })
+        let extension = LuaExtension::built_in("claude-code")?;
+        let handle = ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+        Ok(Self { handle })
+    }
+
+    fn from_session_with_starting_intent(session: Session) -> Result<Self> {
+        let extension = LuaExtension::built_in("claude-code")?;
+        let mut handle =
+            ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+        handle.set_last_intent(Some(state_name(ClaudeCodeState::Starting)?));
+        Ok(Self { handle })
     }
 
     /// Access the underlying generic session.
     #[must_use]
     pub fn session(&self) -> &Session {
-        &self.session
+        self.handle.session()
     }
 
     /// Classify current Claude Code state from visible screen and transcript evidence.
     #[must_use]
     pub fn state(&self) -> ClaudeCodeStateSnapshot {
-        self.try_state().unwrap_or_else(|error| {
-            state_snapshot(
-                ClaudeCodeState::PluginError,
-                0.0,
-                format!("Claude Code Lua plugin failed: {error}"),
-                self.session.sequence(),
-            )
-        })
+        self.try_state()
+            .unwrap_or_else(|error| ClaudeCodeStateSnapshot {
+                state: ClaudeCodeState::PluginError,
+                confidence: 0.0,
+                evidence: format!("Claude Code Lua plugin failed: {error}"),
+                sequence: self.handle.session().sequence(),
+            })
     }
 
     /// Classify current Claude Code state and surface Lua plugin failures.
     pub fn try_state(&self) -> Result<ClaudeCodeStateSnapshot> {
-        let snapshot = self.session.snapshot();
-        let transcript = self.session.transcript();
-        classify_state(
-            &self.plugin,
-            &snapshot.plain_text,
-            &transcript,
-            snapshot.sequence,
-            self.last_intent,
-            None,
-        )
+        Ok(self.handle.try_state()?.into())
     }
 
     /// Send a prompt to the interactive Claude Code TUI.
     pub fn send_prompt(&mut self, prompt: impl AsRef<str>) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = self.plugin.call(
+        let plan = self.handle.extension().plan(
             "send_prompt",
             &serde_json::json!({ "prompt": prompt.as_ref() }),
         )?;
-        self.apply_plan_with_required_intent(&plan, "send_prompt")?;
+        self.handle
+            .apply_plan_with_required_intent(&plan, "send_prompt")?;
         self.try_state()
     }
 
     /// Wait until Claude appears to need user input, approval, or has completed a turn.
     pub fn wait_turn(&self, timeout: Duration) -> Result<ClaudeCodeStateSnapshot> {
-        let matcher: Matcher = self.plugin.call(
-            "wait_turn_matcher",
-            &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
-        )?;
-        let result = self.session.wait_for(&matcher, timeout)?;
-        classify_state(
-            &self.plugin,
-            &result.snapshot.plain_text,
-            &result.transcript_tail,
-            result.sequence,
-            self.last_intent,
-            Some(COMPLETED_TURN_STABLE_MS),
-        )
+        Ok(self
+            .handle
+            .wait(
+                "wait_turn_matcher",
+                serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+                timeout,
+            )?
+            .into())
     }
 
     /// Approve the current Claude Code prompt using the Lua adapter's action plan.
-    pub fn approve(&self) -> Result<()> {
-        let plan: ActionPlan = self.plugin.call("approve", &serde_json::json!({}))?;
-        self.apply_actions(&plan.actions)
+    ///
+    /// Returns the post-apply state snapshot so callers don't need to round-trip
+    /// a separate `claude.state` query after approving. The snapshot is the
+    /// classifier's read at the moment after the approve action ran; the screen
+    /// has not necessarily settled, so callers that want a stable
+    /// classification should follow up with `wait_turn`.
+    pub fn approve(&self) -> Result<ClaudeCodeStateSnapshot> {
+        let plan = self
+            .handle
+            .extension()
+            .plan("approve", &serde_json::json!({}))?;
+        self.handle.apply_actions(&plan.actions)?;
+        self.try_state()
     }
 
     /// Deny the current Claude Code prompt using the Lua adapter's action plan.
-    pub fn deny(&self) -> Result<()> {
-        let plan: ActionPlan = self.plugin.call("deny", &serde_json::json!({}))?;
-        self.apply_actions(&plan.actions)
+    ///
+    /// Returns the post-apply state snapshot. See [`approve`](Self::approve)
+    /// for the stability caveat.
+    pub fn deny(&self) -> Result<ClaudeCodeStateSnapshot> {
+        let plan = self
+            .handle
+            .extension()
+            .plan("deny", &serde_json::json!({}))?;
+        self.handle.apply_actions(&plan.actions)?;
+        self.try_state()
     }
 
     /// Cancel the current turn with the Lua adapter's action plan.
     pub fn cancel(&mut self) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = self.plugin.call("cancel", &serde_json::json!({}))?;
-        self.apply_plan_with_required_intent(&plan, "cancel")?;
+        let plan = self
+            .handle
+            .extension()
+            .plan("cancel", &serde_json::json!({}))?;
+        self.handle
+            .apply_plan_with_required_intent(&plan, "cancel")?;
         self.try_state()
     }
-
-    fn apply_plan_with_required_intent(&mut self, plan: &ActionPlan, method: &str) -> Result<()> {
-        self.apply_actions(&plan.actions)?;
-        self.last_intent = Some(plan.last_intent.ok_or_else(|| {
-            crate::Error::Lua(format!(
-                "Claude Code Lua method `{method}` did not return last_intent"
-            ))
-        })?);
-        Ok(())
-    }
-
-    fn apply_actions(&self, actions: &[Action]) -> Result<()> {
-        for action in actions {
-            self.session.send(action.clone())?;
-        }
-        Ok(())
-    }
-}
-
-fn classify_state(
-    plugin: &LuaPlugin,
-    screen: &str,
-    transcript: &str,
-    sequence: u64,
-    last_intent: Option<ClaudeCodeState>,
-    stable_ms: Option<u64>,
-) -> Result<ClaudeCodeStateSnapshot> {
-    plugin.call(
-        "classify",
-        &ClassifyInput {
-            screen,
-            transcript,
-            sequence,
-            last_intent: last_intent.map(state_name).transpose()?,
-            stable_ms,
-            completed_turn_stable_ms: COMPLETED_TURN_STABLE_MS,
-        },
-    )
-}
-
-fn state_snapshot(
-    state: ClaudeCodeState,
-    confidence: f32,
-    evidence: impl Into<String>,
-    sequence: u64,
-) -> ClaudeCodeStateSnapshot {
-    ClaudeCodeStateSnapshot {
-        state,
-        confidence,
-        evidence: evidence.into(),
-        sequence,
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ClassifyInput<'a> {
-    screen: &'a str,
-    transcript: &'a str,
-    sequence: u64,
-    last_intent: Option<String>,
-    stable_ms: Option<u64>,
-    completed_turn_stable_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActionPlan {
-    actions: Vec<Action>,
-    #[serde(default)]
-    last_intent: Option<ClaudeCodeState>,
-}
-
-fn claude_plugin() -> Result<LuaPlugin> {
-    LuaPlugin::trusted(
-        &claude_code_manifest(),
-        include_str!("../../plugins/claude-code/main.lua"),
-    )
 }
 
 fn state_name(state: ClaudeCodeState) -> Result<String> {
     serde_json::to_value(state)?
         .as_str()
         .map(ToString::to_string)
-        .ok_or_else(|| crate::Error::Lua("Claude Code state did not serialize to a string".into()))
+        .ok_or_else(|| Error::Lua("Claude Code state did not serialize to a string".into()))
+}
+
+fn state_from_name(name: &str) -> Option<ClaudeCodeState> {
+    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::action::Action;
+    use crate::extension::{ActionPlan, LuaExtension, StateCandidate};
+    use crate::matcher::Matcher;
+    use crate::screen::CursorState;
+    use crate::screen::ScreenSnapshot;
+    use crate::target::TerminalSize;
+
+    fn classify_state(
+        extension: &LuaExtension,
+        screen: &str,
+        transcript: &str,
+        sequence: u64,
+        last_intent: Option<ClaudeCodeState>,
+        stable_ms: Option<u64>,
+    ) -> Result<ClaudeCodeStateSnapshot> {
+        use crate::extension::{ClassifyContext, Extension, STATUS_BAR_ROWS, split_status_bar};
+        let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+        let intent_name = last_intent.map(state_name).transpose()?;
+        let ctx = ClassifyContext {
+            screen,
+            body_text: &body_text,
+            status_text: &status_text,
+            transcript,
+            sequence,
+            last_intent: intent_name.as_deref(),
+            stable_ms,
+            completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+        };
+        Ok(extension.classify(&ctx)?.into())
+    }
+
+    fn claude_plugin() -> Result<LuaExtension> {
+        LuaExtension::built_in("claude-code")
+    }
+
+    fn lua_call_plan(
+        extension: &LuaExtension,
+        intent: &str,
+        params: serde_json::Value,
+    ) -> ActionPlan {
+        use crate::extension::Extension;
+        extension.plan(intent, &params).expect("plan from Lua")
+    }
+
+    fn lua_call_matcher(
+        extension: &LuaExtension,
+        intent: &str,
+        params: serde_json::Value,
+    ) -> Matcher {
+        use crate::extension::Extension;
+        extension
+            .wait_matcher(intent, &params)
+            .expect("matcher from Lua")
+    }
+
+    fn parse_last_intent(plan: &ActionPlan) -> Option<ClaudeCodeState> {
+        plan.last_intent.as_deref().and_then(state_from_name)
+    }
 
     #[test]
     fn default_config_targets_interactive_claude_without_print_mode() {
@@ -326,13 +355,12 @@ mod tests {
 
     #[test]
     fn lua_plugin_supplies_prompt_action_plan() {
-        let plan: ActionPlan = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call(
-                "send_prompt",
-                &serde_json::json!({ "prompt": "hello Claude" }),
-            )
-            .expect("load prompt action plan from Lua");
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(
+            &extension,
+            "send_prompt",
+            serde_json::json!({ "prompt": "hello Claude" }),
+        );
 
         assert_eq!(
             plan.actions,
@@ -341,18 +369,20 @@ mod tests {
                 Action::Key(crate::Key::Enter),
             ]
         );
-        assert_eq!(plan.last_intent, Some(ClaudeCodeState::PromptSubmitted));
+        assert_eq!(
+            parse_last_intent(&plan),
+            Some(ClaudeCodeState::PromptSubmitted)
+        );
     }
 
     #[test]
     fn lua_plugin_supplies_turn_wait_matcher() {
-        let matcher: Matcher = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call(
-                "wait_turn_matcher",
-                &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
-            )
-            .expect("load wait matcher from Lua");
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let matcher = lua_call_matcher(
+            &extension,
+            "wait_turn_matcher",
+            serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+        );
 
         let Matcher::All(matchers) = matcher else {
             panic!("expected Lua wait matcher to require all conditions");
@@ -378,16 +408,15 @@ mod tests {
 
     #[test]
     fn lua_turn_wait_matcher_matches_prompt_line() {
-        let matcher: Matcher = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call(
-                "wait_turn_matcher",
-                &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
-            )
-            .expect("load wait matcher from Lua");
-        let snapshot = crate::ScreenSnapshot {
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let matcher = lua_call_matcher(
+            &extension,
+            "wait_turn_matcher",
+            serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+        );
+        let snapshot = ScreenSnapshot {
             size: TerminalSize::new(3, 20),
-            cursor: crate::CursorState {
+            cursor: CursorState {
                 row: 1,
                 col: 2,
                 visible: true,
@@ -526,110 +555,206 @@ mod tests {
 
     #[test]
     fn lua_cancel_sets_cancelling_intent() {
-        let plan: ActionPlan = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call("cancel", &serde_json::json!({}))
-            .expect("load cancel action plan from Lua");
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "cancel", serde_json::json!({}));
 
         assert_eq!(plan.actions, vec![Action::Interrupt]);
-        assert_eq!(plan.last_intent, Some(ClaudeCodeState::Cancelling));
+        assert_eq!(parse_last_intent(&plan), Some(ClaudeCodeState::Cancelling));
     }
 
     #[test]
-    fn classifier_matches_sanitized_claude_code_fixtures() {
-        let fixtures = [
-            (
-                include_str!("../../tests/fixtures/claude_code/ready.txt"),
-                None,
-                ClaudeCodeState::Ready,
-                "ready prompt text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/thinking.txt"),
-                None,
-                ClaudeCodeState::Thinking,
-                "active work indicator detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/permission.txt"),
-                None,
-                ClaudeCodeState::WaitingForPermission,
-                "permission or approval prompt text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/plan_approval.txt"),
-                None,
-                ClaudeCodeState::WaitingForPlanApproval,
-                "plan approval text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/completed.txt"),
-                Some(ClaudeCodeState::PromptSubmitted),
-                ClaudeCodeState::CompletedTurn,
-                "stable input prompt after prompt submission",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/tool_use.txt"),
-                None,
-                ClaudeCodeState::Thinking,
-                "active work indicator detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/streaming_response.txt"),
-                None,
-                ClaudeCodeState::Thinking,
-                "active work indicator detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/interrupted.txt"),
-                Some(ClaudeCodeState::Cancelling),
-                ClaudeCodeState::WaitingForUserInput,
-                "input prompt glyph detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/permission_bash.txt"),
-                None,
-                ClaudeCodeState::WaitingForPermission,
-                "permission or approval prompt text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/plan_variant.txt"),
-                None,
-                ClaudeCodeState::WaitingForPlanApproval,
-                "plan approval text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/usage.txt"),
-                Some(ClaudeCodeState::PromptSubmitted),
-                ClaudeCodeState::CompletedTurn,
-                "stable usage screen detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/error.txt"),
-                None,
-                ClaudeCodeState::Error,
-                "visible error banner detected",
-            ),
-        ];
+    fn lua_approve_trust_types_numeric_option_one() {
+        // The trust dialog requires typing "1" before Enter; a bare Enter
+        // does not accept option 1 in the Claude Code TUI. Lock the action
+        // sequence down so a future Lua edit can't silently regress it.
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "approve_trust", serde_json::json!({}));
 
-        for (index, (fixture, last_intent, expected, evidence)) in fixtures.into_iter().enumerate()
-        {
+        assert_eq!(
+            plan.actions,
+            vec![
+                Action::Text("1".to_string()),
+                Action::Key(crate::action::Key::Enter),
+            ],
+        );
+    }
+
+    #[test]
+    fn lua_deny_trust_types_numeric_option_two() {
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "deny_trust", serde_json::json!({}));
+
+        assert_eq!(
+            plan.actions,
+            vec![
+                Action::Text("2".to_string()),
+                Action::Key(crate::action::Key::Enter),
+            ],
+        );
+    }
+
+    /// Auto-enrolling classifier regression test.
+    ///
+    /// For every `*.txt` fixture under `tests/fixtures/claude_code/`, this
+    /// test loads a sibling `<name>.expected.json` describing the expected
+    /// state, evidence, optional `last_intent`, and a confidence floor, and
+    /// asserts the Lua-backed classifier still matches.
+    ///
+    /// Adding a new fixture is now a documentation-only change: drop the
+    /// two files (text + JSON) into the fixtures directory and this test
+    /// picks them up automatically. Fixtures without a matching
+    /// `.expected.json` are skipped with a warning to leave room for
+    /// exploratory captures that have not been classified yet.
+    #[test]
+    fn classifier_matches_sanitized_claude_code_fixtures() {
+        #[derive(serde::Deserialize)]
+        struct Expectation {
+            state: String,
+            evidence: String,
+            #[serde(default)]
+            last_intent: Option<String>,
+            #[serde(default = "default_min_confidence")]
+            min_confidence: f32,
+        }
+
+        fn default_min_confidence() -> f32 {
+            0.6
+        }
+
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("claude_code");
+
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&fixtures_dir)
+            .unwrap_or_else(|err| panic!("read fixtures dir {}: {err}", fixtures_dir.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("txt"))
+            .collect();
+        entries.sort();
+
+        assert!(
+            !entries.is_empty(),
+            "no .txt fixtures found in {}",
+            fixtures_dir.display()
+        );
+
+        let extension = claude_plugin().expect("load plugin");
+        let mut asserted = 0usize;
+
+        for (index, txt_path) in entries.into_iter().enumerate() {
+            let fixture_name = txt_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| txt_path.display().to_string());
+
+            let expected_path = txt_path.with_extension("expected.json");
+            if !expected_path.exists() {
+                println!(
+                    "skipping fixture {fixture_name}: missing sibling {}",
+                    expected_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("<expected>.json")
+                );
+                continue;
+            }
+
+            let fixture_body = std::fs::read_to_string(&txt_path)
+                .unwrap_or_else(|err| panic!("read fixture {fixture_name}: {err}"));
+            let expected_raw = std::fs::read_to_string(&expected_path)
+                .unwrap_or_else(|err| panic!("read expectations for {fixture_name}: {err}"));
+            let expectation: Expectation = serde_json::from_str(&expected_raw)
+                .unwrap_or_else(|err| panic!("parse expectations for {fixture_name}: {err}"));
+
+            let expected_state = state_from_name(&expectation.state).unwrap_or_else(|| {
+                panic!(
+                    "unknown expected state {:?} in expectations for {fixture_name}",
+                    expectation.state
+                )
+            });
+            let last_intent = expectation.last_intent.as_deref().map(|name| {
+                state_from_name(name).unwrap_or_else(|| {
+                    panic!("unknown last_intent {name:?} in expectations for {fixture_name}")
+                })
+            });
+
             let state = classify_state(
-                &claude_plugin().expect("load plugin"),
-                fixture,
+                &extension,
+                &fixture_body,
                 "",
                 index as u64,
                 last_intent,
                 Some(COMPLETED_TURN_STABLE_MS),
             )
-            .expect("classify fixture via Lua plugin");
+            .unwrap_or_else(|err| {
+                panic!(
+                    "classify fixture {fixture_name} via Lua plugin: {err}\n--- fixture body ---\n{fixture_body}"
+                )
+            });
+
             assert_eq!(
-                state.state, expected,
-                "fixture {index} classified with evidence: {}",
-                state.evidence
+                state.state, expected_state,
+                "fixture {fixture_name} classified as {:?} with evidence: {}",
+                state.state, state.evidence
             );
-            assert_eq!(state.evidence, evidence);
-            assert!(state.confidence >= 0.6);
+            assert_eq!(
+                state.evidence, expectation.evidence,
+                "fixture {fixture_name} evidence mismatch"
+            );
+            assert!(
+                state.confidence >= expectation.min_confidence,
+                "fixture {fixture_name} confidence {} below floor {}",
+                state.confidence,
+                expectation.min_confidence
+            );
+            asserted += 1;
         }
+
+        assert!(
+            asserted > 0,
+            "no fixtures had sibling .expected.json files under {}",
+            fixtures_dir.display()
+        );
+    }
+
+    #[test]
+    fn unknown_extension_state_translates_to_error_with_state_in_evidence() {
+        let snapshot = ExtensionStateSnapshot {
+            state: "no-such-state".to_string(),
+            confidence: 0.3,
+            evidence: "from plugin".to_string(),
+            sequence: 42,
+            candidates: vec![StateCandidate {
+                state: "ready".to_string(),
+                confidence: 0.1,
+            }],
+        };
+        let claude: ClaudeCodeStateSnapshot = snapshot.into();
+        assert_eq!(claude.state, ClaudeCodeState::Error);
+        assert!(claude.evidence.contains("no-such-state"));
+        assert!(claude.evidence.contains("from plugin"));
+        assert_eq!(claude.sequence, 42);
+    }
+
+    #[test]
+    fn unknown_extension_state_with_empty_evidence_still_names_the_unknown_state() {
+        // The `if evidence.is_empty()` branch in From<ExtensionStateSnapshot>
+        // for ClaudeCodeStateSnapshot is reachable when a plugin returns an
+        // unfamiliar state name without an evidence message. Lock the
+        // "no trailing colon" formatting so a future refactor doesn't
+        // accidentally produce `unknown extension state `x`: ` with a
+        // dangling separator.
+        let snapshot = ExtensionStateSnapshot {
+            state: "wat".to_string(),
+            confidence: 0.0,
+            evidence: String::new(),
+            sequence: 1,
+            candidates: Vec::new(),
+        };
+        let claude: ClaudeCodeStateSnapshot = snapshot.into();
+        assert_eq!(claude.state, ClaudeCodeState::Error);
+        assert_eq!(claude.evidence, "unknown extension state `wat`");
     }
 }

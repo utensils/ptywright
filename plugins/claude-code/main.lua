@@ -101,6 +101,24 @@ local function has_plan_indicator(text)
   })
 end
 
+local function has_trust_indicator(text)
+  -- Claude Code's workspace-trust dialog asks "Do you trust the files in
+  -- this folder?" with a numbered list (1. Yes, proceed / 2. No, exit).
+  -- Require BOTH the question phrasing and at least one numbered-option
+  -- string. The earlier "question OR (phrase + option)" form let any
+  -- assistant prose containing "do you trust the files" classify as
+  -- waiting_for_trust, after which automation might submit `1`+Enter
+  -- against the user's actual conversation. Both branches now demand
+  -- one of the option strings; that means a model that quotes the
+  -- question but does not render the dialog body cannot trigger the
+  -- numeric approve action.
+  return (contains(text, "do you trust the files") or contains(text, "trust the files"))
+    and contains_any(text, {
+      "yes, proceed",
+      "no, exit",
+    })
+end
+
 local function has_usage_screen(text)
   return contains(text, "total cost:")
     and contains(text, "usage:")
@@ -109,11 +127,21 @@ end
 
 function M.classify(input)
   local screen = input.screen or ""
+  -- body_text excludes the bottom status-bar rows so that benign status
+  -- strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` do not
+  -- false-positive on substring matches such as `permission`. The host
+  -- (src/extension.rs::split_status_bar) computes the split with
+  -- STATUS_BAR_ROWS; if for any reason the host doesn't provide the split
+  -- (older callers, tests) fall back to the full screen so we degrade
+  -- gracefully rather than misclassifying everything as starting.
+  local body = input.body_text or screen
+  local status = input.status_text or ""
   local transcript = input.transcript or ""
   local sequence = input.sequence or 0
   local last_intent = input.last_intent
   local stable_ms = tonumber(input.stable_ms) or 0
-  local text = lower(screen .. "\n" .. transcript)
+  local text = lower(body .. "\n" .. transcript)
+  local body_text = lower(body)
   local screen_text = lower(screen)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
 
@@ -121,32 +149,51 @@ function M.classify(input)
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
   end
 
-  if has_plan_indicator(screen_text) then
+  -- Plan-approval dialogs in the Claude Code TUI sometimes straddle the
+  -- body/status split: the "Plan ready"/"Plan" header sits in the body
+  -- while the approve/accept/proceed hint can render in the bottom rows.
+  -- The plan branch below uses body_and_status for that reason and keeps
+  -- the false-positive guard by requiring "plan" to appear in body first.
+  -- Permission dialogs do not straddle the split in practice (the entire
+  -- dialog renders in the body area), so the permission branch stays on
+  -- body_text alone — matching it across the status bar would re-introduce
+  -- the `bypass permissions on` false-positive we fixed in Milestone 21.4.
+  local body_and_status = body_text .. "\n" .. lower(status)
+
+  -- Workspace-trust dialog is checked before permission/plan because its
+  -- approve action differs (numbered selection, not a single Enter press).
+  -- Trust questions and answers live entirely in the dialog body; the
+  -- status bar carries only navigation hints.
+  if has_trust_indicator(body_text) then
+    return state_snapshot("waiting_for_trust", 0.86, "workspace trust dialog detected", sequence)
+  end
+
+  if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
     return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence)
   end
 
-  if has_permission_indicator(screen_text) then
+  if has_permission_indicator(body_text) then
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence)
   end
 
-  if has_active_work_indicator(screen_text) then
+  if has_active_work_indicator(body_text) then
     return state_snapshot("thinking", 0.76, "active work indicator detected", sequence)
   end
 
-  if has_error_indicator(screen) then
+  if has_error_indicator(body) then
     return state_snapshot("error", 0.72, "visible error banner detected", sequence)
   end
 
-  if has_usage_screen(screen_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
+  if has_usage_screen(body_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence)
   end
 
-  if contains_any(screen_text, { "what would you like", "how can i help", "type a message" }) then
+  if contains_any(body_text, { "what would you like", "how can i help", "type a message" }) then
     return state_snapshot("ready", 0.74, "ready prompt text detected", sequence)
   end
 
   if has_input_prompt(screen) then
-    if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms and not has_active_work_indicator(screen_text) then
+    if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms and not has_active_work_indicator(body_text) then
       return state_snapshot("completed_turn", 0.78, "stable input prompt after prompt submission", sequence)
     end
     return state_snapshot("waiting_for_user_input", 0.62, "input prompt glyph detected", sequence)
@@ -170,6 +217,7 @@ function M.wait_turn_matcher(input)
   return matcher.all({
     matcher.any({
       matcher.contains_text("Do you want to proceed"),
+      matcher.contains_text("Do you trust the files"),
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
@@ -191,6 +239,29 @@ function M.deny(_input)
   return {
     actions = {
       action.key("escape"),
+    },
+  }
+end
+
+-- Trust-dialog approval needs a numbered selection (1 = Yes, proceed)
+-- followed by Enter, since the TUI does not treat a bare Enter on the
+-- list as accepting option 1. Kept as a separate intent so callers can
+-- dispatch on `waiting_for_trust` explicitly instead of overloading
+-- `approve`.
+function M.approve_trust(_input)
+  return {
+    actions = {
+      action.text("1"),
+      action.key("enter"),
+    },
+  }
+end
+
+function M.deny_trust(_input)
+  return {
+    actions = {
+      action.text("2"),
+      action.key("enter"),
     },
   }
 end

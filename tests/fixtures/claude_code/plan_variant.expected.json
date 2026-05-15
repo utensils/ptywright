@@ -1,0 +1,6 @@
+{
+  "state": "waiting_for_plan_approval",
+  "evidence": "plan approval text detected",
+  "last_intent": null,
+  "min_confidence": 0.6
+}

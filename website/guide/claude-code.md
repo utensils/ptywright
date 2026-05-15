@@ -1,26 +1,26 @@
 # Claude Code adapter
 
-ptywright includes an interactive Claude Code adapter built on the generic PTY/session/screen/action/matcher layers.
+ptywright drives interactive TUIs through a generic [`adapter.*` JSON-RPC surface](../reference/json-rpc.md#generic-adapter-methods) backed by the `Extension` trait. Claude Code is the first plugin shipped under that surface; the original `claude.*` aliases continue to work for callers that already speak them.
 
-This adapter is intentionally scoped to the terminal TUI. It does not use or optimize for `claude -p`. Claude Code-specific decisions now live in the built-in Lua plugin at `plugins/claude-code/main.lua`; Rust provides the PTY controls and executes the generic action/matcher plans returned by Lua.
+This adapter is intentionally scoped to the terminal TUI. It does not use or optimize for `claude -p`. Claude Code-specific decisions live in the built-in Lua plugin at `plugins/claude-code/main.lua`; Rust provides the PTY controls and executes the generic action/matcher plans the plugin returns.
 
 ## Scope
 
 Implemented now:
 
-- Spawn `claude` interactively in a real PTY from Rust.
+- Spawn `claude` interactively in a real PTY from Rust or via `adapter.start` / `claude.start`.
 - Send prompts as terminal input through Lua-provided action plans.
-- Classify coarse TUI states from screen/transcript evidence in Lua.
-- Detect common permission, approval, thinking/tool-use, streaming, and input prompt text in Lua.
-- Approve, deny, or cancel with Lua-provided terminal key actions.
-- Expose convenience JSON-RPC methods under the `claude.*` namespace.
+- Classify coarse TUI states from screen/transcript evidence in Lua, against the body region of the screen only (the bottom three status-bar rows are excluded from body classification).
+- Detect common permission, plan-approval, workspace-trust, thinking/tool-use, streaming, completed-turn, and input-prompt text.
+- Approve, deny, cancel, or send numeric trust-dialog selections through Lua-provided terminal key actions.
+- Expose convenience JSON-RPC methods under the `claude.*` namespace alongside the generic `adapter.*` surface.
 
 Still evolving:
 
-- Even stronger turn boundary detection across Claude Code UI changes.
+- Even stronger turn-boundary detection across Claude Code UI changes.
 - More detailed permission and plan prompt parsing.
 - Event subscriptions for state transitions.
-- Broader golden screen fixtures from real Claude Code sessions.
+- Broader recorded screen fixtures from real Claude Code sessions.
 
 ## Rust API
 
@@ -34,11 +34,11 @@ let next = claude.wait_turn(Duration::from_secs(120))?;
 # Ok::<(), ptywright::Error>(())
 ```
 
-`ClaudeCodeConfig::default()` launches `claude` with no `-p`/`--print` argument and a 40x120 terminal.
+`ClaudeCodeConfig::default()` launches `claude` with no `-p`/`--print` argument and a 40x120 terminal. Under the hood `ClaudeCodeAdapter` is a typed wrapper around `ExtensionHandle` with the built-in `claude-code` `LuaExtension`; the wrapper translates the plugin's state strings into the typed `ClaudeCodeState` enum.
 
 ## State model
 
-The current state classifier returns:
+The classifier returns:
 
 - `starting`
 - `ready`
@@ -46,6 +46,7 @@ The current state classifier returns:
 - `thinking`
 - `waiting_for_permission`
 - `waiting_for_plan_approval`
+- `waiting_for_trust`
 - `waiting_for_user_input`
 - `completed_turn`
 - `cancelling`
@@ -60,15 +61,17 @@ Every state response includes:
 - `evidence`
 - `sequence`
 
-The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Sanitized fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, interrupted, completed, usage, and error-like screens.
+The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Recorded fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, the workspace-trust dialog, interrupted, completed, usage, and error-like screens. Each fixture under `tests/fixtures/claude_code/<name>.txt` carries a sibling `<name>.expected.json` describing the expected state, evidence string, optional `last_intent`, and confidence floor; adding a new fixture is a documentation-only change.
 
-Current fixtures are based on sanitized captures from Claude Code v2.1.141 on Ghostty/macOS with Sonnet 4.6 and Opus 4.7 displays. Treat the exact labels, footer content, and slash-command layouts as versioned UI assumptions; update the Lua plugin and fixtures together when Claude Code changes its TUI.
+Current fixtures are based on sanitized captures from Claude Code v2.1.141 / v2.1.142 on Ghostty/macOS. Treat the exact labels, footer content, and slash-command layouts as versioned UI assumptions; update the Lua plugin and fixtures together when Claude Code changes its TUI.
 
-`claude.wait_turn` waits for both a turn-boundary indicator and a stable screen interval before classifying a submitted prompt as `completed_turn`. Turn-boundary indicators include prompt lines, permission/approval prompts, and stable slash-command output such as `/usage`. A plain prompt glyph without stable-screen evidence is classified as `waiting_for_user_input`.
+`waiting_for_trust` is distinct from `waiting_for_permission`: the workspace-trust dialog presents a numbered list (`1 = Yes, proceed` / `2 = No, exit`) instead of the Bash/Edit-style "press Enter to approve" UI. A bare Enter does not accept option 1, so the Lua plugin exposes a separate `approve_trust` / `deny_trust` intent that types the numeric option first and then sends Enter.
+
+`claude.wait_turn` waits for both a turn-boundary indicator and a stable screen interval before classifying a submitted prompt as `completed_turn`. Turn-boundary indicators include prompt lines, permission/approval/trust prompts, and stable slash-command output such as `/usage`. A plain prompt glyph without stable-screen evidence is classified as `waiting_for_user_input`.
 
 ## JSON-RPC methods
 
-Claude methods are compatibility/convenience wrappers around the built-in Lua adapter. Generic `session.*` methods remain sufficient for clients that want full control.
+The generic [`adapter.*` surface](../reference/json-rpc.md#generic-adapter-methods) is the recommended entry point for new clients: pass `plugin: "claude-code"` to `adapter.start`, then drive the handle with `adapter.send` / `adapter.wait` / `adapter.state`. The `claude.*` methods listed below are the original Claude-specific aliases. They still work and share the same underlying `ExtensionHandle` semantics. At the moment, `claude.*` and `adapter.*` route through separate registries inside the server; that internal consolidation is tracked as a follow-up.
 
 ```json
 {
@@ -97,16 +100,38 @@ Claude methods are compatibility/convenience wrappers around the built-in Lua ad
 }
 ```
 
-Other methods:
+Available `claude.*` methods:
 
+- `claude.start`
+- `claude.send_prompt`
+- `claude.wait_turn`
 - `claude.approve`
 - `claude.deny`
 - `claude.cancel`
 - `claude.state`
+- `claude.snapshot` — passthrough to the adapter's underlying session snapshot
+- `claude.transcript` — passthrough to the adapter's underlying session transcript
+- `claude.inspect` — diagnostic dump that returns the current state plus the body/status split the classifier would see
+
+`claude.approve` and `claude.deny` return both the post-apply state snapshot and a deprecated boolean alias:
+
+```json
+{
+  "state": {
+    "state": "completed_turn",
+    "confidence": 0.9,
+    "evidence": "...",
+    "sequence": 17
+  },
+  "approved": true
+}
+```
+
+Read `state` like every other mutation method. The `approved` / `denied` booleans are retained so existing callers that pattern-match the old `{approved: true}` / `{denied: true}` shape keep working; treat them as deprecated.
 
 ## Safety and limitations
 
 - The adapter drives whatever `claude` executable is found on `PATH` unless `program` is overridden.
-- Approval and denial are terminal key actions selected by the Lua adapter; verify behavior against your installed Claude Code version.
+- Approval, denial, and trust selections are terminal key actions selected by the Lua adapter; verify behavior against your installed Claude Code version.
 - Lua runs only on explicit adapter calls, not per PTY byte.
-- Screen/transcript evidence may contain sensitive project data. Avoid logging responses blindly.
+- Screen/transcript evidence may contain sensitive project data. Reads through `claude.snapshot`, `claude.transcript`, and `claude.inspect` redact by default; pass `"redact": false` for raw output in trusted local debugging.

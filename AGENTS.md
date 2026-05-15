@@ -117,25 +117,26 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/matcher.rs` — temporal matchers and wait policies.
   - `src/transcript.rs` — bounded in-memory transcript capture plus explicit raw file streaming opt-in.
   - `src/redaction.rs` — redaction helpers, caller-supplied additions, and the default RPC redaction policy.
-  - `src/rpc.rs` — JSON-RPC server, shared `RpcServerState`, NDJSON + LSP framing, stdio and local IPC transports.
+  - `src/extension.rs` — generic `Extension` trait, `ExtensionHandle` host loop, `ExtensionStateSnapshot`, body/status screen split (`STATUS_BAR_ROWS = 3`), and `LuaExtension` (the only implementor today). No application-specific identifiers live here; plugin-defined state names and intents flow through as strings.
+  - `src/rpc.rs` — JSON-RPC server, shared `RpcServerState`, NDJSON + LSP framing, stdio and local IPC transports. Hosts both the generic `adapter.*` surface and the original `claude.*` aliases.
   - `src/paths.rs` — `~/.ptywright/` runtime directory resolution and per-layout accessors. `PTYWRIGHT_HOME` overrides the root.
   - `src/config.rs` — `~/.ptywright/config.toml` loader with forgiving defaults and forward-compatible parsing.
   - `src/logging.rs` — `tracing` init with daily rotation, configurable retention, redaction-aware writers, and mode-specific helpers (`init_for_run`, `init_for_serve_stdio`, `init_for_serve_socket`, `init_for_oneshot`). **Never write logs to stdout in `serve --stdio` mode** — stdout is reserved for JSON-RPC framing. The per-mode helpers enforce this for you; if you add a new entrypoint, pick one of them rather than calling `tracing_subscriber::fmt()` directly.
   - `src/error.rs` — crate-wide `Error` / `Result`.
 - Plugin and adapter layer (application-specific code lives here, not in the generic layers):
   - `src/plugin.rs` — plugin manifests, permission declarations, runtime metadata enum, and built-in `claude_code_manifest`.
-  - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by adapters.
-  - `src/adapters/` — adapter implementations layered over the generic primitives; `claude_code.rs` is the current production adapter and drives Claude Code through Lua.
-  - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, and usage-output parsing.
+  - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by adapters. Installs the `ptywright.action.*` / `ptywright.matcher.*` host helpers gated on manifest-declared permissions.
+  - `src/adapters/` — typed adapter shims layered over `ExtensionHandle`; `claude_code.rs` is the current production shim and translates the generic plugin state strings into the typed `ClaudeCodeState` enum.
+  - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, workspace-trust dialog detection, and usage-output parsing.
 - Tests:
   - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
-  - `tests/fixtures/claude_code/` — recorded screen fixtures for adapter transition tests; update these when Claude Code's UI shifts.
+  - `tests/fixtures/claude_code/` — recorded screen fixtures for adapter transition tests; update these when Claude Code's UI shifts. The classifier regression test auto-enrols every `<name>.txt` that has a sibling `<name>.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor, so adding a new fixture is a single-PR documentation-only change.
 - Tooling and packaging:
   - `website/` — VitePress docs site.
   - `.github/workflows/` — CI, docs deploy (`pages.yml`), and release packaging (`release.yml`).
   - `flake.nix` — Nix package, app, formatter, and devshell.
 
-When adding behavior, decide first which layer it belongs to. Claude-specific logic must not land in the generic modules; new generic primitives should not import from `adapters/`.
+When adding behavior, decide first which layer it belongs to. No Claude-specific identifiers (state names, intent names, fixture conventions) belong in `src/` outside `src/adapters/` and `plugins/claude-code/`. New TUI adapters land as additional `src/adapters/<name>.rs` shims wrapping an `ExtensionHandle`, or as Lua-only plugin manifests; they should not introduce new application-specific identifiers into the generic layers. New generic primitives should not import from `adapters/`.
 
 When exploring the repo, ignore build artifacts: `target/` (Cargo output) and `result` / `result-*` (Nix build symlinks). Both are gitignored and contain nothing worth grepping.
 
