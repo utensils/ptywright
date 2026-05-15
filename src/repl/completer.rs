@@ -108,17 +108,47 @@ impl PluginCache {
     }
 }
 
+/// Cached server-side live adapter ids. The TUI seeds this from the
+/// initial `adapter.live` probe; the completer suggests these inside
+/// `:attach <TAB>` so the operator can complete ids that no other
+/// connection has loaded locally.
+#[derive(Debug, Default, Clone)]
+pub struct AdapterCache {
+    inner: Arc<Mutex<Vec<String>>>,
+}
+
+impl AdapterCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, ids: Vec<String>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = ids;
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
 /// Completer for the REPL. Reads adapter ids out of [`ReplCtx`] and plugin
 /// names out of a `PluginCache`, both behind locks so the TUI can update
 /// them between completion requests.
 pub struct ReplCompleter {
     ctx: Arc<Mutex<ReplCtx>>,
     plugins: PluginCache,
+    adapters: AdapterCache,
 }
 
 impl ReplCompleter {
-    pub fn new(ctx: Arc<Mutex<ReplCtx>>, plugins: PluginCache) -> Self {
-        Self { ctx, plugins }
+    pub fn new(ctx: Arc<Mutex<ReplCtx>>, plugins: PluginCache, adapters: AdapterCache) -> Self {
+        Self {
+            ctx,
+            plugins,
+            adapters,
+        }
     }
 }
 
@@ -153,15 +183,15 @@ impl Completer for ReplCompleter {
                 .collect();
         }
 
-        // `:attach <TAB>` → `all` plus locally-known adapter ids. Server-side
-        // live ids are discoverable via `:live` itself; surfacing them here
-        // would require a live-cache the completer doesn't own yet.
+        // `:attach <TAB>` → `all`, plus the union of locally-known adapter
+        // ids and the server-side live ids cached at startup.
         if prefix.trim_start().starts_with(":attach") {
             let after = prefix.trim_start_matches(":attach").trim_start();
             let after_len = after.len();
             let after_start = prefix_end - after_len;
             let span = Span::new(after_start, prefix_end);
             let mut suggestions: Vec<Suggestion> = Vec::new();
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             if "all".starts_with(after) {
                 suggestions.push(Suggestion {
                     value: "all".to_string(),
@@ -171,10 +201,21 @@ impl Completer for ReplCompleter {
                     ..Default::default()
                 });
             }
+            for id in self.adapters.snapshot() {
+                if id.starts_with(after) && seen.insert(id.clone()) {
+                    suggestions.push(Suggestion {
+                        value: id,
+                        description: Some("server-side adapter".into()),
+                        span,
+                        append_whitespace: false,
+                        ..Default::default()
+                    });
+                }
+            }
             let ctx = self.ctx.lock().ok();
             if let Some(ctx) = ctx {
                 for tab in &ctx.adapters {
-                    if tab.id.starts_with(after) {
+                    if tab.id.starts_with(after) && seen.insert(tab.id.clone()) {
                         suggestions.push(Suggestion {
                             value: tab.id.clone(),
                             description: Some("adapter id".into()),
@@ -281,7 +322,7 @@ mod tests {
     #[test]
     fn empty_buffer_returns_full_dsl_table() {
         let ctx = ctx_with_adapters(&[]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new());
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let suggestions = completer.complete("", 0);
         assert!(suggestions.len() >= DSL_COMMANDS.len());
     }
@@ -289,7 +330,7 @@ mod tests {
     #[test]
     fn prefix_filters_dsl_table() {
         let ctx = ctx_with_adapters(&[]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new());
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let suggestions = completer.complete("ses", 3);
         assert!(suggestions.iter().all(|s| s.value.starts_with("session.")));
         assert!(!suggestions.is_empty());
@@ -298,7 +339,7 @@ mod tests {
     #[test]
     fn focus_completes_known_adapter_ids() {
         let ctx = ctx_with_adapters(&[("e1", "claude-code"), ("e2", "claude-code")]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new());
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let suggestions = completer.complete(":focus ", 7);
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert!(values.contains(&"e1"));
@@ -310,7 +351,7 @@ mod tests {
         let ctx = ctx_with_adapters(&[]);
         let plugins = PluginCache::new();
         plugins.set(vec!["claude-code".into(), "future-plugin".into()]);
-        let mut completer = ReplCompleter::new(ctx, plugins);
+        let mut completer = ReplCompleter::new(ctx, plugins, AdapterCache::new());
         let line = r#"session.spawn(""#;
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
@@ -323,7 +364,7 @@ mod tests {
         let ctx = ctx_with_adapters(&[]);
         let plugins = PluginCache::new();
         plugins.set(vec!["claude-code".into(), "rspec".into()]);
-        let mut completer = ReplCompleter::new(ctx, plugins);
+        let mut completer = ReplCompleter::new(ctx, plugins, AdapterCache::new());
         let line = r#"session.spawn("cla"#;
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
@@ -333,12 +374,38 @@ mod tests {
     #[test]
     fn attach_completer_suggests_all_and_known_ids() {
         let ctx = ctx_with_adapters(&[("e7", "claude-code")]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new());
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let line = ":attach ";
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert!(values.contains(&"all"), "expected `all`, got {values:?}");
         assert!(values.contains(&"e7"), "expected `e7`, got {values:?}");
+    }
+
+    #[test]
+    fn attach_completer_surfaces_server_only_ids() {
+        // No local tab for `e9` — only the server-side adapter cache
+        // knows it. The completer must still surface it inside `:attach`.
+        let ctx = ctx_with_adapters(&[]);
+        let server = AdapterCache::new();
+        server.set(vec!["e9".into(), "e10".into()]);
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), server);
+        let line = ":attach e";
+        let suggestions = completer.complete(line, line.len());
+        let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
+        assert!(values.contains(&"e9"), "expected `e9`, got {values:?}");
+        assert!(values.contains(&"e10"), "expected `e10`, got {values:?}");
+    }
+
+    #[test]
+    fn attach_completer_dedupes_local_and_server_overlap() {
+        let ctx = ctx_with_adapters(&[("e1", "claude-code")]);
+        let server = AdapterCache::new();
+        server.set(vec!["e1".into(), "e2".into()]);
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), server);
+        let suggestions = completer.complete(":attach e", ":attach e".len());
+        let count_e1 = suggestions.iter().filter(|s| s.value == "e1").count();
+        assert_eq!(count_e1, 1, "expected one `e1` suggestion, got {count_e1}");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! each `CmdOutcome` is printed.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use reedline::{
 use serde_json::{Value, json};
 
 use super::command::{CmdOutcome, parse};
-use super::completer::{PluginCache, ReplCompleter};
+use super::completer::{AdapterCache, PluginCache, ReplCompleter};
 use super::ctx::ReplCtx;
 use super::highlighter::ReplHighlighter;
 use super::transport::{Notification, RpcClient};
@@ -30,16 +31,23 @@ use crate::screen::{ScreenCellStyle, ScreenSnapshot};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the REPL pings the server to keep its notification pump warm.
+///
 /// The server only polls notifications on inbound requests, so a parked
 /// prompt needs a heartbeat for `session.changed` events from other
-/// connections to reach us. See `RpcClient::start_heartbeat`.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(300);
+/// connections to reach us. The chosen value trades responsiveness against
+/// per-connection overhead: every tick takes the server's shared-state
+/// `Mutex` and walks every session + adapter row. 500 ms is responsive
+/// enough for a human at a prompt and keeps a single-user fan-out
+/// well under any contention threshold. Bump it if you wire many
+/// always-on REPLs against the same server.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Public entry. Builds reedline + prompt and runs the read-eval-print
 /// loop until the user quits with `:quit` / `Ctrl-D`.
 pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     let ctx = Arc::new(Mutex::new(ReplCtx::new()));
     let plugins = PluginCache::new();
+    let adapters_cache = AdapterCache::new();
 
     // Seed the plugin cache so the very first Tab inside
     // `session.spawn("…")` knows which plugin names exist.
@@ -62,9 +70,14 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
 
     // Probe for live adapters once at startup. The user can `:attach <id>`
     // or `:attach all` to load them into local tabs without losing the
-    // option to start with a clean slate.
+    // option to start with a clean slate. The same response also seeds
+    // the `:attach <TAB>` completer cache so the operator can complete
+    // server-side ids they don't have locally yet.
     let live_hint = match client.call("adapter.live", json!({}), RPC_TIMEOUT) {
-        Ok(value) => format_live_hint(&value),
+        Ok(value) => {
+            adapters_cache.set(extract_live_ids(&value));
+            format_live_hint(&value)
+        }
         Err(_) => None,
     };
 
@@ -73,7 +86,11 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     let history_path = Paths::from_env().repl_history_path();
     let history = super::history::open(&history_path)?;
 
-    let completer = Box::new(ReplCompleter::new(Arc::clone(&ctx), plugins));
+    let completer = Box::new(ReplCompleter::new(
+        Arc::clone(&ctx),
+        plugins,
+        adapters_cache,
+    ));
     let highlighter = Box::new(ReplHighlighter::new());
     let hinter =
         Box::new(DefaultHinter::default().with_style(Style::new().italic().fg(Color::DarkGray)));
@@ -81,19 +98,30 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     // External printer relays `[notif] …` lines from a background thread
     // above the prompt without disturbing the line editor. reedline polls
     // the receiver between events when configured.
+    //
+    // The printer thread observes a shared stop flag so REPL teardown
+    // does not leave it parked on `recv` forever — important on the
+    // socket transport, where the server may not close the broadcast
+    // channel promptly when we drop our writer half.
     let external_printer = ExternalPrinter::<String>::default();
     let notification_sender = external_printer.sender();
     let notifications_rx = client.notifications();
+    let printer_stop = Arc::new(AtomicBool::new(false));
+    let printer_stop_clone = Arc::clone(&printer_stop);
     std::thread::Builder::new()
         .name("ptywright-repl-notif-printer".into())
         .spawn(move || {
-            // Drop the printer's sender when the channel closes (i.e.,
-            // RpcClient is being torn down) so the print queue does not
-            // grow forever.
-            while let Ok(notification) = notifications_rx.recv() {
-                let line = format_notification(&notification);
-                if notification_sender.send(line).is_err() {
-                    return;
+            use crossbeam_channel::RecvTimeoutError;
+            while !printer_stop_clone.load(Ordering::Relaxed) {
+                match notifications_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(notification) => {
+                        let line = format_notification(&notification);
+                        if notification_sender.send(line).is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
         })
@@ -128,6 +156,12 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
         .with_menu(menu)
         .with_edit_mode(edit_mode)
         .with_external_printer(external_printer);
+
+    // RAII guard so the printer thread is signaled regardless of which
+    // exit path `run` takes (clean `:quit`, Ctrl-D, reedline error, or a
+    // panic). Without it, the printer would park on `recv_timeout`
+    // indefinitely on the socket transport.
+    let _printer_guard = PrinterStopGuard(Arc::clone(&printer_stop));
 
     let prompt = PtywrightPrompt {
         transport_label: transport_label.clone(),
@@ -200,6 +234,18 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     }
 }
 
+/// RAII helper that flips the notification-printer thread's stop flag
+/// when this guard is dropped, so the printer cannot outlive a `run()`
+/// invocation that returned via any exit path (clean quit, error, or
+/// panic).
+struct PrinterStopGuard(Arc<AtomicBool>);
+
+impl Drop for PrinterStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn extract_plugin_names(value: &Value) -> Option<Vec<String>> {
     let plugins = value.get("plugins")?.as_array()?;
     Some(
@@ -210,23 +256,35 @@ fn extract_plugin_names(value: &Value) -> Option<Vec<String>> {
     )
 }
 
+/// Extract running adapter ids from an `adapter.live` response, skipping
+/// finished entries and malformed rows. Used to seed the completer cache
+/// and to drive the banner hint formatter.
+fn extract_live_ids(value: &Value) -> Vec<String> {
+    let Some(adapters) = value.get("adapters").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    adapters
+        .iter()
+        .filter(|entry| {
+            !entry
+                .get("finished")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            entry
+                .get("adapter")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
 /// Build the live-adapter hint shown under the banner. `None` when the
 /// server reports no live adapters (don't waste a banner row).
 fn format_live_hint(value: &Value) -> Option<String> {
-    let adapters = value.get("adapters")?.as_array()?;
-    let mut ids: Vec<String> = Vec::new();
-    for entry in adapters {
-        if entry
-            .get("finished")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if let Some(id) = entry.get("adapter").and_then(Value::as_str) {
-            ids.push(id.to_string());
-        }
-    }
+    let ids = extract_live_ids(value);
     if ids.is_empty() {
         return None;
     }
@@ -499,6 +557,22 @@ mod tests {
         assert!(hint.contains("e1"));
         assert!(hint.contains("e2"));
         assert!(hint.contains(":attach"));
+    }
+
+    #[test]
+    fn live_ids_drops_malformed_or_finished_entries() {
+        let value = json!({
+            "adapters": [
+                { "adapter": "e1", "finished": false },
+                { "adapter": "e2", "finished": true },
+                { "adapter": "", "finished": false },
+                { "plugin": "claude-code", "finished": false },
+                "not-an-object",
+                { "adapter": "e3", "finished": false }
+            ]
+        });
+        let ids = extract_live_ids(&value);
+        assert_eq!(ids, vec!["e1".to_string(), "e3".to_string()]);
     }
 
     #[test]

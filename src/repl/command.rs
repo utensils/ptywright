@@ -604,6 +604,10 @@ fn dispatch_meta(
                 json!({ "enabled": enabled }),
                 timeout,
             )?;
+            // Pause the client's heartbeat in lockstep — otherwise it
+            // would re-assert `set_notifications {enabled: true}` every
+            // interval and silently undo `:notifications off`.
+            client.set_heartbeat_enabled(enabled);
             Ok(CmdOutcome::Json(result))
         }
         MetaCmd::Live => session_live(client, timeout),

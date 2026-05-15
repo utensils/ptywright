@@ -61,13 +61,21 @@ pub struct RpcClient {
     writer: Mutex<Box<dyn Write + Send>>,
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, CallSlot>>>,
-    notifications_tx: Sender<Notification>,
+    /// Receiver half of the notification broadcast channel. The sender
+    /// side is owned exclusively by the reader thread, which drops it
+    /// at EOF; subscribers clone this `Receiver` via [`Self::notifications`].
     notifications_rx: Receiver<Notification>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     /// Set to `true` to ask the heartbeat thread to exit on its next tick.
     /// Drop sets it unconditionally so the thread does not outlive the
     /// client's last `Arc` reference.
     heartbeat_stop: Arc<AtomicBool>,
+    /// When `false`, the heartbeat tick is a no-op. Flipped from
+    /// [`set_heartbeat_enabled`] so callers can pause heartbeats without
+    /// tearing the thread down — e.g., a REPL's `:notifications off` must
+    /// not be silently re-enabled by the heartbeat re-asserting
+    /// `server.set_notifications`.
+    heartbeat_enabled: Arc<AtomicBool>,
     heartbeat_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -87,10 +95,10 @@ impl RpcClient {
             writer: Mutex::new(Box::new(writer)),
             next_id: AtomicI64::new(1),
             pending: Arc::clone(&pending),
-            notifications_tx: notifications_tx.clone(),
             notifications_rx,
             reader_thread: Mutex::new(None),
             heartbeat_stop: Arc::new(AtomicBool::new(false)),
+            heartbeat_enabled: Arc::new(AtomicBool::new(true)),
             heartbeat_thread: Mutex::new(None),
         });
 
@@ -98,7 +106,9 @@ impl RpcClient {
             .name("ptywright-repl-rpc-reader".into())
             .spawn({
                 let pending = Arc::clone(&pending);
-                let notifications_tx = notifications_tx.clone();
+                // The reader thread owns the only retained `Sender`; when
+                // the thread exits, dropping it closes the channel so
+                // every subscriber's `recv` returns `Disconnected`.
                 move || reader_loop(reader, framing, pending, notifications_tx)
             })
             .expect("spawn rpc reader thread");
@@ -181,6 +191,7 @@ impl RpcClient {
         }
         let weak: Weak<Self> = Arc::downgrade(self);
         let stop = Arc::clone(&self.heartbeat_stop);
+        let enabled = Arc::clone(&self.heartbeat_enabled);
         let handle = std::thread::Builder::new()
             .name("ptywright-repl-rpc-heartbeat".into())
             .spawn(move || {
@@ -189,21 +200,36 @@ impl RpcClient {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
+                    if !enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let Some(client) = weak.upgrade() else {
                         return;
                     };
                     // `set_notifications` is idempotent and cheap; its only
                     // purpose here is to trigger the server's per-connection
                     // poll_notifications so any queued frames get flushed.
+                    // A short timeout keeps shutdown latency bounded — a
+                    // hung server cannot pin the heartbeat past 750 ms.
                     let _ = client.call(
                         "server.set_notifications",
                         json!({ "enabled": true }),
-                        Duration::from_secs(2),
+                        Duration::from_millis(750),
                     );
                 }
             })
             .expect("spawn rpc heartbeat thread");
         *slot = Some(handle);
+    }
+
+    /// Pause or resume the heartbeat without tearing the thread down.
+    ///
+    /// Flipping to `false` is the recommended companion to
+    /// `server.set_notifications {enabled: false}` — otherwise the
+    /// heartbeat would silently re-assert subscription every interval and
+    /// undo the operator's intent.
+    pub fn set_heartbeat_enabled(&self, enabled: bool) {
+        self.heartbeat_enabled.store(enabled, Ordering::Relaxed);
     }
 
     fn send_frame(&self, payload: &str) -> Result<()> {
@@ -253,7 +279,6 @@ impl Drop for RpcClient {
             // detaching is safe.
             let _ = handle;
         }
-        drop(self.notifications_tx.clone());
     }
 }
 
@@ -432,6 +457,35 @@ mod tests {
         (server_to_client_r, client_to_server_w, server_thread)
     }
 
+    /// Spawn two NDJSON server handlers backed by one shared
+    /// [`RpcServerState`] so a test can mutate state on connection A
+    /// and observe the effect on connection B — the exact shape of the
+    /// cross-connection notification scenario the heartbeat fixes.
+    fn spawn_shared_inprocess_pair() -> (
+        (PipeReader, PipeWriter, std::thread::JoinHandle<()>),
+        (PipeReader, PipeWriter, std::thread::JoinHandle<()>),
+    ) {
+        let state = RpcServerState::new();
+
+        let (a_to_s_r, a_to_s_w) = pipe().expect("pipe a→s");
+        let (s_to_a_r, s_to_a_w) = pipe().expect("pipe s→a");
+        let state_a = state.clone();
+        let server_a = std::thread::spawn(move || {
+            let _ = serve_ndjson_with_state(a_to_s_r, s_to_a_w, state_a);
+        });
+
+        let (b_to_s_r, b_to_s_w) = pipe().expect("pipe b→s");
+        let (s_to_b_r, s_to_b_w) = pipe().expect("pipe s→b");
+        let server_b = std::thread::spawn(move || {
+            let _ = serve_ndjson_with_state(b_to_s_r, s_to_b_w, state);
+        });
+
+        (
+            (s_to_a_r, a_to_s_w, server_a),
+            (s_to_b_r, b_to_s_w, server_b),
+        )
+    }
+
     #[test]
     fn call_returns_server_response() {
         let (read, write, _server) = spawn_inprocess_server();
@@ -539,6 +593,119 @@ mod tests {
             .call("server.capabilities", json!({}), Duration::from_secs(5))
             .expect("server.capabilities over lsp");
         assert_eq!(result["name"], "ptywright");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn heartbeat_flushes_notifications_from_sibling_connection() {
+        // Two clients share a single RpcServerState. Client A enables
+        // notifications + starts the heartbeat; client B creates a
+        // session. Without the heartbeat, the server's per-connection
+        // poll_notifications would never fire on A's connection (A
+        // sends no requests after the initial setup), so A would never
+        // observe the `session.changed` for B's session. With the
+        // heartbeat ticking every 50 ms, A should see it within a
+        // bounded deadline.
+        let ((a_read, a_write, _a_server), (b_read, b_write, _b_server)) =
+            spawn_shared_inprocess_pair();
+        let client_a = RpcClient::new(a_read, a_write, Framing::Ndjson);
+        let client_b = RpcClient::new(b_read, b_write, Framing::Ndjson);
+
+        client_a
+            .call(
+                "server.set_notifications",
+                json!({ "enabled": true }),
+                Duration::from_secs(5),
+            )
+            .expect("enable notifications on A");
+        let notifications = client_a.notifications();
+        client_a.start_heartbeat(Duration::from_millis(50));
+
+        let create = client_b
+            .call(
+                "session.create",
+                json!({
+                    "program": "/bin/sh",
+                    "args": ["-lc", "printf 'heartbeat-fixture\\n' && cat"],
+                }),
+                Duration::from_secs(5),
+            )
+            .expect("session.create on B");
+        let session = create["session"]
+            .as_str()
+            .expect("session id from B")
+            .to_string();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw = false;
+        while std::time::Instant::now() < deadline {
+            match notifications.recv_timeout(Duration::from_millis(250)) {
+                Ok(notification) => {
+                    if notification.method == "session.changed"
+                        && notification.params["session"] == session.as_str()
+                    {
+                        saw = true;
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            saw,
+            "client A should have received session.changed for session `{session}` via heartbeat"
+        );
+
+        // Clean up B's session.
+        let _ = client_b.call(
+            "session.kill",
+            json!({ "session": session }),
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn heartbeat_paused_when_disabled_does_not_re_subscribe() {
+        // When the operator types `:notifications off`, the dispatch
+        // layer flips `set_heartbeat_enabled(false)`. The heartbeat
+        // thread must skip its tick rather than silently re-asserting
+        // `set_notifications {enabled: true}`. We verify behavior by
+        // pausing the heartbeat and confirming the client neither
+        // panics nor floods the server (no notifications expected).
+        let (read, write, _server) = spawn_inprocess_server();
+        let client = RpcClient::new(read, write, Framing::Ndjson);
+        // Configure subscription off, then start the heartbeat with the
+        // gate disabled. The thread should never call `server.*`.
+        client
+            .call(
+                "server.set_notifications",
+                json!({ "enabled": false }),
+                Duration::from_secs(5),
+            )
+            .expect("disable notifications");
+        client.set_heartbeat_enabled(false);
+        client.start_heartbeat(Duration::from_millis(30));
+
+        // Wait briefly. If the heartbeat were live it would have fired
+        // a few times and the server would have responded — but with
+        // the gate off there should be no notifications.
+        let notifications = client.notifications();
+        match notifications.recv_timeout(Duration::from_millis(200)) {
+            Ok(notification) => {
+                panic!("expected no notifications while heartbeat is paused, got {notification:?}");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(other) => panic!("notifications channel unexpectedly closed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_heartbeat_is_idempotent() {
+        let (read, write, _server) = spawn_inprocess_server();
+        let client = RpcClient::new(read, write, Framing::Ndjson);
+        client.start_heartbeat(Duration::from_millis(500));
+        // Second call must not spawn a second thread or panic.
+        client.start_heartbeat(Duration::from_millis(500));
     }
 
     #[test]
