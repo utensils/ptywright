@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::action::Action;
 use crate::adapters::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use crate::error::{Error, Result};
+use crate::extension::{ExtensionHandle, LuaExtension};
 use crate::matcher::Matcher;
 use crate::plugin::{PluginHostCapabilities, PluginManifest};
 use crate::redaction::RedactionPolicy;
@@ -17,6 +18,16 @@ use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
 use crate::transcript::TranscriptFileConfig;
 use crate::{NAME, VERSION};
+
+/// `completed_turn_stable_ms` forwarded to plugins via the `ExtensionHandle`.
+/// Mirrors the historic Claude Code value; safe to keep generic because
+/// plugins can override their own stability window through the matcher.
+const ADAPTER_COMPLETED_TURN_STABLE_MS: u64 = 300;
+
+/// Default wait-intent invoked by `adapter.wait` when the caller does not
+/// supply one. Matches the conventional plugin function name; specific
+/// plugins are free to expose other named intents.
+const DEFAULT_WAIT_INTENT: &str = "wait_turn_matcher";
 
 const JSONRPC_VERSION: &str = "2.0";
 
@@ -43,11 +54,31 @@ impl Default for RpcSharedState {
 /// Stateful JSON-RPC handler for one client connection.
 pub struct RpcServer {
     shared: RpcServerState,
+    /// Claude Code adapters registered via the legacy `claude.*` surface.
+    /// Kept alongside the generic `extensions` map until callers migrate to
+    /// `adapter.*`; both surfaces use the same underlying [`ExtensionHandle`]
+    /// internally but the registries are namespaced to avoid id collisions.
     claude_adapters: HashMap<String, ClaudeCodeAdapter>,
     next_claude_adapter: u64,
+    /// Generic plugin-backed extension handles registered via `adapter.*`.
+    /// IDs are independent of `claude_adapters` (different namespace) and
+    /// carry the plugin name in the handle for future `adapter.list`-style
+    /// introspection.
+    extensions: HashMap<String, ExtensionEntry>,
+    next_extension_id: u64,
     notifications_enabled: bool,
     last_notified_sequences: HashMap<String, u64>,
     notified_exits: HashSet<String>,
+}
+
+/// Per-adapter row stored in the `extensions` registry.
+///
+/// We keep the plugin name alongside the handle so `adapter.list` /
+/// `adapter.inspect` responses can include it without forcing every plugin to
+/// re-expose its manifest through the Extension trait.
+struct ExtensionEntry {
+    plugin: String,
+    handle: ExtensionHandle,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +192,69 @@ struct NotificationsParams {
     enabled: bool,
 }
 
+// ---- adapter.* (generic plugin-backed) params ---------------------------
+//
+// The `adapter.*` surface is the plugin-name-aware sibling of `claude.*`.
+// Callers select a plugin manifest by name, the server instantiates a fresh
+// [`ExtensionHandle`] around a [`Session`], and subsequent calls reference
+// the handle by id. `claude.*` methods continue to work as deprecated
+// aliases (they will be migrated to internally route through this registry
+// in a follow-up commit per the SPEC).
+
+#[derive(Debug, Deserialize)]
+struct AdapterStartParams {
+    /// Built-in plugin manifest name, e.g. `"claude-code"`.
+    plugin: String,
+    /// PTY program to spawn. If omitted, the server picks a sensible default
+    /// based on `plugin` (`claude-code` → `"claude"`); pass explicitly for
+    /// any plugin that doesn't have a host-known default.
+    program: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    pixel_width: Option<u16>,
+    pixel_height: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdapterParams {
+    adapter: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdapterSendParams {
+    adapter: String,
+    intent: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdapterWaitParams {
+    adapter: String,
+    /// Plugin function used to construct the wait matcher. Defaults to the
+    /// conventional `wait_turn_matcher` so callers can omit it for the
+    /// common turn-boundary wait.
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    params: Value,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdapterReadParams {
+    adapter: String,
+    /// Whether to redact sensitive-looking output fields. Defaults to true.
+    redact: Option<bool>,
+    /// Optional caller-supplied redaction additions/replacement for this read.
+    redaction: Option<RedactionPolicy>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RpcErrorCode {
     ParseError,
@@ -208,6 +302,8 @@ impl RpcServer {
             shared,
             claude_adapters: HashMap::new(),
             next_claude_adapter: 1,
+            extensions: HashMap::new(),
+            next_extension_id: 1,
             notifications_enabled: false,
             last_notified_sequences: HashMap::new(),
             notified_exits: HashSet::new(),
@@ -343,6 +439,15 @@ impl RpcServer {
                     "claude.snapshot",
                     "claude.transcript",
                     "claude.inspect",
+                    "adapter.list",
+                    "adapter.start",
+                    "adapter.state",
+                    "adapter.send",
+                    "adapter.wait",
+                    "adapter.snapshot",
+                    "adapter.transcript",
+                    "adapter.inspect",
+                    "adapter.close",
                     "plugin.capabilities",
                     "plugin.validate_manifest"
                 ],
@@ -368,6 +473,15 @@ impl RpcServer {
             "claude.snapshot" => self.claude_snapshot(request.params),
             "claude.transcript" => self.claude_transcript(request.params),
             "claude.inspect" => self.claude_inspect(request.params),
+            "adapter.list" => Ok(self.adapter_list()),
+            "adapter.start" => self.adapter_start(request.params),
+            "adapter.state" => self.adapter_state(request.params),
+            "adapter.send" => self.adapter_send(request.params),
+            "adapter.wait" => self.adapter_wait(request.params),
+            "adapter.snapshot" => self.adapter_snapshot(request.params),
+            "adapter.transcript" => self.adapter_transcript(request.params),
+            "adapter.inspect" => self.adapter_inspect(request.params),
+            "adapter.close" => self.adapter_close(request.params),
             "plugin.capabilities" => Ok(json!(PluginHostCapabilities::current())),
             "plugin.validate_manifest" => self.plugin_validate_manifest(request.params),
             _ => Err((
@@ -804,6 +918,253 @@ impl RpcServer {
         let id = format!("c{}", self.next_claude_adapter);
         self.next_claude_adapter += 1;
         id
+    }
+
+    fn allocate_extension_id(&mut self) -> String {
+        let id = format!("e{}", self.next_extension_id);
+        self.next_extension_id += 1;
+        id
+    }
+
+    fn extension(&self, id: &str) -> std::result::Result<&ExtensionEntry, (RpcErrorCode, String)> {
+        self.extensions.get(id).ok_or_else(|| {
+            (
+                RpcErrorCode::InvalidParams,
+                format!("unknown adapter: {id}"),
+            )
+        })
+    }
+
+    fn extension_mut(
+        &mut self,
+        id: &str,
+    ) -> std::result::Result<&mut ExtensionEntry, (RpcErrorCode, String)> {
+        self.extensions.get_mut(id).ok_or_else(|| {
+            (
+                RpcErrorCode::InvalidParams,
+                format!("unknown adapter: {id}"),
+            )
+        })
+    }
+
+    // ---- adapter.* handlers ---------------------------------------------
+
+    /// `adapter.list` — enumerate the built-in plugin manifests this server
+    /// can instantiate. Reused by introspection clients before calling
+    /// `adapter.start`.
+    fn adapter_list(&self) -> Value {
+        let capabilities = PluginHostCapabilities::current();
+        json!({ "plugins": capabilities.builtin_plugins })
+    }
+
+    /// `adapter.start` — spawn a PTY session and wrap it in an
+    /// [`ExtensionHandle`] for the requested plugin. Returns the allocated
+    /// adapter id plus the initial classified state.
+    fn adapter_start(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterStartParams = parse_params(params)?;
+        let extension = LuaExtension::built_in(&params.plugin).map_err(rpc_error_from_error)?;
+        let program = params
+            .program
+            .or_else(|| default_program_for_plugin(&params.plugin))
+            .ok_or_else(|| {
+                (
+                    RpcErrorCode::InvalidParams,
+                    format!(
+                        "no host-known default program for plugin `{plugin}`; pass `program` explicitly",
+                        plugin = params.plugin,
+                    ),
+                )
+            })?;
+        let size = TerminalSize {
+            rows: params.rows.unwrap_or(40),
+            cols: params.cols.unwrap_or(120),
+            pixel_width: params.pixel_width.unwrap_or(0),
+            pixel_height: params.pixel_height.unwrap_or(0),
+        };
+        let mut target = Target::new(program).args(params.args).size(size);
+        target.cwd = params.cwd;
+        target.env = params.env;
+        let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
+        let handle = ExtensionHandle::start(
+            Box::new(extension),
+            session,
+            ADAPTER_COMPLETED_TURN_STABLE_MS,
+        );
+        let state = handle.state();
+        let id = self.allocate_extension_id();
+        self.extensions.insert(
+            id.clone(),
+            ExtensionEntry {
+                plugin: params.plugin.clone(),
+                handle,
+            },
+        );
+        Ok(json!({
+            "adapter": id,
+            "plugin": params.plugin,
+            "state": state,
+        }))
+    }
+
+    /// `adapter.state` — re-classify and return the current state without
+    /// applying any actions.
+    fn adapter_state(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterParams = parse_params(params)?;
+        let entry = self.extension(&params.adapter)?;
+        Ok(json!({ "state": entry.handle.state() }))
+    }
+
+    /// `adapter.send` — invoke a named plugin intent (e.g. `send_prompt`,
+    /// `approve`, `deny`, `cancel`) and return the post-apply state. Replaces
+    /// the bespoke `claude.send_prompt` / `claude.approve` / etc. by taking
+    /// the intent name as a string.
+    fn adapter_send(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterSendParams = parse_params(params)?;
+        let intent = params.intent.clone();
+        let state = self
+            .extension_mut(&params.adapter)?
+            .handle
+            .send(&intent, params.params)
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "state": state }))
+    }
+
+    /// `adapter.wait` — block until the plugin's named matcher fires or the
+    /// timeout expires, then classify and return the resulting state. The
+    /// intent defaults to `wait_turn_matcher` so simple callers can omit it.
+    fn adapter_wait(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterWaitParams = parse_params(params)?;
+        let intent = params
+            .intent
+            .unwrap_or_else(|| DEFAULT_WAIT_INTENT.to_string());
+        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(120_000));
+        let state = self
+            .extension(&params.adapter)?
+            .handle
+            .wait(&intent, params.params, timeout)
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "state": state }))
+    }
+
+    /// `adapter.snapshot` — passthrough to the adapter's underlying session
+    /// snapshot. Mirrors `session.snapshot`'s redaction semantics.
+    fn adapter_snapshot(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterReadParams = parse_params(params)?;
+        let entry = self.extension(&params.adapter)?;
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
+        let mut snapshot = entry.handle.session().snapshot();
+        if let Some(policy) = policy {
+            snapshot = snapshot.redacted(&policy);
+        }
+        serde_json::to_value(snapshot)
+            .map_err(|error| (RpcErrorCode::InternalError, error.to_string()))
+    }
+
+    /// `adapter.transcript` — passthrough to the adapter's underlying session
+    /// transcript. Mirrors `session.transcript`'s redaction semantics.
+    fn adapter_transcript(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterReadParams = parse_params(params)?;
+        let entry = self.extension(&params.adapter)?;
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
+        let session = entry.handle.session();
+        let text = if let Some(policy) = policy {
+            session.redacted_transcript(&policy)
+        } else {
+            session.transcript()
+        };
+        Ok(json!({ "text": text }))
+    }
+
+    /// `adapter.inspect` — diagnostic dump. Returns the current classified
+    /// state plus the body/status split the classifier would see, so callers
+    /// can reproduce a misclassification without spinning up a parallel
+    /// `session.*` session.
+    fn adapter_inspect(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterReadParams = parse_params(params)?;
+        let entry = self.extension(&params.adapter)?;
+        let session = entry.handle.session();
+        let snapshot = session.snapshot();
+        let transcript = session.transcript();
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
+        let tail_start = transcript.len().saturating_sub(4096);
+        let mut transcript_tail = transcript[tail_start..].to_string();
+        let mut plain_text = snapshot.plain_text.clone();
+        if let Some(policy) = policy {
+            plain_text = policy.redact(&plain_text);
+            transcript_tail = policy.redact(&transcript_tail);
+        }
+        let (body_text, status_text) = crate::extension::split_status_bar_for_inspect(&plain_text);
+        Ok(json!({
+            "adapter": params.adapter,
+            "plugin": entry.plugin,
+            "state": entry.handle.state(),
+            "plain_text": plain_text,
+            "body_text": body_text,
+            "status_text": status_text,
+            "transcript_tail": transcript_tail,
+            "sequence": snapshot.sequence,
+        }))
+    }
+
+    /// `adapter.close` — drop the handle and its session. Subsequent calls
+    /// against the same adapter id return InvalidParams.
+    fn adapter_close(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: AdapterParams = parse_params(params)?;
+        if self.extensions.remove(&params.adapter).is_some() {
+            Ok(json!({ "closed": true }))
+        } else {
+            Err((
+                RpcErrorCode::InvalidParams,
+                format!("unknown adapter: {}", params.adapter),
+            ))
+        }
+    }
+}
+
+/// Host-known default executable to spawn when `adapter.start` is invoked
+/// without an explicit `program`. Mirrors the existing `claude.start`
+/// behaviour where `program` defaults to `"claude"` for the Claude Code
+/// adapter. Unknown plugins return `None`, forcing the caller to specify.
+fn default_program_for_plugin(plugin: &str) -> Option<String> {
+    match plugin {
+        "claude-code" => Some("claude".to_string()),
+        _ => None,
     }
 }
 
@@ -1329,6 +1690,158 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":99,"method":"claude.cancel","params":{{"claude":"{claude}"}}}}"#
             ),
         );
+    }
+
+    #[test]
+    fn adapter_list_includes_built_in_claude_code_plugin() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.list"}"#,
+        );
+
+        let plugins = response["result"]["plugins"]
+            .as_array()
+            .expect("adapter.list must return a plugins array");
+        assert!(
+            plugins.iter().any(|p| p["name"] == "claude-code"),
+            "adapter.list must include the built-in claude-code plugin; got {plugins:#?}"
+        );
+    }
+
+    #[test]
+    fn adapter_start_rejects_unknown_plugin() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"does-not-exist","program":"/bin/sh"}}"#,
+        );
+
+        assert_eq!(response["error"]["code"], -32603);
+        let message = response["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("no built-in Lua extension"),
+            "error message should name the missing plugin; got `{message}`"
+        );
+    }
+
+    #[test]
+    fn adapter_methods_for_unknown_adapter_return_invalid_params() {
+        // Mirror the claude.* coverage so the new dispatcher arms can't
+        // silently regress for a missing adapter id.
+        for (id, method) in [
+            (30, "adapter.state"),
+            (31, "adapter.snapshot"),
+            (32, "adapter.transcript"),
+            (33, "adapter.inspect"),
+            (34, "adapter.close"),
+        ] {
+            let mut server = RpcServer::new();
+            let response = handle(
+                &mut server,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"adapter":"missing"}}}}"#
+                ),
+            );
+            assert_eq!(
+                response["error"]["code"], -32602,
+                "{method} should reject unknown adapter with InvalidParams"
+            );
+        }
+        // send/wait take additional required fields beyond `adapter`, so
+        // cover them with their full param shape.
+        let mut server = RpcServer::new();
+        let send = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":40,"method":"adapter.send","params":{"adapter":"missing","intent":"approve","params":{}}}"#,
+        );
+        assert_eq!(send["error"]["code"], -32602);
+        let wait = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":41,"method":"adapter.wait","params":{"adapter":"missing","intent":"wait_turn_matcher","timeout_ms":100}}"#,
+        );
+        assert_eq!(wait["error"]["code"], -32602);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adapter_lifecycle_round_trips_through_generic_surface() {
+        // End-to-end smoke for the adapter.* surface against a /bin/sh
+        // stand-in. Exercises start → state → snapshot → transcript →
+        // inspect → close without touching the legacy claude.* methods. The
+        // shell prints a fixture line then `cat`s stdin so it stays alive
+        // long enough for the read methods to observe state.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'adapter-fixture\\n' && cat"]}}"#,
+        );
+        let adapter = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start must return an adapter id");
+        assert_eq!(start["result"]["plugin"], "claude-code");
+        assert!(
+            start["result"]["state"].is_object(),
+            "adapter.start must return an initial state snapshot"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let state = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.state","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+        assert!(state["result"]["state"]["state"].is_string());
+
+        let snapshot = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"adapter.snapshot","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+        assert!(snapshot["result"]["plain_text"].is_string());
+
+        let transcript = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"adapter.transcript","params":{{"adapter":"{adapter}","redact":false}}}}"#
+            ),
+        );
+        let text = transcript["result"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("adapter-fixture"),
+            "adapter.transcript must include the underlying bytes; got `{text}`"
+        );
+
+        let inspect = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"adapter.inspect","params":{{"adapter":"{adapter}","redact":false}}}}"#
+            ),
+        );
+        assert_eq!(inspect["result"]["plugin"], "claude-code");
+        assert_eq!(inspect["result"]["adapter"], adapter);
+        assert!(inspect["result"]["body_text"].is_string());
+        assert!(inspect["result"]["status_text"].is_string());
+
+        let close = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":6,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+        assert_eq!(close["result"]["closed"], true);
+
+        // After close, subsequent calls against the same id must reject.
+        let after_close = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"adapter.state","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+        assert_eq!(after_close["error"]["code"], -32602);
     }
 
     #[test]
