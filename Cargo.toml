@@ -54,6 +54,13 @@ reedline = { version = "0.47", optional = true, default-features = false, featur
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"
 
+[target.'cfg(unix)'.dependencies]
+# Direct dep so `serve --socket` can install SIGINT/SIGTERM handlers that
+# unlink the socket file on graceful exit. libc is already in the tree
+# transitively, but pinning it directly keeps the signal-handler call
+# site honest under future `cargo update`s.
+libc = "0.2"
+
 [[bin]]
 name = "ptywright-echo-tui"
 path = "tests/fixtures/echo_tui/main.rs"

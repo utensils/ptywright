@@ -34,8 +34,9 @@ pub fn connect(path: &Path) -> Result<SocketTransport> {
         )),
         std::io::ErrorKind::ConnectionRefused => Error::Rpc(format!(
             "socket {path} exists but is not accepting connections — \
-             is a stale server file lingering? Remove it and re-run \
-             `ptywright serve --socket {path}`.",
+             a previous server probably exited without cleaning up. Run \
+             `ptywright serve` (or `ptywright serve --socket {path}`) and \
+             it will reclaim the stale socket automatically before binding.",
             path = path.display(),
         )),
         std::io::ErrorKind::PermissionDenied => Error::Rpc(format!(

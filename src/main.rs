@@ -354,6 +354,59 @@ fn serve_command(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Backing storage for the socket-cleanup signal handler. Declared at
+/// module scope so the C-ABI shim ([`handle_shutdown_signal`]) can reach
+/// it — signal handlers cannot capture environment.
+#[cfg(unix)]
+static SOCKET_CLEANUP_PATH: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(signum: libc::c_int) {
+    if let Some(slot) = SOCKET_CLEANUP_PATH.get()
+        && let Ok(guard) = slot.lock()
+        && let Some(path) = guard.as_ref()
+    {
+        // Best-effort unlink. The path was the one we bound; if it is
+        // gone or a different file, we silently move on.
+        let _ = std::fs::remove_file(path);
+    }
+    // Use `_exit` rather than `exit` so we do not run Drop handlers
+    // (Rust destructors are not async-signal-safe). 128 + signum is the
+    // conventional shell exit code for signal-terminated processes.
+    unsafe { libc::_exit(128 + signum) }
+}
+
+/// Install SIGINT/SIGTERM/SIGHUP handlers that unlink the listening
+/// socket before the process exits, so a clean Ctrl-C does not leave a
+/// dead socket file behind. Server startup already cleans up stale
+/// sockets (see [`serve_socket`]), so this is a UX nicety rather than a
+/// correctness requirement.
+///
+/// Calling this twice replaces the recorded path but leaves the signal
+/// handlers in place.
+#[cfg(unix)]
+fn install_socket_cleanup(path: &Path) {
+    let slot = SOCKET_CLEANUP_PATH.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(path.to_path_buf());
+    }
+
+    static HANDLERS_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    HANDLERS_INSTALLED.get_or_init(|| {
+        // SAFETY: `signal` is async-signal-safe. The handler only
+        // touches an atomic OnceLock + `_exit`, both safe from a signal
+        // handler. Replacing the default SIGINT/SIGTERM/SIGHUP
+        // dispositions is intentional — we want clean shutdown.
+        let handler = handle_shutdown_signal as *const () as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGHUP, handler);
+        }
+    });
+}
+
 #[cfg(unix)]
 fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
     use std::os::unix::fs::FileTypeExt;
@@ -371,6 +424,7 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
     }
 
     let listener = UnixListener::bind(path)?;
+    install_socket_cleanup(path);
     let state = RpcServerState::new();
     tracing::info!(socket = %path.display(), "ptywright: listening on local socket");
     for stream in listener.incoming() {

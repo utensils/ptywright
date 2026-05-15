@@ -852,6 +852,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "interprocess",
+ "libc",
  "mlua",
  "nu-ansi-term",
  "portable-pty",
