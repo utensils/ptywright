@@ -21,7 +21,7 @@ use crate::action::Action;
 use crate::error::{Error, Result};
 use crate::lua_plugin::LuaPlugin;
 use crate::matcher::Matcher;
-use crate::plugin::{PluginManifest, builtin_manifests};
+use crate::plugin::{BUILTIN_PLUGINS, PluginManifest};
 use crate::session::Session;
 
 /// Bottom rows of a rendered screen treated as the status bar.
@@ -184,22 +184,17 @@ impl LuaExtension {
     /// of plugins bundled into the binary. Returns an error if the requested
     /// built-in is not known.
     ///
-    /// Looks up the manifest in [`builtin_manifests`] and pairs it with the
-    /// embedded Lua source via [`builtin_source_for`]. Adding a new built-in
-    /// is a one-line addition to each of those two registries — no
-    /// per-plugin Rust code is required here.
+    /// Looks up the manifest + embedded source in
+    /// [`BUILTIN_PLUGINS`](crate::plugin::BUILTIN_PLUGINS). Adding a new
+    /// built-in is a one-line addition to that slice — no per-plugin Rust
+    /// code is required here.
     pub fn built_in(name: &str) -> Result<Self> {
-        let manifest = builtin_manifests()
-            .into_iter()
-            .find(|manifest| manifest.name == name)
+        let entry = BUILTIN_PLUGINS
+            .iter()
+            .find(|entry| (entry.manifest)().name == name)
             .ok_or_else(|| Error::Lua(format!("no built-in Lua extension named `{name}`")))?;
-        let source = builtin_source_for(&manifest.name).ok_or_else(|| {
-            Error::Lua(format!(
-                "built-in plugin `{}` has no embedded Lua source",
-                manifest.name
-            ))
-        })?;
-        let plugin = LuaPlugin::trusted(&manifest, source)?;
+        let manifest = (entry.manifest)();
+        let plugin = LuaPlugin::trusted(&manifest, entry.source)?;
         Ok(Self::new(plugin, manifest))
     }
 
@@ -209,19 +204,6 @@ impl LuaExtension {
     #[must_use]
     pub fn plugin(&self) -> &LuaPlugin {
         &self.plugin
-    }
-}
-
-/// Embedded Lua source for a built-in plugin name.
-///
-/// Paired with [`builtin_manifests`](crate::plugin::builtin_manifests):
-/// every manifest in that registry must have a corresponding source arm
-/// here so [`LuaExtension::built_in`] can resolve `name -> source`. Adding
-/// a second built-in is a one-line addition to each function.
-pub(crate) fn builtin_source_for(name: &str) -> Option<&'static str> {
-    match name {
-        "claude-code" => Some(include_str!("../plugins/claude-code/main.lua")),
-        _ => None,
     }
 }
 
@@ -553,6 +535,20 @@ mod tests {
             Ok(_) => panic!("unknown built-in should not load"),
             Err(error) => assert!(matches!(error, Error::Lua(_))),
         }
+    }
+
+    #[test]
+    fn plugin_accessor_exposes_underlying_lua_plugin() {
+        // Downstream callers (and integration tests) need access to the
+        // wrapped LuaPlugin for permission introspection and direct
+        // function calls that aren't part of the Extension trait surface.
+        let extension = LuaExtension::built_in("claude-code").expect("built-in claude-code");
+        assert!(
+            extension
+                .plugin()
+                .has_permission(&crate::plugin::PluginPermission::SessionSpawn),
+            "claude-code manifest declares session.spawn",
+        );
     }
 
     /// Regression: serialising a [`ClassifyContext`] with `last_intent = None`

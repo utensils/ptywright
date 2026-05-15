@@ -1340,11 +1340,7 @@ mod tests {
         let claude = plugins
             .iter()
             .find(|p| p["name"] == "claude-code")
-            .unwrap_or_else(|| {
-                panic!(
-                    "adapter.list must include the built-in claude-code plugin; got {plugins:#?}"
-                )
-            });
+            .expect("adapter.list must include the built-in claude-code plugin");
         // The manifest declares default_target so adapter.start can spawn
         // claude-code without an explicit program. Lock that wiring in
         // here — without it the RPC surface would force every caller to
@@ -1353,6 +1349,45 @@ mod tests {
             claude["default_target"]["program"], "claude",
             "claude-code manifest must declare its default program"
         );
+    }
+
+    #[test]
+    fn adapter_start_uses_manifest_default_program_and_args_when_caller_omits_them() {
+        // Lock in the no-program/no-args branch of adapter.start so callers
+        // can spawn the built-in claude-code plugin with just `{"plugin":
+        // "claude-code"}`. Exercises both `params.program.or_else(...)` and
+        // `params.args.unwrap_or_else(...)`. Whether `claude` actually
+        // resolves on PATH varies by environment, so this test accepts
+        // either a successful spawn (with cleanup) or an internal spawn
+        // error — what we're verifying is that resolution *succeeded* and
+        // no InvalidParams "no host-known default" error fired.
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code"}}"#,
+        );
+        if let Some(error) = response.get("error") {
+            let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            assert_ne!(
+                code, -32602,
+                "manifest default_target must satisfy resolution; \
+                 InvalidParams indicates the fallback never ran (got error {error:?})",
+            );
+        }
+        if let Some(adapter) = response
+            .get("result")
+            .and_then(|r| r.get("adapter"))
+            .and_then(|a| a.as_str())
+        {
+            // claude is installed in this environment; clean up so the
+            // spawned process doesn't outlive the test.
+            let _ = handle(
+                &mut server,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+                ),
+            );
+        }
     }
 
     #[test]

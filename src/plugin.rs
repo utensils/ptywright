@@ -184,15 +184,39 @@ pub enum PluginManifestError {
     DuplicatePermission(String),
 }
 
+/// Built-in plugin registry entry: pairs a manifest constructor with the
+/// embedded Lua source for that plugin.
+///
+/// Co-locating the two in a single registry guarantees every registered
+/// plugin has a loadable source — there is no defensive "manifest exists
+/// but source is missing" branch to maintain.
+pub(crate) struct BuiltinPlugin {
+    pub manifest: fn() -> PluginManifest,
+    pub source: &'static str,
+}
+
+/// Every Lua plugin embedded in this binary. Adding a new built-in plugin
+/// is a single struct-literal entry here — the manifest constructor and the
+/// embedded source travel together so the registry can't be partially
+/// populated.
+pub(crate) const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[BuiltinPlugin {
+    manifest: claude_code_manifest,
+    source: include_str!("../plugins/claude-code/main.lua"),
+}];
+
 /// Manifests for every Lua plugin embedded in this binary.
 ///
-/// Adding a new built-in plugin is a one-line addition here plus a matching
-/// arm in [`builtin_source_for`](crate::extension::builtin_source_for) so the
-/// embedded source can be loaded by name. No application-specific Rust code
-/// belongs anywhere else in the core.
+/// Thin convenience wrapper over [`BUILTIN_PLUGINS`] for callers that only
+/// need the manifest metadata (e.g. `adapter.list`,
+/// `plugin.capabilities`). To load a plugin by name use
+/// [`crate::extension::LuaExtension::built_in`], which consults the same
+/// registry and pairs the manifest with the embedded source in one step.
 #[must_use]
 pub fn builtin_manifests() -> Vec<PluginManifest> {
-    vec![claude_code_manifest()]
+    BUILTIN_PLUGINS
+        .iter()
+        .map(|entry| (entry.manifest)())
+        .collect()
 }
 
 /// Manifest for the built-in Lua Claude Code adapter.
