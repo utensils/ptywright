@@ -483,6 +483,7 @@ mod tests {
             runtime: Some(PluginRuntime::Lua),
             entrypoint: Some("main.lua".to_string()),
             permissions: vec![PluginPermission::MatcherWait],
+            default_target: None,
         };
         let plugin = LuaPlugin::trusted(
             &manifest,
@@ -518,6 +519,7 @@ mod tests {
             runtime: Some(PluginRuntime::Wasm),
             entrypoint: Some("main.wasm".to_string()),
             permissions: Vec::new(),
+            default_target: None,
         };
 
         let error = LuaPlugin::trusted(&manifest, "return {}").expect_err("runtime rejected");
@@ -535,6 +537,7 @@ mod tests {
             runtime: Some(PluginRuntime::Lua),
             entrypoint: Some("../main.lua".to_string()),
             permissions: Vec::new(),
+            default_target: None,
         };
 
         let error =
@@ -566,6 +569,7 @@ mod tests {
             runtime: Some(PluginRuntime::Lua),
             entrypoint: Some("link/main.lua".to_string()),
             permissions: Vec::new(),
+            default_target: None,
         };
 
         let error = LuaPlugin::load_trusted(&root, &manifest).expect_err("symlink rejected");

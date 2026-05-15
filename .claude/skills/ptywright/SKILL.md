@@ -7,7 +7,7 @@ allowed-tools: Bash, Read, Glob, Grep
 
 # ptywright — Headless PTY/TUI Automation CLI
 
-ptywright spawns interactive terminal programs in a real PTY, parses their screen state with a `vt100`-backed engine, sends input as deterministic actions, and waits on screen/transcript/lifecycle matchers. It exposes a JSON-RPC 2.0 server over stdio or a local socket so agents can drive any TUI — and ships a Lua-backed Claude Code adapter on top of the same primitives.
+ptywright spawns interactive terminal programs in a real PTY, parses their screen state with a `vt100`-backed engine, sends input as deterministic actions, and waits on screen/transcript/lifecycle matchers. It exposes a JSON-RPC 2.0 server over stdio or a local socket so agents can drive any TUI — and ships a built-in Lua plugin (`claude-code`) for interactive Claude Code automation. There is no per-application Rust shim; every TUI plugin is driven through the generic `adapter.*` JSON-RPC surface.
 
 ## Quick Reference
 
@@ -28,7 +28,7 @@ ptywright completions zsh                                     # Generate complet
 Parse `$ARGUMENTS` to pick a path:
 
 - If the user describes a **TUI to drive** (e.g. "spawn `htop` and wait until the header renders", "drive Claude Code through a prompt"), use the `serve --stdio` JSON-RPC server piped through `jq`. Never use `ptywright run` for automation — `run` is a live tty bridge for humans.
-- If the user mentions **Claude Code**, prefer the generic `adapter.*` surface with `plugin: "claude-code"` (or the equivalent `claude.*` aliases) over rebuilding turn detection from `session.*` primitives. See the [Claude Code adapter pattern](#drive-claude-code-end-to-end) and [test matrix](#claude-code-adapter-test-matrix) — this is the most-exercised path in the project today.
+- If the user mentions **Claude Code**, use the generic `adapter.*` surface with `plugin: "claude-code"` rather than rebuilding turn detection from `session.*` primitives. See the [Claude Code plugin pattern](#drive-claude-code-end-to-end) and [test matrix](#claude-code-plugin-test-matrix) — this is the most-exercised path in the project today.
 - If `$ARGUMENTS` starts with a **subcommand** (`run`, `serve`, `completions`), pass it through.
 - If `$ARGUMENTS` is empty, run `ptywright --help`.
 
@@ -65,7 +65,7 @@ Same protocol, but over a local IPC endpoint:
 - **macOS/Linux**: Unix domain socket. Stale socket files are removed on startup; non-socket files are refused.
 - **Windows**: named pipe via the `interprocess` crate. Use a name like `\\.\pipe\ptywright`.
 
-Multiple clients can connect concurrently. **Only `session.*` ids are shared across connections** (via `RpcServerState`); `claude.*` adapter ids and `adapter.*` extension ids live in per-connection registries and cannot be looked up from a sibling socket client. If you need a long-lived adapter handle, keep one client open and serialise calls through it. Each connection also owns its own framing/subscription state.
+Multiple clients can connect concurrently. **Only `session.*` ids are shared across connections** (via `RpcServerState`); `adapter.*` extension ids live in per-connection registries and cannot be looked up from a sibling socket client. If you need a long-lived adapter handle, keep one client open and serialise calls through it. Each connection also owns its own framing/subscription state.
 
 ### `ptywright completions <shell>`
 
@@ -104,9 +104,6 @@ Live shape (verified against ptywright 0.1.0):
               "adapter.list", "adapter.start", "adapter.state",
               "adapter.send", "adapter.wait", "adapter.snapshot",
               "adapter.transcript", "adapter.inspect", "adapter.close",
-              "claude.start", "claude.send_prompt", "claude.wait_turn",
-              "claude.approve", "claude.deny", "claude.cancel", "claude.state",
-              "claude.snapshot", "claude.transcript", "claude.inspect",
               "plugin.capabilities", "plugin.validate_manifest"],
   "notifications": ["session.changed", "session.exited"]
 }
@@ -137,9 +134,9 @@ Live shape (verified against ptywright 0.1.0):
 
 Defaults: `rows=24, cols=80, timeout_ms=30000`. Transcript is bounded in memory (128 KiB UTF-8 by default; tune via `transcript_max_chars`). `raw_transcript_path` enables raw file streaming and requires `raw_transcript_append` when re-opening an existing path.
 
-#### `adapter.*` — generic plugin-backed adapter surface
+#### `adapter.*` — generic plugin-backed surface
 
-The plugin-name-aware entry point. Pick this for new code: any built-in plugin (today, `claude-code`) can be driven through it, and the same `intent` plus `params` shape works across plugins.
+The single plugin-driving surface. Any built-in plugin (today, `claude-code`) is driven through it. The same `intent` plus `params` shape works across plugins; no per-application RPC namespace exists.
 
 | Method | Params | Returns |
 | --- | --- | --- |
@@ -153,34 +150,21 @@ The plugin-name-aware entry point. Pick this for new code: any built-in plugin (
 | `adapter.inspect` | `{adapter, redact?, redaction?}` | `{adapter, plugin, state, plain_text, body_text, status_text, transcript_tail, sequence}` |
 | `adapter.close` | `{adapter}` | `{closed: true}` |
 
-`adapter.start` requires `plugin` (e.g. `"claude-code"`). `program` is host-defaulted for known plugins (`claude-code` → `"claude"`) and must be supplied for plugins without a host default. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params` — for the Claude Code plugin the intents are `send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`. `adapter.inspect` applies the same body/status split the classifier uses, so you can reproduce a misclassification report without standing up a parallel `session.*` connection.
+`adapter.start` requires `plugin` (e.g. `"claude-code"`). Each plugin manifest may declare an optional `default_target = {program, args}`; `adapter.start` reads that field when the caller omits `program`. The bundled `claude-code` plugin declares `default_target.program = "claude"`, so `{"plugin": "claude-code"}` is enough to spawn it. Plugins without a `default_target` require the caller to pass `program` explicitly. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params` — for the claude-code plugin the intents are `send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`. `adapter.inspect` applies the same body/status split the classifier uses, so you can reproduce a misclassification report without standing up a parallel `session.*` connection.
 
-`adapter.wait` automatically injects the host's configured `completed_turn_stable_ms` (300 ms by default) into the matcher params if the caller does not supply one, so generic callers can omit `params` entirely and still get stable-screen turn boundaries — the matcher only fires after the screen has been quiet for the configured window. Earlier ptywright builds required callers to pass `params: {completed_turn_stable_ms: 300}` explicitly, or the Lua matcher would either crash or fire immediately on the idle `❯` glyph; this is fixed as of the bracketed-paste / classifier hardening pass.
+`adapter.wait` automatically injects the host's configured `completed_turn_stable_ms` (300 ms by default) into the matcher params if the caller does not supply one, so generic callers can omit `params` entirely and still get stable-screen turn boundaries — the matcher only fires after the screen has been quiet for the configured window.
 
-#### `claude.*` — Claude Code adapter aliases
+#### Driving the built-in `claude-code` plugin
 
-The original Claude-specific surface. Still supported, identical underlying behavior. Internally `claude.*` and `adapter.*` use separate handle registries; they do not yet share IDs.
+The plugin classifies states (`starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine. State strings are plugin-defined; the Rust core does not interpret them.
 
-| Method | Params | Returns |
-| --- | --- | --- |
-| `claude.start` | `{program?="claude", args?, cwd?, env?, rows?=40, cols?=120}` | `{claude, state}` |
-| `claude.send_prompt` | `{claude, prompt}` | `{state}` |
-| `claude.wait_turn` | `{claude, timeout_ms?}` | `{state}` (classification + evidence) |
-| `claude.approve` | `{claude}` | `{state, approved: true}` — `approved` is a deprecated alias |
-| `claude.deny` | `{claude}` | `{state, denied: true}` — `denied` is a deprecated alias |
-| `claude.cancel` | `{claude}` | `{state}` |
-| `claude.state` | `{claude}` | `{state}` |
-| `claude.snapshot` | `{claude, redact?, redaction?}` | `ScreenSnapshot` |
-| `claude.transcript` | `{claude, redact?, redaction?}` | `{text}` |
-| `claude.inspect` | `{claude, redact?, redaction?}` | `{state, plain_text, body_text, status_text, transcript_tail, sequence}` |
-
-The adapter classifies states (`starting`, `ready`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine. `waiting_for_trust` is the workspace-trust dialog: send `intent: "approve_trust"` / `"deny_trust"` through `adapter.send` (they type `1`+Enter or `2`+Enter, since a bare Enter does not accept option 1 on the numbered list).
+`waiting_for_trust` is the workspace-trust dialog: send `intent: "approve_trust"` / `"deny_trust"` through `adapter.send` (they type `1`+Enter or `2`+Enter, since a bare Enter does not accept option 1 on the numbered list).
 
 After a fresh-launch `approve_trust`, Claude Code shows a welcome panel with "Welcome back …", "Tips for getting started", and "What's new". The classifier reports this as `starting` (evidence: `welcome screen visible`) rather than `waiting_for_user_input`, because Claude treats the first keypress on that panel as a dismissal rather than a prompt submission. Send `intent: "dismiss_welcome"` through `adapter.send` (or call `send_prompt` directly — bracketed-paste'd content dismisses the welcome and submits in one step) before treating the adapter as ready for prompts.
 
-`send_prompt` writes the prompt as a `bracketed_paste` action (`CSI 200 ~` … `CSI 201 ~`) so Claude Code v2.1+ treats the payload as a single paste and a trailing Enter as a real submit. Earlier ptywright builds wrote the prompt with a plain paste, which raced against Claude's input tokeniser and could leave longer prompts typed-but-not-submitted. The generic `paste` action still writes raw bytes — only use `bracketed_paste` against programs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …); against `cat` or a plain shell the wrapper bytes would land in the child as literal characters.
+`send_prompt` writes the prompt as a `bracketed_paste` action (`CSI 200 ~` … `CSI 201 ~`) so Claude Code v2.1+ treats the payload as a single paste and a trailing Enter as a real submit. The generic `paste` action still writes raw bytes — only use `bracketed_paste` against programs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …); against `cat` or a plain shell the wrapper bytes would land in the child as literal characters.
 
-> **Fixed in Milestone 21.4 (May 2026).** Earlier builds reported `waiting_for_permission` on the idle input screen because the status-bar string `⏵⏵ bypass permissions on (shift+tab to cycle)` contains the substring `permissions`. The classifier now runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status), and the `idle_bypass_permissions.txt` fixture under `tests/fixtures/claude_code/` locks the fix in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` (or `claude.inspect`) to dump the body/status view the classifier sees when investigating new misclassifications.
+> **Body/status split.** The classifier runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status) so benign status strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` cannot false-positive on substring matches in the body. The `idle_bypass_permissions.txt` fixture under `tests/fixtures/claude_code/` locks this in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test in `tests/lua_classifier_tests.rs` auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` to dump the body/status view the classifier sees when investigating new misclassifications.
 
 #### `plugin.*`
 
@@ -324,7 +308,7 @@ Substitute the real session id (returned by `session.create`) into id 2 and 3 �
 
 ### Drive Claude Code end-to-end
 
-The Claude Code plugin is the primary thing we exercise, so this is the pattern to reach for first. Every `adapter.*` / `claude.*` response carries:
+The Claude Code plugin is the primary thing we exercise, so this is the pattern to reach for first. Every `adapter.*` response carries:
 
 ```json
 {
@@ -390,11 +374,11 @@ proc.wait(timeout=5)
 sys.exit(0 if snap["state"] == "completed_turn" else 1)
 ```
 
-Run it with `python3 drive_claude.py` from any cwd — the script handles ids, framing, and state branching for you. Swap `approve` for `deny` to exercise plan rejection, or send `intent: "cancel"` mid-loop for mid-turn cancellation. The same script works against the `claude.*` aliases if you swap `adapter.start` → `claude.start`, `adapter.send {intent: "send_prompt", params: {...}}` → `claude.send_prompt`, and so on.
+Run it with `python3 drive_claude.py` from any cwd — the script handles ids, framing, and state branching for you. Swap `approve` for `deny` to exercise plan rejection, or send `intent: "cancel"` mid-loop for mid-turn cancellation.
 
 #### Fallback: drive via `session.*` for raw transcript control
 
-When you need the raw PTY transcript rather than the plugin's classified turn, drive Claude Code through generic `session.*` primitives. This trades the adapter's automated turn classification for a hand-rolled completion matcher and gives you full transcript access in exchange. The plugin classifier no longer false-positives on the idle screen (see the Milestone 21.4 fix above), so this path is now a deliberate choice rather than a workaround.
+When you need the raw PTY transcript rather than the plugin's classified turn, drive Claude Code through generic `session.*` primitives. This trades the plugin's automated turn classification for a hand-rolled completion matcher and gives you full transcript access in exchange. The plugin classifier no longer false-positives on the idle screen (see the body/status split note above), so this path is a deliberate choice rather than a workaround.
 
 ```python
 # drive_claude_session.py — drive Claude through session.* for raw transcript access
@@ -438,9 +422,9 @@ Why this matcher pair? `⏺` is Claude's answer-block bullet — it only renders
 
 For the `--permission-mode bypassPermissions` flag to take effect on first launch in a new directory, the workspace must already be trusted — Claude Code only auto-skips the trust dialog in `--print` mode. Reuse a directory you've previously approved interactively, or drive the trust prompt explicitly via `session.input` actions (or use the `adapter.*` driver above, which handles `waiting_for_trust` for you).
 
-### Claude Code adapter test matrix
+### Claude Code plugin test matrix
 
-These are the scenarios worth driving repeatedly while the plugin is still hardening. Use the script above as a base and tweak the prompt / branching. Method names use `adapter.*`; equivalents in `claude.*` work the same way.
+These are the scenarios worth driving repeatedly while the plugin is still hardening. Use the script above as a base and tweak the prompt / branching.
 
 | Scenario | Setup | Expected terminal state |
 | --- | --- | --- |
@@ -459,7 +443,7 @@ Two things to verify on every run:
 1. **`screen_stable` evidence is present in `completed_turn`.** Without it the turn-boundary detection is just string matching. The evidence string from the state snapshot should mention `screen_stable` and a duration ≥ 300 ms.
 2. **No protocol noise on stdout.** Capture stderr separately (`2>err.log`) and assert that every stdout line is valid JSON-RPC. Any human-readable banner is a regression in the per-mode logging wiring.
 
-### Fixture-driven adapter tests
+### Fixture-driven plugin tests
 
 The repo ships sanitized Claude Code screen fixtures under `tests/fixtures/claude_code/`. When upstream Claude Code changes its TUI (new banner, renamed permission prompt, different plan UI), update the fixture and the classifier in one PR — `plugins/claude-code/main.lua` and `tests/fixtures/claude_code/` belong together. If a real session classifies the wrong state, capture the screen to a new fixture file before fixing the Lua, so the regression is locked in.
 
@@ -485,7 +469,7 @@ ptywright serve --socket /tmp/ptywright.sock &
 nc -U /tmp/ptywright.sock <<<'{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}'
 ```
 
-Multiple `nc -U` clients can talk to the same server. Only `session.*` ids are shared across connections; `claude.*` and `adapter.*` ids are per-connection — drive them from the same socket client that called `claude.start` / `adapter.start`. Use a process supervisor in production; the binary itself does not daemonize.
+Multiple `nc -U` clients can talk to the same server. Only `session.*` ids are shared across connections; `adapter.*` ids are per-connection — drive them from the same socket client that called `adapter.start`. Use a process supervisor in production; the binary itself does not daemonize.
 
 ### Force a clean test environment
 
@@ -499,11 +483,11 @@ Useful in CI and inside this skill's own test commands — nothing lands in the 
 
 - **Never write to stdout in `serve --stdio` mode.** Stdout is JSON-RPC framing. Use stderr or the log file.
 - **`run` is debug-only.** Its stdout is raw terminal bytes; do not pipe through `jq`.
-- **Waits return evidence; do not sleep.** Every successful `session.wait` ships back `sequence`, `snapshot`, and `transcript_tail`. The Claude adapter's turn detection further requires a `screen_stable` window — copy that pattern for any flaky TUI.
+- **Waits return evidence; do not sleep.** Every successful `session.wait` ships back `sequence`, `snapshot`, and `transcript_tail`. The claude-code plugin's turn detection further requires a `screen_stable` window — copy that pattern for any flaky TUI.
 - **Reads are redacted by default.** Pass `{"redact": false}` only for local debugging in trusted contexts.
 - **Transcripts are bounded.** Default 128 KiB per session. Bump via `session.create.transcript_max_chars` or stream raw bytes to a file with `raw_transcript_path`.
 - **Notifications are opt-in per connection.** Call `server.set_notifications` once after connecting if you want `session.changed` / `session.exited`.
-- **Single binary.** No Python/Node sidecar; the embedded Lua adapter is compiled in.
+- **Single binary.** No Python/Node sidecar; the embedded Lua plugin is compiled in.
 - **Cross-platform target.** macOS/Linux PTYs and Unix sockets, Windows ConPTY and named pipes. Some flags (e.g. socket path syntax) differ — the help text is the source of truth.
 
 ## Troubleshooting

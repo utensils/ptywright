@@ -182,9 +182,9 @@ Matcher payloads:
 {"type":"all","value":[{"type":"contains_text","value":"rea"},{"type":"contains_text","value":"dy"}]}
 ```
 
-### Generic adapter methods
+### Adapter methods
 
-`adapter.*` is the plugin-name-aware surface for driving any TUI through ptywright's built-in extension layer. Callers select a plugin manifest by name; the server spawns a PTY session and wraps it in an `ExtensionHandle` for that plugin. Subsequent calls reference the handle by id. The Claude Code-specific `claude.*` methods listed below remain available as the original aliases.
+`adapter.*` is the generic plugin-name-aware surface for driving any TUI through ptywright's extension layer. Callers select a plugin manifest by name; the server spawns a PTY session and wraps it in an `ExtensionHandle` for that plugin. Subsequent calls reference the handle by id. There is no per-application RPC namespace — application-specific behaviour (state names, intent names, evidence strings) lives entirely in Lua plugins under `plugins/<name>/`.
 
 | Method               | Params                                                                                                                | Result                                                                                                      |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -198,34 +198,25 @@ Matcher payloads:
 | `adapter.inspect`    | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                        | `{ "adapter", "plugin", "state", "plain_text", "body_text", "status_text", "transcript_tail", "sequence" }` |
 | `adapter.close`      | `{ "adapter": "e1" }`                                                                                                 | `{ "closed": true }`                                                                                        |
 
-`adapter.list` enumerates the built-in plugin manifests this server can instantiate. `adapter.start` requires the `plugin` field; `program` is host-defaulted for known plugins (`claude-code` → `"claude"`) and must be supplied explicitly for plugins without a host-known default. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params`; the server forwards them to the plugin and returns the post-apply classified state. `adapter.wait` defaults `intent` to `wait_turn_matcher` so simple callers can omit it, and defaults `timeout_ms` to `120000`. `adapter.inspect` applies the same body/status split the classifier uses (bottom three rows treated as status bar) so misclassification reports can be reproduced without standing up a parallel `session.*` connection.
+`adapter.list` enumerates the built-in plugin manifests this server can instantiate. Each manifest may declare an optional `default_target = { program, args }`; `adapter.start` reads that field when the caller omits `program` (so e.g. `{"plugin": "claude-code"}` is enough to spawn the bundled claude-code adapter, since its manifest declares `"program": "claude"`). Plugins without a `default_target` require callers to pass `program` explicitly. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params`; the server forwards them verbatim to the plugin and returns the post-apply classified state. `adapter.wait` defaults `intent` to `wait_turn_matcher` so simple callers can omit it, and defaults `timeout_ms` to `120000`. `adapter.inspect` applies the same body/status split the classifier uses (bottom three rows treated as status bar) so misclassification reports can be reproduced without standing up a parallel `session.*` connection.
 
-See the [Extensions guide](../guide/extensions.md) for plugin authoring and the host API exposed to Lua plugins.
+#### Driving the built-in `claude-code` plugin
 
-### Claude Code convenience methods
+The Lua plugin exposes the following intents through `adapter.send`:
 
-Claude methods drive interactive Claude Code through a PTY. They do not use `claude -p`. The `claude.*` surface is the original Claude-specific alias for the same `ExtensionHandle` machinery; both surfaces share the built-in `claude-code` Lua plugin while Rust executes PTY/session/action/matcher controls. New clients should prefer `adapter.*`; `claude.*` remains supported.
+| Intent             | Params                  | Behaviour                                                                                                                                                                         |
+| ------------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `send_prompt`      | `{ "prompt": "..." }`   | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`.                                                                                            |
+| `approve`          | `{}`                    | Presses Enter to accept the current permission / plan-approval dialog.                                                                                                            |
+| `deny`             | `{}`                    | Presses Escape to dismiss the current dialog.                                                                                                                                     |
+| `cancel`           | `{}`                    | Sends Ctrl-C. Sets `last_intent = "cancelling"` so the classifier reports `cancelling` until the screen settles.                                                                  |
+| `approve_trust`    | `{}`                    | Types `1` + Enter for the workspace-trust dialog (bare Enter does not accept option 1 in the Claude Code TUI).                                                                    |
+| `deny_trust`       | `{}`                    | Types `2` + Enter to deny workspace trust.                                                                                                                                        |
+| `dismiss_welcome`  | `{}`                    | Presses Enter to clear the first-launch welcome panel.                                                                                                                            |
 
-| Method               | Params                                        | Result                                                                                 |
-| -------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `claude.start`       | `{ "cwd": "/repo", "rows": 40, "cols": 120 }` | `{ "claude": "c1", "state": ... }`                                                     |
-| `claude.send_prompt` | `{ "claude": "c1", "prompt": "..." }`         | `{ "state": ... }`                                                                     |
-| `claude.wait_turn`   | `{ "claude": "c1", "timeout_ms": 120000 }`    | `{ "state": ... }`                                                                     |
-| `claude.approve`     | `{ "claude": "c1" }`                          | `{ "state": ..., "approved": true }`                                                   |
-| `claude.deny`        | `{ "claude": "c1" }`                          | `{ "state": ..., "denied": true }`                                                     |
-| `claude.cancel`      | `{ "claude": "c1" }`                          | `{ "state": ... }`                                                                     |
-| `claude.state`       | `{ "claude": "c1" }`                          | `{ "state": ... }`                                                                     |
-| `claude.snapshot`    | `{ "claude": "c1", "redact"?, "redaction"? }` | `ScreenSnapshot` (same shape as `session.snapshot`)                                    |
-| `claude.transcript`  | `{ "claude": "c1", "redact"?, "redaction"? }` | `{ "text": "..." }`                                                                    |
-| `claude.inspect`     | `{ "claude": "c1", "redact"?, "redaction"? }` | `{ "state", "plain_text", "body_text", "status_text", "transcript_tail", "sequence" }` |
+Plugin-defined state strings the classifier emits: `starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`. The state vocabulary is owned by the Lua plugin — the Rust core does not interpret it.
 
-`claude.start` accepts optional `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, and `pixel_height` fields. The default program is `claude`; default args are empty.
-
-`claude.approve` and `claude.deny` return the post-apply state snapshot alongside the deprecated boolean alias. New callers should read `state` like every other mutation method; the `approved` / `denied` booleans are retained so existing pattern-matching against `{approved: true}` / `{denied: true}` keeps working.
-
-Claude Code state strings are `snake_case`: `starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`. `waiting_for_trust` is the workspace-trust dialog and is approved by typing `1`+Enter (or denied by typing `2`+Enter) rather than a bare Enter; the built-in adapter exposes that via separate `approve_trust` / `deny_trust` intents through `adapter.send`.
-
-See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics and limitations.
+See the [Extensions guide](../guide/extensions.md) for plugin authoring and the [Claude Code adapter guide](../guide/claude-code.md) for state semantics and limitations of the built-in claude-code plugin.
 
 ### Plugin methods
 

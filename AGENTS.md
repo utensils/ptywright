@@ -2,7 +2,7 @@
 
 `AGENTS.md` is the canonical agent guide for this repository; `CLAUDE.md` is a symlink to it. Edits to either file land in `AGENTS.md` — keep that in mind when opening it as `CLAUDE.md`.
 
-ptywright is a Rust CLI and library for driving interactive terminal applications through PTYs. The project is intentionally early, but the direction is a cross-platform automation toolkit with a generic core and application-specific adapters layered above it.
+ptywright is a Rust CLI and library for driving interactive terminal applications through PTYs. The project is intentionally early, but the direction is a cross-platform automation toolkit with a generic core in Rust and application-specific plugins written in trusted Lua. The Rust layer never carries application-specific types or RPC namespaces.
 
 ## Product intent
 
@@ -12,9 +12,9 @@ Build a local, scriptable driver for terminal software:
 - Observe terminal state as a user would see it.
 - Send deterministic input actions.
 - Wait for prompts, screen states, turn boundaries, and failures.
-- Layer shell, REPL, full-screen TUI, and app-specific adapters above reusable primitives.
+- Layer shell, REPL, full-screen TUI, and app-specific plugins above reusable primitives.
 
-The core must stay generic. Do not bake a single target application into core names, traits, modules, or docs unless the code is explicitly adapter-specific.
+The core must stay generic. Do not bake a single target application into core names, traits, modules, or docs. Application-specific behavior belongs in Lua plugins under `plugins/<name>/`.
 
 Long-form design notes, milestone history, and open questions may live in a local-only, git-ignored `SPEC.md`. If that file exists in the working tree, read it before making structural changes; do not assume it is present in fresh clones.
 
@@ -28,7 +28,7 @@ Prefer small, explicit layers:
 4. **Action** — key sequences, paste/write, resize, waits, interrupts.
 5. **Matcher** — prompt detection, output predicates, timeout policies, error states.
 6. **Turn** — request/response orchestration and transcript capture.
-7. **Adapter** — app-specific workflows implemented over the generic layers.
+7. **Plugin** — app-specific workflows implemented in Lua over the generic layers. Plugins live under `plugins/<name>/` and are loaded through the `Extension` trait. There is no per-plugin Rust shim.
 
 Guidelines:
 
@@ -108,7 +108,7 @@ When debugging RPC or adapter behavior, override the `tracing` filter at runtime
 
 ## Current architecture
 
-The codebase is organized so each generic abstraction layer lives in one focused module, and adapters are layered on top without leaking back into the core.
+The codebase is organized so each generic abstraction layer lives in one focused module, and plugins are layered on top without leaking back into the core.
 
 - `src/main.rs` — clap CLI wiring. With no args it prints help; `--version` prints package version; `serve --stdio` exposes JSON-RPC with NDJSON or LSP-style framing; `serve --socket` exposes Unix sockets on macOS/Linux and named pipes on Windows; `completions` generates shell completions.
 - `src/run_terminal.rs` — `ptywright run` implementation for live stdin/stdout PTY bridging, raw-mode handling, and terminal-generated input filtering.
@@ -122,19 +122,20 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/transcript.rs` — bounded in-memory transcript capture plus explicit raw file streaming opt-in.
   - `src/redaction.rs` — redaction helpers, caller-supplied additions, and the default RPC redaction policy.
   - `src/extension.rs` — generic `Extension` trait, `ExtensionHandle` host loop, `ExtensionStateSnapshot`, body/status screen split (`STATUS_BAR_ROWS = 3`), and `LuaExtension` (the only implementor today). No application-specific identifiers live here; plugin-defined state names and intents flow through as strings.
-  - `src/rpc.rs` — JSON-RPC server, shared `RpcServerState`, NDJSON + LSP framing, stdio and local IPC transports. Hosts both the generic `adapter.*` surface and the original `claude.*` aliases.
+  - `src/rpc.rs` — JSON-RPC server, shared `RpcServerState`, NDJSON + LSP framing, stdio and local IPC transports. Exposes only the generic `adapter.*` surface; there is no application-specific RPC namespace.
   - `src/paths.rs` — `~/.ptywright/` runtime directory resolution and per-layout accessors. `PTYWRIGHT_HOME` overrides the root.
   - `src/config.rs` — `~/.ptywright/config.toml` loader with forgiving defaults and forward-compatible parsing.
   - `src/logging.rs` — `tracing` init with daily rotation, configurable retention, redaction-aware writers, and mode-specific helpers (`init_for_run`, `init_for_serve_stdio`, `init_for_serve_socket`, `init_for_oneshot`). **Never write logs to stdout in `serve --stdio` mode** — stdout is reserved for JSON-RPC framing. The per-mode helpers enforce this for you; if you add a new entrypoint, pick one of them rather than calling `tracing_subscriber::fmt()` directly.
   - `src/error.rs` — crate-wide `Error` / `Result`.
-- Plugin and adapter layer (application-specific code lives here, not in the generic layers):
-  - `src/plugin.rs` — plugin manifests, permission declarations, runtime metadata enum, and built-in `claude_code_manifest`.
-  - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by adapters. Installs the `ptywright.action.*` / `ptywright.matcher.*` host helpers gated on manifest-declared permissions.
-  - `src/adapters/` — typed adapter shims layered over `ExtensionHandle`; `claude_code.rs` is the current production shim and translates the generic plugin state strings into the typed `ClaudeCodeState` enum.
-  - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, workspace-trust dialog detection, and usage-output parsing.
+- Plugin layer (application-specific code lives entirely here, not in Rust):
+  - `src/plugin.rs` — plugin manifests, permission declarations, runtime metadata enum, the `DefaultTarget` field plugins use to declare a default spawn program, and the `builtin_manifests()` registry that lists every Lua plugin embedded in this binary. Adding a new built-in plugin is a one-line addition here plus a matching arm in `src/extension.rs::builtin_source_for`.
+  - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by plugins. Installs the `ptywright.action.*` / `ptywright.matcher.*` host helpers gated on manifest-declared permissions.
+  - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, workspace-trust dialog detection, and usage-output parsing. There is no Rust shim wrapping it.
 - Tests:
   - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
-  - `tests/fixtures/claude_code/` — recorded screen fixtures for adapter transition tests; update these when Claude Code's UI shifts. The classifier regression test auto-enrols every `<name>.txt` that has a sibling `<name>.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor, so adding a new fixture is a single-PR documentation-only change.
+  - `tests/lua_classifier_tests.rs` — auto-enrolling classifier regression matrix. Loads every `<name>.txt` fixture under `tests/fixtures/claude_code/` with a sibling `<name>.expected.json` and drives it through `LuaExtension::built_in("claude-code")`.
+  - `tests/lua_plugin_intents.rs` — per-intent contract tests (`send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`, `wait_turn_matcher`, the `cancelling` hold-state) driven through the generic `ExtensionHandle` API. Doubles as a reference for plugin authors writing new TUI plugins.
+  - `tests/fixtures/claude_code/` — recorded screen fixtures for the classifier; update these when Claude Code's UI shifts. Adding a new fixture is a single-PR documentation-only change: drop a `<name>.txt` and sibling `<name>.expected.json` and the matrix picks them up.
 - Tooling and packaging:
   - `website/` — VitePress docs site.
   - `.github/workflows/` — CI, docs deploy (`pages.yml`), and release packaging (`release.yml`).
@@ -143,7 +144,13 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `config.example.toml` — annotated reference for `~/.ptywright/config.toml`; keep in sync with `src/config.rs` when adding tunables.
   - `CHANGELOG.md` — hand-maintained, Keep-a-Changelog style. Add user-visible changes to the `[Unreleased]` section in the same PR; release tooling promotes it on tag.
 
-When adding behavior, decide first which layer it belongs to. No Claude-specific identifiers (state names, intent names, fixture conventions) belong in `src/` outside `src/adapters/` and `plugins/claude-code/`. New TUI adapters land as additional `src/adapters/<name>.rs` shims wrapping an `ExtensionHandle`, or as Lua-only plugin manifests; they should not introduce new application-specific identifiers into the generic layers. New generic primitives should not import from `adapters/`.
+When adding behavior, decide first which layer it belongs to. **No Claude-specific or other application-specific identifiers (state names, intent names, fixture conventions) belong anywhere in `src/` outside the manifest entry in `src/plugin.rs` and the embedded-source arm in `src/extension.rs::builtin_source_for`.** Application-specific code lives in `plugins/<name>/main.lua`. Adding a new built-in TUI plugin is:
+
+1. Write `plugins/<name>/main.lua` exporting `classify`, the intent functions you want callers to be able to invoke through `adapter.send` (and `wait_*_matcher` functions for `adapter.wait`).
+2. Add a manifest constructor next to `claude_code_manifest()` in `src/plugin.rs` and register it in `builtin_manifests()`.
+3. Add a matching arm in `src/extension.rs::builtin_source_for` so the embedded Lua source can be loaded by name.
+
+That's the entire integration surface — no per-plugin Rust types, no per-plugin RPC namespace, no per-plugin matcher kinds. Callers reach the new plugin through the generic `adapter.*` JSON-RPC surface or `LuaExtension::built_in("<name>")` from Rust.
 
 When exploring the repo, ignore build artifacts: `target/` (Cargo output) and `result` / `result-*` (Nix build symlinks). Both are gitignored and contain nothing worth grepping.
 

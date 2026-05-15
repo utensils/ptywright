@@ -128,21 +128,28 @@ Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and 
 
 `wait_for` returns `MatchResult` with elapsed time, final snapshot, transcript tail, and sequence evidence.
 
-## Claude Code adapter
+## Driving a TUI plugin
 
-`ClaudeCodeAdapter` starts `claude` interactively in a PTY and classifies coarse TUI state from screen/transcript evidence. The adapter does not use `claude -p`. Claude-specific action plans, wait matchers, and classification rules live in the built-in Lua plugin at `plugins/claude-code/main.lua`; Rust executes the generic PTY controls.
+There is no per-application Rust shim. Application-specific behaviour lives in Lua plugins under `plugins/<name>/`, and Rust callers drive them through the generic `Extension` / `ExtensionHandle` surface. `LuaExtension::built_in(<name>)` loads the named built-in plugin; `ExtensionHandle::start` wraps it around a `Session`; `handle.send(intent, params)` dispatches plugin-defined intents and returns the post-apply state snapshot.
 
 ```rust
-use ptywright::{ClaudeCodeAdapter, ClaudeCodeConfig};
+use serde_json::json;
 
-let mut claude = ClaudeCodeAdapter::start(ClaudeCodeConfig::default())?;
-let state = claude.send_prompt("help")?;
+use ptywright::{ExtensionHandle, LuaExtension, Session, SessionConfig, Target};
+
+let target = Target::new("claude");
+let session = Session::spawn(SessionConfig::new(target))?;
+let extension = LuaExtension::built_in("claude-code")?;
+let mut handle = ExtensionHandle::start(Box::new(extension), session, 300);
+
+let state = handle.send("send_prompt", json!({ "prompt": "help" }))?;
+println!("state={}, evidence={}", state.state, state.evidence);
 # Ok::<(), ptywright::Error>(())
 ```
 
-`ClaudeCodeAdapter::from_session(session)` is also fallible because it loads the built-in Lua plugin before wrapping externally managed sessions.
+`state.state` is a plugin-defined string (e.g. `"prompt_submitted"`, `"thinking"`, `"completed_turn"`); the Rust core does not interpret it. The matching catalogue of state strings for the bundled claude-code plugin is documented in the [Claude Code adapter guide](../guide/claude-code.md).
 
-See [Claude Code adapter](../guide/claude-code.md) for state and limitation details.
+For Rust callers that prefer a typed enum, define one locally and convert from the plugin's state string — that translation is application-specific and intentionally not part of the library surface.
 
 ## Redaction
 

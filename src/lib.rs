@@ -1,12 +1,14 @@
 //! Core library surface for `ptywright`.
 //!
 //! ptywright is an early-stage Rust CLI and library for driving interactive
-//! terminal applications through real PTYs. The core stays generic: Claude Code
-//! and other application-specific behavior should be layered on top of reusable
-//! target, session, screen, action, matcher, and transcript primitives.
+//! terminal applications through real PTYs. The core stays generic:
+//! application-specific behavior (Claude Code today, additional TUIs tomorrow)
+//! lives in Lua plugins under `plugins/<name>/`, layered on top of the
+//! reusable target, session, screen, action, matcher, transcript, and
+//! extension primitives exposed here. ptywright does not carry typed Rust
+//! shims per TUI.
 
 pub mod action;
-pub mod adapters;
 pub mod config;
 pub mod error;
 pub mod extension;
@@ -23,7 +25,6 @@ pub mod target;
 pub mod transcript;
 
 pub use action::{Action, Key};
-pub use adapters::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeState, ClaudeCodeStateSnapshot};
 pub use config::{Config, LogFormat, LoggingConfig};
 pub use error::{Error, Result};
 pub use extension::{
@@ -38,8 +39,8 @@ pub use lua_plugin::LuaPlugin;
 pub use matcher::{MatchResult, Matcher, MatcherContext};
 pub use paths::{Paths, expand_tilde};
 pub use plugin::{
-    PluginHostCapabilities, PluginKind, PluginManifest, PluginManifestError, PluginPermission,
-    PluginRuntime, claude_code_manifest,
+    DefaultTarget, PluginHostCapabilities, PluginKind, PluginManifest, PluginManifestError,
+    PluginPermission, PluginRuntime, builtin_manifests,
 };
 pub use redaction::RedactionPolicy;
 pub use rpc::{
