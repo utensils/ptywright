@@ -21,6 +21,7 @@ pub mod ctx;
 pub mod highlighter;
 pub mod history;
 pub mod render;
+pub mod snapshot;
 pub mod socket;
 pub mod spawn;
 pub mod transport;
