@@ -63,20 +63,38 @@ local function has_input_prompt(screen)
   return false
 end
 
--- A line is considered a Claude Code 2.1.x "thinking" indicator if it is
--- short and ends with the Unicode horizontal ellipsis `…` (U+2026, three
--- bytes in UTF-8). Claude renders a single status line of the form
+-- A line is considered a Claude Code 2.1.x "thinking" indicator if it
+-- starts with a known spinner glyph AND ends with the Unicode horizontal
+-- ellipsis `…` (U+2026). Claude renders a single status line of the form
 -- `<spinner> <Verb>…` while a turn is in flight, where the spinner glyph
--- rotates through `✶`, `✻`, `✺`, `·`, `•` (and braille animations) and
--- the verb is a randomized whimsy word (Razzle-dazzling, Cogitating,
--- Brewing, Pondering, …). The verb changes per turn and per release, so
--- matching specific words is fragile — but the trailing ellipsis and
--- short line length are both stable signals. User-typed input lines
--- starting with `❯` are skipped to avoid false-positives on prose
--- containing ellipsis.
+-- rotates through a fixed set (`✶`, `✻`, `✺`, `✦`, `·`, `•`, plus the
+-- standard braille spinner range `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏`) and the verb is
+-- a randomized whimsy word (Razzle-dazzling, Cogitating, Brewing,
+-- Pondering, …). The verb changes per turn and per release, so matching
+-- specific words is fragile — but the spinner glyph at line start plus
+-- the trailing ellipsis are both stable signals.
+--
+-- Requiring the spinner anchor (not just ellipsis + short line) is
+-- important: assistant prose lines like `One moment…` or `Done…` are
+-- short and end with the ellipsis but are NOT thinking indicators, and
+-- without the anchor they would keep the classifier stuck on `thinking`
+-- after the prompt returned. This is the explicit anchor the Copilot
+-- review on PR #21 asked for.
 local ELLIPSIS = "…"
-local USER_PROMPT_GLYPH = "❯"
 local THINKING_LINE_MAX_BYTES = 80
+local SPINNER_GLYPHS = {
+  "✶", "✻", "✺", "✦", "·", "•",
+  "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+}
+
+local function starts_with_spinner_glyph(line)
+  for _, glyph in ipairs(SPINNER_GLYPHS) do
+    if string.sub(line, 1, #glyph) == glyph then
+      return true
+    end
+  end
+  return false
+end
 
 local function line_ends_with_ellipsis(line)
   local n = #line
@@ -87,10 +105,8 @@ local function has_thinking_spinner_line(text)
   for line in string.gmatch(text or "", "[^\n]+") do
     local trimmed = trim(line)
     if #trimmed > 0 and #trimmed <= THINKING_LINE_MAX_BYTES then
-      if string.sub(trimmed, 1, #USER_PROMPT_GLYPH) ~= USER_PROMPT_GLYPH then
-        if line_ends_with_ellipsis(trimmed) then
-          return true
-        end
+      if starts_with_spinner_glyph(trimmed) and line_ends_with_ellipsis(trimmed) then
+        return true
       end
     end
   end

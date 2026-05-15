@@ -1,0 +1,14 @@
+ ▐▛███▜▌   Claude Code v2.1.142
+▝▜█████▛▘  Opus 4.7 · Claude Max
+  ▘▘ ▝▝    ~/Projects/sample
+
+❯ Reply with: "One moment…"
+
+⏺ One moment…
+
+✻ Brewed for 1s
+
+────────────────────────────────────────────────────────────────────────
+❯
+  user @ host /Users/me/Projects/sample                       [Opus 4.7]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
