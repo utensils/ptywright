@@ -85,30 +85,47 @@ Current fixtures are based on sanitized captures from Claude Code v2.1.141 / v2.
 Drive the plugin entirely through [`adapter.*`](../reference/json-rpc.md#adapter-methods). The plugin manifest declares `default_target.program = "claude"`, so `adapter.start` only needs `{"plugin": "claude-code"}`:
 
 ```json
-{ "jsonrpc": "2.0", "id": 1, "method": "adapter.start", "params": { "plugin": "claude-code", "cwd": "/repo" } }
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "adapter.start",
+  "params": { "plugin": "claude-code", "cwd": "/repo" }
+}
 ```
 
 ```json
-{ "jsonrpc": "2.0", "id": 2, "method": "adapter.send",
-  "params": { "adapter": "e1", "intent": "send_prompt", "params": { "prompt": "implement the next test" } } }
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "adapter.send",
+  "params": {
+    "adapter": "e1",
+    "intent": "send_prompt",
+    "params": { "prompt": "implement the next test" }
+  }
+}
 ```
 
 ```json
-{ "jsonrpc": "2.0", "id": 3, "method": "adapter.wait",
-  "params": { "adapter": "e1", "timeout_ms": 120000 } }
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "adapter.wait",
+  "params": { "adapter": "e1", "timeout_ms": 120000 }
+}
 ```
 
 Plugin intents available via `adapter.send`:
 
-| Intent             | Params                | Notes                                                                                                                                       |
-| ------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `send_prompt`      | `{ "prompt": "..." }` | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`.                                                      |
-| `approve`          | `{}`                  | Presses Enter to accept the current permission / plan-approval dialog.                                                                      |
-| `deny`             | `{}`                  | Presses Escape to dismiss the current dialog.                                                                                               |
-| `cancel`           | `{}`                  | Sends Ctrl-C. Sets `last_intent = "cancelling"`.                                                                                            |
-| `approve_trust`    | `{}`                  | Types `1` + Enter for the workspace-trust dialog.                                                                                           |
-| `deny_trust`       | `{}`                  | Types `2` + Enter for the workspace-trust dialog.                                                                                           |
-| `dismiss_welcome`  | `{}`                  | Presses Enter to clear the first-launch welcome panel.                                                                                      |
+| Intent            | Params                | Notes                                                                                   |
+| ----------------- | --------------------- | --------------------------------------------------------------------------------------- |
+| `send_prompt`     | `{ "prompt": "..." }` | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`. |
+| `approve`         | `{}`                  | Presses Enter to accept the current permission / plan-approval dialog.                  |
+| `deny`            | `{}`                  | Presses Escape to dismiss the current dialog.                                           |
+| `cancel`          | `{}`                  | Sends Ctrl-C. Sets `last_intent = "cancelling"`.                                        |
+| `approve_trust`   | `{}`                  | Types `1` + Enter for the workspace-trust dialog.                                       |
+| `deny_trust`      | `{}`                  | Types `2` + Enter for the workspace-trust dialog.                                       |
+| `dismiss_welcome` | `{}`                  | Presses Enter to clear the first-launch welcome panel.                                  |
 
 Diagnostic reads — `adapter.snapshot`, `adapter.transcript`, `adapter.inspect` — work the same way as their `session.*` counterparts and redact by default. `adapter.inspect` additionally returns the `body_text` / `status_text` split the classifier sees, so misclassification reports can be reproduced without spinning up a parallel `session.*` connection.
 

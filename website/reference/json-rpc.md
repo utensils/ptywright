@@ -204,15 +204,15 @@ Matcher payloads:
 
 The Lua plugin exposes the following intents through `adapter.send`:
 
-| Intent             | Params                  | Behaviour                                                                                                                                                                         |
-| ------------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `send_prompt`      | `{ "prompt": "..." }`   | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`.                                                                                            |
-| `approve`          | `{}`                    | Presses Enter to accept the current permission / plan-approval dialog.                                                                                                            |
-| `deny`             | `{}`                    | Presses Escape to dismiss the current dialog.                                                                                                                                     |
-| `cancel`           | `{}`                    | Sends Ctrl-C. Sets `last_intent = "cancelling"` so the classifier reports `cancelling` until the screen settles.                                                                  |
-| `approve_trust`    | `{}`                    | Types `1` + Enter for the workspace-trust dialog (bare Enter does not accept option 1 in the Claude Code TUI).                                                                    |
-| `deny_trust`       | `{}`                    | Types `2` + Enter to deny workspace trust.                                                                                                                                        |
-| `dismiss_welcome`  | `{}`                    | Presses Enter to clear the first-launch welcome panel.                                                                                                                            |
+| Intent            | Params                | Behaviour                                                                                                        |
+| ----------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `send_prompt`     | `{ "prompt": "..." }` | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`.                          |
+| `approve`         | `{}`                  | Presses Enter to accept the current permission / plan-approval dialog.                                           |
+| `deny`            | `{}`                  | Presses Escape to dismiss the current dialog.                                                                    |
+| `cancel`          | `{}`                  | Sends Ctrl-C. Sets `last_intent = "cancelling"` so the classifier reports `cancelling` until the screen settles. |
+| `approve_trust`   | `{}`                  | Types `1` + Enter for the workspace-trust dialog (bare Enter does not accept option 1 in the Claude Code TUI).   |
+| `deny_trust`      | `{}`                  | Types `2` + Enter to deny workspace trust.                                                                       |
+| `dismiss_welcome` | `{}`                  | Presses Enter to clear the first-launch welcome panel.                                                           |
 
 Plugin-defined state strings the classifier emits: `starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`. The state vocabulary is owned by the Lua plugin — the Rust core does not interpret it.
 
