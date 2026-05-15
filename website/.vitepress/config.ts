@@ -76,6 +76,7 @@ export default defineConfig({
           text: 'Design',
           items: [
             { text: 'Architecture', link: '/guide/architecture' },
+            { text: 'Extensions', link: '/guide/extensions' },
             { text: 'Claude Code adapter', link: '/guide/claude-code' },
             { text: 'Design principles', link: '/guide/design-principles' },
             { text: 'Platforms', link: '/guide/platforms' },

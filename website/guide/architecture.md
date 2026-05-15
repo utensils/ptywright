@@ -1,6 +1,6 @@
 # Architecture
 
-ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior, including the interactive Claude Code adapter, sits above reusable terminal primitives.
+ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior, including the interactive Claude Code adapter, sits above reusable terminal primitives. The generic `Extension` trait is the seam between those primitives and any specific TUI's classifier and intents.
 
 ## Repository layout
 
@@ -8,22 +8,24 @@ ptywright is an early PTY/TUI automation runtime. The core is intentionally gene
 ptywright/
 ├── src/
 │   ├── action.rs      # serializable input/lifecycle actions
-│   ├── adapters/      # app-specific adapters such as Claude Code
+│   ├── adapters/      # app-specific adapter shims (currently claude_code.rs)
 │   ├── config.rs      # ~/.ptywright/config.toml loader
 │   ├── error.rs       # public error/result types
+│   ├── extension.rs   # Extension trait, ExtensionHandle, ExtensionStateSnapshot
 │   ├── lib.rs         # public library surface
 │   ├── logging.rs     # tracing init with rotation, retention, and redaction
 │   ├── main.rs        # clap CLI entrypoint
 │   ├── lua_plugin.rs  # trusted Lua plugin runtime for adapter orchestration
 │   ├── matcher.rs     # screen/transcript predicates
 │   ├── paths.rs       # ~/.ptywright runtime directory resolution
+│   ├── plugin.rs      # plugin manifest, permissions, host capabilities
 │   ├── rpc.rs         # JSON-RPC server and framing helpers
 │   ├── screen.rs      # terminal engine seam, parser, and snapshots
 │   ├── session.rs     # PTY-backed process lifecycle
 │   ├── target.rs      # spawn configuration
 │   └── transcript.rs  # bounded output transcript
 ├── plugins/           # built-in trusted Lua plugins embedded in the binary
-├── tests/             # CLI integration tests
+├── tests/             # CLI integration tests and recorded fixtures
 ├── website/           # VitePress docs
 ├── flake.nix          # Nix package, app, devshell, formatter
 ├── install.sh         # GitHub Release installer for macOS/Linux
@@ -57,17 +59,27 @@ Turn orchestration / adapters
 
 ## Abstraction boundaries
 
-| Layer      | Responsibility                                             | Should avoid                  |
-| ---------- | ---------------------------------------------------------- | ----------------------------- |
-| Target     | Program, args, cwd, environment, terminal size             | PTY lifecycle details         |
-| Session    | Child process, PTY handle, reader/writer, resize, exit     | App prompt semantics          |
-| Screen     | Parsed terminal view, cursor, scrollback, alternate screen | Input timing policy           |
-| Transcript | Bounded retained PTY output text                           | Terminal rendering decisions  |
-| Action     | Keys, writes, paste, resize, interrupt, EOF, kill          | App-specific success rules    |
-| Matcher    | Screen/transcript predicates and timeout evidence          | Owning the process            |
-| RPC        | Protocol framing, session registry, method dispatch        | Human output on stdout        |
-| Turn       | Send input, wait for completion, capture transcript        | Hard-coded app names          |
-| Adapter    | App-specific workflows                                     | Reimplementing PTY primitives |
+| Layer      | Responsibility                                                     | Should avoid                          |
+| ---------- | ------------------------------------------------------------------ | ------------------------------------- |
+| Target     | Program, args, cwd, environment, terminal size                     | PTY lifecycle details                 |
+| Session    | Child process, PTY handle, reader/writer, resize, exit             | App prompt semantics                  |
+| Screen     | Parsed terminal view, cursor, scrollback, alternate screen         | Input timing policy                   |
+| Transcript | Bounded retained PTY output text                                   | Terminal rendering decisions          |
+| Action     | Keys, writes, paste, resize, interrupt, EOF, kill                  | App-specific success rules            |
+| Matcher    | Screen/transcript predicates and timeout evidence                  | Owning the process                    |
+| RPC        | Protocol framing, session registry, method dispatch                | Human output on stdout                |
+| Extension  | Plugin-backed classifier + intent plans over a session             | PTY IO, parser changes, RPC framing   |
+| Turn       | Send input, wait for completion, capture transcript                | Hard-coded app names                  |
+| Adapter    | App-specific façade over an `ExtensionHandle`                      | Reimplementing PTY primitives         |
+
+The `Extension` layer lives in `src/extension.rs` and is the boundary between the generic core and any specific TUI. It is intentionally application-agnostic: the trait classifies plugin-defined state strings and builds generic [`Action`] / [`Matcher`] plans, with no Claude-specific identifiers in the trait surface.
+
+- [`Extension`](https://github.com/utensils/ptywright/blob/main/src/extension.rs) — three-method trait: `classify(ctx)`, `plan(intent, params)`, `wait_matcher(intent, params)`. Plugin runtimes implement it; the generic core consumes it.
+- [`LuaExtension`] — the only implementor shipped today. Wraps a trusted embedded `LuaPlugin` and exposes it through the trait. A future WASM or external-process runtime would slot in here without changing the rest of the core.
+- [`ExtensionHandle`] — owns a [`Session`] plus a boxed [`Extension`]. Drives the host loop (classify, apply intent action plans, wait on intent matchers) and forwards `last_intent` plus a stability threshold into each classify call.
+- [`ExtensionStateSnapshot`] — `{state, confidence, evidence, sequence, candidates}` where `state` is a plugin-defined string. Adapter shims translate it into their own typed enum (e.g. `ClaudeCodeStateSnapshot`).
+
+Classifier context split by region: `ExtensionHandle` splits the rendered screen into `body_text` (everything above the status bar) and `status_text` (the bottom `STATUS_BAR_ROWS = 3` lines) before handing it to `Extension::classify`. Body classifiers run against `body_text` so a benign status string like `⏵⏵ bypass permissions on` cannot false-positive on substring matches in the body. Short screens (heights at or below `STATUS_BAR_ROWS * 2`) are returned as body-only so small fixtures and small windows don't lose all their content to the status bucket. The same split is reused by `claude.inspect` / `adapter.inspect` for diagnostic dumps.
 
 ## Current implementation
 
@@ -95,16 +107,16 @@ The public API hides backend crate types so ptywright can evolve the PTY or term
 
 ptywright targets interactive Claude Code through the terminal TUI. It does not optimize around `claude -p` or non-interactive Agent SDK flows.
 
-The Claude Code adapter uses only generic primitives:
+The Claude Code adapter at `src/adapters/claude_code.rs` is a thin typed façade over `ExtensionHandle`:
 
 - Rust spawns `claude` in a PTY-backed `Session`;
-- Rust observes `ScreenSnapshot` and transcript evidence;
-- the built-in Lua plugin classifies Claude Code screen states;
-- the Lua plugin returns generic `Action` values for prompts, approvals, denials, and interrupts;
+- Rust constructs an `ExtensionHandle` with `LuaExtension::built_in("claude-code")`;
+- the built-in Lua plugin at `plugins/claude-code/main.lua` classifies Claude Code screen states;
+- the Lua plugin returns generic `Action` values for prompts, approvals, denials, interrupts, and the trust-dialog numeric selections;
 - the Lua plugin returns generic `Matcher` values for turn waits;
-- Rust executes actions, waits, redaction, lifecycle, and RPC responses.
+- the adapter shim translates the plugin's state strings into the typed `ClaudeCodeState` enum.
 
-This keeps Claude Code UI specifics in `plugins/claude-code/main.lua` while the core remains useful for shells, REPLs, full-screen TUIs, and other long-running terminal programs.
+The Rust core has no Claude-specific identifiers outside `src/adapters/`. Generic modules under `src/` do not import from `src/adapters/`, and the `Extension` trait surface is plugin-name-agnostic. New TUIs land as additional Lua plugins (with an optional typed adapter shim alongside `claude_code.rs`) and reuse the same `ExtensionHandle` host loop.
 
 ## Testing direction
 

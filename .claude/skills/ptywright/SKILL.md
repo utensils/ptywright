@@ -28,7 +28,7 @@ ptywright completions zsh                                     # Generate complet
 Parse `$ARGUMENTS` to pick a path:
 
 - If the user describes a **TUI to drive** (e.g. "spawn `htop` and wait until the header renders", "drive Claude Code through a prompt"), use the `serve --stdio` JSON-RPC server piped through `jq`. Never use `ptywright run` for automation — `run` is a live tty bridge for humans.
-- If the user mentions **Claude Code**, prefer the `claude.*` adapter methods over rebuilding turn detection from `session.*` primitives. See the [Claude Code adapter pattern](#drive-claude-code-end-to-end) and [test matrix](#claude-code-adapter-test-matrix) — this is the most-exercised path in the project today.
+- If the user mentions **Claude Code**, prefer the generic `adapter.*` surface with `plugin: "claude-code"` (or the equivalent `claude.*` aliases) over rebuilding turn detection from `session.*` primitives. See the [Claude Code adapter pattern](#drive-claude-code-end-to-end) and [test matrix](#claude-code-adapter-test-matrix) — this is the most-exercised path in the project today.
 - If `$ARGUMENTS` starts with a **subcommand** (`run`, `serve`, `completions`), pass it through.
 - If `$ARGUMENTS` is empty, run `ptywright --help`.
 
@@ -101,8 +101,12 @@ Live shape (verified against ptywright 0.1.0):
               "session.create", "session.list", "session.close",
               "session.kill", "session.resize", "session.input",
               "session.snapshot", "session.transcript", "session.wait",
+              "adapter.list", "adapter.start", "adapter.state",
+              "adapter.send", "adapter.wait", "adapter.snapshot",
+              "adapter.transcript", "adapter.inspect", "adapter.close",
               "claude.start", "claude.send_prompt", "claude.wait_turn",
               "claude.approve", "claude.deny", "claude.cancel", "claude.state",
+              "claude.snapshot", "claude.transcript", "claude.inspect",
               "plugin.capabilities", "plugin.validate_manifest"],
   "notifications": ["session.changed", "session.exited"]
 }
@@ -133,21 +137,44 @@ Live shape (verified against ptywright 0.1.0):
 
 Defaults: `rows=24, cols=80, timeout_ms=30000`. Transcript is bounded in memory (128 KiB UTF-8 by default; tune via `transcript_max_chars`). `raw_transcript_path` enables raw file streaming and requires `raw_transcript_append` when re-opening an existing path.
 
-#### `claude.*` — Claude Code adapter (Lua-backed)
+#### `adapter.*` — generic plugin-backed adapter surface
+
+The plugin-name-aware entry point. Pick this for new code: any built-in plugin (today, `claude-code`) can be driven through it, and the same `intent` plus `params` shape works across plugins.
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `adapter.list` | — | `{plugins: [PluginManifest, ...]}` |
+| `adapter.start` | `{plugin, program?, args?, cwd?, env?, rows?, cols?, pixel_width?, pixel_height?}` | `{adapter, plugin, state}` |
+| `adapter.state` | `{adapter}` | `{state}` |
+| `adapter.send` | `{adapter, intent, params?}` | `{state}` |
+| `adapter.wait` | `{adapter, intent?="wait_turn_matcher", params?, timeout_ms?=120000}` | `{state}` |
+| `adapter.snapshot` | `{adapter, redact?, redaction?}` | `ScreenSnapshot` |
+| `adapter.transcript` | `{adapter, redact?, redaction?}` | `{text}` |
+| `adapter.inspect` | `{adapter, redact?, redaction?}` | `{adapter, plugin, state, plain_text, body_text, status_text, transcript_tail, sequence}` |
+| `adapter.close` | `{adapter}` | `{closed: true}` |
+
+`adapter.start` requires `plugin` (e.g. `"claude-code"`). `program` is host-defaulted for known plugins (`claude-code` → `"claude"`) and must be supplied for plugins without a host default. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params` — for the Claude Code plugin the intents are `send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`. `adapter.inspect` applies the same body/status split the classifier uses, so you can reproduce a misclassification report without standing up a parallel `session.*` connection.
+
+#### `claude.*` — Claude Code adapter aliases
+
+The original Claude-specific surface. Still supported, identical underlying behavior. Internally `claude.*` and `adapter.*` use separate handle registries; they do not yet share IDs.
 
 | Method | Params | Returns |
 | --- | --- | --- |
 | `claude.start` | `{program?="claude", args?, cwd?, env?, rows?=40, cols?=120}` | `{claude, state}` |
 | `claude.send_prompt` | `{claude, prompt}` | `{state}` |
 | `claude.wait_turn` | `{claude, timeout_ms?}` | `{state}` (classification + evidence) |
-| `claude.approve` | `{claude}` | `{approved: true}` — no state; re-query `claude.state` to inspect |
-| `claude.deny` | `{claude}` | `{denied: true}` — no state; re-query `claude.state` to inspect |
+| `claude.approve` | `{claude}` | `{state, approved: true}` — `approved` is a deprecated alias |
+| `claude.deny` | `{claude}` | `{state, denied: true}` — `denied` is a deprecated alias |
 | `claude.cancel` | `{claude}` | `{state}` |
 | `claude.state` | `{claude}` | `{state}` |
+| `claude.snapshot` | `{claude, redact?, redaction?}` | `ScreenSnapshot` |
+| `claude.transcript` | `{claude, redact?, redaction?}` | `{text}` |
+| `claude.inspect` | `{claude, redact?, redaction?}` | `{state, plain_text, body_text, status_text, transcript_tail, sequence}` |
 
-The adapter classifies states (`Starting`, `Ready`, `Thinking`, `WaitingForPermission`, `WaitingForPlanApproval`, `CompletedTurn`, etc.) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine.
+The adapter classifies states (`starting`, `ready`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine. `waiting_for_trust` is the workspace-trust dialog: send `intent: "approve_trust"` / `"deny_trust"` through `adapter.send` (they type `1`+Enter or `2`+Enter, since a bare Enter does not accept option 1 on the numbered list).
 
-> **Known classifier issue (Claude Code 2.1.142, May 2026):** the built-in Lua plugin reports `waiting_for_permission` at confidence ~0.84 on the *idle* input screen because the status-bar string `⏵⏵ bypass permissions on (shift+tab to cycle)` contains the substring `permissions`. Until `plugins/claude-code/main.lua` is taught to exclude status-bar lines, automated drivers that branch on `waiting_for_permission` against current Claude Code releases will misfire. Workaround: drive Claude Code through the generic `session.*` primitives (see the [end-to-end pattern](#drive-claude-code-end-to-end)) and use `⏺` (answer-bullet) + `screen_stable` as the turn-end signal. Capture a fixture under `tests/fixtures/claude_code/` before fixing.
+> **Fixed in Milestone 21.4 (May 2026).** Earlier builds reported `waiting_for_permission` on the idle input screen because the status-bar string `⏵⏵ bypass permissions on (shift+tab to cycle)` contains the substring `permissions`. The classifier now runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status), and the `idle_bypass_permissions.txt` fixture under `tests/fixtures/claude_code/` locks the fix in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` (or `claude.inspect`) to dump the body/status view the classifier sees when investigating new misclassifications.
 
 #### `plugin.*`
 
@@ -290,11 +317,12 @@ Substitute the real session id (returned by `session.create`) into id 2 and 3 �
 
 ### Drive Claude Code end-to-end
 
-The Claude adapter is the primary thing we exercise, so this is the pattern to reach for first. Every `claude.*` response carries:
+The Claude Code plugin is the primary thing we exercise, so this is the pattern to reach for first. Every `adapter.*` / `claude.*` response carries:
 
 ```json
 {
-  "claude": "c1",
+  "adapter": "e1",
+  "plugin": "claude-code",
   "state": {
     "state": "waiting_for_permission",
     "confidence": 0.87,
@@ -304,16 +332,18 @@ The Claude adapter is the primary thing we exercise, so this is the pattern to r
 }
 ```
 
-State names are `snake_case`: `starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`. There is **no** `claude.transcript` method — the adapter owns its session internally. Inspect `state.evidence` for the latest screen excerpt, or drive Claude Code through generic `session.*` calls if you need the raw transcript.
+State names are `snake_case`: `starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`.
 
-Run this Python driver against a single stdio server. It captures the real `claude` id, loops on `wait_turn`, branches on the state, and gives up cleanly on `error` / `plugin_error`:
+Run this Python driver against a single stdio server. It uses the generic `adapter.*` surface, captures the real adapter id, loops on `adapter.wait`, branches on the state, handles the workspace-trust dialog explicitly, and gives up cleanly on `error` / `plugin_error`:
 
 ```python
-# drive_claude.py — minimal happy-path + permission/plan-approval handler
+# drive_claude.py — adapter.* driver with trust + permission + plan-approval handling
 import json, subprocess, sys
 
+PLUGIN = "claude-code"
 WAIT_MS = 120_000
 APPROVE = {"waiting_for_permission", "waiting_for_plan_approval"}
+TRUST = "waiting_for_trust"
 TERMINAL = {"completed_turn", "exited", "error", "plugin_error"}
 
 proc = subprocess.Popen(
@@ -326,38 +356,42 @@ def rpc(rid, method, params=None):
     proc.stdin.write(json.dumps(req) + "\n"); proc.stdin.flush()
     return json.loads(proc.stdout.readline())
 
-start = rpc(1, "claude.start", {"cwd": "/path/to/repo"})  # spawns `claude`
-cid = start["result"]["claude"]
+start = rpc(1, "adapter.start", {"plugin": PLUGIN, "cwd": "/path/to/repo"})
+aid = start["result"]["adapter"]
 print("started:", start["result"]["state"]["state"])
 
-rpc(2, "claude.send_prompt", {"claude": cid, "prompt": "summarize CHANGELOG.md"})
+rpc(2, "adapter.send", {"adapter": aid, "intent": "send_prompt",
+                        "params": {"prompt": "summarize CHANGELOG.md"}})
 
 turn = 0
 while True:
     turn += 1
-    resp = rpc(10 + turn, "claude.wait_turn", {"claude": cid, "timeout_ms": WAIT_MS})
+    resp = rpc(10 + turn, "adapter.wait", {"adapter": aid, "timeout_ms": WAIT_MS})
     snap = resp["result"]["state"]
     print(f"turn {turn}: {snap['state']} (seq={snap['sequence']}, conf={snap['confidence']:.2f})")
     if snap["state"] in TERMINAL:
         break
-    if snap["state"] in APPROVE:
-        rpc(100 + turn, "claude.approve", {"claude": cid})
+    if snap["state"] == TRUST:
+        rpc(100 + turn, "adapter.send", {"adapter": aid, "intent": "approve_trust", "params": {}})
+    elif snap["state"] in APPROVE:
+        rpc(100 + turn, "adapter.send", {"adapter": aid, "intent": "approve", "params": {}})
 
 print("evidence:", snap["evidence"])
+rpc(999, "adapter.close", {"adapter": aid})
 proc.stdin.close()
 proc.wait(timeout=5)
 sys.exit(0 if snap["state"] == "completed_turn" else 1)
 ```
 
-Run it with `python3 drive_claude.py` from any cwd — the script handles ids, framing, and state branching for you. Swap in `claude.deny` for plan rejection tests, or call `claude.cancel` before the loop ends to exercise mid-turn cancellation.
+Run it with `python3 drive_claude.py` from any cwd — the script handles ids, framing, and state branching for you. Swap `approve` for `deny` to exercise plan rejection, or send `intent: "cancel"` mid-loop for mid-turn cancellation. The same script works against the `claude.*` aliases if you swap `adapter.start` → `claude.start`, `adapter.send {intent: "send_prompt", params: {...}}` → `claude.send_prompt`, and so on.
 
-#### Workaround: drive via `session.*` until the classifier is fixed
+#### Fallback: drive via `session.*` for raw transcript control
 
-While the `waiting_for_permission` false-positive is unresolved (see above), the most reliable way to drive Claude Code is through generic PTY primitives. This trades the adapter's automated turn classification for a hand-rolled completion matcher — and gives you full transcript access in exchange.
+When you need the raw PTY transcript rather than the plugin's classified turn, drive Claude Code through generic `session.*` primitives. This trades the adapter's automated turn classification for a hand-rolled completion matcher and gives you full transcript access in exchange. The plugin classifier no longer false-positives on the idle screen (see the Milestone 21.4 fix above), so this path is now a deliberate choice rather than a workaround.
 
 ```python
-# drive_claude_session.py — bypass the classifier, drive Claude through session.*
-import json, os, subprocess, time
+# drive_claude_session.py — drive Claude through session.* for raw transcript access
+import json, os, subprocess
 proc = subprocess.Popen(
     ["ptywright", "serve", "--stdio"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -389,27 +423,29 @@ rpc(5, "session.wait", {"session":sid,"matcher":{"type":"contains_text","value":
 rpc(6, "session.wait", {"session":sid,"matcher":{"type":"screen_stable","value":{"min_ms":1500}},"timeout_ms":15000})
 
 print(rpc(7, "session.snapshot", {"session":sid,"redact":False})["plain_text"])
+print(rpc(8, "session.transcript", {"session":sid,"redact":False})["text"])
 rpc(99, "session.kill", {"session":sid})
 ```
 
 Why this matcher pair? `⏺` is Claude's answer-block bullet — it only renders when Claude has produced its response. Pinning to specific completion verbs is brittle: Claude Code 2.1.x rotates the verb per turn (`Cogitated for 3s`, `Churned for 11s`, `Baked for 9s`, `Unravelling…`). The bullet + stable-screen pair is verb-agnostic and held across the Claude Code 2.0 and 2.1 versions we've exercised.
 
-For the `--permission-mode bypassPermissions` flag to take effect on first launch in a new directory, the workspace must already be trusted — Claude Code only auto-skips the trust dialog in `--print` mode. Reuse a directory you've previously approved interactively, or drive the trust prompt explicitly via `session.input` actions.
+For the `--permission-mode bypassPermissions` flag to take effect on first launch in a new directory, the workspace must already be trusted — Claude Code only auto-skips the trust dialog in `--print` mode. Reuse a directory you've previously approved interactively, or drive the trust prompt explicitly via `session.input` actions (or use the `adapter.*` driver above, which handles `waiting_for_trust` for you).
 
 ### Claude Code adapter test matrix
 
-These are the scenarios worth driving repeatedly while the adapter and built-in Lua plugin are still hardening. Use the script above as a base and tweak the prompt / branching:
+These are the scenarios worth driving repeatedly while the plugin is still hardening. Use the script above as a base and tweak the prompt / branching. Method names use `adapter.*`; equivalents in `claude.*` work the same way.
 
 | Scenario | Setup | Expected terminal state |
 | --- | --- | --- |
-| Smoke (start + state) | `claude.start` → `claude.state` → `claude.cancel` | starts as `starting`/`ready`, ends with cancel returning a state |
+| Smoke (start + state) | `adapter.start {plugin: "claude-code"}` → `adapter.state` → `adapter.send {intent: "cancel"}` | starts as `starting`/`ready`, ends with cancel returning a state |
 | Happy path | Prompt that needs no tool approval | `completed_turn` after one or more `thinking` rounds |
+| Workspace trust | First-launch directory; expect `waiting_for_trust` → `adapter.send {intent: "approve_trust"}` → continues into normal turn flow | numeric `1`+Enter accepted, no infinite re-prompt |
 | Permission approve | Prompt that triggers `Bash`/`Edit` permission UI | `waiting_for_permission` → `approve` → `completed_turn` |
-| Permission deny | Same setup, call `claude.deny` | adapter recovers to `ready` or returns `completed_turn` with denial evidence |
+| Permission deny | Same setup, call `adapter.send {intent: "deny"}` | adapter recovers to `ready` or returns `completed_turn` with denial evidence |
 | Plan approve | Prompt that triggers plan mode | `waiting_for_plan_approval` → `approve` → `thinking` → `completed_turn` |
-| Mid-turn cancel | After `wait_turn` returns `thinking`, call `claude.cancel` | transitions through `cancelling`, ends with stable state |
-| Crash recovery | `claude.start` with a bogus `program` | `error` / `plugin_error` returned with evidence; subsequent calls reject the dead adapter |
-| Long turn | Prompt that takes >60s; loop `wait_turn` with `timeout_ms: 30000` | repeated `thinking` until `completed_turn`; no spurious `completed_turn` from premature stable-screen |
+| Mid-turn cancel | After `adapter.wait` returns `thinking`, call `adapter.send {intent: "cancel"}` | transitions through `cancelling`, ends with stable state |
+| Crash recovery | `adapter.start` with a bogus `program` | `error` / `plugin_error` returned with evidence; subsequent calls reject the dead adapter |
+| Long turn | Prompt that takes >60s; loop `adapter.wait` with `timeout_ms: 30000` | repeated `thinking` until `completed_turn`; no spurious `completed_turn` from premature stable-screen |
 
 Two things to verify on every run:
 
