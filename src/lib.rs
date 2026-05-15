@@ -9,6 +9,7 @@ pub mod action;
 pub mod adapters;
 pub mod config;
 pub mod error;
+pub mod extension;
 pub mod logging;
 pub mod lua_plugin;
 pub mod matcher;
@@ -25,6 +26,10 @@ pub use action::{Action, Key};
 pub use adapters::{ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeState, ClaudeCodeStateSnapshot};
 pub use config::{Config, LogFormat, LoggingConfig};
 pub use error::{Error, Result};
+pub use extension::{
+    ActionPlan, ClassifyContext, Extension, ExtensionHandle, ExtensionStateSnapshot, LuaExtension,
+    StateCandidate,
+};
 pub use logging::{
     LogGuard, RedactingMakeWriter, RedactingWriter, cleanup_old_logs, init_for_oneshot,
     init_for_run, init_for_serve_socket, init_for_serve_stdio,

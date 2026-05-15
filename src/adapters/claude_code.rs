@@ -6,11 +6,8 @@ const COMPLETED_TURN_STABLE_MS: u64 = 300;
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::Action;
-use crate::error::Result;
-use crate::lua_plugin::LuaPlugin;
-use crate::matcher::Matcher;
-use crate::plugin::claude_code_manifest;
+use crate::error::{Error, Result};
+use crate::extension::{ExtensionHandle, ExtensionStateSnapshot, LuaExtension};
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
 
@@ -97,91 +94,106 @@ pub struct ClaudeCodeStateSnapshot {
     pub sequence: u64,
 }
 
+impl From<ExtensionStateSnapshot> for ClaudeCodeStateSnapshot {
+    fn from(value: ExtensionStateSnapshot) -> Self {
+        let ExtensionStateSnapshot {
+            state,
+            confidence,
+            evidence,
+            sequence,
+            candidates: _,
+        } = value;
+        let (state_enum, evidence) = match state_from_name(&state) {
+            Some(parsed) => (parsed, evidence),
+            None => (
+                ClaudeCodeState::Error,
+                if evidence.is_empty() {
+                    format!("unknown extension state `{state}`")
+                } else {
+                    format!("unknown extension state `{state}`: {evidence}")
+                },
+            ),
+        };
+        Self {
+            state: state_enum,
+            confidence,
+            evidence,
+            sequence,
+        }
+    }
+}
+
 /// Interactive Claude Code adapter backed by a generic ptywright session.
 pub struct ClaudeCodeAdapter {
-    session: Session,
-    plugin: LuaPlugin,
-    last_intent: Option<ClaudeCodeState>,
+    handle: ExtensionHandle,
 }
 
 impl ClaudeCodeAdapter {
     /// Spawn interactive Claude Code in a PTY.
     pub fn start(config: ClaudeCodeConfig) -> Result<Self> {
         let session = Session::spawn(SessionConfig::new(config.target()))?;
-        Ok(Self {
-            session,
-            plugin: claude_plugin()?,
-            last_intent: Some(ClaudeCodeState::Starting),
-        })
+        Self::from_session_with_starting_intent(session)
     }
 
     /// Wrap an existing session. Useful for tests or externally managed sessions.
     pub fn from_session(session: Session) -> Result<Self> {
-        Ok(Self {
-            session,
-            plugin: claude_plugin()?,
-            last_intent: None,
-        })
+        let extension = LuaExtension::built_in("claude-code")?;
+        let handle = ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+        Ok(Self { handle })
+    }
+
+    fn from_session_with_starting_intent(session: Session) -> Result<Self> {
+        let extension = LuaExtension::built_in("claude-code")?;
+        let mut handle =
+            ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+        handle.set_last_intent(Some(state_name(ClaudeCodeState::Starting)?));
+        Ok(Self { handle })
     }
 
     /// Access the underlying generic session.
     #[must_use]
     pub fn session(&self) -> &Session {
-        &self.session
+        self.handle.session()
     }
 
     /// Classify current Claude Code state from visible screen and transcript evidence.
     #[must_use]
     pub fn state(&self) -> ClaudeCodeStateSnapshot {
-        self.try_state().unwrap_or_else(|error| {
-            state_snapshot(
-                ClaudeCodeState::PluginError,
-                0.0,
-                format!("Claude Code Lua plugin failed: {error}"),
-                self.session.sequence(),
-            )
-        })
+        self.try_state()
+            .unwrap_or_else(|error| ClaudeCodeStateSnapshot {
+                state: ClaudeCodeState::PluginError,
+                confidence: 0.0,
+                evidence: format!("Claude Code Lua plugin failed: {error}"),
+                sequence: self.handle.session().sequence(),
+            })
     }
 
     /// Classify current Claude Code state and surface Lua plugin failures.
     pub fn try_state(&self) -> Result<ClaudeCodeStateSnapshot> {
-        let snapshot = self.session.snapshot();
-        let transcript = self.session.transcript();
-        classify_state(
-            &self.plugin,
-            &snapshot.plain_text,
-            &transcript,
-            snapshot.sequence,
-            self.last_intent,
-            None,
-        )
+        Ok(self.handle.try_state()?.into())
     }
 
     /// Send a prompt to the interactive Claude Code TUI.
     pub fn send_prompt(&mut self, prompt: impl AsRef<str>) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = self.plugin.call(
+        let plan = self.handle.extension().plan(
             "send_prompt",
             &serde_json::json!({ "prompt": prompt.as_ref() }),
         )?;
-        self.apply_plan_with_required_intent(&plan, "send_prompt")?;
+        self.handle
+            .apply_plan_with_required_intent(&plan, "send_prompt")?;
         self.try_state()
     }
 
     /// Wait until Claude appears to need user input, approval, or has completed a turn.
     pub fn wait_turn(&self, timeout: Duration) -> Result<ClaudeCodeStateSnapshot> {
-        let matcher: Matcher = self.plugin.call(
-            "wait_turn_matcher",
-            &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
-        )?;
-        let result = self.session.wait_for(&matcher, timeout)?;
-        classify_state(
-            &self.plugin,
-            &result.snapshot.plain_text,
-            &result.transcript_tail,
-            result.sequence,
-            self.last_intent,
-            Some(COMPLETED_TURN_STABLE_MS),
-        )
+        Ok(self
+            .handle
+            .wait(
+                "wait_turn_matcher",
+                serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+                timeout,
+            )?
+            .into())
     }
 
     /// Approve the current Claude Code prompt using the Lua adapter's action plan.
@@ -192,8 +204,11 @@ impl ClaudeCodeAdapter {
     /// has not necessarily settled, so callers that want a stable
     /// classification should follow up with `wait_turn`.
     pub fn approve(&self) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = self.plugin.call("approve", &serde_json::json!({}))?;
-        self.apply_actions(&plan.actions)?;
+        let plan = self
+            .handle
+            .extension()
+            .plan("approve", &serde_json::json!({}))?;
+        self.handle.apply_actions(&plan.actions)?;
         self.try_state()
     }
 
@@ -202,153 +217,99 @@ impl ClaudeCodeAdapter {
     /// Returns the post-apply state snapshot. See [`approve`](Self::approve)
     /// for the stability caveat.
     pub fn deny(&self) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = self.plugin.call("deny", &serde_json::json!({}))?;
-        self.apply_actions(&plan.actions)?;
+        let plan = self
+            .handle
+            .extension()
+            .plan("deny", &serde_json::json!({}))?;
+        self.handle.apply_actions(&plan.actions)?;
         self.try_state()
     }
 
     /// Cancel the current turn with the Lua adapter's action plan.
     pub fn cancel(&mut self) -> Result<ClaudeCodeStateSnapshot> {
-        let plan: ActionPlan = self.plugin.call("cancel", &serde_json::json!({}))?;
-        self.apply_plan_with_required_intent(&plan, "cancel")?;
+        let plan = self
+            .handle
+            .extension()
+            .plan("cancel", &serde_json::json!({}))?;
+        self.handle
+            .apply_plan_with_required_intent(&plan, "cancel")?;
         self.try_state()
     }
-
-    fn apply_plan_with_required_intent(&mut self, plan: &ActionPlan, method: &str) -> Result<()> {
-        self.apply_actions(&plan.actions)?;
-        self.last_intent = Some(plan.last_intent.ok_or_else(|| {
-            crate::Error::Lua(format!(
-                "Claude Code Lua method `{method}` did not return last_intent"
-            ))
-        })?);
-        Ok(())
-    }
-
-    fn apply_actions(&self, actions: &[Action]) -> Result<()> {
-        for action in actions {
-            self.session.send(action.clone())?;
-        }
-        Ok(())
-    }
-}
-
-/// Bottom rows of the rendered screen treated as the Claude Code status bar.
-///
-/// Used to split screen text into `body_text` (content area) and `status_text`
-/// (status bar) before handing it to the Lua classifier so that benign status
-/// strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` cannot
-/// false-positive on the `permissions` substring match in
-/// `plugins/claude-code/main.lua`.
-const STATUS_BAR_ROWS: usize = 3;
-
-/// Apply the same body/status split that the classifier uses, for diagnostic
-/// RPC methods like `claude.inspect` that want to surface what the classifier
-/// would have seen. Exposed at crate visibility so `src/rpc.rs` can reuse the
-/// constant + helper without duplicating the threshold logic.
-pub(crate) fn split_status_bar_for_inspect(screen: &str) -> (String, String) {
-    split_status_bar(screen, STATUS_BAR_ROWS)
-}
-
-fn split_status_bar(screen: &str, status_rows: usize) -> (String, String) {
-    let lines: Vec<&str> = screen.split('\n').collect();
-    if lines.is_empty() {
-        return (String::new(), String::new());
-    }
-    // Only split a screen that's tall enough to actually have a body + status
-    // bar. The Claude Code status bar pattern (separator + status rows at the
-    // bottom) only manifests on full-height TUI screens. Short fixtures and
-    // small windows are entirely body — splitting them would shove the only
-    // content into status_text and break classification.
-    if lines.len() <= status_rows * 2 {
-        return (screen.to_string(), String::new());
-    }
-    let cutoff = lines.len() - status_rows;
-    let body = lines[..cutoff].join("\n");
-    let status = lines[cutoff..].join("\n");
-    (body, status)
-}
-
-fn classify_state(
-    plugin: &LuaPlugin,
-    screen: &str,
-    transcript: &str,
-    sequence: u64,
-    last_intent: Option<ClaudeCodeState>,
-    stable_ms: Option<u64>,
-) -> Result<ClaudeCodeStateSnapshot> {
-    let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
-    plugin.call(
-        "classify",
-        &ClassifyInput {
-            screen,
-            body_text: &body_text,
-            status_text: &status_text,
-            transcript,
-            sequence,
-            last_intent: last_intent.map(state_name).transpose()?,
-            stable_ms,
-            completed_turn_stable_ms: COMPLETED_TURN_STABLE_MS,
-        },
-    )
-}
-
-fn state_snapshot(
-    state: ClaudeCodeState,
-    confidence: f32,
-    evidence: impl Into<String>,
-    sequence: u64,
-) -> ClaudeCodeStateSnapshot {
-    ClaudeCodeStateSnapshot {
-        state,
-        confidence,
-        evidence: evidence.into(),
-        sequence,
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ClassifyInput<'a> {
-    /// Full visible screen text. Kept for backward compatibility with any Lua
-    /// classifier path that wants the unsegmented view.
-    screen: &'a str,
-    /// Screen text with the bottom status-bar rows removed. Permission/plan
-    /// classification should match on `body_text` to avoid false-positives
-    /// from status strings like "bypass permissions on".
-    body_text: &'a str,
-    /// Only the bottom status-bar rows. Available for plugins that want to
-    /// inspect the status bar explicitly (e.g. detect "[ctx: 26% used]").
-    status_text: &'a str,
-    transcript: &'a str,
-    sequence: u64,
-    last_intent: Option<String>,
-    stable_ms: Option<u64>,
-    completed_turn_stable_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActionPlan {
-    actions: Vec<Action>,
-    #[serde(default)]
-    last_intent: Option<ClaudeCodeState>,
-}
-
-fn claude_plugin() -> Result<LuaPlugin> {
-    LuaPlugin::trusted(
-        &claude_code_manifest(),
-        include_str!("../../plugins/claude-code/main.lua"),
-    )
 }
 
 fn state_name(state: ClaudeCodeState) -> Result<String> {
     serde_json::to_value(state)?
         .as_str()
         .map(ToString::to_string)
-        .ok_or_else(|| crate::Error::Lua("Claude Code state did not serialize to a string".into()))
+        .ok_or_else(|| Error::Lua("Claude Code state did not serialize to a string".into()))
+}
+
+fn state_from_name(name: &str) -> Option<ClaudeCodeState> {
+    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::action::Action;
+    use crate::extension::{ActionPlan, LuaExtension, StateCandidate};
+    use crate::matcher::Matcher;
+    use crate::screen::CursorState;
+    use crate::screen::ScreenSnapshot;
+    use crate::target::TerminalSize;
+
+    fn classify_state(
+        extension: &LuaExtension,
+        screen: &str,
+        transcript: &str,
+        sequence: u64,
+        last_intent: Option<ClaudeCodeState>,
+        stable_ms: Option<u64>,
+    ) -> Result<ClaudeCodeStateSnapshot> {
+        use crate::extension::{ClassifyContext, Extension, STATUS_BAR_ROWS, split_status_bar};
+        let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+        let intent_name = last_intent.map(state_name).transpose()?;
+        let ctx = ClassifyContext {
+            screen,
+            body_text: &body_text,
+            status_text: &status_text,
+            transcript,
+            sequence,
+            last_intent: intent_name.as_deref(),
+            stable_ms,
+            completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+        };
+        Ok(extension.classify(&ctx)?.into())
+    }
+
+    fn claude_plugin() -> Result<LuaExtension> {
+        LuaExtension::built_in("claude-code")
+    }
+
+    fn lua_call_plan(
+        extension: &LuaExtension,
+        intent: &str,
+        params: serde_json::Value,
+    ) -> ActionPlan {
+        use crate::extension::Extension;
+        extension.plan(intent, &params).expect("plan from Lua")
+    }
+
+    fn lua_call_matcher(
+        extension: &LuaExtension,
+        intent: &str,
+        params: serde_json::Value,
+    ) -> Matcher {
+        use crate::extension::Extension;
+        extension
+            .wait_matcher(intent, &params)
+            .expect("matcher from Lua")
+    }
+
+    fn parse_last_intent(plan: &ActionPlan) -> Option<ClaudeCodeState> {
+        plan.last_intent.as_deref().and_then(state_from_name)
+    }
 
     #[test]
     fn default_config_targets_interactive_claude_without_print_mode() {
@@ -385,13 +346,12 @@ mod tests {
 
     #[test]
     fn lua_plugin_supplies_prompt_action_plan() {
-        let plan: ActionPlan = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call(
-                "send_prompt",
-                &serde_json::json!({ "prompt": "hello Claude" }),
-            )
-            .expect("load prompt action plan from Lua");
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(
+            &extension,
+            "send_prompt",
+            serde_json::json!({ "prompt": "hello Claude" }),
+        );
 
         assert_eq!(
             plan.actions,
@@ -400,18 +360,20 @@ mod tests {
                 Action::Key(crate::Key::Enter),
             ]
         );
-        assert_eq!(plan.last_intent, Some(ClaudeCodeState::PromptSubmitted));
+        assert_eq!(
+            parse_last_intent(&plan),
+            Some(ClaudeCodeState::PromptSubmitted)
+        );
     }
 
     #[test]
     fn lua_plugin_supplies_turn_wait_matcher() {
-        let matcher: Matcher = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call(
-                "wait_turn_matcher",
-                &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
-            )
-            .expect("load wait matcher from Lua");
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let matcher = lua_call_matcher(
+            &extension,
+            "wait_turn_matcher",
+            serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+        );
 
         let Matcher::All(matchers) = matcher else {
             panic!("expected Lua wait matcher to require all conditions");
@@ -437,16 +399,15 @@ mod tests {
 
     #[test]
     fn lua_turn_wait_matcher_matches_prompt_line() {
-        let matcher: Matcher = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call(
-                "wait_turn_matcher",
-                &serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
-            )
-            .expect("load wait matcher from Lua");
-        let snapshot = crate::ScreenSnapshot {
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let matcher = lua_call_matcher(
+            &extension,
+            "wait_turn_matcher",
+            serde_json::json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+        );
+        let snapshot = ScreenSnapshot {
             size: TerminalSize::new(3, 20),
-            cursor: crate::CursorState {
+            cursor: CursorState {
                 row: 1,
                 col: 2,
                 visible: true,
@@ -584,43 +545,12 @@ mod tests {
     }
 
     #[test]
-    fn split_status_bar_partitions_screen_into_body_and_status() {
-        let screen =
-            "Claude Code v2.1.142\nHaiku 4.5\n\n────\n❯  \n────\nstatus line one\nstatus line two";
-        let (body, status) = split_status_bar(screen, 3);
-        assert!(body.contains("Claude Code v2.1.142"));
-        assert!(body.contains("❯  "));
-        assert!(!body.contains("status line one"));
-        assert!(!body.contains("status line two"));
-        assert!(status.contains("status line one"));
-        assert!(status.contains("status line two"));
-    }
-
-    #[test]
-    fn split_status_bar_handles_short_screens_without_panic() {
-        // Empty input — both halves empty.
-        assert_eq!(split_status_bar("", 3), (String::new(), String::new()));
-        // Short screens (<= status_rows * 2 lines) stay fully as body; we do
-        // not strip content from small fixtures that don't actually have a
-        // bottom status bar.
-        assert_eq!(
-            split_status_bar("only line", 3),
-            ("only line".to_string(), String::new()),
-        );
-        let (body, status) = split_status_bar("a\nb", 3);
-        assert_eq!(body, "a\nb");
-        assert_eq!(status, "");
-    }
-
-    #[test]
     fn lua_cancel_sets_cancelling_intent() {
-        let plan: ActionPlan = claude_plugin()
-            .expect("load built-in Claude Code Lua plugin")
-            .call("cancel", &serde_json::json!({}))
-            .expect("load cancel action plan from Lua");
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "cancel", serde_json::json!({}));
 
         assert_eq!(plan.actions, vec![Action::Interrupt]);
-        assert_eq!(plan.last_intent, Some(ClaudeCodeState::Cancelling));
+        assert_eq!(parse_last_intent(&plan), Some(ClaudeCodeState::Cancelling));
     }
 
     #[test]
@@ -737,5 +667,24 @@ mod tests {
             assert_eq!(state.evidence, evidence);
             assert!(state.confidence >= 0.6);
         }
+    }
+
+    #[test]
+    fn unknown_extension_state_translates_to_error_with_state_in_evidence() {
+        let snapshot = ExtensionStateSnapshot {
+            state: "no-such-state".to_string(),
+            confidence: 0.3,
+            evidence: "from plugin".to_string(),
+            sequence: 42,
+            candidates: vec![StateCandidate {
+                state: "ready".to_string(),
+                confidence: 0.1,
+            }],
+        };
+        let claude: ClaudeCodeStateSnapshot = snapshot.into();
+        assert_eq!(claude.state, ClaudeCodeState::Error);
+        assert!(claude.evidence.contains("no-such-state"));
+        assert!(claude.evidence.contains("from plugin"));
+        assert_eq!(claude.sequence, 42);
     }
 }

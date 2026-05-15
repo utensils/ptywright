@@ -730,8 +730,7 @@ impl RpcServer {
             plain_text = policy.redact(&plain_text);
             transcript_tail = policy.redact(&transcript_tail);
         }
-        let (body_text, status_text) =
-            crate::adapters::claude_code::split_status_bar_for_inspect(&plain_text);
+        let (body_text, status_text) = crate::extension::split_status_bar_for_inspect(&plain_text);
         Ok(json!({
             "state": adapter.state(),
             "plain_text": plain_text,
