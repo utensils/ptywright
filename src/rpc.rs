@@ -1052,6 +1052,93 @@ mod tests {
     }
 
     #[test]
+    fn claude_mutation_methods_for_unknown_adapter_return_invalid_params() {
+        // approve/deny/cancel all share the same lookup path; cover each so a
+        // future refactor that splits the dispatcher cannot silently regress
+        // any one of them.
+        for (id, method) in [
+            (20, "claude.approve"),
+            (21, "claude.deny"),
+            (22, "claude.cancel"),
+        ] {
+            let mut server = RpcServer::new();
+            let response = handle(
+                &mut server,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"claude":"missing"}}}}"#
+                ),
+            );
+
+            assert_eq!(
+                response["error"]["code"], -32602,
+                "{method} should reject unknown adapter with InvalidParams"
+            );
+            let message = response["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                message.contains("unknown Claude Code adapter"),
+                "{method} error message should name the missing lookup, got `{message}`"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_approve_deny_cancel_dispatch_through_rpc_against_live_session() {
+        // Use /bin/sh -lc cat as a long-lived stand-in for `claude`: the Lua
+        // adapter's approve/deny plans send byte sequences, and `cat` accepts
+        // arbitrary input without exiting until EOF or interrupt. This
+        // verifies the JSON-RPC dispatch path end-to-end without depending on
+        // a real Claude Code install.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"claude.start","params":{"program":"/bin/sh","args":["-lc","cat"]}}"#,
+        );
+        let claude = start["result"]["claude"]
+            .as_str()
+            .expect("claude adapter id");
+
+        let approve = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"claude.approve","params":{{"claude":"{claude}"}}}}"#
+            ),
+        );
+        assert_eq!(approve["result"]["approved"], true);
+
+        let deny = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"claude.deny","params":{{"claude":"{claude}"}}}}"#
+            ),
+        );
+        assert_eq!(deny["result"]["denied"], true);
+
+        // cancel records the cancelling intent on the adapter and returns the
+        // resulting state snapshot. The exact classification depends on what
+        // bytes `cat` echoed back — assert the response shape, not the state
+        // label, since `cat` is not Claude.
+        let cancel = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"claude.cancel","params":{{"claude":"{claude}"}}}}"#
+            ),
+        );
+        assert!(
+            cancel["result"]["state"].is_object(),
+            "cancel must return a state snapshot object"
+        );
+        assert!(
+            cancel["result"]["state"]["state"].is_string(),
+            "state snapshot must include a state label"
+        );
+        assert!(
+            cancel["result"]["state"]["sequence"].is_number(),
+            "state snapshot must include a sequence number"
+        );
+    }
+
+    #[test]
     fn rpc_error_messages_are_redacted() {
         let mut server = RpcServer::new();
         let response = handle(

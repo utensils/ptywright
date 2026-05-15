@@ -597,4 +597,80 @@ mod tests {
 
     use std::sync::Mutex;
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Shared `Write`/`MakeWriter` bridge for capturing tracing output in
+    /// a test-local buffer without installing a global subscriber.
+    #[derive(Clone)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn snapshot(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("utf8 log output")
+        }
+    }
+
+    impl io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedBuffer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn tracing_event_routes_through_redaction_writer_end_to_end() {
+        // End-to-end check that the redaction adapter sits in the same
+        // pipeline tracing macros use: build a real subscriber wired through
+        // RedactingMakeWriter, fire an event whose message and structured
+        // field both carry secret-shaped values, and assert neither raw
+        // value reaches the underlying sink. This is the contract claimed by
+        // SPEC's resolved design decisions ("redact ptywright-owned
+        // diagnostics on every record").
+        let buffer = SharedBuffer::new();
+        let writer = RedactingMakeWriter::new(buffer.clone(), Arc::new(RedactionPolicy::default()));
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        // Bearer-prefixed token in a structured string field is quoted by
+        // the formatter; the token regex still matches inside the quotes.
+        // The assignment-shaped secret in the message text exercises the
+        // assignment pattern.
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                bearer_header = "Bearer abcdef123456ghijklmnop",
+                "operation failed for token=plain-secret-value done"
+            );
+        });
+
+        let text = buffer.snapshot();
+        assert!(
+            !text.contains("plain-secret-value"),
+            "message-text secret leaked through tracing: {text}"
+        );
+        assert!(
+            !text.contains("abcdef123456ghijklmnop"),
+            "structured-field secret leaked through tracing: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "expected at least one [REDACTED] marker, got: {text}"
+        );
+    }
 }

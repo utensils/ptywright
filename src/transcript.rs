@@ -211,4 +211,34 @@ mod tests {
             .expect("time after epoch")
             .as_nanos()
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn raw_transcript_file_is_created_with_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "ptywright-transcript-mode-{}-{}.log",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let transcript = Transcript::new(TranscriptConfig {
+            max_chars: 16,
+            raw_file: Some(TranscriptFileConfig::new(&path)),
+        })
+        .expect("create raw transcript");
+        drop(transcript);
+
+        let metadata = std::fs::metadata(&path).expect("stat raw transcript");
+        // Raw transcripts are unredacted sensitive data: SPEC's resolved
+        // design decisions promise "restrictive permissions where supported".
+        // Mask the file-type bits and require owner-read/write only.
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "raw transcript permissions must be 0o600 on Unix, got {mode:o}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
 }
