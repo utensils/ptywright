@@ -34,7 +34,10 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
         "transcript.snapshot()",
         "dump the focused adapter's transcript",
     ),
-    ("screen.snapshot()", "render the focused PTY inline (styled)"),
+    (
+        "screen.snapshot()",
+        "render the focused PTY inline (styled)",
+    ),
     ("view()", "alias for screen.snapshot()"),
     ("inspect()", "diagnostic dump"),
     (":tabs", "list adapters"),

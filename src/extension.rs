@@ -144,10 +144,12 @@ pub struct ActionPlan {
 /// [`LuaExtension`] is the only implementor shipped today; a WASM or external
 /// process implementor would slot in here without changing the rest of the
 /// core. The trait is intentionally not `Send`/`Sync`: the embedded
-/// [`LuaPlugin`] uses `Rc` internally, so each handle is owned by a single
-/// thread. Multi-threaded RPC transports already serialize per-connection
-/// access via separate [`ExtensionHandle`] instances.
-pub trait Extension {
+/// Implementors must be `Send` so adapter handles can live in shared
+/// JSON-RPC state and be driven by whichever client connection happens
+/// to be calling into the server. Only one thread will access a given
+/// handle at a time — the shared registry serializes per-adapter access
+/// behind a `Mutex<ExtensionEntry>`.
+pub trait Extension: Send {
     /// Manifest describing this extension.
     fn manifest(&self) -> &PluginManifest;
 

@@ -91,6 +91,23 @@ impl Paths {
         self.root.join("repl-history")
     }
 
+    /// Default JSON-RPC socket / named-pipe path used when callers omit
+    /// `--socket`. On macOS / Linux this is `~/.ptywright/socket` (an
+    /// AF_UNIX socket); on Windows it is `\\.\pipe\ptywright-<user>`
+    /// because named pipes have to live under `\\.\pipe\`.
+    #[must_use]
+    pub fn default_socket_path(&self) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+            PathBuf::from(format!(r"\\.\pipe\ptywright-{user}"))
+        }
+        #[cfg(not(windows))]
+        {
+            self.root.join("socket")
+        }
+    }
+
     /// Create `dir` (and parents) on demand, returning the path back for chaining.
     /// Performs no work when the directory already exists.
     pub fn ensure_dir(dir: impl AsRef<Path>) -> Result<PathBuf> {
@@ -150,6 +167,8 @@ mod tests {
         assert_eq!(paths.transcripts_dir(), root.join("transcripts"));
         assert_eq!(paths.sockets_dir(), root.join("sockets"));
         assert_eq!(paths.repl_history_path(), root.join("repl-history"));
+        #[cfg(not(windows))]
+        assert_eq!(paths.default_socket_path(), root.join("socket"));
     }
 
     #[test]

@@ -285,9 +285,11 @@ fn repl_command(
             ));
         }
         (None, false) => {
-            return Err(ptywright::Error::Rpc(
-                "ptywright repl requires --socket <path> or --stdio -- <cmd...>".to_string(),
-            ));
+            // No transport flag → connect to the per-user default socket.
+            // Matches `ptywright serve` running without --socket below.
+            let path = Paths::from_env().default_socket_path();
+            tracing::info!(socket = %path.display(), "ptywright repl: connecting to default socket");
+            Transport::Socket(path)
         }
     };
     let framing = match framing {
@@ -314,9 +316,19 @@ fn serve_command(
             ));
         }
         (false, None) => {
-            return Err(ptywright::Error::Rpc(
-                "serve requires --stdio or --socket".to_string(),
-            ));
+            // No transport flag → bind the per-user default socket. Print
+            // the chosen path so the operator can wire a REPL up against
+            // it (and so they know `--socket` is the override).
+            let default = Paths::from_env().default_socket_path();
+            if let Some(parent) = default.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            eprintln!(
+                "ptywright: serving on {} (override with --socket)",
+                default.display()
+            );
+            tracing::info!(socket = %default.display(), "ptywright: serving on default socket");
+            serve_socket(&default, framing)?;
         }
     }
     Ok(ExitCode::SUCCESS)
