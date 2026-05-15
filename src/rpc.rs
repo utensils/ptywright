@@ -1641,13 +1641,37 @@ mod tests {
             .as_str()
             .expect("claude adapter id");
 
-        // Give the shell stand-in a moment to print the fixture line.
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Poll claude.transcript until the fixture line shows up rather
+        // than blindly sleeping. The shell stand-in races against test
+        // scheduling under load, and a fixed sleep was the original source
+        // of intermittent failures when the suite ran in parallel.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let text = loop {
+            let transcript = handle(
+                &mut server,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":2,"method":"claude.transcript","params":{{"claude":"{claude}","redact":false}}}}"#
+                ),
+            );
+            let text = transcript["result"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if text.contains("inspect-fixture-line") {
+                break text;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "fixture line never appeared in transcript within 5s; latest text: `{text}`"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
 
         let snapshot = handle(
             &mut server,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"claude.snapshot","params":{{"claude":"{claude}"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":3,"method":"claude.snapshot","params":{{"claude":"{claude}"}}}}"#
             ),
         );
         assert!(
@@ -1659,13 +1683,6 @@ mod tests {
             "claude.snapshot must include a sequence number"
         );
 
-        let transcript = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"claude.transcript","params":{{"claude":"{claude}","redact":false}}}}"#
-            ),
-        );
-        let text = transcript["result"]["text"].as_str().unwrap_or("");
         assert!(
             text.contains("inspect-fixture-line"),
             "claude.transcript must include the underlying session's bytes; got `{text}`"
@@ -1785,7 +1802,26 @@ mod tests {
             "adapter.start must return an initial state snapshot"
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Poll adapter.transcript instead of sleeping so the test stays
+        // deterministic when the suite runs in parallel. The fixture line
+        // is printed by the inner shell before `cat` starts reading stdin.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let transcript = handle(
+                &mut server,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":10,"method":"adapter.transcript","params":{{"adapter":"{adapter}","redact":false}}}}"#
+                ),
+            );
+            let text = transcript["result"]["text"].as_str().unwrap_or("");
+            if text.contains("adapter-fixture") {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("fixture line never appeared in adapter transcript within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
 
         let state = handle(
             &mut server,
