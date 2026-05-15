@@ -292,9 +292,16 @@ function M.classify(input)
 end
 
 function M.send_prompt(input)
+  -- Use bracketed paste explicitly. Claude Code v2.1+ enables bracketed
+  -- paste mode (`CSI ? 2004 h`) for its input box, so the wrapper lets
+  -- the trailing Enter submit cleanly. Without the wrapper a long
+  -- prompt races against Claude's input tokeniser: the bytes land but
+  -- the Enter gets absorbed and the prompt sits un-submitted. The
+  -- generic `action.paste(...)` still exists for callers / plugins
+  -- driving programs that have not opted into bracketed paste.
   return {
     actions = {
-      action.paste(input.prompt or ""),
+      action.bracketed_paste(input.prompt or ""),
       action.key("enter"),
     },
     last_intent = "prompt_submitted",
@@ -303,10 +310,20 @@ end
 
 function M.wait_turn_matcher(input)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
+  -- Boundary anchors: any single one of these is enough to wake the wait.
+  -- Keep this list in sync with the classifier — every screen the
+  -- classifier reports as anything other than `starting` / `thinking`
+  -- needs at least one anchor here, or `adapter.wait` will time out on
+  -- it. The v2 trust strings (`Accessing workspace`, `Yes, I trust
+  -- this folder`) are mirrored from `has_trust_indicator` so callers
+  -- waiting after `adapter.start` against an untrusted directory wake
+  -- on either the pre-2.1 or 2.1.x dialog.
   return matcher.all({
     matcher.any({
       matcher.contains_text("Do you want to proceed"),
       matcher.contains_text("Do you trust the files"),
+      matcher.contains_text("Accessing workspace"),
+      matcher.contains_text("Yes, I trust this folder"),
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),

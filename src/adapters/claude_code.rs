@@ -356,6 +356,12 @@ mod tests {
 
     #[test]
     fn lua_plugin_supplies_prompt_action_plan() {
+        // Claude Code v2.1+ enables bracketed paste, so the plan must use
+        // the bracketed variant to keep the trailing Enter from being
+        // absorbed into the paste tokeniser on longer prompts. The plain
+        // `Action::Paste` variant still exists for callers driving
+        // programs that have not enabled bracketed paste — see the
+        // Codex review note that prompted this split.
         let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
         let plan = lua_call_plan(
             &extension,
@@ -366,7 +372,7 @@ mod tests {
         assert_eq!(
             plan.actions,
             vec![
-                Action::Paste("hello Claude".to_string()),
+                Action::BracketedPaste("hello Claude".to_string()),
                 Action::Key(crate::Key::Enter),
             ]
         );
@@ -398,6 +404,25 @@ mod tests {
             boundary_matchers
                 .iter()
                 .any(|matcher| matcher == &Matcher::ContainsText("Total cost:".to_string()))
+        );
+        // The classifier recognises Claude Code 2.1's `Accessing workspace`
+        // / `Yes, I trust this folder` dialog; the wait matcher must wake
+        // on the same dialog or callers waiting after `adapter.start`
+        // against a fresh untrusted directory will time out. Lock the
+        // anchor in here so a future Lua edit can't silently drop it.
+        assert!(
+            boundary_matchers
+                .iter()
+                .any(|matcher| matcher
+                    == &Matcher::ContainsText("Accessing workspace".to_string())),
+            "wait matcher missing v2 trust dialog anchor; boundary matchers were {boundary_matchers:?}",
+        );
+        assert!(
+            boundary_matchers
+                .iter()
+                .any(|matcher| matcher
+                    == &Matcher::ContainsText("Yes, I trust this folder".to_string())),
+            "wait matcher missing v2 trust confirmation anchor; boundary matchers were {boundary_matchers:?}",
         );
         assert!(matchers.iter().any(|matcher| matches!(
             matcher,

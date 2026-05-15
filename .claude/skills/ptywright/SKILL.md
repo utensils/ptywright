@@ -178,7 +178,7 @@ The adapter classifies states (`starting`, `ready`, `thinking`, `waiting_for_per
 
 After a fresh-launch `approve_trust`, Claude Code shows a welcome panel with "Welcome back …", "Tips for getting started", and "What's new". The classifier reports this as `starting` (evidence: `welcome screen visible`) rather than `waiting_for_user_input`, because Claude treats the first keypress on that panel as a dismissal rather than a prompt submission. Send `intent: "dismiss_welcome"` through `adapter.send` (or call `send_prompt` directly — bracketed-paste'd content dismisses the welcome and submits in one step) before treating the adapter as ready for prompts.
 
-`send_prompt` writes the prompt with bracketed-paste markers (`CSI 200 ~` … `CSI 201 ~`) so Claude Code v2.1+ treats the payload as a single paste and a trailing Enter as a real submit. Earlier ptywright builds wrote the prompt as raw text, which raced against Claude's input tokeniser and could leave longer prompts typed-but-not-submitted. The bracketed framing is harmless against apps that have not enabled bracketed paste — they ignore the wrapper sequences entirely.
+`send_prompt` writes the prompt as a `bracketed_paste` action (`CSI 200 ~` … `CSI 201 ~`) so Claude Code v2.1+ treats the payload as a single paste and a trailing Enter as a real submit. Earlier ptywright builds wrote the prompt with a plain paste, which raced against Claude's input tokeniser and could leave longer prompts typed-but-not-submitted. The generic `paste` action still writes raw bytes — only use `bracketed_paste` against programs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …); against `cat` or a plain shell the wrapper bytes would land in the child as literal characters.
 
 > **Fixed in Milestone 21.4 (May 2026).** Earlier builds reported `waiting_for_permission` on the idle input screen because the status-bar string `⏵⏵ bypass permissions on (shift+tab to cycle)` contains the substring `permissions`. The classifier now runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status), and the `idle_bypass_permissions.txt` fixture under `tests/fixtures/claude_code/` locks the fix in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` (or `claude.inspect`) to dump the body/status view the classifier sees when investigating new misclassifications.
 
@@ -197,6 +197,7 @@ After a fresh-launch `approve_trust`, Claude Code shows a welcome panel with "We
 {"type":"text","value":"hello"}
 {"type":"key","value":"enter"}                         // enter|escape|tab|backspace|up|down|left|right|ctrl_c|ctrl_d
 {"type":"paste","value":"multiline\npaste"}
+{"type":"bracketed_paste","value":"goes wrapped in CSI 200~ ... CSI 201~"}
 {"type":"resize","value":{"rows":40,"cols":120,"pixel_width":0,"pixel_height":0}}
 {"type":"interrupt"}                                   // Ctrl-C
 {"type":"eof"}                                         // Ctrl-D
