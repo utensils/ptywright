@@ -55,7 +55,11 @@ pub enum Action {
     Text(String),
     /// Send a named key.
     Key(Key),
-    /// Paste text. Bracketed paste support can be added here later.
+    /// Paste text. The session writes the bytes wrapped in bracketed-paste
+    /// markers (`CSI 200 ~` … `CSI 201 ~`) so apps that have enabled
+    /// bracketed paste treat the content as a single paste rather than as
+    /// interactive typing. Apps that haven't enabled bracketed paste ignore
+    /// the wrapper sequences.
     Paste(String),
     /// Resize the PTY and terminal parser.
     Resize(TerminalSize),

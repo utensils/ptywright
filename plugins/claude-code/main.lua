@@ -102,19 +102,25 @@ local function has_plan_indicator(text)
 end
 
 local function has_trust_indicator(text)
-  -- Claude Code's workspace-trust dialog asks "Do you trust the files in
-  -- this folder?" with a numbered list (1. Yes, proceed / 2. No, exit).
-  -- Require BOTH the question phrasing and at least one numbered-option
-  -- string. The earlier "question OR (phrase + option)" form let any
-  -- assistant prose containing "do you trust the files" classify as
-  -- waiting_for_trust, after which automation might submit `1`+Enter
-  -- against the user's actual conversation. Both branches now demand
+  -- Claude Code's workspace-trust dialog has shipped two phrasings:
+  --   pre-2.1: "Do you trust the files in this folder?"
+  --            with "1. Yes, proceed / 2. No, exit"
+  --   2.1.x:  "Accessing workspace: <path>\nIs this a project you created
+  --            or one you trust?" with "1. Yes, I trust this folder / 2. No, exit"
+  -- Both forms keep "no, exit" as the second option so we anchor on that
+  -- to confirm the numbered list is actually rendered, while accepting
+  -- either question phrasing on the body side. Both branches still demand
   -- one of the option strings; that means a model that quotes the
   -- question but does not render the dialog body cannot trigger the
   -- numeric approve action.
-  return (contains(text, "do you trust the files") or contains(text, "trust the files"))
+  local has_question = contains(text, "do you trust the files")
+    or contains(text, "trust the files")
+    or contains(text, "trust this folder")
+    or contains(text, "accessing workspace")
+  return has_question
     and contains_any(text, {
       "yes, proceed",
+      "yes, i trust this folder",
       "no, exit",
     })
 end
@@ -123,6 +129,19 @@ local function has_usage_screen(text)
   return contains(text, "total cost:")
     and contains(text, "usage:")
     and contains_any(text, { "current session", "current week", "total duration" })
+end
+
+local function has_welcome_screen(text)
+  -- Claude Code's first-launch welcome panel renders after the workspace
+  -- trust dialog is accepted. It shows "Welcome back <user>!" alongside a
+  -- "Tips for getting started" / "What's new" pane and traps the first
+  -- Enter keypress (dismissing the welcome rather than submitting the
+  -- caller's prompt). Detect it so the classifier reports `starting`
+  -- instead of `waiting_for_user_input` — Claude is not actually ready to
+  -- accept a prompt yet, even though the input cursor `❯` is on screen.
+  return contains(text, "tips for getting started")
+    and contains(text, "what's new")
+    and contains_any(text, { "welcome back", "claude code v" })
 end
 
 function M.classify(input)
@@ -196,6 +215,16 @@ function M.classify(input)
     if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms and not has_active_work_indicator(body_text) then
       return state_snapshot("completed_turn", 0.78, "stable input prompt after prompt submission", sequence)
     end
+    -- The welcome panel renders an input cursor even though Claude won't
+    -- treat the first Enter as a prompt submission. Report `starting` so
+    -- callers don't race-send before `dismiss_welcome` is invoked. This
+    -- check runs *after* the completed_turn branch so a real turn boundary
+    -- with welcome chrome still visible (transient just after start) isn't
+    -- demoted back to starting — in practice the welcome chrome is gone
+    -- long before a turn completes, so the ordering here is conservative.
+    if has_welcome_screen(body_text) then
+      return state_snapshot("starting", 0.7, "welcome screen visible", sequence)
+    end
     return state_snapshot("waiting_for_user_input", 0.62, "input prompt glyph detected", sequence)
   end
 
@@ -261,6 +290,18 @@ function M.deny_trust(_input)
   return {
     actions = {
       action.text("2"),
+      action.key("enter"),
+    },
+  }
+end
+
+-- Dismiss Claude Code's first-launch welcome panel. The panel appears
+-- after the workspace trust dialog is accepted and traps the first
+-- Enter keypress (the panel disappears rather than the caller's prompt
+-- submitting). Send a bare Enter to clear it before `send_prompt`.
+function M.dismiss_welcome(_input)
+  return {
+    actions = {
       action.key("enter"),
     },
   }

@@ -163,7 +163,8 @@ impl Session {
     /// Send an action to the session.
     pub fn send(&self, action: Action) -> Result<()> {
         match action {
-            Action::Text(text) | Action::Paste(text) => self.write_all(text.as_bytes()),
+            Action::Text(text) => self.write_all(text.as_bytes()),
+            Action::Paste(text) => self.write_bracketed_paste(text.as_bytes()),
             Action::Key(key) => self.send_key(key),
             Action::Resize(size) => self.resize(size),
             Action::Interrupt => self.send_key(Key::CtrlC),
@@ -172,6 +173,38 @@ impl Session {
         }
     }
 
+    /// Write `bytes` wrapped in bracketed-paste markers so the receiving
+    /// application can distinguish a paste from interactive typing.
+    ///
+    /// Modern TUIs (Claude Code v2.1+, vim, fish, …) enable bracketed paste
+    /// (`CSI ? 2004 h`) when they want paste content delivered as a single
+    /// unit. Without the brackets, a paste followed by a real Enter key
+    /// races: the application may still be tokenising the pasted bytes
+    /// when the Enter arrives, and the Enter can be folded into the input
+    /// buffer rather than treated as a submit. That race is exactly what
+    /// `Action::Paste(prompt) + Action::Key(Enter)` hits against Claude
+    /// Code's input box for longer prompts. Apps that have not enabled
+    /// bracketed paste ignore the wrapper sequences (they're standard
+    /// `CSI ~` sequences with no fallback rendering).
+    fn write_bracketed_paste(&self, bytes: &[u8]) -> Result<()> {
+        self.write_all(&bracketed_paste_payload(bytes))
+    }
+}
+
+/// Wrap `bytes` in bracketed-paste START/END markers. Extracted from
+/// [`Session::write_bracketed_paste`] so the framing is unit-testable
+/// without spawning a PTY.
+fn bracketed_paste_payload(bytes: &[u8]) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut wrapped = Vec::with_capacity(START.len() + bytes.len() + END.len());
+    wrapped.extend_from_slice(START);
+    wrapped.extend_from_slice(bytes);
+    wrapped.extend_from_slice(END);
+    wrapped
+}
+
+impl Session {
     /// Write raw text bytes to the PTY master.
     pub fn write_text(&self, text: impl AsRef<str>) -> Result<()> {
         self.write_all(text.as_ref().as_bytes())
@@ -391,5 +424,37 @@ mod tests {
 
         assert!(result.snapshot.plain_text.contains("ready"));
         assert!(session.wait().expect("wait child").success);
+    }
+
+    #[test]
+    fn bracketed_paste_payload_wraps_input_with_csi_markers() {
+        // CSI 200~ / CSI 201~ are the standard bracketed-paste markers.
+        // Apps that have enabled bracketed paste (Claude Code v2.1+,
+        // vim, fish, …) use them to distinguish a paste from interactive
+        // typing — without the wrapper a paste followed by Enter races
+        // against the receiver's input tokeniser.
+        let bytes = bracketed_paste_payload(b"hello");
+        assert_eq!(&bytes[..6], b"\x1b[200~");
+        assert_eq!(&bytes[6..11], b"hello");
+        assert_eq!(&bytes[11..], b"\x1b[201~");
+    }
+
+    #[test]
+    fn bracketed_paste_payload_handles_empty_input() {
+        let bytes = bracketed_paste_payload(b"");
+        assert_eq!(bytes, b"\x1b[200~\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn bracketed_paste_payload_preserves_embedded_newlines() {
+        // Embedded newlines must NOT be split — bracketed paste mode tells
+        // the receiver the whole block is one paste, so the receiver's
+        // line tokeniser keeps it together rather than treating the newline
+        // as a submit.
+        let bytes = bracketed_paste_payload(b"line one\nline two");
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("line one\nline two"));
+        assert!(s.starts_with("\x1b[200~"));
+        assert!(s.ends_with("\x1b[201~"));
     }
 }

@@ -593,6 +593,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lua_dismiss_welcome_sends_single_enter() {
+        // The first-launch welcome panel traps Enter; the plugin exposes
+        // `dismiss_welcome` as a single-Enter action so callers don't have
+        // to drop down to session.input to clear it.
+        let extension = claude_plugin().expect("load built-in Claude Code Lua plugin");
+        let plan = lua_call_plan(&extension, "dismiss_welcome", serde_json::json!({}));
+        assert_eq!(plan.actions, vec![Action::Key(crate::action::Key::Enter)]);
+        assert!(
+            plan.last_intent.is_none(),
+            "dismiss_welcome is non-mutating; last_intent must stay as-is"
+        );
+    }
+
     /// Auto-enrolling classifier regression test.
     ///
     /// For every `*.txt` fixture under `tests/fixtures/claude_code/`, this

@@ -311,6 +311,7 @@ impl ExtensionHandle {
         params: Value,
         timeout: Duration,
     ) -> Result<ExtensionStateSnapshot> {
+        let params = merge_wait_defaults(params, self.completed_turn_stable_ms);
         let matcher = self.extension.wait_matcher(intent, &params)?;
         let result = self.session.wait_for(&matcher, timeout)?;
         let stable_ms = u64::try_from(result.stable_for.as_millis()).unwrap_or(u64::MAX);
@@ -380,6 +381,33 @@ impl ExtensionHandle {
 
 /// Split a rendered screen into `(body, status)` halves.
 ///
+/// Coerce wait-matcher params into a JSON object and inject the host's
+/// configured `completed_turn_stable_ms` if the caller did not already
+/// supply one.
+///
+/// Generic callers of `adapter.wait` typically omit the nested `params`
+/// field entirely, which deserialises to `Value::Null`. Forwarding that
+/// straight to a Lua plugin's `wait_*_matcher` makes the plugin index a
+/// userdata-Null sentinel (mlua serde representation of a JSON null) and
+/// blow up at runtime. Coercing to an empty object both fixes that crash
+/// and gives the host a single place to inject defaults plugins need to
+/// behave correctly — today just the stability threshold the plugin uses
+/// to anchor its turn-boundary matcher.
+fn merge_wait_defaults(params: Value, completed_turn_stable_ms: u64) -> Value {
+    let mut object = match params {
+        Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
+        // Non-object/non-null params: hand back to the plugin verbatim so
+        // existing tests that pass scalars through wait_matcher_value() in
+        // the LuaExtension tests still see the same shape.
+        other => return other,
+    };
+    object
+        .entry("completed_turn_stable_ms")
+        .or_insert_with(|| Value::from(completed_turn_stable_ms));
+    Value::Object(object)
+}
+
 /// The bottom `status_rows` lines are treated as the status bar. Short
 /// screens (where `lines.len() <= status_rows * 2`) are returned as
 /// body-only because they don't have a meaningful status bar to peel off.
@@ -542,5 +570,37 @@ mod tests {
             state.evidence
         );
         Ok(())
+    }
+
+    #[test]
+    fn merge_wait_defaults_coerces_null_and_injects_stable_ms() {
+        // Generic adapter.wait callers omit nested `params`, which serde
+        // deserialises as Value::Null. Forwarding Null to a Lua matcher
+        // function makes mlua's serde adapter produce a userdata sentinel
+        // that the plugin cannot index, so the host must coerce it to an
+        // object before calling the plugin.
+        let merged = merge_wait_defaults(Value::Null, 300);
+        assert_eq!(merged, serde_json::json!({"completed_turn_stable_ms": 300}));
+    }
+
+    #[test]
+    fn merge_wait_defaults_preserves_caller_supplied_stable_ms() {
+        // The host injects its configured threshold only when the caller
+        // did not already supply one. Callers that want a different
+        // stability window must still be able to override.
+        let merged = merge_wait_defaults(serde_json::json!({"completed_turn_stable_ms": 50}), 300);
+        assert_eq!(merged, serde_json::json!({"completed_turn_stable_ms": 50}));
+    }
+
+    #[test]
+    fn merge_wait_defaults_keeps_other_object_keys() {
+        // Future plugins may take additional params alongside the stability
+        // hint. The merge must only add the missing key, not rewrite the
+        // whole object.
+        let merged = merge_wait_defaults(serde_json::json!({"pattern": "ready"}), 300);
+        assert_eq!(
+            merged,
+            serde_json::json!({"pattern": "ready", "completed_turn_stable_ms": 300}),
+        );
     }
 }

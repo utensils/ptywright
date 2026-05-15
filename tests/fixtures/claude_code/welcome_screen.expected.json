@@ -1,0 +1,6 @@
+{
+  "state": "starting",
+  "evidence": "welcome screen visible",
+  "last_intent": null,
+  "min_confidence": 0.6
+}

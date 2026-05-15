@@ -1,0 +1,16 @@
+╭─── Claude Code v2.1.142 ────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                       │
+│              Welcome back James Brink!             │ Ask Claude to create a new app or clone a repo │
+│                                                    │ ────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                     │
+│                      ▝▜█████▛▘                     │ Added new `claude agents` flags                │
+│                        ▘▘ ▝▝                       │                                                │
+│                                                    │ /release-notes for more                        │
+│            /private/tmp/sample-workspace           │                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+  user @ host /private/tmp/sample-workspace                                          [Opus 4.7]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+❯
