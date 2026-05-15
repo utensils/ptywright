@@ -409,4 +409,58 @@ function M.cancel(_input)
   }
 end
 
+-- Generic key/text intent. The REPL's `send.key("…")` and any other
+-- caller that wants to nudge the PTY with a single named key or a short
+-- text token can use this without knowing whether the target is a
+-- recognised key alias or a literal character. Hyphenated names
+-- (`"ctrl-c"`, `"shift-tab"`, `"page-up"`) are normalised to the
+-- underscore form the host's `Key` serde enum expects.
+--
+-- Keep this table in sync with `src/action.rs::Key`. Anything missing
+-- here falls through to `action.text`, which means the caller would see
+-- a literal character or short string typed into the PTY instead of an
+-- escape sequence — almost always a bug rather than the intent.
+local KEY_ALIASES = {
+  -- Submission / line editing
+  enter = true, escape = true, tab = true, shift_tab = true,
+  backspace = true, delete = true, space = true,
+  -- Arrows
+  up = true, down = true, left = true, right = true,
+  -- Navigation cluster
+  home = true, ["end"] = true, page_up = true, page_down = true,
+  insert = true,
+  -- Ctrl combos (ctrl_h / ctrl_i / ctrl_j / ctrl_m are intentionally
+  -- absent — use backspace / tab / enter so transcripts stay readable)
+  ctrl_a = true, ctrl_b = true, ctrl_c = true, ctrl_d = true,
+  ctrl_e = true, ctrl_f = true, ctrl_g = true,
+  ctrl_k = true, ctrl_l = true, ctrl_n = true, ctrl_o = true,
+  ctrl_p = true, ctrl_q = true, ctrl_r = true, ctrl_s = true,
+  ctrl_t = true, ctrl_u = true, ctrl_v = true, ctrl_w = true,
+  ctrl_x = true, ctrl_y = true, ctrl_z = true,
+  -- Function keys
+  f1 = true, f2 = true, f3 = true, f4 = true,
+  f5 = true, f6 = true, f7 = true, f8 = true,
+  f9 = true, f10 = true, f11 = true, f12 = true,
+}
+
+function M.key(input)
+  local raw = (input and input.key) or ""
+  local normalised = raw:gsub("-", "_")
+  if KEY_ALIASES[normalised] then
+    return {
+      actions = {
+        action.key(normalised),
+      },
+    }
+  end
+  -- Fall through: arbitrary single characters or short strings ("y",
+  -- "n", "1", "q") are sent as raw text so the PTY treats them as
+  -- typed input.
+  return {
+    actions = {
+      action.text(raw),
+    },
+  }
+end
+
 return M

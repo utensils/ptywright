@@ -38,14 +38,24 @@ pub struct RpcServerState {
 
 struct RpcSharedState {
     sessions: HashMap<String, Arc<Session>>,
+    /// Live `adapter.start`-spawned extensions, shared across connections
+    /// so disconnecting one client does not kill PTYs another client
+    /// (or the same client after re-connect) might still want to drive.
+    /// Each entry is `Arc<Mutex<...>>` so handlers can clone the handle
+    /// out of the shared registry, drop the outer lock, then serialize
+    /// per-adapter access without blocking unrelated work.
+    extensions: HashMap<String, Arc<Mutex<ExtensionEntry>>>,
     next_session: u64,
+    next_extension: u64,
 }
 
 impl Default for RpcSharedState {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            extensions: HashMap::new(),
             next_session: 1,
+            next_extension: 1,
         }
     }
 }
@@ -53,12 +63,6 @@ impl Default for RpcSharedState {
 /// Stateful JSON-RPC handler for one client connection.
 pub struct RpcServer {
     shared: RpcServerState,
-    /// Generic plugin-backed extension handles registered via `adapter.*`.
-    /// The plugin name is stored on each entry so `adapter.list` /
-    /// `adapter.inspect` can surface it without round-tripping the
-    /// extension's manifest.
-    extensions: HashMap<String, ExtensionEntry>,
-    next_extension_id: u64,
     notifications_enabled: bool,
     last_notified_sequences: HashMap<String, u64>,
     notified_exits: HashSet<String>,
@@ -69,8 +73,15 @@ pub struct RpcServer {
 /// We keep the plugin name alongside the handle so `adapter.list` /
 /// `adapter.inspect` responses can include it without forcing every plugin to
 /// re-expose its manifest through the Extension trait.
+///
+/// `session` is a stable id allocated at `adapter.start` time so notification
+/// subscribers can correlate `session.changed` / `session.exited` events with
+/// the adapter that owns the underlying PTY. The id is allocated from the
+/// same counter as `session.create` sessions, so it is unique within the
+/// server process and never collides with directly-spawned sessions.
 struct ExtensionEntry {
     plugin: String,
+    session: String,
     handle: ExtensionHandle,
 }
 
@@ -257,8 +268,6 @@ impl RpcServer {
     pub fn with_state(shared: RpcServerState) -> Self {
         Self {
             shared,
-            extensions: HashMap::new(),
-            next_extension_id: 1,
             notifications_enabled: false,
             last_notified_sequences: HashMap::new(),
             notified_exits: HashSet::new(),
@@ -311,6 +320,9 @@ impl RpcServer {
 
     fn poll_notifications(&mut self) -> Result<Vec<String>> {
         let mut messages = Vec::new();
+
+        // Shared sessions first (allocated via `session.create`). Snapshot the
+        // current list under the lock so we can release it before emitting.
         let mut sessions = self
             .shared
             .inner
@@ -318,12 +330,55 @@ impl RpcServer {
             .expect("rpc shared state poisoned")
             .sessions
             .iter()
-            .map(|(id, session)| (id.clone(), Arc::clone(session)))
+            .map(|(id, session)| (id.clone(), session.sequence(), session.is_finished()))
             .collect::<Vec<_>>();
-        sessions.sort_by(|(left, _), (right, _)| left.cmp(right));
+        sessions.sort_by(|(left, ..), (right, ..)| left.cmp(right));
 
-        for (id, session) in sessions {
-            let sequence = session.sequence();
+        // Adapter-backed sessions live in shared state so every connection
+        // sees the same set. Clone the Arcs out under one short lock,
+        // then read each entry's session metadata without holding the
+        // outer registry lock for the duration of the iteration.
+        //
+        // **Use `try_lock` rather than `lock`** when reading each adapter
+        // entry: a long-running `adapter.wait` holds the same per-entry
+        // mutex for the entire wait duration (up to `timeout_ms`,
+        // defaulting to 120 s — see `adapter_wait`). A `lock()` here
+        // would block this whole notification-poll behind the wait,
+        // which in turn stalls every other connection's `session.changed`
+        // / `session.exited` flow (including the heartbeat-driven flush
+        // from idle REPLs). Skipping a contended entry means we miss one
+        // tick for that adapter — the next inbound request from any
+        // connection re-polls and catches up — but the other adapters'
+        // notifications keep flowing.
+        let adapter_arcs: Vec<Arc<Mutex<ExtensionEntry>>> = self
+            .shared
+            .inner
+            .lock()
+            .expect("rpc shared state poisoned")
+            .extensions
+            .values()
+            .cloned()
+            .collect();
+        let mut adapter_sessions: Vec<(String, u64, bool)> = adapter_arcs
+            .into_iter()
+            .filter_map(|arc| match arc.try_lock() {
+                Ok(entry) => {
+                    let session = entry.handle.session();
+                    Some((
+                        entry.session.clone(),
+                        session.sequence(),
+                        session.is_finished(),
+                    ))
+                }
+                // Entry is busy — almost always an in-flight `adapter.wait`.
+                // Skip it for this tick rather than block all of polling.
+                Err(_) => None,
+            })
+            .collect();
+        adapter_sessions.sort_by(|(left, ..), (right, ..)| left.cmp(right));
+        sessions.append(&mut adapter_sessions);
+
+        for (id, sequence, finished) in sessions {
             if self.last_notified_sequences.get(&id).copied() != Some(sequence) {
                 self.last_notified_sequences.insert(id.clone(), sequence);
                 messages.push(serialize_response(json!({
@@ -335,7 +390,7 @@ impl RpcServer {
                     },
                 }))?);
             }
-            if session.is_finished() && self.notified_exits.insert(id.clone()) {
+            if finished && self.notified_exits.insert(id.clone()) {
                 messages.push(serialize_response(json!({
                     "jsonrpc": JSONRPC_VERSION,
                     "method": "session.exited",
@@ -385,6 +440,7 @@ impl RpcServer {
                     "session.transcript",
                     "session.wait",
                     "adapter.list",
+                    "adapter.live",
                     "adapter.start",
                     "adapter.state",
                     "adapter.send",
@@ -409,6 +465,7 @@ impl RpcServer {
             "session.transcript" => self.session_transcript(request.params),
             "session.wait" => self.session_wait(request.params),
             "adapter.list" => Ok(self.adapter_list()),
+            "adapter.live" => Ok(self.adapter_live()),
             "adapter.start" => self.adapter_start(request.params),
             "adapter.state" => self.adapter_state(request.params),
             "adapter.send" => self.adapter_send(request.params),
@@ -646,26 +703,21 @@ impl RpcServer {
         id
     }
 
-    fn allocate_extension_id(&mut self) -> String {
-        let id = format!("e{}", self.next_extension_id);
-        self.next_extension_id += 1;
+    fn allocate_extension_id(&self) -> String {
+        let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        let id = format!("e{}", shared.next_extension);
+        shared.next_extension += 1;
         id
     }
 
-    fn extension(&self, id: &str) -> std::result::Result<&ExtensionEntry, (RpcErrorCode, String)> {
-        self.extensions.get(id).ok_or_else(|| {
-            (
-                RpcErrorCode::InvalidParams,
-                format!("unknown adapter: {id}"),
-            )
-        })
-    }
-
-    fn extension_mut(
-        &mut self,
+    /// Clone a handle to the named adapter out of shared state. The
+    /// caller then locks the returned `Mutex` to actually use the entry.
+    fn extension(
+        &self,
         id: &str,
-    ) -> std::result::Result<&mut ExtensionEntry, (RpcErrorCode, String)> {
-        self.extensions.get_mut(id).ok_or_else(|| {
+    ) -> std::result::Result<Arc<Mutex<ExtensionEntry>>, (RpcErrorCode, String)> {
+        let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        shared.extensions.get(id).cloned().ok_or_else(|| {
             (
                 RpcErrorCode::InvalidParams,
                 format!("unknown adapter: {id}"),
@@ -737,16 +789,22 @@ impl RpcServer {
         );
         let state = handle.state();
         let id = self.allocate_extension_id();
-        self.extensions.insert(
-            id.clone(),
-            ExtensionEntry {
-                plugin: params.plugin.clone(),
-                handle,
-            },
-        );
+        let session_id = self.allocate_session_id();
+        {
+            let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            shared.extensions.insert(
+                id.clone(),
+                Arc::new(Mutex::new(ExtensionEntry {
+                    plugin: params.plugin.clone(),
+                    session: session_id.clone(),
+                    handle,
+                })),
+            );
+        }
         Ok(json!({
             "adapter": id,
             "plugin": params.plugin,
+            "session": session_id,
             "state": state,
         }))
     }
@@ -758,7 +816,8 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterParams = parse_params(params)?;
-        let entry = self.extension(&params.adapter)?;
+        let entry_arc = self.extension(&params.adapter)?;
+        let entry = entry_arc.lock().expect("extension poisoned");
         Ok(json!({ "state": entry.handle.state() }))
     }
 
@@ -772,8 +831,9 @@ impl RpcServer {
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterSendParams = parse_params(params)?;
         let intent = params.intent.clone();
-        let state = self
-            .extension_mut(&params.adapter)?
+        let entry_arc = self.extension(&params.adapter)?;
+        let mut entry = entry_arc.lock().expect("extension poisoned");
+        let state = entry
             .handle
             .send(&intent, params.params)
             .map_err(rpc_error_from_error)?;
@@ -792,8 +852,14 @@ impl RpcServer {
             .intent
             .unwrap_or_else(|| DEFAULT_WAIT_INTENT.to_string());
         let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(120_000));
-        let state = self
-            .extension(&params.adapter)?
+        let entry_arc = self.extension(&params.adapter)?;
+        // Holding the per-adapter mutex across `wait` blocks concurrent
+        // sends to the same adapter for the duration of the wait. That is
+        // intentional for v1 — wait + send on the same adapter from two
+        // clients would be ambiguous anyway. A future `adapter.cancel`
+        // method can break out of the wait without needing the mutex.
+        let entry = entry_arc.lock().expect("extension poisoned");
+        let state = entry
             .handle
             .wait(&intent, params.params, timeout)
             .map_err(rpc_error_from_error)?;
@@ -807,12 +873,13 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterReadParams = parse_params(params)?;
-        let entry = self.extension(&params.adapter)?;
+        let entry_arc = self.extension(&params.adapter)?;
         let policy = if params.redact.unwrap_or(true) {
             Some(redaction_policy_for_read(params.redaction)?)
         } else {
             None
         };
+        let entry = entry_arc.lock().expect("extension poisoned");
         let mut snapshot = entry.handle.session().snapshot();
         if let Some(policy) = policy {
             snapshot = snapshot.redacted(&policy);
@@ -828,12 +895,13 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterReadParams = parse_params(params)?;
-        let entry = self.extension(&params.adapter)?;
+        let entry_arc = self.extension(&params.adapter)?;
         let policy = if params.redact.unwrap_or(true) {
             Some(redaction_policy_for_read(params.redaction)?)
         } else {
             None
         };
+        let entry = entry_arc.lock().expect("extension poisoned");
         let session = entry.handle.session();
         let text = if let Some(policy) = policy {
             session.redacted_transcript(&policy)
@@ -852,7 +920,8 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterReadParams = parse_params(params)?;
-        let entry = self.extension(&params.adapter)?;
+        let entry_arc = self.extension(&params.adapter)?;
+        let entry = entry_arc.lock().expect("extension poisoned");
         let session = entry.handle.session();
         let snapshot = session.snapshot();
         let transcript = session.transcript();
@@ -875,6 +944,7 @@ impl RpcServer {
         Ok(json!({
             "adapter": params.adapter,
             "plugin": entry.plugin,
+            "session": entry.session,
             "state": entry.handle.state(),
             "plain_text": plain_text,
             "body_text": body_text,
@@ -897,7 +967,12 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterParams = parse_params(params)?;
-        if let Some(entry) = self.extensions.remove(&params.adapter) {
+        let removed = {
+            let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            shared.extensions.remove(&params.adapter)
+        };
+        if let Some(entry_arc) = removed {
+            let entry = entry_arc.lock().expect("extension poisoned");
             // Best-effort kill — if the child already exited the kill returns
             // an error which we discard. The session is dropped immediately
             // afterwards either way.
@@ -909,6 +984,36 @@ impl RpcServer {
                 format!("unknown adapter: {}", params.adapter),
             ))
         }
+    }
+
+    /// `adapter.live` — list every adapter currently registered in shared
+    /// state. Useful for re-connecting clients that need to discover
+    /// adapters left running by a previous REPL session.
+    fn adapter_live(&self) -> Value {
+        let snapshot: Vec<Value> = {
+            let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            let mut entries: Vec<(String, Arc<Mutex<ExtensionEntry>>)> = shared
+                .extensions
+                .iter()
+                .map(|(id, arc)| (id.clone(), Arc::clone(arc)))
+                .collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries
+        }
+        .into_iter()
+        .map(|(id, arc)| {
+            let entry = arc.lock().expect("extension poisoned");
+            let session = entry.handle.session();
+            json!({
+                "adapter": id,
+                "plugin": entry.plugin,
+                "session": entry.session,
+                "sequence": session.sequence(),
+                "finished": session.is_finished(),
+            })
+        })
+        .collect();
+        json!({ "adapters": snapshot })
     }
 }
 
@@ -1262,6 +1367,63 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn adapters_survive_disconnect_and_are_visible_to_other_handlers() {
+        // Regression for "exiting the REPL kills the adapter": once an
+        // `adapter.start` succeeds, dropping the spawning RpcServer must
+        // *not* drop the adapter. A second RpcServer over the same shared
+        // state can still send / read / inspect / close it.
+        let state = RpcServerState::new();
+        let adapter;
+        {
+            let mut first = RpcServer::with_state(state.clone());
+            let start = handle(
+                &mut first,
+                r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'survive-disconnect\\n' && cat"]}}"#,
+            );
+            adapter = start["result"]["adapter"]
+                .as_str()
+                .expect("adapter id")
+                .to_string();
+            // `first` drops here — without persistent adapters this would
+            // tear down the PTY child.
+        }
+
+        let mut second = RpcServer::with_state(state);
+        let live = handle(
+            &mut second,
+            r#"{"jsonrpc":"2.0","id":2,"method":"adapter.live"}"#,
+        );
+        let live_adapters = live["result"]["adapters"].as_array().expect("array");
+        assert!(
+            live_adapters
+                .iter()
+                .any(|row| row["adapter"] == adapter.as_str()),
+            "adapter.live must surface adapters spawned by a previous handler; got {live_adapters:?}"
+        );
+
+        // A read against the original adapter id must still succeed.
+        let state_call = handle(
+            &mut second,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"adapter.state","params":{{"adapter":"{adapter}"}}}}"#,
+            ),
+        );
+        assert!(
+            state_call["result"]["state"].is_object(),
+            "adapter.state must still work after the spawning handler is dropped; got {state_call}"
+        );
+
+        // Clean up.
+        let _ = handle(
+            &mut second,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#,
+            ),
+        );
+    }
+
+    #[test]
     fn notification_subscriptions_are_per_connection_handler() {
         let state = RpcServerState::new();
         let mut first = RpcServer::with_state(state.clone());
@@ -1312,6 +1474,179 @@ mod tests {
                 .any(|message| message.contains("session.changed")),
             "expected session.changed notification, got: {poll_messages:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn notifications_report_adapter_session_changes() {
+        // Adapter-spawned PTYs are not registered in `shared.sessions`, but
+        // the notification poller still surfaces their progress under the
+        // `session` id returned by `adapter.start`. The REPL client relies on
+        // this to keep its live screen-preview pane current without polling.
+        let mut server = RpcServer::new();
+        let _ = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+            )
+            .expect("enable notifications");
+        let start_messages = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":2,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'adapter-notify\\n' && cat"]}}"#,
+            )
+            .expect("adapter.start");
+        let start_response: Value =
+            serde_json::from_str(&start_messages[0]).expect("json response");
+        let adapter = start_response["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start must return an adapter id");
+        let session = start_response["result"]["session"]
+            .as_str()
+            .expect("adapter.start must return the allocated session id")
+            .to_string();
+
+        // The `adapter.start` handler runs `poll_notifications` itself
+        // before returning, so if the spawned shell already wrote
+        // `adapter-notify` to the PTY by the time `handle_line_messages`
+        // unwinds (which is what happens under Ubuntu CI's parallel-test
+        // load) the resulting `session.changed` lands inside
+        // `start_messages` — not in any subsequent poll. The polling loop
+        // below cannot wake itself either, because the test shell drops
+        // into `cat` and emits no further bytes. Check both buckets so
+        // either ordering is accepted.
+        let saw_in = |messages: &[String]| {
+            messages.iter().any(|message| {
+                message.contains("\"method\":\"session.changed\"") && message.contains(&session)
+            })
+        };
+        let mut saw_changed = saw_in(&start_messages);
+
+        // Generous 20 s deadline keeps the loop branch reliable on busy
+        // CI hosts. The steady-state behaviour is observed within tens of
+        // milliseconds locally; we only need this much budget when many
+        // parallel `/bin/sh` PTY spawns + mlua's send-mutex add overhead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !saw_changed {
+            let poll_messages = server
+                .handle_line_messages(&format!(
+                    r#"{{"jsonrpc":"2.0","id":3,"method":"adapter.state","params":{{"adapter":"{adapter}"}}}}"#,
+                ))
+                .expect("poll for notifications");
+            saw_changed = saw_in(&poll_messages);
+            if !saw_changed {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        assert!(
+            saw_changed,
+            "expected session.changed notification for adapter session `{session}` within 20s"
+        );
+
+        // Drain and close.
+        let _ = server.handle_line_messages(&format!(
+            r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#,
+        ));
+    }
+
+    /// Regression for the contention bug Copilot called out on
+    /// `poll_notifications`: `adapter.wait` holds the per-entry mutex for
+    /// the entire wait duration. If `poll_notifications` used `.lock()`
+    /// (rather than `try_lock`) to read each entry's `session().sequence()`,
+    /// a long wait on adapter A would block notification polling for
+    /// adapter B too — silencing the heartbeat-driven flush every other
+    /// REPL relies on.
+    ///
+    /// Simulate the in-flight wait by manually holding adapter A's
+    /// per-entry mutex on the test thread, then assert that a `session.changed`
+    /// notification still surfaces for adapter B. With the bug present
+    /// the test deadlocks; with `try_lock` we skip A this tick and B
+    /// flows through normally.
+    #[test]
+    #[cfg(unix)]
+    fn poll_notifications_skips_busy_adapter_entries() {
+        let mut server = RpcServer::new();
+        let _ = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+            )
+            .expect("enable notifications");
+
+        // Two adapters, each writing a single line then dropping into
+        // `cat` so the session sequence advances exactly once on each.
+        let start_a = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":2,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'a\\n' && cat"]}}"#,
+            )
+            .expect("start adapter A");
+        let resp_a: Value = serde_json::from_str(&start_a[0]).expect("json response A");
+        let adapter_a = resp_a["result"]["adapter"]
+            .as_str()
+            .expect("adapter id A")
+            .to_string();
+
+        let start_b = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":3,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'b\\n' && cat"]}}"#,
+            )
+            .expect("start adapter B");
+        let resp_b: Value = serde_json::from_str(&start_b[0]).expect("json response B");
+        let session_b = resp_b["result"]["session"]
+            .as_str()
+            .expect("session id B")
+            .to_string();
+
+        // Helper: scan a batch of JSON-RPC messages for a
+        // `session.changed` notification mentioning adapter B's session
+        // id. Same shape as the sister test
+        // `notifications_report_adapter_session_changes` uses.
+        let saw_in = |messages: &[String]| {
+            messages.iter().any(|message| {
+                message.contains("\"method\":\"session.changed\"") && message.contains(&session_b)
+            })
+        };
+        // The B-start handler runs `poll_notifications` itself before
+        // returning. Under llvm-cov instrumentation (slow PTY spawn)
+        // the printf can land before that pass executes, so the very
+        // first `session.changed` for B may already be in `start_b`
+        // rather than any subsequent poll. Check the start batch as
+        // the seed for `saw_b`.
+        let mut saw_b = saw_in(&start_b);
+
+        // Hold adapter A's per-entry mutex from this thread to mimic
+        // an in-flight `adapter.wait`. Acquire the Arc first under a
+        // brief outer-state lock; drop the outer guard before locking
+        // the inner mutex so we don't block other shared-state lookups.
+        let arc_a = {
+            let inner = server.shared.inner.lock().expect("shared state");
+            inner
+                .extensions
+                .get(&adapter_a)
+                .expect("adapter A entry")
+                .clone()
+        };
+        let _held = arc_a.lock().expect("hold adapter A mutex");
+
+        // Drive the notification pump via the cheapest read-only method
+        // — `server.capabilities` is what the REPL's heartbeat uses for
+        // exactly this reason. With the bug present the call deadlocks
+        // here forever (waiting on adapter A's mutex). With `try_lock`
+        // the contended A entry is skipped and B's notification flows
+        // through normally.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !saw_b {
+            let messages = server
+                .handle_line_messages(r#"{"jsonrpc":"2.0","id":99,"method":"server.capabilities"}"#)
+                .expect("poll via capabilities");
+            saw_b = saw_in(&messages);
+            if !saw_b {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        assert!(
+            saw_b,
+            "expected session.changed for adapter B while adapter A's entry mutex is held"
+        );
+
+        drop(_held);
     }
 
     #[test]
@@ -1492,6 +1827,14 @@ mod tests {
             start["result"]["state"].is_object(),
             "adapter.start must return an initial state snapshot"
         );
+        let start_session = start["result"]["session"]
+            .as_str()
+            .expect("adapter.start must return the allocated session id")
+            .to_string();
+        assert!(
+            start_session.starts_with('s'),
+            "adapter session ids share the `s<n>` namespace with session.create; got `{start_session}`"
+        );
 
         // Poll adapter.transcript instead of sleeping so the test stays
         // deterministic when the suite runs in parallel. The fixture line
@@ -1550,6 +1893,10 @@ mod tests {
         );
         assert_eq!(inspect["result"]["plugin"], "claude-code");
         assert_eq!(inspect["result"]["adapter"], adapter);
+        assert_eq!(
+            inspect["result"]["session"], start_session,
+            "adapter.inspect must echo the same session id adapter.start allocated"
+        );
         assert!(inspect["result"]["body_text"].is_string());
         assert!(inspect["result"]["status_text"].is_string());
 

@@ -1,9 +1,8 @@
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mlua::LuaSerdeExt;
@@ -26,8 +25,8 @@ pub struct LuaPlugin {
     lua: mlua::Lua,
     exports: mlua::RegistryKey,
     permissions: BTreeSet<PluginPermission>,
-    instruction_count: Rc<Cell<u64>>,
-    call_started_at: Rc<Cell<Option<Instant>>>,
+    instruction_count: Arc<Mutex<u64>>,
+    call_started_at: Arc<Mutex<Option<Instant>>>,
     instruction_limit: u64,
     wall_clock_limit: Duration,
 }
@@ -97,8 +96,11 @@ impl LuaPlugin {
         I: Serialize,
         O: DeserializeOwned,
     {
-        self.instruction_count.set(0);
-        self.call_started_at.set(Some(Instant::now()));
+        *self
+            .instruction_count
+            .lock()
+            .expect("instruction count poisoned") = 0;
+        *self.call_started_at.lock().expect("call clock poisoned") = Some(Instant::now());
         let result = (|| {
             let exports: mlua::Table = self.lua.registry_value(&self.exports)?;
             let function: mlua::Function = exports.get(function)?;
@@ -106,7 +108,7 @@ impl LuaPlugin {
             let output: mlua::Value = function.call(input)?;
             self.lua.from_value(output)
         })();
-        self.call_started_at.set(None);
+        *self.call_started_at.lock().expect("call clock poisoned") = None;
         result.map_err(|error| self.error(error))
     }
 
@@ -145,19 +147,21 @@ impl LuaPlugin {
         wall_clock_limit: Duration,
     ) -> Result<Self> {
         let lua = new_lua().map_err(|error| lua_error(&name, error))?;
-        let call_started_at = Rc::new(Cell::new(Some(Instant::now())));
+        let call_started_at = Arc::new(Mutex::new(Some(Instant::now())));
         let instruction_count = install_execution_limits(
             &lua,
             instruction_limit,
             wall_clock_limit,
-            Rc::clone(&call_started_at),
+            Arc::clone(&call_started_at),
         )
         .map_err(|error| lua_error(&name, error))?;
         install_host_api(&lua, &permissions).map_err(|error| lua_error(&name, error))?;
-        instruction_count.set(0);
-        call_started_at.set(Some(Instant::now()));
+        *instruction_count
+            .lock()
+            .expect("instruction count poisoned") = 0;
+        *call_started_at.lock().expect("call clock poisoned") = Some(Instant::now());
         let exports_result: mlua::Result<mlua::Table> = lua.load(source).set_name(&name).eval();
-        call_started_at.set(None);
+        *call_started_at.lock().expect("call clock poisoned") = None;
         let exports = exports_result.map_err(|error| lua_error(&name, error))?;
         let exports = lua
             .create_registry_value(exports)
@@ -190,23 +194,24 @@ fn install_execution_limits(
     lua: &mlua::Lua,
     instruction_limit: u64,
     wall_clock_limit: Duration,
-    call_started_at: Rc<Cell<Option<Instant>>>,
-) -> mlua::Result<Rc<Cell<u64>>> {
-    let instruction_count = Rc::new(Cell::new(0_u64));
-    let hook_count = Rc::clone(&instruction_count);
+    call_started_at: Arc<Mutex<Option<Instant>>>,
+) -> mlua::Result<Arc<Mutex<u64>>> {
+    let instruction_count = Arc::new(Mutex::new(0_u64));
+    let hook_count = Arc::clone(&instruction_count);
     lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(LUA_INSTRUCTION_HOOK_INTERVAL),
         move |_lua, _debug| {
-            let next = hook_count
-                .get()
-                .saturating_add(u64::from(LUA_INSTRUCTION_HOOK_INTERVAL));
-            hook_count.set(next);
+            let mut count = hook_count.lock().expect("instruction count poisoned");
+            *count = count.saturating_add(u64::from(LUA_INSTRUCTION_HOOK_INTERVAL));
+            let next = *count;
+            drop(count);
             if next > instruction_limit {
                 return Err(mlua::Error::RuntimeError(
                     "Lua plugin instruction limit exceeded".to_string(),
                 ));
             }
-            if let Some(started_at) = call_started_at.get()
+            let started = *call_started_at.lock().expect("call clock poisoned");
+            if let Some(started_at) = started
                 && started_at.elapsed() > wall_clock_limit
             {
                 return Err(mlua::Error::RuntimeError(

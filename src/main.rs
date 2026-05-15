@@ -49,6 +49,32 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RpcFraming::Ndjson)]
         framing: RpcFraming,
     },
+    /// Interactive REPL client for a running `ptywright serve`.
+    ///
+    /// Requires building with `--features repl`. With the feature off, the
+    /// subcommand is omitted from `--help` and parsing rejects it as
+    /// unknown.
+    #[cfg(feature = "repl")]
+    Repl {
+        /// Connect to a long-running `ptywright serve --socket <path>`.
+        #[arg(long, conflicts_with = "stdio", group = "transport")]
+        socket: Option<PathBuf>,
+        /// Spawn a child server and speak JSON-RPC over its stdio. Pass
+        /// the child command after `--`.
+        #[arg(long, group = "transport")]
+        stdio: bool,
+        /// JSON-RPC framing for the connection.
+        #[arg(long, value_enum, default_value_t = RpcFraming::Ndjson)]
+        framing: RpcFraming,
+        /// Child command and args. Required iff --stdio. Pass after `--`,
+        /// e.g. `ptywright repl --stdio -- ptywright serve --stdio`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            requires = "stdio"
+        )]
+        command: Vec<String>,
+    },
     /// Generate shell completions.
     #[command(after_long_help = "\
 Setup instructions:
@@ -129,6 +155,13 @@ fn run() -> ptywright::Result<ExitCode> {
             socket,
             framing,
         }) => serve_command(stdio, socket.as_deref(), framing),
+        #[cfg(feature = "repl")]
+        Some(Commands::Repl {
+            socket,
+            stdio,
+            framing,
+            command,
+        }) => repl_command(socket, stdio, framing, command),
         Some(Commands::Completions { shell }) => generate_completions(&shell),
         None => {
             let mut command = Cli::command();
@@ -157,6 +190,8 @@ fn init_logging_for(
                 init_for_oneshot(logging)
             }
         }
+        #[cfg(feature = "repl")]
+        Some(Commands::Repl { .. }) => init_for_oneshot(logging),
         Some(Commands::Completions { .. }) | None => init_for_oneshot(logging),
     }
 }
@@ -226,6 +261,64 @@ compdef _clap_dynamic_completer_ptywright ptywright
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "repl")]
+fn repl_command(
+    socket: Option<PathBuf>,
+    stdio: bool,
+    framing: RpcFraming,
+    command: Vec<String>,
+) -> ptywright::Result<ExitCode> {
+    use ptywright::repl::{Framing, ReplArgs, Transport};
+    let transport = match (socket, stdio) {
+        (Some(path), false) => Transport::Socket(path),
+        (None, true) => {
+            if command.is_empty() {
+                return Err(ptywright::Error::Rpc(
+                    "ptywright repl --stdio requires a child command after `--`".to_string(),
+                ));
+            }
+            Transport::Stdio(command)
+        }
+        (Some(_), true) => {
+            return Err(ptywright::Error::Rpc(
+                "ptywright repl accepts only one transport: --socket or --stdio".to_string(),
+            ));
+        }
+        (None, false) => {
+            // No transport flag → connect to the per-user default socket.
+            // Matches `ptywright serve` running without --socket below.
+            let path = Paths::from_env().default_socket_path();
+            // Pre-check for the most common first-run failure (no server
+            // running) so the operator gets a friendlier message than
+            // ENOENT bubbled up from inside the transport.
+            #[cfg(unix)]
+            if !path.exists() {
+                return Err(ptywright::Error::Rpc(format!(
+                    "no ptywright server is listening at {path} (the default socket).\n\
+                     \n\
+                     Start one in another terminal:\n  \
+                     ptywright serve\n\
+                     \n\
+                     …or pipe a child server through stdio in one command:\n  \
+                     ptywright repl --stdio -- ptywright serve --stdio\n\
+                     \n\
+                     To use a non-default path, pass --socket on both sides:\n  \
+                     ptywright serve --socket /tmp/p.sock &\n  \
+                     ptywright repl   --socket /tmp/p.sock",
+                    path = path.display(),
+                )));
+            }
+            tracing::info!(socket = %path.display(), "ptywright repl: connecting to default socket");
+            Transport::Socket(path)
+        }
+    };
+    let framing = match framing {
+        RpcFraming::Ndjson => Framing::Ndjson,
+        RpcFraming::Lsp => Framing::Lsp,
+    };
+    ptywright::repl::run(ReplArgs { transport, framing })
+}
+
 fn serve_command(
     stdio: bool,
     socket: Option<&Path>,
@@ -243,12 +336,94 @@ fn serve_command(
             ));
         }
         (false, None) => {
-            return Err(ptywright::Error::Rpc(
-                "serve requires --stdio or --socket".to_string(),
-            ));
+            // No transport flag → bind the per-user default socket. Print
+            // the chosen path so the operator can wire a REPL up against
+            // it (and so they know `--socket` is the override).
+            let default = Paths::from_env().default_socket_path();
+            if let Some(parent) = default.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            eprintln!(
+                "ptywright: serving on {} (override with --socket)",
+                default.display()
+            );
+            tracing::info!(socket = %default.display(), "ptywright: serving on default socket");
+            serve_socket(&default, framing)?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Backing storage for the socket-cleanup signal handler. Declared at
+/// module scope so the C-ABI shim ([`handle_shutdown_signal`]) can reach
+/// it — signal handlers cannot capture environment.
+///
+/// Holds a NUL-terminated `CString` rather than a `PathBuf` so the
+/// handler can call the async-signal-safe `unlink(2)` syscall directly
+/// instead of going through `std::fs::remove_file`, which allocates and
+/// is not on POSIX's signal-safe function list. `OnceLock::get` is
+/// lock-free, so reading the path from inside the handler does not need
+/// a mutex either — once `install_socket_cleanup` has stored the path,
+/// the handler can read it without taking any locks.
+#[cfg(unix)]
+static SOCKET_CLEANUP_PATH: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(signum: libc::c_int) {
+    // SAFETY: every operation below is on POSIX's list of async-signal-
+    // safe functions (`unlink`, `_exit`). `OnceLock::get` is lock-free
+    // and the `CString` it returns lives at module scope, so reading
+    // its pointer is non-allocating. We deliberately do not `_exit`
+    // through `std::process::exit` because Drop handlers are not
+    // signal-safe; `_exit` returns the conventional `128 + signum`.
+    if let Some(c_path) = SOCKET_CLEANUP_PATH.get() {
+        unsafe {
+            libc::unlink(c_path.as_ptr());
+        }
+    }
+    unsafe { libc::_exit(128 + signum) }
+}
+
+/// Install SIGINT/SIGTERM/SIGHUP handlers that unlink the listening
+/// socket before the process exits, so a clean Ctrl-C does not leave a
+/// dead socket file behind. Server startup already cleans up stale
+/// sockets (see [`serve_socket`]), so this is a UX nicety rather than a
+/// correctness requirement.
+///
+/// Idempotent: only the first call records the path and installs the
+/// handlers. Subsequent calls (in the unlikely case `serve_socket` is
+/// re-entered) silently do nothing rather than racing the handler.
+#[cfg(unix)]
+fn install_socket_cleanup(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // Refuse paths containing an interior NUL — `CString::new` would
+    // reject it, and the handler can't unlink such a path anyway.
+    let Ok(c_path) = std::ffi::CString::new(bytes) else {
+        return;
+    };
+    // `set` is fallible: a second install attempt with a different path
+    // leaves the original recorded path in place. That's intentional —
+    // the first server to bind a socket is the one whose path the
+    // handler should clean up.
+    let _ = SOCKET_CLEANUP_PATH.set(c_path);
+
+    static HANDLERS_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    HANDLERS_INSTALLED.get_or_init(|| {
+        // SAFETY: `libc::signal` itself is async-signal-safe. The
+        // handler we install (`handle_shutdown_signal`) calls only
+        // `unlink` + `_exit`, both on POSIX's signal-safe list, and
+        // reads its path from a lock-free `OnceLock`. Replacing the
+        // default SIGINT/SIGTERM/SIGHUP dispositions is intentional —
+        // we want clean shutdown.
+        let handler = handle_shutdown_signal as *const () as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGHUP, handler);
+        }
+    });
 }
 
 #[cfg(unix)]
@@ -268,6 +443,7 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
     }
 
     let listener = UnixListener::bind(path)?;
+    install_socket_cleanup(path);
     let state = RpcServerState::new();
     tracing::info!(socket = %path.display(), "ptywright: listening on local socket");
     for stream in listener.incoming() {

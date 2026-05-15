@@ -86,6 +86,35 @@ jobs:
         if: runner.os != 'macOS'
         run: rustup run stable cargo build --release --locked
 
+      # Lean baseline build (without the default `repl` feature). Keeps
+      # the `--no-default-features` path green so projects that opt out of
+      # the REPL stack — reedline, ratatui, crossbeam-channel,
+      # nu-ansi-term — don't suddenly stop building. Windows is
+      # check-only for v1.
+      - name: Check (--no-default-features, macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" check --locked --no-default-features
+      - name: Check (--no-default-features)
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo check --locked --no-default-features
+      - name: Clippy (--no-default-features)
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo clippy --locked --no-default-features -- -D warnings
+      - name: Test (--no-default-features, macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" test --locked --no-default-features --lib --bins --tests
+      - name: Test (--no-default-features)
+        if: runner.os == 'ubuntu-latest'
+        run: rustup run stable cargo test --locked --no-default-features
+
   coverage:
     runs-on: ubuntu-latest
     continue-on-error: true

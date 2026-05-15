@@ -187,6 +187,74 @@ fn serve_unix_socket_returns_json_rpc_response() {
 
 #[test]
 #[cfg(unix)]
+fn serve_unix_socket_unlinks_socket_on_sigterm() {
+    // Regression: previously `ptywright serve --socket …` left the socket
+    // file on disk on graceful exit, so the next `ptywright repl` saw a
+    // stale socket and reported a confusing "is a stale server file
+    // lingering?" error. The shutdown signal handler installed in
+    // `serve_socket` should unlink the socket before the process exits.
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket = std::env::temp_dir().join(format!(
+        "ptywright-test-cleanup-{}-{unique}.sock",
+        std::process::id()
+    ));
+
+    let mut child = bin()
+        .args(["serve", "--socket"])
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ptywright serve --socket");
+
+    // Wait for the server to bind the socket.
+    let mut bound = false;
+    for _ in 0..200 {
+        if UnixStream::connect(&socket).is_ok() {
+            bound = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(bound, "server never bound socket {socket:?}");
+    assert!(
+        socket.exists(),
+        "socket file must exist while server is running"
+    );
+
+    // Send SIGTERM. The signal handler should unlink the file before
+    // `_exit`.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait();
+
+    // Poll briefly to allow the OS to reflect the unlink; the handler
+    // runs synchronously before `_exit` but the parent's filesystem
+    // view can lag the syscall on some platforms.
+    let mut removed = false;
+    for _ in 0..50 {
+        if !socket.exists() {
+            removed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        removed,
+        "socket file should have been unlinked on SIGTERM, still exists at {socket:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn serve_unix_socket_shares_sessions_across_connections() {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

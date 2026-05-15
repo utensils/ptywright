@@ -180,7 +180,7 @@
               {
                 category = "check";
                 name = "ci-local";
-                help = "run the same sequence CI runs: fmt-check, check, clippy, test, build";
+                help = "run the same sequence CI runs: fmt-check, check, clippy, test, build (default + --no-default-features)";
                 command = ''
                   set -euo pipefail
                   cargo fmt --all -- --check
@@ -188,6 +188,13 @@
                   cargo clippy -- -D warnings
                   cargo test
                   cargo build --release
+                  # Lean baseline: keep the `--no-default-features` path
+                  # green so callers who opt out of the `repl` stack don't
+                  # silently break. Mirrors the extra steps in
+                  # .github/workflows/ci.yml.
+                  cargo check --no-default-features
+                  cargo clippy --no-default-features -- -D warnings
+                  cargo test --no-default-features
                 '';
               }
               {
@@ -212,8 +219,8 @@
               {
                 category = "run";
                 name = "ptywright";
-                help = "run ptywright";
-                command = "cargo run -- \"$@\"";
+                help = "run ptywright (with the default `repl` feature, including the interactive REPL client)";
+                command = "cargo run --features repl -- \"$@\"";
               }
               {
                 category = "docs";

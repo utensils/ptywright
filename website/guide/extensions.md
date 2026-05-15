@@ -49,7 +49,7 @@ Action constructors return tagged tables matching the JSON `Action` shape:
 - `ptywright.action.text(value)` — typed text input.
 - `ptywright.action.paste(value)` — raw paste; writes `value` to the PTY as-is. Use against programs that have NOT enabled bracketed paste (cat, plain shells, generic REPLs).
 - `ptywright.action.bracketed_paste(value)` — bracketed paste; writes `value` wrapped in `CSI 200 ~` … `CSI 201 ~`. Use against TUIs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …) so a subsequent Enter is interpreted as a submit rather than absorbed into the paste tokeniser.
-- `ptywright.action.key(name)` — single-key input (e.g. `"enter"`, `"escape"`, `"tab"`).
+- `ptywright.action.key(name)` — single-key input. `name` is a `snake_case` string matching a variant of the host's `Key` enum. The full surface covers submission/edit keys (`"enter"`, `"escape"`, `"tab"`, `"shift_tab"`, `"backspace"`, `"delete"`, `"space"`), arrows (`"up"`, `"down"`, `"left"`, `"right"`), the navigation cluster (`"home"`, `"end"`, `"page_up"`, `"page_down"`, `"insert"`), every readline-style control combo from `"ctrl_a"` through `"ctrl_z"` except the four that alias other named keys (`ctrl_h`/`ctrl_i`/`ctrl_j`/`ctrl_m` — use `backspace`/`tab`/`enter`), and `"f1"` through `"f12"`. Plugins that accept caller-supplied key strings should normalise hyphens to underscores (`"shift-tab"` → `"shift_tab"`); see the `KEY_ALIASES` table in `plugins/claude-code/main.lua` for the reference implementation.
 - `ptywright.action.interrupt()` — Ctrl-C.
 - `ptywright.action.eof()` — Ctrl-D.
 - `ptywright.action.kill()` — SIGKILL the child; requires the `session.kill` permission.

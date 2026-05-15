@@ -10,7 +10,9 @@ ptywright keeps configuration, log files, and any future cached state under a si
 ├── logs/            # daily-rotated log files (ptywright.YYYY-MM-DD.log)
 ├── data/            # reserved for future on-disk state
 ├── transcripts/     # reserved for opt-in raw transcript files
-└── sockets/         # reserved for IPC paths created by serve --socket
+├── sockets/         # reserved for IPC paths created by serve --socket
+├── socket           # default `serve --socket` endpoint (and the path `repl` connects to when no transport is supplied)
+└── repl-history     # persisted REPL command history (Ctrl-R reverse search)
 ```
 
 ptywright creates each subdirectory lazily, only when the corresponding feature writes to it.
@@ -57,12 +59,13 @@ A copy of this template lives at [`config.example.toml`](https://github.com/uten
 
 ptywright uses [`tracing`](https://docs.rs/tracing/) with daily-rotated files written through a non-blocking background writer. Each CLI mode wires the right combination of sinks so the output contracts of the binary are upheld:
 
-| Mode                                 | Stderr | File | Notes                                                                                           |
-| ------------------------------------ | :----: | :--: | ----------------------------------------------------------------------------------------------- |
-| `ptywright run`                      |   ✗    |  ✓   | The `run` command bridges raw bytes to your terminal — extra stderr would corrupt the live PTY. |
-| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is reserved for JSON-RPC framing and is never written.                                   |
-| `ptywright serve --socket`           |   ✓    |  ✓   | Same as `--stdio`.                                                                              |
-| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                              |
+| Mode                                 | Stderr | File | Notes                                                                                                                                                                                    |
+| ------------------------------------ | :----: | :--: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ptywright run`                      |   ✗    |  ✓   | The `run` command bridges raw bytes to your terminal — extra stderr would corrupt the live PTY.                                                                                          |
+| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is reserved for JSON-RPC framing and is never written.                                                                                                                            |
+| `ptywright serve --socket`           |   ✓    |  ✓   | Same as `--stdio`.                                                                                                                                                                       |
+| `ptywright repl`                     |   ✓    |  ✓   | The REPL is a sequential reedline loop sharing stdout/stderr with the operator's terminal; stderr writes interleave with the prompt scrollback rather than corrupting a separate buffer. |
+| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                                                                                                                       |
 
 ### File names and rotation
 
