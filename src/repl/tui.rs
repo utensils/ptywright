@@ -25,6 +25,7 @@ use super::highlighter::ReplHighlighter;
 use super::transport::RpcClient;
 use crate::error::{Error, Result};
 use crate::paths::Paths;
+use crate::screen::{ScreenCellStyle, ScreenSnapshot};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -124,6 +125,9 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
                     Ok(CmdOutcome::ShowHelp(text)) => print_help(&text),
                     Ok(CmdOutcome::Line(text)) => print_line_result(&text),
                     Ok(CmdOutcome::Json(value)) => print_json_result(&value),
+                    Ok(CmdOutcome::Screen { adapter, snapshot }) => {
+                        print_screen(&adapter, &snapshot)
+                    }
                     Err(error) => print_error(&error.to_string()),
                 }
             }
@@ -209,6 +213,136 @@ fn print_error(message: &str) {
         Color::Red.bold().paint("✗"),
         Color::Red.paint(message),
     );
+}
+
+/// Render a `ScreenSnapshot` into the scrollback using ANSI codes so the
+/// operator sees the PTY exactly as the agent would. Cells are walked in
+/// row-major order, contiguous same-style runs are batched into one
+/// paint() call to keep the byte stream compact.
+fn print_screen(adapter: &str, snapshot: &ScreenSnapshot) {
+    let dim = Style::new().dimmed();
+    let title = format!(
+        " preview · {adapter} · {}×{} · seq {} ",
+        snapshot.size.cols, snapshot.size.rows, snapshot.sequence,
+    );
+    let rule_width = (snapshot.size.cols as usize).clamp(40, 120);
+    let header = format!(
+        "─{title:─^width$}─",
+        title = title,
+        width = rule_width.saturating_sub(2),
+    );
+    println!();
+    println!("  {}", dim.paint(header));
+
+    // Group cells by row and sort by column. The vt100 backend already
+    // emits cells row-major but it's cheap insurance — and lets us tolerate
+    // future backends that might not.
+    let rows_count = snapshot.size.rows as usize;
+    let mut rows: Vec<Vec<&_>> = (0..rows_count).map(|_| Vec::new()).collect();
+    for cell in &snapshot.cells {
+        let r = cell.row as usize;
+        if r < rows.len() {
+            rows[r].push(cell);
+        }
+    }
+    for row in &mut rows {
+        row.sort_by_key(|c| c.col);
+    }
+
+    for row in rows {
+        print!("  ");
+        let mut buffer = String::new();
+        let mut current_style: Option<Style> = None;
+        for cell in row {
+            if cell.wide_continuation {
+                continue;
+            }
+            let style = cell_style_to_ansi(&cell.style);
+            let text = if cell.text.is_empty() {
+                " "
+            } else {
+                cell.text.as_str()
+            };
+            match current_style {
+                Some(s) if s == style => buffer.push_str(text),
+                _ => {
+                    if let Some(s) = current_style.take()
+                        && !buffer.is_empty()
+                    {
+                        print!("{}", s.paint(std::mem::take(&mut buffer)));
+                    }
+                    current_style = Some(style);
+                    buffer.push_str(text);
+                }
+            }
+        }
+        if let Some(s) = current_style
+            && !buffer.is_empty()
+        {
+            print!("{}", s.paint(buffer));
+        }
+        println!();
+    }
+
+    let footer = format!(
+        "─ end · cursor {}:{}{} ─",
+        snapshot.cursor.row,
+        snapshot.cursor.col,
+        if snapshot.alternate_screen {
+            " · alt-screen"
+        } else {
+            ""
+        },
+    );
+    println!("  {}", dim.paint(footer));
+    println!();
+}
+
+fn cell_style_to_ansi(style: &ScreenCellStyle) -> Style {
+    let mut out = Style::new();
+    if let Some(color) = parse_cell_color(&style.foreground) {
+        out = out.fg(color);
+    }
+    if let Some(color) = parse_cell_color(&style.background) {
+        out = out.on(color);
+    }
+    if style.bold {
+        out = out.bold();
+    }
+    if style.dim {
+        out = out.dimmed();
+    }
+    if style.italic {
+        out = out.italic();
+    }
+    if style.underline {
+        out = out.underline();
+    }
+    if style.inverse {
+        out = out.reverse();
+    }
+    out
+}
+
+fn parse_cell_color(value: &str) -> Option<Color> {
+    if value == "default" {
+        return None;
+    }
+    if let Some(idx) = value.strip_prefix("idx:")
+        && let Ok(n) = idx.parse::<u8>()
+    {
+        return Some(Color::Fixed(n));
+    }
+    if let Some(rgb) = value.strip_prefix("rgb:") {
+        let parts: Vec<&str> = rgb.split(':').collect();
+        if parts.len() == 3 {
+            let r = parts[0].parse().ok()?;
+            let g = parts[1].parse().ok()?;
+            let b = parts[2].parse().ok()?;
+            return Some(Color::Rgb(r, g, b));
+        }
+    }
+    None
 }
 
 // ---- Prompt impl --------------------------------------------------------

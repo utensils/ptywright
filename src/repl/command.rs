@@ -66,6 +66,12 @@ pub enum CmdOutcome {
     /// Multi-line help text the TUI should surface as a modal overlay
     /// rather than squeezing into the history pane.
     ShowHelp(String),
+    /// Rendered terminal snapshot. The TUI prints it inline with cell
+    /// styles so the operator can see the PTY exactly as the agent does.
+    Screen {
+        adapter: String,
+        snapshot: crate::screen::ScreenSnapshot,
+    },
     /// REPL should exit.
     Quit,
 }
@@ -649,10 +655,20 @@ fn dispatch_dsl(
             )?;
             Ok(CmdOutcome::Json(result))
         }
-        "screen.snapshot" => {
+        "screen.snapshot" | "screen.view" | "view" => {
             let adapter = focus_or_err(ctx)?.to_string();
-            let result = client.call("adapter.snapshot", json!({ "adapter": adapter }), timeout)?;
-            Ok(CmdOutcome::Json(result))
+            // adapter.snapshot is asked to *not* redact so the REPL view
+            // matches what the underlying terminal really shows. Operators
+            // who need a redacted copy can fall through to
+            // `:rpc adapter.snapshot {"adapter":"e1","redact":true}`.
+            let result = client.call(
+                "adapter.snapshot",
+                json!({ "adapter": adapter, "redact": false }),
+                timeout,
+            )?;
+            let snapshot: crate::screen::ScreenSnapshot = serde_json::from_value(result)
+                .map_err(|error| Error::Rpc(format!("decode adapter.snapshot: {error}")))?;
+            Ok(CmdOutcome::Screen { adapter, snapshot })
         }
         "inspect" => {
             let adapter = focus_or_err(ctx)?.to_string();
@@ -936,8 +952,9 @@ pub fn help_text() -> &'static str {
        wait(matches(r\"…\"))            wait for output to match\n\
        wait(screen_stable(250ms))      wait for the screen to settle\n\
        transcript.snapshot(redact=true)\n\
-       screen.snapshot()\n\
-       inspect()\n\
+       screen.snapshot()                render the focused PTY inline\n\
+       view()                           alias for screen.snapshot()\n\
+       inspect()                        diagnostic dump\n\
      \n\
      Meta:\n\
        :tabs       :focus <id>   :notifications on|off\n\
