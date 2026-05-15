@@ -116,7 +116,15 @@ Available `claude.*` methods:
 `claude.approve` and `claude.deny` return both the post-apply state snapshot and a deprecated boolean alias:
 
 ```json
-{ "state": { "state": "completed_turn", "confidence": 0.9, "evidence": "...", "sequence": 17 }, "approved": true }
+{
+  "state": {
+    "state": "completed_turn",
+    "confidence": 0.9,
+    "evidence": "...",
+    "sequence": 17
+  },
+  "approved": true
+}
 ```
 
 Read `state` like every other mutation method. The `approved` / `denied` booleans are retained so existing callers that pattern-match the old `{approved: true}` / `{denied: true}` shape keep working; treat them as deprecated.

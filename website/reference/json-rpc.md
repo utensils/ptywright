@@ -183,17 +183,17 @@ Matcher payloads:
 
 `adapter.*` is the plugin-name-aware surface for driving any TUI through ptywright's built-in extension layer. Callers select a plugin manifest by name; the server spawns a PTY session and wraps it in an `ExtensionHandle` for that plugin. Subsequent calls reference the handle by id. The Claude Code-specific `claude.*` methods listed below remain available as the original aliases.
 
-| Method               | Params                                                                                                                    | Result                                                            |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `adapter.list`       | —                                                                                                                         | `{ "plugins": [PluginManifest, ...] }`                            |
-| `adapter.start`      | `{ "plugin": "claude-code", "program"?, "args"?, "cwd"?, "env"?, "rows"?, "cols"?, "pixel_width"?, "pixel_height"? }`     | `{ "adapter": "e1", "plugin": "claude-code", "state": ... }`     |
-| `adapter.state`      | `{ "adapter": "e1" }`                                                                                                     | `{ "state": ... }`                                                |
-| `adapter.send`       | `{ "adapter": "e1", "intent": "send_prompt", "params": { "prompt": "..." } }`                                             | `{ "state": ... }`                                                |
-| `adapter.wait`       | `{ "adapter": "e1", "intent"?: "wait_turn_matcher", "params"?: { ... }, "timeout_ms"?: 120000 }`                          | `{ "state": ... }`                                                |
-| `adapter.snapshot`   | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                            | `ScreenSnapshot` (same shape as `session.snapshot`)               |
-| `adapter.transcript` | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                            | `{ "text": "..." }`                                               |
-| `adapter.inspect`    | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                            | `{ "adapter", "plugin", "state", "plain_text", "body_text", "status_text", "transcript_tail", "sequence" }` |
-| `adapter.close`      | `{ "adapter": "e1" }`                                                                                                     | `{ "closed": true }`                                              |
+| Method               | Params                                                                                                                | Result                                                                                                      |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `adapter.list`       | —                                                                                                                     | `{ "plugins": [PluginManifest, ...] }`                                                                      |
+| `adapter.start`      | `{ "plugin": "claude-code", "program"?, "args"?, "cwd"?, "env"?, "rows"?, "cols"?, "pixel_width"?, "pixel_height"? }` | `{ "adapter": "e1", "plugin": "claude-code", "state": ... }`                                                |
+| `adapter.state`      | `{ "adapter": "e1" }`                                                                                                 | `{ "state": ... }`                                                                                          |
+| `adapter.send`       | `{ "adapter": "e1", "intent": "send_prompt", "params": { "prompt": "..." } }`                                         | `{ "state": ... }`                                                                                          |
+| `adapter.wait`       | `{ "adapter": "e1", "intent"?: "wait_turn_matcher", "params"?: { ... }, "timeout_ms"?: 120000 }`                      | `{ "state": ... }`                                                                                          |
+| `adapter.snapshot`   | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                        | `ScreenSnapshot` (same shape as `session.snapshot`)                                                         |
+| `adapter.transcript` | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                        | `{ "text": "..." }`                                                                                         |
+| `adapter.inspect`    | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                        | `{ "adapter", "plugin", "state", "plain_text", "body_text", "status_text", "transcript_tail", "sequence" }` |
+| `adapter.close`      | `{ "adapter": "e1" }`                                                                                                 | `{ "closed": true }`                                                                                        |
 
 `adapter.list` enumerates the built-in plugin manifests this server can instantiate. `adapter.start` requires the `plugin` field; `program` is host-defaulted for known plugins (`claude-code` → `"claude"`) and must be supplied explicitly for plugins without a host-known default. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params`; the server forwards them to the plugin and returns the post-apply classified state. `adapter.wait` defaults `intent` to `wait_turn_matcher` so simple callers can omit it, and defaults `timeout_ms` to `120000`. `adapter.inspect` applies the same body/status split the classifier uses (bottom three rows treated as status bar) so misclassification reports can be reproduced without standing up a parallel `session.*` connection.
 
@@ -203,17 +203,17 @@ See the [Extensions guide](../guide/extensions.md) for plugin authoring and the 
 
 Claude methods drive interactive Claude Code through a PTY. They do not use `claude -p`. The `claude.*` surface is the original Claude-specific alias for the same `ExtensionHandle` machinery; both surfaces share the built-in `claude-code` Lua plugin while Rust executes PTY/session/action/matcher controls. New clients should prefer `adapter.*`; `claude.*` remains supported.
 
-| Method               | Params                                        | Result                                                                |
-| -------------------- | --------------------------------------------- | --------------------------------------------------------------------- |
-| `claude.start`       | `{ "cwd": "/repo", "rows": 40, "cols": 120 }` | `{ "claude": "c1", "state": ... }`                                    |
-| `claude.send_prompt` | `{ "claude": "c1", "prompt": "..." }`         | `{ "state": ... }`                                                    |
-| `claude.wait_turn`   | `{ "claude": "c1", "timeout_ms": 120000 }`    | `{ "state": ... }`                                                    |
-| `claude.approve`     | `{ "claude": "c1" }`                          | `{ "state": ..., "approved": true }`                                  |
-| `claude.deny`        | `{ "claude": "c1" }`                          | `{ "state": ..., "denied": true }`                                    |
-| `claude.cancel`      | `{ "claude": "c1" }`                          | `{ "state": ... }`                                                    |
-| `claude.state`       | `{ "claude": "c1" }`                          | `{ "state": ... }`                                                    |
-| `claude.snapshot`    | `{ "claude": "c1", "redact"?, "redaction"? }` | `ScreenSnapshot` (same shape as `session.snapshot`)                   |
-| `claude.transcript`  | `{ "claude": "c1", "redact"?, "redaction"? }` | `{ "text": "..." }`                                                   |
+| Method               | Params                                        | Result                                                                                 |
+| -------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `claude.start`       | `{ "cwd": "/repo", "rows": 40, "cols": 120 }` | `{ "claude": "c1", "state": ... }`                                                     |
+| `claude.send_prompt` | `{ "claude": "c1", "prompt": "..." }`         | `{ "state": ... }`                                                                     |
+| `claude.wait_turn`   | `{ "claude": "c1", "timeout_ms": 120000 }`    | `{ "state": ... }`                                                                     |
+| `claude.approve`     | `{ "claude": "c1" }`                          | `{ "state": ..., "approved": true }`                                                   |
+| `claude.deny`        | `{ "claude": "c1" }`                          | `{ "state": ..., "denied": true }`                                                     |
+| `claude.cancel`      | `{ "claude": "c1" }`                          | `{ "state": ... }`                                                                     |
+| `claude.state`       | `{ "claude": "c1" }`                          | `{ "state": ... }`                                                                     |
+| `claude.snapshot`    | `{ "claude": "c1", "redact"?, "redaction"? }` | `ScreenSnapshot` (same shape as `session.snapshot`)                                    |
+| `claude.transcript`  | `{ "claude": "c1", "redact"?, "redaction"? }` | `{ "text": "..." }`                                                                    |
 | `claude.inspect`     | `{ "claude": "c1", "redact"?, "redaction"? }` | `{ "state", "plain_text", "body_text", "status_text", "transcript_tail", "sequence" }` |
 
 `claude.start` accepts optional `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, and `pixel_height` fields. The default program is `claude`; default args are empty.

@@ -59,18 +59,18 @@ Turn orchestration / adapters
 
 ## Abstraction boundaries
 
-| Layer      | Responsibility                                                     | Should avoid                          |
-| ---------- | ------------------------------------------------------------------ | ------------------------------------- |
-| Target     | Program, args, cwd, environment, terminal size                     | PTY lifecycle details                 |
-| Session    | Child process, PTY handle, reader/writer, resize, exit             | App prompt semantics                  |
-| Screen     | Parsed terminal view, cursor, scrollback, alternate screen         | Input timing policy                   |
-| Transcript | Bounded retained PTY output text                                   | Terminal rendering decisions          |
-| Action     | Keys, writes, paste, resize, interrupt, EOF, kill                  | App-specific success rules            |
-| Matcher    | Screen/transcript predicates and timeout evidence                  | Owning the process                    |
-| RPC        | Protocol framing, session registry, method dispatch                | Human output on stdout                |
-| Extension  | Plugin-backed classifier + intent plans over a session             | PTY IO, parser changes, RPC framing   |
-| Turn       | Send input, wait for completion, capture transcript                | Hard-coded app names                  |
-| Adapter    | App-specific façade over an `ExtensionHandle`                      | Reimplementing PTY primitives         |
+| Layer      | Responsibility                                             | Should avoid                        |
+| ---------- | ---------------------------------------------------------- | ----------------------------------- |
+| Target     | Program, args, cwd, environment, terminal size             | PTY lifecycle details               |
+| Session    | Child process, PTY handle, reader/writer, resize, exit     | App prompt semantics                |
+| Screen     | Parsed terminal view, cursor, scrollback, alternate screen | Input timing policy                 |
+| Transcript | Bounded retained PTY output text                           | Terminal rendering decisions        |
+| Action     | Keys, writes, paste, resize, interrupt, EOF, kill          | App-specific success rules          |
+| Matcher    | Screen/transcript predicates and timeout evidence          | Owning the process                  |
+| RPC        | Protocol framing, session registry, method dispatch        | Human output on stdout              |
+| Extension  | Plugin-backed classifier + intent plans over a session     | PTY IO, parser changes, RPC framing |
+| Turn       | Send input, wait for completion, capture transcript        | Hard-coded app names                |
+| Adapter    | App-specific façade over an `ExtensionHandle`              | Reimplementing PTY primitives       |
 
 The `Extension` layer lives in `src/extension.rs` and is the boundary between the generic core and any specific TUI. It is intentionally application-agnostic: the trait classifies plugin-defined state strings and builds generic [`Action`] / [`Matcher`] plans, with no Claude-specific identifiers in the trait surface.
 
