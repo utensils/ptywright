@@ -83,7 +83,7 @@ fn command_dispatcher_drives_full_spawn_and_close_cycle() {
         Duration::from_secs(5),
     )
     .expect("dispatch plugins");
-    matches!(outcome, CmdOutcome::Json(_));
+    assert!(matches!(outcome, CmdOutcome::Json(_)));
 
     // The dispatch path that actually spawns a PTY is unix-only because
     // the claude-code plugin's default target points at /bin/sh on

@@ -338,6 +338,18 @@ impl RpcServer {
         // sees the same set. Clone the Arcs out under one short lock,
         // then read each entry's session metadata without holding the
         // outer registry lock for the duration of the iteration.
+        //
+        // **Use `try_lock` rather than `lock`** when reading each adapter
+        // entry: a long-running `adapter.wait` holds the same per-entry
+        // mutex for the entire wait duration (up to `timeout_ms`,
+        // defaulting to 120 s — see `adapter_wait`). A `lock()` here
+        // would block this whole notification-poll behind the wait,
+        // which in turn stalls every other connection's `session.changed`
+        // / `session.exited` flow (including the heartbeat-driven flush
+        // from idle REPLs). Skipping a contended entry means we miss one
+        // tick for that adapter — the next inbound request from any
+        // connection re-polls and catches up — but the other adapters'
+        // notifications keep flowing.
         let adapter_arcs: Vec<Arc<Mutex<ExtensionEntry>>> = self
             .shared
             .inner
@@ -349,14 +361,18 @@ impl RpcServer {
             .collect();
         let mut adapter_sessions: Vec<(String, u64, bool)> = adapter_arcs
             .into_iter()
-            .map(|arc| {
-                let entry = arc.lock().expect("extension poisoned");
-                let session = entry.handle.session();
-                (
-                    entry.session.clone(),
-                    session.sequence(),
-                    session.is_finished(),
-                )
+            .filter_map(|arc| match arc.try_lock() {
+                Ok(entry) => {
+                    let session = entry.handle.session();
+                    Some((
+                        entry.session.clone(),
+                        session.sequence(),
+                        session.is_finished(),
+                    ))
+                }
+                // Entry is busy — almost always an in-flight `adapter.wait`.
+                // Skip it for this tick rather than block all of polling.
+                Err(_) => None,
             })
             .collect();
         adapter_sessions.sort_by(|(left, ..), (right, ..)| left.cmp(right));
@@ -1488,25 +1504,34 @@ mod tests {
             .expect("adapter.start must return the allocated session id")
             .to_string();
 
-        // Generous 20 s deadline keeps the test reliable on busy CI hosts.
-        // The steady-state behaviour is observed within tens of
+        // The `adapter.start` handler runs `poll_notifications` itself
+        // before returning, so if the spawned shell already wrote
+        // `adapter-notify` to the PTY by the time `handle_line_messages`
+        // unwinds (which is what happens under Ubuntu CI's parallel-test
+        // load) the resulting `session.changed` lands inside
+        // `start_messages` — not in any subsequent poll. The polling loop
+        // below cannot wake itself either, because the test shell drops
+        // into `cat` and emits no further bytes. Check both buckets so
+        // either ordering is accepted.
+        let saw_in = |messages: &[String]| {
+            messages.iter().any(|message| {
+                message.contains("\"method\":\"session.changed\"") && message.contains(&session)
+            })
+        };
+        let mut saw_changed = saw_in(&start_messages);
+
+        // Generous 20 s deadline keeps the loop branch reliable on busy
+        // CI hosts. The steady-state behaviour is observed within tens of
         // milliseconds locally; we only need this much budget when many
         // parallel `/bin/sh` PTY spawns + mlua's send-mutex add overhead.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut saw_changed = false;
         while std::time::Instant::now() < deadline && !saw_changed {
             let poll_messages = server
                 .handle_line_messages(&format!(
                     r#"{{"jsonrpc":"2.0","id":3,"method":"adapter.state","params":{{"adapter":"{adapter}"}}}}"#,
                 ))
                 .expect("poll for notifications");
-            for message in poll_messages {
-                if message.contains("\"method\":\"session.changed\"") && message.contains(&session)
-                {
-                    saw_changed = true;
-                    break;
-                }
-            }
+            saw_changed = saw_in(&poll_messages);
             if !saw_changed {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
@@ -1520,6 +1545,95 @@ mod tests {
         let _ = server.handle_line_messages(&format!(
             r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#,
         ));
+    }
+
+    /// Regression for the contention bug Copilot called out on
+    /// `poll_notifications`: `adapter.wait` holds the per-entry mutex for
+    /// the entire wait duration. If `poll_notifications` used `.lock()`
+    /// (rather than `try_lock`) to read each entry's `session().sequence()`,
+    /// a long wait on adapter A would block notification polling for
+    /// adapter B too — silencing the heartbeat-driven flush every other
+    /// REPL relies on.
+    ///
+    /// Simulate the in-flight wait by manually holding adapter A's
+    /// per-entry mutex on the test thread, then assert that a `session.changed`
+    /// notification still surfaces for adapter B. With the bug present
+    /// the test deadlocks; with `try_lock` we skip A this tick and B
+    /// flows through normally.
+    #[test]
+    #[cfg(unix)]
+    fn poll_notifications_skips_busy_adapter_entries() {
+        let mut server = RpcServer::new();
+        let _ = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+            )
+            .expect("enable notifications");
+
+        // Two adapters, each writing a single line then dropping into
+        // `cat` so the session sequence advances exactly once on each.
+        let start_a = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":2,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'a\\n' && cat"]}}"#,
+            )
+            .expect("start adapter A");
+        let resp_a: Value = serde_json::from_str(&start_a[0]).expect("json response A");
+        let adapter_a = resp_a["result"]["adapter"]
+            .as_str()
+            .expect("adapter id A")
+            .to_string();
+
+        let start_b = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":3,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'b\\n' && cat"]}}"#,
+            )
+            .expect("start adapter B");
+        let resp_b: Value = serde_json::from_str(&start_b[0]).expect("json response B");
+        let session_b = resp_b["result"]["session"]
+            .as_str()
+            .expect("session id B")
+            .to_string();
+
+        // Hold adapter A's per-entry mutex from this thread to mimic
+        // an in-flight `adapter.wait`. Acquire the Arc first under a
+        // brief outer-state lock; drop the outer guard before locking
+        // the inner mutex so we don't block other shared-state lookups.
+        let arc_a = {
+            let inner = server.shared.inner.lock().expect("shared state");
+            inner
+                .extensions
+                .get(&adapter_a)
+                .expect("adapter A entry")
+                .clone()
+        };
+        let _held = arc_a.lock().expect("hold adapter A mutex");
+
+        // Give both PTY reader threads a moment to deliver their printf.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        // Drive the notification pump via the cheapest read-only method
+        // — `server.capabilities` is what the REPL's heartbeat uses for
+        // exactly this reason. With the bug present the call deadlocks
+        // here forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_b = false;
+        while std::time::Instant::now() < deadline && !saw_b {
+            let messages = server
+                .handle_line_messages(r#"{"jsonrpc":"2.0","id":99,"method":"server.capabilities"}"#)
+                .expect("poll via capabilities");
+            saw_b = messages.iter().any(|message| {
+                message.contains("\"method\":\"session.changed\"") && message.contains(&session_b)
+            });
+            if !saw_b {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        assert!(
+            saw_b,
+            "expected session.changed for adapter B while adapter A's entry mutex is held"
+        );
+
+        drop(_held);
     }
 
     #[test]

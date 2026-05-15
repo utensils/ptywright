@@ -357,23 +357,30 @@ fn serve_command(
 /// Backing storage for the socket-cleanup signal handler. Declared at
 /// module scope so the C-ABI shim ([`handle_shutdown_signal`]) can reach
 /// it — signal handlers cannot capture environment.
+///
+/// Holds a NUL-terminated `CString` rather than a `PathBuf` so the
+/// handler can call the async-signal-safe `unlink(2)` syscall directly
+/// instead of going through `std::fs::remove_file`, which allocates and
+/// is not on POSIX's signal-safe function list. `OnceLock::get` is
+/// lock-free, so reading the path from inside the handler does not need
+/// a mutex either — once `install_socket_cleanup` has stored the path,
+/// the handler can read it without taking any locks.
 #[cfg(unix)]
-static SOCKET_CLEANUP_PATH: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
-    std::sync::OnceLock::new();
+static SOCKET_CLEANUP_PATH: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 extern "C" fn handle_shutdown_signal(signum: libc::c_int) {
-    if let Some(slot) = SOCKET_CLEANUP_PATH.get()
-        && let Ok(guard) = slot.lock()
-        && let Some(path) = guard.as_ref()
-    {
-        // Best-effort unlink. The path was the one we bound; if it is
-        // gone or a different file, we silently move on.
-        let _ = std::fs::remove_file(path);
+    // SAFETY: every operation below is on POSIX's list of async-signal-
+    // safe functions (`unlink`, `_exit`). `OnceLock::get` is lock-free
+    // and the `CString` it returns lives at module scope, so reading
+    // its pointer is non-allocating. We deliberately do not `_exit`
+    // through `std::process::exit` because Drop handlers are not
+    // signal-safe; `_exit` returns the conventional `128 + signum`.
+    if let Some(c_path) = SOCKET_CLEANUP_PATH.get() {
+        unsafe {
+            libc::unlink(c_path.as_ptr());
+        }
     }
-    // Use `_exit` rather than `exit` so we do not run Drop handlers
-    // (Rust destructors are not async-signal-safe). 128 + signum is the
-    // conventional shell exit code for signal-terminated processes.
     unsafe { libc::_exit(128 + signum) }
 }
 
@@ -383,21 +390,33 @@ extern "C" fn handle_shutdown_signal(signum: libc::c_int) {
 /// sockets (see [`serve_socket`]), so this is a UX nicety rather than a
 /// correctness requirement.
 ///
-/// Calling this twice replaces the recorded path but leaves the signal
-/// handlers in place.
+/// Idempotent: only the first call records the path and installs the
+/// handlers. Subsequent calls (in the unlikely case `serve_socket` is
+/// re-entered) silently do nothing rather than racing the handler.
 #[cfg(unix)]
 fn install_socket_cleanup(path: &Path) {
-    let slot = SOCKET_CLEANUP_PATH.get_or_init(|| std::sync::Mutex::new(None));
-    if let Ok(mut guard) = slot.lock() {
-        *guard = Some(path.to_path_buf());
-    }
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // Refuse paths containing an interior NUL — `CString::new` would
+    // reject it, and the handler can't unlink such a path anyway.
+    let Ok(c_path) = std::ffi::CString::new(bytes) else {
+        return;
+    };
+    // `set` is fallible: a second install attempt with a different path
+    // leaves the original recorded path in place. That's intentional —
+    // the first server to bind a socket is the one whose path the
+    // handler should clean up.
+    let _ = SOCKET_CLEANUP_PATH.set(c_path);
 
     static HANDLERS_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     HANDLERS_INSTALLED.get_or_init(|| {
-        // SAFETY: `signal` is async-signal-safe. The handler only
-        // touches an atomic OnceLock + `_exit`, both safe from a signal
-        // handler. Replacing the default SIGINT/SIGTERM/SIGHUP
-        // dispositions is intentional — we want clean shutdown.
+        // SAFETY: `libc::signal` itself is async-signal-safe. The
+        // handler we install (`handle_shutdown_signal`) calls only
+        // `unlink` + `_exit`, both on POSIX's signal-safe list, and
+        // reads its path from a lock-free `OnceLock`. Replacing the
+        // default SIGINT/SIGTERM/SIGHUP dispositions is intentional —
+        // we want clean shutdown.
         let handler = handle_shutdown_signal as *const () as libc::sighandler_t;
         unsafe {
             libc::signal(libc::SIGINT, handler);
