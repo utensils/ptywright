@@ -15,6 +15,8 @@ use std::process::ExitCode;
 
 use crate::error::Result;
 
+pub mod transport;
+
 /// Wire framing for the JSON-RPC transport. Mirrors the server-side
 /// `RpcFraming` enum in `src/main.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
