@@ -79,6 +79,7 @@ export default defineConfig({
             { text: 'Claude Code adapter', link: '/guide/claude-code' },
             { text: 'Design principles', link: '/guide/design-principles' },
             { text: 'Platforms', link: '/guide/platforms' },
+            { text: 'Runtime directory', link: '/guide/runtime-directory' },
           ],
         },
       ],

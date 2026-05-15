@@ -40,3 +40,10 @@ ptywright is early-stage. This roadmap captures the intended shape without promi
 - Shell and REPL helpers.
 - Full-screen TUI helpers.
 - App-specific adapters that live outside the generic core.
+
+## Runtime and operations
+
+- Per-user runtime directory at `~/.ptywright/` (override with `PTYWRIGHT_HOME`) for config, rotated logs, and reserved space for future cached state.
+- Optional TOML config file with forgiving defaults and forward-compatible parsing.
+- Structured logging through `tracing` with daily-rotated files, configurable retention, JSON or text formats, and built-in redaction of secret-shaped values on every record.
+- Per-mode logging init helpers that uphold each subcommand's output contract (file-only for `run`, file + stderr for `serve`, stderr-only for one-shot commands).

@@ -6,13 +6,15 @@ The goal is to make terminal automation feel local, inspectable, and determinist
 
 ## Current status
 
-ptywright is a skeleton:
+ptywright is pre-0.1 but the core PTY/automation layers are in place:
 
-- `ptywright --help` prints the help menu.
-- `ptywright --version` prints the package version.
-- The library exposes package metadata and a small `Target` builder.
-- Nix, CI, release, install, and docs plumbing are in place.
-- Linux, macOS, and Windows are part of the intended support matrix.
+- Cross-platform PTY-backed `Session` with terminal screen snapshots, transcripts, deterministic actions, and event-driven matchers.
+- JSON-RPC 2.0 server over stdio (NDJSON or LSP framing) and multi-client local IPC (Unix sockets on macOS/Linux, named pipes on Windows).
+- `ptywright run` for live PTY bridging and `ptywright completions` for bash/zsh/fish/elvish/powershell.
+- Trusted embedded Lua runtime with a built-in interactive Claude Code adapter.
+- Per-user runtime directory at `~/.ptywright/` (override with `PTYWRIGHT_HOME`) for configuration and rotated log files.
+- Structured logging through `tracing` with daily rotation, configurable retention, and built-in redaction of secret-shaped values.
+- Linux, macOS, and Windows in the supported platform matrix.
 
 ::: tip Planned vs implemented
 The docs describe the intended shape so the project can grow in the right direction. Pages call out planned capabilities explicitly when an API does not exist yet.

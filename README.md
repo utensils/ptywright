@@ -89,6 +89,16 @@ cargo test --locked
 cargo run -- --help
 ```
 
+## Runtime directory and logging
+
+ptywright keeps configuration and rotated log files under `~/.ptywright/` (override with `PTYWRIGHT_HOME=/some/path`). Logs are written through `tracing` with daily rotation, 14-day retention by default, and built-in redaction of secret-shaped values. Override the filter at runtime with `PTYWRIGHT_LOG`:
+
+```bash
+PTYWRIGHT_LOG="info,ptywright::rpc=debug" ptywright serve --stdio
+```
+
+See [`config.example.toml`](config.example.toml) for the full set of tunables and the [Runtime directory](https://utensils.io/ptywright/guide/runtime-directory.html) docs for layout details. `ptywright run` writes only to file (it owns your terminal); `serve --stdio` and `serve --socket` write to file and stderr while keeping stdout reserved for JSON-RPC framing.
+
 See [AGENTS.md](AGENTS.md) for repository guidance.
 
 ## License

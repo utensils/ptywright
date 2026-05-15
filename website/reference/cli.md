@@ -61,7 +61,7 @@ ptywright serve --socket /tmp/ptywright.sock
 Rules:
 
 - `--stdio` uses stdin/stdout. stdout is protocol-only; stderr is reserved for diagnostics.
-- `--socket PATH` listens on a local Unix socket on macOS/Linux. On Windows, use `--stdio`; named-pipe support remains planned.
+- `--socket PATH` listens on a local IPC endpoint: a Unix domain socket on macOS/Linux, or a named pipe on Windows (e.g. `\\.\pipe\ptywright`). Both share the same flag and the same multi-client server state.
 - Default framing is `ndjson`: each input line is one complete JSON-RPC request or notification, and each response/notification is one compact JSON object per line.
 - `--framing lsp` uses `Content-Length: N\r\n\r\n<json>` frames.
 
@@ -93,6 +93,35 @@ ptywright completions fish > ~/.config/fish/completions/ptywright.fish
 ```
 
 Supported shells are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.
+
+## Runtime directory and logging
+
+ptywright keeps configuration, log files, and other per-user state under `~/.ptywright/` (override the root entirely with `PTYWRIGHT_HOME=/some/path`). See the [Runtime directory guide](../guide/runtime-directory.md) for the full layout, config schema, and logging details.
+
+### Per-mode log sinks
+
+| Subcommand                           | Stderr | File | Notes                                                                               |
+| ------------------------------------ | :----: | :--: | ----------------------------------------------------------------------------------- |
+| `ptywright run`                      |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY. |
+| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                               |
+| `ptywright serve --socket`           |   ✓    |  ✓   | Same sinks as `--stdio`.                                                            |
+| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                  |
+
+### Environment variables
+
+| Variable         | Purpose                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------- |
+| `PTYWRIGHT_HOME` | Root for the runtime directory. Overrides the default `~/.ptywright/`.                        |
+| `PTYWRIGHT_LOG`  | `tracing-subscriber` `EnvFilter` directive. Overrides `[logging] level` from the config file. |
+
+```bash
+PTYWRIGHT_LOG="info,ptywright::rpc=debug" ptywright serve --stdio
+PTYWRIGHT_HOME=/tmp/ptywright-sandbox ptywright run -- /bin/sh -lc 'printf hi'
+```
+
+### Log files
+
+Files are written to `<PTYWRIGHT_HOME>/logs/ptywright.YYYY-MM-DD.log`, rotated daily, and pruned at startup against `[logging] max_days` (default `14`; set `0` to disable retention). Every record passes through ptywright's built-in [`RedactionPolicy`](./library.md#redaction) before reaching disk or stderr.
 
 ## Exit behavior
 

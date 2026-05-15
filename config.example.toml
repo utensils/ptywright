@@ -1,0 +1,26 @@
+# ptywright configuration example.
+#
+# Default location: ~/.ptywright/config.toml
+# Override the runtime directory entirely with PTYWRIGHT_HOME=/some/path.
+#
+# Every key is optional. Missing keys fall back to the documented defaults
+# below, so this file only needs to contain the values you want to change.
+
+[logging]
+# tracing-subscriber EnvFilter directive. Examples:
+#   "warn"                          quiet by default
+#   "info"                          general progress
+#   "info,ptywright::rpc=debug"     RPC traces, info elsewhere
+#   "trace"                         everything
+# Override at runtime with the PTYWRIGHT_LOG environment variable.
+level = "warn"
+
+# Write rotated log files under <home>/logs/. Disable to keep stderr-only.
+file = true
+
+# Maximum age in days for retained log files. Set to 0 to disable retention
+# (files will accumulate forever).
+max_days = 14
+
+# Output format for log records. Either "text" (human-readable) or "json".
+format = "text"

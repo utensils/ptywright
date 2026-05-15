@@ -195,6 +195,61 @@ manifest.validate().expect("valid manifest");
 
 WASM and third-party plugin loading are not enabled yet.
 
+## Runtime directory
+
+`Paths` resolves the per-user `~/.ptywright/` runtime directory and exposes per-layout accessors. Resolution order: `PTYWRIGHT_HOME` env var → `~/.ptywright/` → `./.ptywright` (only if `HOME` is unset).
+
+```rust
+use ptywright::{Paths, expand_tilde};
+
+let paths = Paths::from_env();
+let logs = paths.ensure_logs_dir()?;
+assert!(logs.ends_with("logs"));
+
+let absolute = expand_tilde("~/projects/foo");
+# Ok::<(), ptywright::Error>(())
+```
+
+Accessors: `home`, `config_path`, `logs_dir`, `data_dir`, `transcripts_dir`, `sockets_dir`. `Paths::ensure_dir(path)` lazily creates a directory tree on demand. `expand_tilde` is a pure helper for paths that come from config strings.
+
+## Configuration
+
+`Config` reads `~/.ptywright/config.toml` and merges with sensible defaults. Missing files, missing sections, and missing keys all fall back to documented defaults; unknown keys are tolerated for forward compatibility.
+
+```rust
+use ptywright::{Config, LogFormat, Paths};
+
+let paths = Paths::from_env();
+let config = Config::load_or_default(&paths.config_path())?;
+assert!(config.logging.file);
+assert_eq!(config.logging.format, LogFormat::Text);
+# Ok::<(), ptywright::Error>(())
+```
+
+`LoggingConfig` fields: `level` (`EnvFilter` directive), `file` (write rotated log files), `max_days` (retention window; `0` disables cleanup), `format` (`Text` | `Json`).
+
+## Logging
+
+ptywright wires `tracing` differently per CLI mode so output contracts (stdout-only JSON-RPC, no stderr corruption during `run`) are upheld. Pick the right helper for your entrypoint and hold the returned `LogGuard` for the lifetime of the process so the non-blocking writer can flush at exit.
+
+| Function                | Sinks         | When to use                                                |
+| ----------------------- | ------------- | ---------------------------------------------------------- |
+| `init_for_run`          | file only     | Tools that bridge a raw PTY to the user's terminal.        |
+| `init_for_serve_stdio`  | file + stderr | JSON-RPC servers that own stdout for protocol framing.     |
+| `init_for_serve_socket` | file + stderr | Local-IPC servers (Unix sockets, Windows named pipes).     |
+| `init_for_oneshot`      | stderr only   | Short-lived commands (`--help`, `--version`, completions). |
+
+```rust
+use ptywright::{Config, Paths, init_for_serve_stdio};
+
+let paths = Paths::from_env();
+let config = Config::load_or_default(&paths.config_path())?;
+let _log_guard = init_for_serve_stdio(&paths, &config.logging);
+# Ok::<(), ptywright::Error>(())
+```
+
+`RedactingMakeWriter` wraps any `tracing-subscriber` `MakeWriter` so each formatted record is run through `RedactionPolicy` before reaching its sink. `cleanup_old_logs(dir, max_days)` is exposed for callers that want to trigger retention sweeps outside of the standard init flow.
+
 ## Planned API families
 
 Next public APIs should grow around these reusable concepts:

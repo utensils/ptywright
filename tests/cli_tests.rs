@@ -254,6 +254,49 @@ fn serve_unix_socket_shares_sessions_across_connections() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn run_writes_log_file_under_ptywright_home() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!("ptywright-home-{}-{unique}", std::process::id()));
+
+    let output = bin()
+        .env("PTYWRIGHT_HOME", &home)
+        .env("PTYWRIGHT_LOG", "info")
+        .args(["run", "--", "/bin/sh", "-lc", "printf cli-ready"])
+        .output()
+        .expect("run ptywright run");
+
+    assert!(output.status.success(), "ptywright run failed: {output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("cli-ready"));
+
+    let logs_dir = home.join("logs");
+    assert!(
+        logs_dir.exists(),
+        "logs dir not created at {}",
+        logs_dir.display()
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(&logs_dir)
+        .expect("read logs dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries.iter().any(|name| name.starts_with("ptywright")),
+        "expected a ptywright.* log file in {}, got {entries:?}",
+        logs_dir.display()
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
 fn dynamic_completions(shell: &str, index: &str, words: &[&str]) -> String {
     let output = bin()
         .env("COMPLETE", shell)
