@@ -33,3 +33,10 @@ vt100 = "0.16.2"
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"
+
+[[bin]]
+name = "ptywright-echo-tui"
+path = "tests/fixtures/echo_tui/main.rs"
+test = false
+doctest = false
+bench = false

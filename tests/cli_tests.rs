@@ -5,6 +5,11 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ptywright"))
 }
 
+#[cfg(unix)]
+fn echo_tui_bin_path() -> &'static str {
+    env!("CARGO_BIN_EXE_ptywright-echo-tui")
+}
+
 #[test]
 fn prints_help_by_default() {
     let output = bin().output().expect("run ptywright");
@@ -402,4 +407,182 @@ fn prints_version() {
         stdout.trim(),
         format!("ptywright {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+/// End-to-end integration test (Milestone 21.8): drive a tiny in-tree TUI
+/// fixture binary (`ptywright-echo-tui`) through the JSON-RPC server using
+/// only the generic `session.*` methods. This proves ptywright can drive an
+/// arbitrary PTY-backed program end-to-end without depending on Claude Code
+/// or any external tool.
+///
+/// The fixture prints `READY> `, reads a line and echoes it as `> <line>`,
+/// then on a blank line prints `<answer>OK</answer>` and exits.
+///
+/// Round-trip exercised here:
+///   1. `session.create` spawns `ptywright-echo-tui` in a PTY.
+///   2. `session.wait` (contains_text "READY>" + screen_stable) — prompt up.
+///   3. `session.input` sends "hello" + enter, then a bare enter (blank line).
+///   4. `session.wait` (contains_text "<answer>OK</answer>" + screen_stable).
+///   5. `session.snapshot` returns plain_text containing the answer marker.
+///   6. `session.kill` cleans up.
+#[test]
+#[cfg(unix)]
+fn end_to_end_session_round_trip_with_echo_tui_fixture() {
+    use std::io::{BufRead, BufReader};
+
+    let mut child = bin()
+        .args(["serve", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --stdio");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    // Send one NDJSON request and read exactly one response line.
+    let mut request_one = |line: String| -> serde_json::Value {
+        stdin.write_all(line.as_bytes()).expect("write request");
+        stdin.write_all(b"\n").expect("write newline");
+        stdin.flush().expect("flush request");
+        let mut buf = String::new();
+        let n = stdout.read_line(&mut buf).expect("read response line");
+        assert!(n > 0, "server closed stdout before responding");
+        serde_json::from_str(buf.trim()).expect("json response")
+    };
+
+    // 1. session.create with the in-tree echo_tui fixture binary.
+    let create = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session.create",
+        "params": {
+            "program": echo_tui_bin_path(),
+            "rows": 24,
+            "cols": 80,
+        },
+    });
+    let create_resp = request_one(create.to_string());
+    assert_eq!(create_resp["id"], 1);
+    let session = create_resp["result"]["session"]
+        .as_str()
+        .expect("session id returned")
+        .to_owned();
+
+    // 2. Wait for the prompt to render and the screen to settle.
+    let wait_prompt = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session.wait",
+        "params": {
+            "session": session,
+            "matcher": {"type": "all", "value": [
+                {"type": "contains_text", "value": "READY>"},
+                {"type": "screen_stable", "value": {"min_ms": 250}},
+            ]},
+            "timeout_ms": 20_000,
+        },
+    });
+    let wait_prompt_resp = request_one(wait_prompt.to_string());
+    assert_eq!(wait_prompt_resp["id"], 2);
+    assert!(
+        wait_prompt_resp["result"]["matched"]
+            .as_bool()
+            .unwrap_or(false),
+        "expected matched=true waiting for prompt, got: {wait_prompt_resp}"
+    );
+
+    // 3a. Send "hello" then Enter (the fixture echoes it as `> hello`).
+    let send_hello = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session.input",
+        "params": {
+            "session": session,
+            "action": {"type": "text", "value": "hello"},
+        },
+    });
+    let send_hello_resp = request_one(send_hello.to_string());
+    assert_eq!(send_hello_resp["result"]["sent"], serde_json::json!(true));
+
+    let press_enter = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session.input",
+        "params": {
+            "session": session,
+            "action": {"type": "key", "value": "enter"},
+        },
+    });
+    let press_enter_resp = request_one(press_enter.to_string());
+    assert_eq!(press_enter_resp["result"]["sent"], serde_json::json!(true));
+
+    // 3b. Send a blank line (just Enter) to trigger the answer + exit.
+    let blank_line = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session.input",
+        "params": {
+            "session": session,
+            "action": {"type": "key", "value": "enter"},
+        },
+    });
+    let blank_line_resp = request_one(blank_line.to_string());
+    assert_eq!(blank_line_resp["result"]["sent"], serde_json::json!(true));
+
+    // 4. Wait for the answer marker to appear and the screen to settle.
+    let wait_answer = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "session.wait",
+        "params": {
+            "session": session,
+            "matcher": {"type": "all", "value": [
+                {"type": "contains_text", "value": "<answer>OK</answer>"},
+                {"type": "screen_stable", "value": {"min_ms": 250}},
+            ]},
+            "timeout_ms": 20_000,
+        },
+    });
+    let wait_answer_resp = request_one(wait_answer.to_string());
+    assert_eq!(wait_answer_resp["id"], 6);
+    assert!(
+        wait_answer_resp["result"]["matched"]
+            .as_bool()
+            .unwrap_or(false),
+        "expected matched=true waiting for answer, got: {wait_answer_resp}"
+    );
+
+    // 5. Snapshot and assert the plain_text contains the answer marker.
+    let snapshot = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "session.snapshot",
+        "params": {"session": session},
+    });
+    let snapshot_resp = request_one(snapshot.to_string());
+    let plain_text = snapshot_resp["result"]["plain_text"]
+        .as_str()
+        .expect("plain_text string");
+    assert!(
+        plain_text.contains("<answer>OK</answer>"),
+        "snapshot.plain_text missing answer marker; got: {plain_text:?}"
+    );
+    assert!(
+        plain_text.contains("> hello"),
+        "snapshot.plain_text missing echoed line; got: {plain_text:?}"
+    );
+
+    // 6. Clean up.
+    let kill = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "session.kill",
+        "params": {"session": session},
+    });
+    let _ = request_one(kill.to_string());
+
+    drop(stdin);
+    let _ = child.wait();
 }
