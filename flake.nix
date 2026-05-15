@@ -51,6 +51,11 @@
               "rust-src"
               "rustfmt"
               "clippy"
+              # llvm-tools-preview ships the `llvm-cov` and `llvm-profdata`
+              # binaries that match this rustc release. Without it,
+              # `cargo llvm-cov` falls back to whatever LLVM is on PATH,
+              # which can mismatch the .profraw format produced by tests.
+              "llvm-tools-preview"
             ];
           };
 
@@ -191,9 +196,11 @@
                 help = "test coverage summary (pass --html for a browsable report)";
                 command = ''
                   set -euo pipefail
-                  LLVM_COV="$(find /nix/store -maxdepth 3 -name llvm-cov 2>/dev/null | head -1)"
-                  LLVM_PROFDATA="$(find /nix/store -maxdepth 3 -name llvm-profdata 2>/dev/null | head -1)"
-                  export LLVM_COV LLVM_PROFDATA
+                  # llvm-tools-preview is part of the rustToolchain extensions
+                  # so cargo-llvm-cov finds llvm-cov / llvm-profdata on PATH
+                  # at versions matched to this rustc release. No more env
+                  # shimming via `find /nix/store` (which picked random
+                  # LLVM majors and broke after store GC).
                   if [ "''${1:-}" = "--html" ]; then
                     cargo llvm-cov --workspace --html --output-dir target/coverage
                     echo "Report: target/coverage/html/index.html"

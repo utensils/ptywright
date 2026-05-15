@@ -737,4 +737,24 @@ mod tests {
         assert!(claude.evidence.contains("from plugin"));
         assert_eq!(claude.sequence, 42);
     }
+
+    #[test]
+    fn unknown_extension_state_with_empty_evidence_still_names_the_unknown_state() {
+        // The `if evidence.is_empty()` branch in From<ExtensionStateSnapshot>
+        // for ClaudeCodeStateSnapshot is reachable when a plugin returns an
+        // unfamiliar state name without an evidence message. Lock the
+        // "no trailing colon" formatting so a future refactor doesn't
+        // accidentally produce `unknown extension state `x`: ` with a
+        // dangling separator.
+        let snapshot = ExtensionStateSnapshot {
+            state: "wat".to_string(),
+            confidence: 0.0,
+            evidence: String::new(),
+            sequence: 1,
+            candidates: Vec::new(),
+        };
+        let claude: ClaudeCodeStateSnapshot = snapshot.into();
+        assert_eq!(claude.state, ClaudeCodeState::Error);
+        assert_eq!(claude.evidence, "unknown extension state `wat`");
+    }
 }

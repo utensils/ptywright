@@ -1990,6 +1990,53 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn claude_wait_turn_completes_when_total_cost_appears() {
+        // Drive ExtensionHandle::wait through the claude.* surface against a
+        // shell stand-in that prints `Total cost:` (one of the matcher's
+        // turn-boundary alternatives) and then sleeps long enough for the
+        // 300 ms screen_stable window to elapse. This positively covers the
+        // wait_turn dispatcher, ExtensionHandle::wait's post-match classify
+        // path, and the From<ExtensionStateSnapshot> -> ClaudeCodeStateSnapshot
+        // conversion on a real result.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"claude.start","params":{"program":"/bin/sh","args":["-lc","printf 'Total cost: 0\\n'; sleep 5"]}}"#,
+        );
+        let claude = start["result"]["claude"]
+            .as_str()
+            .expect("claude adapter id");
+
+        // 3 s is comfortably more than the 300 ms stable window + a small
+        // OS-scheduler buffer. If the matcher mis-classified `Total cost:`
+        // this would time out instead of returning.
+        let response = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"claude.wait_turn","params":{{"claude":"{claude}","timeout_ms":3000}}}}"#
+            ),
+        );
+        assert!(
+            response["result"]["state"].is_object(),
+            "claude.wait_turn must return a state snapshot; got {response}"
+        );
+        let state_label = response["result"]["state"]["state"].as_str().unwrap_or("");
+        assert!(
+            !state_label.is_empty(),
+            "wait_turn response must include a non-empty state label"
+        );
+
+        // Cleanup so the sleep process doesn't outlive the test.
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"claude.cancel","params":{{"claude":"{claude}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
     fn rpc_error_messages_are_redacted() {
         let mut server = RpcServer::new();
         let response = handle(
