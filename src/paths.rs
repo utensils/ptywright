@@ -83,6 +83,14 @@ impl Paths {
         self.root.join("sockets")
     }
 
+    /// File path for the REPL's persistent line-editor history. Reedline's
+    /// `FileBackedHistory` writes plain-text entries here, one per line, so a
+    /// human can grep or hand-edit it if necessary.
+    #[must_use]
+    pub fn repl_history_path(&self) -> PathBuf {
+        self.root.join("repl-history")
+    }
+
     /// Create `dir` (and parents) on demand, returning the path back for chaining.
     /// Performs no work when the directory already exists.
     pub fn ensure_dir(dir: impl AsRef<Path>) -> Result<PathBuf> {
@@ -141,6 +149,7 @@ mod tests {
         assert_eq!(paths.data_dir(), root.join("data"));
         assert_eq!(paths.transcripts_dir(), root.join("transcripts"));
         assert_eq!(paths.sockets_dir(), root.join("sockets"));
+        assert_eq!(paths.repl_history_path(), root.join("repl-history"));
     }
 
     #[test]
