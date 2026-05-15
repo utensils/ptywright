@@ -59,20 +59,70 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
 
 /// Names the host's `action.key(...)` recognises plus the most common
 /// single-char text tokens that the plugin's generic `key` intent forwards
-/// through `action.text`. Suggestions outside this list would be sent as
-/// literal text (e.g. typing the word "space"), which is almost never what
-/// the operator wants — keep the surface tight.
+/// through `action.text`. Ordering matters — the completer surfaces these
+/// in declaration order, so the most-asked-for keys live at the top and
+/// the long tail (less-used ctrl combos, F-keys, single-char fallthrough)
+/// trails behind. Suggestions outside this list either need a host enum
+/// variant added in `src/action.rs::Key` or are intentionally sent as
+/// literal text by the plugin's `M.key` fallthrough.
 const KEY_NAMES: &[(&str, &str)] = &[
+    // ── Submission / line editing ───────────────────────────
     ("enter", "↩ submit"),
     ("escape", "⎋ cancel"),
-    ("tab", "tab"),
+    ("tab", "↹"),
+    ("shift-tab", "⇧↹ back-tab"),
     ("backspace", "⌫"),
+    ("delete", "⌦"),
+    ("space", "␣"),
+    // ── Arrows ──────────────────────────────────────────────
     ("up", "↑"),
     ("down", "↓"),
     ("left", "←"),
     ("right", "→"),
-    ("ctrl-c", "interrupt (sent as ctrl_c)"),
-    ("ctrl-d", "EOF (sent as ctrl_d)"),
+    // ── Navigation cluster ──────────────────────────────────
+    ("home", "⤒ line / page start"),
+    ("end", "⤓ line / page end"),
+    ("page-up", "PgUp"),
+    ("page-down", "PgDn"),
+    ("insert", "Ins"),
+    // ── Common ctrl combos (readline / emacs defaults) ──────
+    ("ctrl-c", "interrupt"),
+    ("ctrl-d", "EOF"),
+    ("ctrl-l", "clear / refresh"),
+    ("ctrl-r", "reverse search"),
+    ("ctrl-u", "kill to line start"),
+    ("ctrl-w", "kill previous word"),
+    ("ctrl-a", "line start"),
+    ("ctrl-e", "line end"),
+    ("ctrl-k", "kill to line end"),
+    ("ctrl-y", "yank"),
+    ("ctrl-z", "suspend"),
+    // ── Less-common ctrl combos (still routed through Key) ──
+    ("ctrl-b", "back one char"),
+    ("ctrl-f", "forward one char"),
+    ("ctrl-g", "bell / cancel"),
+    ("ctrl-n", "next line / history forward"),
+    ("ctrl-o", "newline-and-yank"),
+    ("ctrl-p", "previous line / history back"),
+    ("ctrl-q", "quoted-insert / XON"),
+    ("ctrl-s", "forward search / XOFF"),
+    ("ctrl-t", "transpose chars"),
+    ("ctrl-v", "verbatim-insert"),
+    ("ctrl-x", "chord prefix"),
+    // ── Function keys ───────────────────────────────────────
+    ("f1", ""),
+    ("f2", ""),
+    ("f3", ""),
+    ("f4", ""),
+    ("f5", ""),
+    ("f6", ""),
+    ("f7", ""),
+    ("f8", ""),
+    ("f9", ""),
+    ("f10", ""),
+    ("f11", ""),
+    ("f12", ""),
+    // ── Text fallthrough (kept for muscle memory) ───────────
     ("y", "yes (sent as text)"),
     ("n", "no (sent as text)"),
     ("1", "first numeric option (sent as text)"),
@@ -408,5 +458,49 @@ mod tests {
         assert_eq!(current_token("session.s"), "session.s");
         assert_eq!(current_token("foo(bar"), "bar");
         assert_eq!(current_token("foo( "), "");
+    }
+
+    #[test]
+    fn send_key_completer_lists_submission_keys_first() {
+        // Pin the "most-common-first" contract for the key completion
+        // list: enter / escape / tab / shift-tab / backspace must all
+        // appear before any function key or text-fallthrough entry, so
+        // tab-completing in `send.key("` surfaces them at the top of
+        // the picker.
+        let ctx = ctx_with_adapters(&[]);
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let line = r#"send.key(""#;
+        let suggestions = completer.complete(line, line.len());
+        let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
+
+        let pos = |needle: &str| {
+            values
+                .iter()
+                .position(|v| *v == needle)
+                .unwrap_or(usize::MAX)
+        };
+        let enter = pos("enter");
+        let escape = pos("escape");
+        let shift_tab = pos("shift-tab");
+        let f1 = pos("f1");
+        let yes = pos("y");
+
+        assert!(enter < shift_tab, "expected enter before shift-tab");
+        assert!(escape < shift_tab, "expected escape before shift-tab");
+        assert!(shift_tab < f1, "expected shift-tab before f1");
+        assert!(f1 < yes, "expected f1 before text-fallthrough y");
+    }
+
+    #[test]
+    fn send_key_completer_filters_by_partial_prefix() {
+        // Typing `shi` inside `send.key("` should narrow to the
+        // `shift-tab` suggestion — proves the prefix filter still
+        // works against the expanded table.
+        let ctx = ctx_with_adapters(&[]);
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let line = r#"send.key("shi"#;
+        let suggestions = completer.complete(line, line.len());
+        let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
+        assert_eq!(values, vec!["shift-tab"]);
     }
 }

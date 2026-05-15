@@ -159,6 +159,48 @@ fn key_intent_routes_named_keys_to_action_key() {
 }
 
 #[test]
+fn key_intent_routes_expanded_special_keys() {
+    // The expanded key surface — Shift+Tab, the navigation cluster, the
+    // function keys, and the broader ctrl-letter combos — must all flow
+    // through `M.key` to `action.key` rather than falling through to
+    // `action.text`. Hyphen and underscore are both accepted so callers
+    // can write `shift-tab` or `shift_tab` interchangeably.
+    let extension = claude_plugin();
+
+    let cases = [
+        ("shift-tab", Key::ShiftTab),
+        ("shift_tab", Key::ShiftTab),
+        ("home", Key::Home),
+        ("end", Key::End),
+        ("page-up", Key::PageUp),
+        ("page_down", Key::PageDown),
+        ("insert", Key::Insert),
+        ("delete", Key::Delete),
+        ("space", Key::Space),
+        ("ctrl-r", Key::CtrlR),
+        ("ctrl-u", Key::CtrlU),
+        ("ctrl-w", Key::CtrlW),
+        ("ctrl-z", Key::CtrlZ),
+        ("f1", Key::F1),
+        ("f5", Key::F5),
+        ("f12", Key::F12),
+    ];
+
+    for (input, expected) in cases {
+        let plan = plan(&extension, "key", json!({ "key": input }));
+        assert_eq!(
+            plan.actions,
+            vec![Action::Key(expected.clone())],
+            "key alias `{input}` did not route to Action::Key({expected:?})"
+        );
+        assert!(
+            plan.last_intent.is_none(),
+            "the generic `key` intent must not mutate last_intent"
+        );
+    }
+}
+
+#[test]
 fn key_intent_falls_through_to_text_for_unrecognised_input() {
     // Single chars like "y" / "n" / "1" are sent through `action.text`
     // so REPL callers can use `send.key("y")` instead of
