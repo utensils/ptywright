@@ -102,6 +102,10 @@ cargo test --doc                          # rustdoc examples in public APIs
 
 The default build embeds Lua 5.4 via `mlua` with the `vendored` feature, so source builds outside the Nix devshell need a working C compiler. The Rust toolchain is pinned in `rust-toolchain.toml`; rustup will fetch the pinned channel automatically when building outside Nix.
 
+`clippy` is run without `--all-targets` to match CI exactly. If you want tests/examples linted too, run `cargo clippy --all-targets --locked -- -D warnings` locally, but do not change the devshell command or CI invocation without coordinating both.
+
+When debugging RPC or adapter behavior, override the `tracing` filter at runtime with `PTYWRIGHT_LOG` (e.g. `PTYWRIGHT_LOG="info,ptywright::rpc=debug"`). `PTYWRIGHT_HOME` relocates the runtime directory (`~/.ptywright/` by default) for sandboxed tests or per-project isolation.
+
 ## Current architecture
 
 The codebase is organized so each generic abstraction layer lives in one focused module, and adapters are layered on top without leaking back into the core.
@@ -135,6 +139,9 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `website/` — VitePress docs site.
   - `.github/workflows/` — CI, docs deploy (`pages.yml`), and release packaging (`release.yml`).
   - `flake.nix` — Nix package, app, formatter, and devshell.
+  - `install.sh` — curl-able installer for prebuilt release artifacts (referenced from the docs site).
+  - `config.example.toml` — annotated reference for `~/.ptywright/config.toml`; keep in sync with `src/config.rs` when adding tunables.
+  - `CHANGELOG.md` — hand-maintained, Keep-a-Changelog style. Add user-visible changes to the `[Unreleased]` section in the same PR; release tooling promotes it on tag.
 
 When adding behavior, decide first which layer it belongs to. No Claude-specific identifiers (state names, intent names, fixture conventions) belong in `src/` outside `src/adapters/` and `plugins/claude-code/`. New TUI adapters land as additional `src/adapters/<name>.rs` shims wrapping an `ExtensionHandle`, or as Lua-only plugin manifests; they should not introduce new application-specific identifiers into the generic layers. New generic primitives should not import from `adapters/`.
 
@@ -162,6 +169,7 @@ Use normal branch-and-PR development moving forward.
 - Prefer merge commits or squash merges through GitHub; never force-push `main`.
 - If a feature branch must be rebased after review starts, use `--force-with-lease` and mention it in the PR.
 - Keep docs, README, `AGENTS.md`, and the `CLAUDE.md` symlink target synchronized in the same PR when behavior or workflow changes.
+- For user-visible changes (CLI flags, RPC methods, config keys, runtime layout), add an entry under the `[Unreleased]` section of `CHANGELOG.md` in the same PR. Release tooling promotes `[Unreleased]` on tag — leaving an entry out means it won't appear in release notes.
 
 ## Dependency upkeep
 
