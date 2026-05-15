@@ -201,10 +201,22 @@ fn history_entry_lines(entry: &HistoryEntry) -> Vec<Line<'static>> {
         Span::raw(entry.input.clone()),
     ]));
     if let Some(detail) = entry.detail.as_ref() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(detail.clone(), Style::default().add_modifier(Modifier::DIM)),
-        ]));
+        // Split on '\n' so multi-line outputs (e.g. `:help`) render as
+        // multiple rows in the history pane instead of one overflowing
+        // line.
+        for chunk in detail.split('\n') {
+            if chunk.is_empty() {
+                lines.push(Line::from(""));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        chunk.to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            }
+        }
     }
     lines
 }

@@ -63,6 +63,9 @@ pub enum CmdOutcome {
     Line(String),
     /// JSON result from a JSON-RPC call. The TUI pretty-prints it.
     Json(Value),
+    /// Multi-line help text the TUI should surface as a modal overlay
+    /// rather than squeezing into the history pane.
+    ShowHelp(String),
     /// REPL should exit.
     Quit,
 }
@@ -531,7 +534,7 @@ fn dispatch_meta(
     timeout: Duration,
 ) -> Result<CmdOutcome> {
     match meta {
-        MetaCmd::Help => Ok(CmdOutcome::Line(help_text().to_string())),
+        MetaCmd::Help => Ok(CmdOutcome::ShowHelp(help_text().to_string())),
         MetaCmd::Quit => Ok(CmdOutcome::Quit),
         MetaCmd::Tabs => {
             let line = if ctx.adapters.is_empty() {
@@ -916,7 +919,7 @@ fn arg_to_json(arg: &Arg) -> Value {
     }
 }
 
-fn help_text() -> &'static str {
+pub fn help_text() -> &'static str {
     "ptywright repl commands:\n\
      \n\
      Sessions:\n\

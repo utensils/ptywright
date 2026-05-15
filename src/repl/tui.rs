@@ -10,18 +10,21 @@
 //! prompt+keybinding stack.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, bounded};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use reedline::{Completer, Highlighter, Span as ReedSpan, StyledText};
 use serde_json::Value;
 
@@ -33,16 +36,70 @@ use super::render::{render_history, render_snapshot, render_tabs};
 use super::snapshot::{self, SnapshotStore};
 use super::transport::RpcClient;
 use crate::error::{Error, Result};
+use crate::paths::Paths;
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const HISTORY_CAPACITY: usize = 200;
 
+/// One clickable region tracked during render and consulted on mouse-down.
+#[derive(Debug, Clone)]
+struct Hotspot {
+    rect: Rect,
+    action: HotspotAction,
+}
+
+#[derive(Debug, Clone)]
+enum HotspotAction {
+    Focus(String),
+    OpenHelp,
+    Quit,
+    ToggleNotifications,
+}
+
+/// Modal overlay rendered over the main area, dismissed by any key/click.
+#[derive(Debug, Clone)]
+enum Modal {
+    Help(String),
+}
+
+// ---- platform-aware hotkey glyphs --------------------------------------
+//
+// macOS terminal users expect ⌃ / ⌥ / ⌫ glyphs; on Linux/Windows the
+// "Ctrl-" / "Alt-" spellings are clearer. The actual keybindings are
+// identical — terminals send the same byte sequences either way.
+
+#[cfg(target_os = "macos")]
+const KEY_CTRL: &str = "⌃";
+#[cfg(not(target_os = "macos"))]
+const KEY_CTRL: &str = "Ctrl-";
+
+#[cfg(target_os = "macos")]
+const KEY_ALT: &str = "⌥";
+#[cfg(not(target_os = "macos"))]
+const KEY_ALT: &str = "Alt-";
+
 /// Public entry: build state and run the event loop until the user quits.
 pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
-    let ctx = Arc::new(Mutex::new(ReplCtx::new()));
+    let mut ctx = ReplCtx::new();
+    // Bootstrap a welcome line so first-run users see how to discover the
+    // command surface without having to guess.
+    ctx.record(crate::repl::ctx::HistoryEntry {
+        input: "welcome".into(),
+        kind: OutcomeKind::Note,
+        detail: Some(
+            "Type :help for commands · :quit to exit · click the footer hints with your mouse"
+                .into(),
+        ),
+    });
+    let ctx = Arc::new(Mutex::new(ctx));
     let store = Arc::new(SnapshotStore::new());
     let (redraw_tx, redraw_rx) = bounded::<()>(1);
+
+    // Persistent command history: load past sessions from disk so Up/Down
+    // recall survives across REPL invocations. Path is
+    // `~/.ptywright/repl-history` (or whatever `PTYWRIGHT_HOME` points to).
+    let history_path = Paths::from_env().repl_history_path();
 
     // Seed the plugin cache so completion has something useful immediately.
     let plugins = PluginCache::new();
@@ -75,6 +132,8 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
 
     let mut terminal = ratatui::try_init()
         .map_err(|error| Error::Rpc(format!("initialise terminal for repl: {error}")))?;
+    // Enable mouse capture so the tab strip + footer hints are clickable.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
 
     let result = event_loop(
         &mut terminal,
@@ -88,9 +147,11 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
             completer: ReplCompleter::new(Arc::clone(&ctx), plugins),
             highlighter: ReplHighlighter::new(),
             notifications_enabled: &mut notifications_enabled,
+            history_path,
         },
     );
 
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     let _ = ratatui::try_restore();
     result
 }
@@ -116,13 +177,18 @@ struct EventLoopArgs<'a> {
     completer: ReplCompleter,
     highlighter: ReplHighlighter,
     notifications_enabled: &'a mut bool,
+    history_path: PathBuf,
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, mut args: EventLoopArgs<'_>) -> Result<()> {
-    let mut editor = LineEditor::new();
+    let mut editor = LineEditor::new().with_persistent_history(args.history_path.clone());
+    // Hotspots are rebuilt every frame so a resize never leaves stale rects.
+    let hotspots: Arc<Mutex<Vec<Hotspot>>> = Arc::new(Mutex::new(Vec::new()));
     loop {
+        let hotspots_clone = Arc::clone(&hotspots);
         terminal
             .draw(|frame| {
+                let mut frame_hotspots = Vec::new();
                 render(
                     frame,
                     &args.transport_label,
@@ -131,7 +197,11 @@ fn event_loop(terminal: &mut DefaultTerminal, mut args: EventLoopArgs<'_>) -> Re
                     &editor,
                     &args.highlighter,
                     *args.notifications_enabled,
+                    &mut frame_hotspots,
                 );
+                if let Ok(mut guard) = hotspots_clone.lock() {
+                    *guard = frame_hotspots;
+                }
             })
             .map_err(|error| Error::Rpc(format!("draw frame: {error}")))?;
 
@@ -139,6 +209,13 @@ fn event_loop(terminal: &mut DefaultTerminal, mut args: EventLoopArgs<'_>) -> Re
         if let Some(event) = event {
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Any key dismisses a modal — return Continue so the
+                    // user can immediately resume typing without the
+                    // keystroke being re-interpreted as a command.
+                    if editor.modal.is_some() {
+                        editor.modal = None;
+                        continue;
+                    }
                     match handle_key(key, &mut editor, &mut args) {
                         ControlFlow::Continue => {}
                         ControlFlow::Quit => return Ok(()),
@@ -151,7 +228,21 @@ fn event_loop(terminal: &mut DefaultTerminal, mut args: EventLoopArgs<'_>) -> Re
                         }
                     }
                 }
-                Event::Resize(_, _) | Event::Mouse(MouseEvent { .. }) => { /* redraw covers it */ }
+                Event::Mouse(mouse) => {
+                    let hotspots_snap = hotspots.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                    match handle_mouse(mouse, &mut editor, &mut args, &hotspots_snap) {
+                        ControlFlow::Continue => {}
+                        ControlFlow::Quit => return Ok(()),
+                        ControlFlow::SwitchFocus(adapter) => {
+                            if let Ok(mut ctx) = args.ctx.lock()
+                                && ctx.adapter(&adapter).is_some()
+                            {
+                                ctx.focus = Some(adapter);
+                            }
+                        }
+                    }
+                }
+                Event::Resize(_, _) => { /* redraw covers it */ }
                 _ => {}
             }
         }
@@ -184,6 +275,8 @@ struct LineEditor {
     completion_idx: usize,
     completion_origin: Option<(ReedSpan, String)>,
     status: Option<(String, Style)>,
+    modal: Option<Modal>,
+    history_file: Option<PathBuf>,
 }
 
 impl LineEditor {
@@ -198,7 +291,28 @@ impl LineEditor {
             completion_idx: 0,
             completion_origin: None,
             status: None,
+            modal: None,
+            history_file: None,
         }
+    }
+
+    /// Open `path` as the persistent history file. Loads existing entries
+    /// (capped at `HISTORY_CAPACITY`) into the in-memory deque and
+    /// remembers the path so new entries are appended on `record()`.
+    fn with_persistent_history(mut self, path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines().rev().take(HISTORY_CAPACITY) {
+                let line = line.trim();
+                if !line.is_empty() {
+                    self.history.push_front(line.to_string());
+                }
+            }
+        }
+        self.history_file = Some(path);
+        self
     }
 
     fn clear(&mut self) {
@@ -251,6 +365,24 @@ impl LineEditor {
             if self.history.len() >= HISTORY_CAPACITY {
                 self.history.pop_front();
             }
+            // Persist before pushing so a failed write does not poison the
+            // in-memory deque. The file IO is best-effort: a permission or
+            // disk-full error logs to tracing and the REPL keeps running.
+            if let Some(path) = &self.history_file {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(path)
+                {
+                    let _ = writeln!(file, "{line}");
+                } else {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "ptywright repl: could not append to history file"
+                    );
+                }
+            }
             self.history.push_back(line);
         }
         self.history_idx = None;
@@ -293,8 +425,9 @@ impl LineEditor {
 
     fn cycle_completion(&mut self, completer: &mut ReplCompleter) {
         if self.completions.is_empty() {
-            // First Tab: query the completer and stash the origin span +
-            // base text so subsequent Tabs cycle through alternatives.
+            // First Tab: query the completer and stash the origin span so
+            // subsequent Tabs cycle through alternatives in place rather
+            // than appending alongside the previous pick.
             let suggestions = completer.complete(&self.buffer, self.cursor);
             if suggestions.is_empty() {
                 return;
@@ -313,7 +446,16 @@ impl LineEditor {
             return;
         };
         let pick = self.completions[self.completion_idx].clone();
+        let pick_len = pick.len();
         self.replace_span(span, &pick);
+        // The replaced region now spans the full length of the new pick —
+        // remember that so the *next* Tab replaces the just-inserted text
+        // instead of inserting alongside it. (This was the bug behind the
+        // "holding tab does wild completions" report.)
+        self.completion_origin = Some((
+            ReedSpan::new(span.start, span.start + pick_len),
+            pick.clone(),
+        ));
     }
 
     fn reset_completion(&mut self) {
@@ -427,6 +569,58 @@ fn handle_key(key: KeyEvent, editor: &mut LineEditor, args: &mut EventLoopArgs<'
     ControlFlow::Continue
 }
 
+/// Translate a mouse event into a ControlFlow action. Modal-aware:
+/// any click while the help popup is up dismisses it without firing the
+/// underlying hotspot.
+fn handle_mouse(
+    mouse: MouseEvent,
+    editor: &mut LineEditor,
+    args: &mut EventLoopArgs<'_>,
+    hotspots: &[Hotspot],
+) -> ControlFlow {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return ControlFlow::Continue;
+    }
+    if editor.modal.is_some() {
+        editor.modal = None;
+        return ControlFlow::Continue;
+    }
+    let x = mouse.column;
+    let y = mouse.row;
+    for hotspot in hotspots {
+        let r = hotspot.rect;
+        if x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
+            return apply_hotspot(hotspot.action.clone(), editor, args);
+        }
+    }
+    ControlFlow::Continue
+}
+
+fn apply_hotspot(
+    action: HotspotAction,
+    editor: &mut LineEditor,
+    args: &mut EventLoopArgs<'_>,
+) -> ControlFlow {
+    match action {
+        HotspotAction::Focus(id) => ControlFlow::SwitchFocus(id),
+        HotspotAction::OpenHelp => {
+            editor.modal = Some(Modal::Help(super::command::help_text().to_string()));
+            ControlFlow::Continue
+        }
+        HotspotAction::Quit => ControlFlow::Quit,
+        HotspotAction::ToggleNotifications => {
+            let next = !*args.notifications_enabled;
+            let _ = args.client.call(
+                "server.set_notifications",
+                serde_json::json!({ "enabled": next }),
+                RPC_TIMEOUT,
+            );
+            *args.notifications_enabled = next;
+            ControlFlow::Continue
+        }
+    }
+}
+
 fn execute_line(line: &str, args: &mut EventLoopArgs<'_>, editor: &mut LineEditor) -> ControlFlow {
     let parsed = match super::command::parse(line) {
         Ok(cmd) => cmd,
@@ -462,6 +656,18 @@ fn execute_line(line: &str, args: &mut EventLoopArgs<'_>, editor: &mut LineEdito
 
     match outcome {
         Ok(CmdOutcome::Quit) => ControlFlow::Quit,
+        Ok(CmdOutcome::ShowHelp(text)) => {
+            editor.modal = Some(Modal::Help(text));
+            push_history(
+                args,
+                HistoryEntry {
+                    input: line.to_string(),
+                    kind: OutcomeKind::Note,
+                    detail: Some("(help shown — press any key or click to dismiss)".into()),
+                },
+            );
+            ControlFlow::Continue
+        }
         Ok(CmdOutcome::Line(text)) => {
             push_history(
                 args,
@@ -526,6 +732,7 @@ fn push_history(args: &EventLoopArgs<'_>, entry: HistoryEntry) {
 
 // ---- rendering ---------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame<'_>,
     transport_label: &str,
@@ -534,6 +741,7 @@ fn render(
     editor: &LineEditor,
     highlighter: &ReplHighlighter,
     notifications_enabled: bool,
+    hotspots: &mut Vec<Hotspot>,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -549,11 +757,7 @@ fn render(
     frame.render_widget(header_widget(transport_label), chunks[0]);
 
     let ctx_snapshot = ctx.lock().ok().map(|guard| guard.clone());
-    let tab_line = ctx_snapshot
-        .as_ref()
-        .map(render_tabs)
-        .unwrap_or_else(|| Line::from(""));
-    frame.render_widget(Paragraph::new(tab_line), chunks[1]);
+    render_tab_strip(frame, chunks[1], ctx_snapshot.as_ref(), hotspots);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -565,8 +769,72 @@ fn render(
 
     render_input(frame, chunks[3], editor, highlighter);
 
-    let footer_text = footer_line(ctx_snapshot.as_ref(), editor, notifications_enabled);
-    frame.render_widget(Paragraph::new(footer_text), chunks[4]);
+    render_footer(
+        frame,
+        chunks[4],
+        ctx_snapshot.as_ref(),
+        editor,
+        notifications_enabled,
+        hotspots,
+    );
+
+    // Modal popup is drawn last so it overlays everything else.
+    if let Some(modal) = &editor.modal {
+        render_modal(frame, frame.area(), modal);
+    }
+}
+
+/// Render the tab strip and append a `Focus(<id>)` hotspot per tab.
+fn render_tab_strip(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ctx: Option<&ReplCtx>,
+    hotspots: &mut Vec<Hotspot>,
+) {
+    let line = ctx.map(render_tabs).unwrap_or_else(|| Line::from(""));
+    frame.render_widget(Paragraph::new(line), area);
+    let Some(ctx) = ctx else {
+        return;
+    };
+    // Walk the same Span sequence `render_tabs` produces so the clickable
+    // rects line up exactly with what the user sees.
+    let mut col = area.x;
+    for (idx, tab) in ctx.adapters.iter().enumerate() {
+        if idx > 0 {
+            col = col.saturating_add(2); // two-space separator
+        }
+        let state = tab.state_label.as_deref().unwrap_or("ready");
+        let label = format!("[{}: {} · {}]", tab.id, tab.plugin, state);
+        let width = label.chars().count() as u16;
+        if col + width > area.x + area.width {
+            break;
+        }
+        hotspots.push(Hotspot {
+            rect: Rect::new(col, area.y, width, area.height.max(1)),
+            action: HotspotAction::Focus(tab.id.clone()),
+        });
+        col = col.saturating_add(width);
+    }
+}
+
+fn render_modal(frame: &mut ratatui::Frame<'_>, full: Rect, modal: &Modal) {
+    let Modal::Help(body) = modal;
+    // Center a 70x18 area (or as much as fits) and draw a bordered popup.
+    let target_w = full.width.clamp(40, 90);
+    let target_h = full.height.clamp(10, 22);
+    let x = full.x + (full.width.saturating_sub(target_w)) / 2;
+    let y = full.y + (full.height.saturating_sub(target_h)) / 2;
+    let rect = Rect::new(x, y, target_w, target_h);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" help · any key / click to dismiss ");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(body.clone()).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn header_widget(transport_label: &str) -> Paragraph<'static> {
@@ -671,32 +939,81 @@ fn render_input(
     frame.set_cursor_position((inner.x + cursor_x as u16, inner.y));
 }
 
-fn footer_line(
+/// Render the footer line and register click hotspots for `:help`,
+/// `:quit`, and the notification pill.
+fn render_footer(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
     ctx: Option<&ReplCtx>,
     editor: &LineEditor,
     notifications_enabled: bool,
-) -> Line<'static> {
+    hotspots: &mut Vec<Hotspot>,
+) {
     let focus = ctx
         .and_then(|c| c.focus.clone())
         .unwrap_or_else(|| "—".to_string());
     let cmd_count = ctx.map(|c| c.history.len()).unwrap_or_default();
-    let notif = if notifications_enabled {
-        "notif on"
+    let notif_label = if notifications_enabled {
+        "notif on".to_string()
     } else {
-        "notif off"
+        "notif off".to_string()
     };
     let history_len = editor.history.len();
     let dim = Style::default().add_modifier(Modifier::DIM);
-    Line::from(vec![
-        Span::styled(focus, Style::default().fg(Color::Cyan)),
-        Span::styled("  ·  ", dim),
-        Span::styled(notif.to_string(), dim),
-        Span::styled("  ·  ", dim),
-        Span::styled(format!("{cmd_count} entries"), dim),
-        Span::styled("  ·  ", dim),
-        Span::styled(format!("{history_len} recalled"), dim),
-        Span::styled("  ·  Alt-1..9 focus · Ctrl-C clear · Ctrl-D quit", dim),
-    ])
+    let link = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
+
+    // Build the spans and track each clickable label's column range so we
+    // can register a hotspot covering exactly its rendered cells.
+    let alt = KEY_ALT;
+    let ctrl = KEY_CTRL;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col = area.x;
+    let push =
+        |spans: &mut Vec<Span<'static>>, col: &mut u16, text: String, style: Style| -> (u16, u16) {
+            let start = *col;
+            let width = text.chars().count() as u16;
+            spans.push(Span::styled(text, style));
+            *col = col.saturating_add(width);
+            (start, width)
+        };
+
+    push(
+        &mut spans,
+        &mut col,
+        focus,
+        Style::default().fg(Color::Cyan),
+    );
+    push(&mut spans, &mut col, "  ·  ".to_string(), dim);
+    let (notif_x, notif_w) = push(&mut spans, &mut col, notif_label, link);
+    hotspots.push(Hotspot {
+        rect: Rect::new(notif_x, area.y, notif_w, 1),
+        action: HotspotAction::ToggleNotifications,
+    });
+    push(&mut spans, &mut col, "  ·  ".to_string(), dim);
+    push(&mut spans, &mut col, format!("{cmd_count} entries"), dim);
+    push(&mut spans, &mut col, "  ·  ".to_string(), dim);
+    push(&mut spans, &mut col, format!("{history_len} recalled"), dim);
+    push(&mut spans, &mut col, "  ·  ".to_string(), dim);
+    let (help_x, help_w) = push(&mut spans, &mut col, ":help".to_string(), link);
+    hotspots.push(Hotspot {
+        rect: Rect::new(help_x, area.y, help_w, 1),
+        action: HotspotAction::OpenHelp,
+    });
+    push(
+        &mut spans,
+        &mut col,
+        format!("  ·  {alt}1..9 focus · {ctrl}C clear · "),
+        dim,
+    );
+    let (quit_x, quit_w) = push(&mut spans, &mut col, ":quit".to_string(), link);
+    hotspots.push(Hotspot {
+        rect: Rect::new(quit_x, area.y, quit_w, 1),
+        action: HotspotAction::Quit,
+    });
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn styled_text_to_spans(styled: &StyledText) -> Vec<Span<'static>> {
