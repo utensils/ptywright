@@ -4,8 +4,9 @@ ptywright drives interactive TUIs through a generic extension layer. The `Extens
 
 ## What an extension is
 
-An extension is anything that implements the `Extension` trait. The trait has three methods:
+An extension is anything that implements the `Extension` trait. The trait has four methods:
 
+- `manifest() -> &PluginManifest` — return the plugin's stable identifier, version, runtime, and declared permissions. The host uses this for `adapter.list`, `plugin.capabilities`, and permission gating.
 - `classify(ctx) -> ExtensionStateSnapshot` — read the current body/status text, transcript tail, last intent, and stability hints from `ClassifyContext`, and return a plugin-defined state string plus confidence and evidence.
 - `plan(intent, params) -> ActionPlan` — turn a named intent (for example `"send_prompt"`, `"approve"`, `"cancel"`) into an ordered list of generic `Action` values, optionally recording a `last_intent` for the next classify call.
 - `wait_matcher(intent, params) -> Matcher` — build a generic `Matcher` for a named wait intent (for example `"wait_turn_matcher"`).

@@ -1121,8 +1121,11 @@ impl RpcServer {
         } else {
             None
         };
-        let tail_start = transcript.len().saturating_sub(4096);
-        let mut transcript_tail = transcript[tail_start..].to_string();
+        // 4 KiB tail mirrors what session.wait returns as transcript_tail.
+        // Walk to a valid UTF-8 boundary so multibyte glyphs in Claude
+        // output (⏺, ❯, →, …) cannot panic the handler when the byte
+        // offset lands mid-codepoint. Mirrors `claude_inspect`.
+        let mut transcript_tail = transcript_tail_bytes(&transcript, 4096).to_string();
         let mut plain_text = snapshot.plain_text.clone();
         if let Some(policy) = policy {
             plain_text = policy.redact(&plain_text);
@@ -1141,14 +1144,24 @@ impl RpcServer {
         }))
     }
 
-    /// `adapter.close` — drop the handle and its session. Subsequent calls
-    /// against the same adapter id return InvalidParams.
+    /// `adapter.close` — terminate the underlying PTY child and drop the
+    /// handle. Subsequent calls against the same adapter id return
+    /// InvalidParams.
+    ///
+    /// Mirrors `session.close`: the host kills the child before dropping the
+    /// owning struct. `Session` does not implement `Drop` to kill the child,
+    /// so closing the registry entry alone would leak the PTY process (and
+    /// the spawned `claude` binary) until the parent exited.
     fn adapter_close(
         &mut self,
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: AdapterParams = parse_params(params)?;
-        if self.extensions.remove(&params.adapter).is_some() {
+        if let Some(entry) = self.extensions.remove(&params.adapter) {
+            // Best-effort kill — if the child already exited the kill returns
+            // an error which we discard. The session is dropped immediately
+            // afterwards either way.
+            let _ = entry.handle.session().kill();
             Ok(json!({ "closed": true }))
         } else {
             Err((
@@ -1953,6 +1966,11 @@ mod tests {
         );
         assert!(send_deny["result"]["state"].is_object());
 
+        // adapter.close must kill the underlying child rather than just
+        // dropping the registry entry — Session has no Drop hook to kill the
+        // PTY child, so registry-only removal would leak the spawned shell.
+        // Drive the close against an adapter we just spawned with a
+        // long-running `cat` and assert the child is gone afterwards.
         let close = handle(
             &mut server,
             &format!(

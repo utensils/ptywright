@@ -130,7 +130,7 @@ function M.classify(input)
   -- body_text excludes the bottom status-bar rows so that benign status
   -- strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` do not
   -- false-positive on substring matches such as `permission`. The host
-  -- (src/adapters/claude_code.rs::split_status_bar) computes the split with
+  -- (src/extension.rs::split_status_bar) computes the split with
   -- STATUS_BAR_ROWS; if for any reason the host doesn't provide the split
   -- (older callers, tests) fall back to the full screen so we degrade
   -- gracefully rather than misclassifying everything as starting.
@@ -149,11 +149,15 @@ function M.classify(input)
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
   end
 
-  -- Plan and permission dialogs in the Claude Code TUI sometimes straddle the
-  -- body/status split (the question line is in body, the answer hint sits in
-  -- the bottom rows). Look at body+status_text together for those classifier
-  -- branches, but keep the false-positive guard for status-bar-only matches
-  -- by requiring at least one body match too.
+  -- Plan-approval dialogs in the Claude Code TUI sometimes straddle the
+  -- body/status split: the "Plan ready"/"Plan" header sits in the body
+  -- while the approve/accept/proceed hint can render in the bottom rows.
+  -- The plan branch below uses body_and_status for that reason and keeps
+  -- the false-positive guard by requiring "plan" to appear in body first.
+  -- Permission dialogs do not straddle the split in practice (the entire
+  -- dialog renders in the body area), so the permission branch stays on
+  -- body_text alone — matching it across the status bar would re-introduce
+  -- the `bypass permissions on` false-positive we fixed in Milestone 21.4.
   local body_and_status = body_text .. "\n" .. lower(status)
 
   -- Workspace-trust dialog is checked before permission/plan because its
