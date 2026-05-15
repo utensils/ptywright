@@ -15,6 +15,8 @@ use std::process::ExitCode;
 
 use crate::error::Result;
 
+pub mod socket;
+pub mod spawn;
 pub mod transport;
 
 /// Wire framing for the JSON-RPC transport. Mirrors the server-side
