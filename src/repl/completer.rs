@@ -45,6 +45,33 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
     (":quit", "exit the REPL"),
 ];
 
+/// Conventional key names plugins generally honor in `send.key("…")`.
+/// Plugins are free to handle anything (so `"\x1b"`, etc., are valid), but
+/// these are the ones worth surfacing as suggestions.
+const KEY_NAMES: &[(&str, &str)] = &[
+    ("enter", "↩ submit"),
+    ("escape", "⎋ cancel"),
+    ("tab", "tab"),
+    ("backspace", "⌫"),
+    ("space", "space"),
+    ("up", "↑"),
+    ("down", "↓"),
+    ("left", "←"),
+    ("right", "→"),
+    ("home", "home"),
+    ("end", "end"),
+    ("pageup", "page up"),
+    ("pagedown", "page down"),
+    ("delete", "delete"),
+    ("insert", "insert"),
+    ("y", "yes"),
+    ("n", "no"),
+    ("1", "first numeric option"),
+    ("2", "second numeric option"),
+    ("ctrl-c", "interrupt"),
+    ("ctrl-d", "EOF"),
+];
+
 /// Cached plugin names from the most recent `adapter.list` response.
 /// `Arc<Mutex<_>>` so the TUI thread can refresh it after a `plugins()`
 /// roundtrip without blocking the completer's `&mut` call site.
@@ -128,6 +155,28 @@ impl Completer for ReplCompleter {
                     .map(|name| Suggestion {
                         value: name,
                         description: Some("plugin".into()),
+                        span,
+                        append_whitespace: false,
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+        }
+
+        // `send.key("<TAB>` → conventional key names. Plugins ultimately
+        // decide how to interpret the string, but every TUI handles the
+        // names below — surface them to save the user from typing them out.
+        if let Some(stem) = prefix.rfind("send.key(\"") {
+            let inside_start = stem + "send.key(\"".len();
+            if inside_start <= prefix_end {
+                let inside = &prefix[inside_start..prefix_end];
+                let span = Span::new(inside_start, prefix_end);
+                return KEY_NAMES
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(inside))
+                    .map(|(name, hint)| Suggestion {
+                        value: (*name).to_string(),
+                        description: Some((*hint).to_string()),
                         span,
                         append_whitespace: false,
                         ..Default::default()
