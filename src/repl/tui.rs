@@ -127,6 +127,12 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
         })
         .expect("spawn notification printer thread");
 
+    // RAII guard so the printer thread is signaled regardless of which
+    // exit path `run` takes (clean `:quit`, Ctrl-D, reedline error, or a
+    // panic). Constructed immediately after the spawn so any panic in
+    // the line-editor setup below still trips it on stack unwind.
+    let _printer_guard = PrinterStopGuard(Arc::clone(&printer_stop));
+
     // Register a columnar completion menu so Tab shows candidates and
     // Tab / Shift-Tab cycle through them.
     let menu = ReedlineMenu::EngineCompleter(Box::new(
@@ -156,12 +162,6 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
         .with_menu(menu)
         .with_edit_mode(edit_mode)
         .with_external_printer(external_printer);
-
-    // RAII guard so the printer thread is signaled regardless of which
-    // exit path `run` takes (clean `:quit`, Ctrl-D, reedline error, or a
-    // panic). Without it, the printer would park on `recv_timeout`
-    // indefinitely on the socket transport.
-    let _printer_guard = PrinterStopGuard(Arc::clone(&printer_stop));
 
     let prompt = PtywrightPrompt {
         transport_label: transport_label.clone(),

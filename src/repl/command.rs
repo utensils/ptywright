@@ -665,8 +665,17 @@ fn dispatch_dsl(
         }
         "send.intent" => send_intent(call, client, ctx, timeout),
         "send.text" => {
+            // Plugin convention: `send_prompt` reads `input.prompt`. Match
+            // that so the REPL DSL doesn't end up paste-ing empty strings
+            // because of a wire-shape mismatch.
             let text = expect_one_string(&call, "send.text")?;
-            send_named_intent(client, ctx, "send_prompt", json!({ "text": text }), timeout)
+            send_named_intent(
+                client,
+                ctx,
+                "send_prompt",
+                json!({ "prompt": text }),
+                timeout,
+            )
         }
         "send.key" => {
             let key = expect_one_string(&call, "send.key")?;

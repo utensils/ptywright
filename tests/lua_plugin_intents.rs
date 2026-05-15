@@ -140,6 +140,38 @@ fn deny_trust_types_numeric_option_two() {
 }
 
 #[test]
+fn key_intent_routes_named_keys_to_action_key() {
+    // The generic `key` intent is the entry point the REPL DSL's
+    // `send.key("…")` calls into. Named keys (and hyphenated control
+    // aliases like `ctrl-c`) must serialise to the matching
+    // `Action::Key(...)` variant.
+    let extension = claude_plugin();
+
+    let enter_plan = plan(&extension, "key", json!({ "key": "enter" }));
+    assert_eq!(enter_plan.actions, vec![Action::Key(Key::Enter)]);
+    assert!(enter_plan.last_intent.is_none());
+
+    let ctrl_c_plan = plan(&extension, "key", json!({ "key": "ctrl-c" }));
+    assert_eq!(ctrl_c_plan.actions, vec![Action::Key(Key::CtrlC)]);
+
+    let ctrl_d_plan = plan(&extension, "key", json!({ "key": "ctrl_d" }));
+    assert_eq!(ctrl_d_plan.actions, vec![Action::Key(Key::CtrlD)]);
+}
+
+#[test]
+fn key_intent_falls_through_to_text_for_unrecognised_input() {
+    // Single chars like "y" / "n" / "1" are sent through `action.text`
+    // so REPL callers can use `send.key("y")` instead of
+    // `send.text("y")` interchangeably for quick acknowledgements.
+    let extension = claude_plugin();
+    let y_plan = plan(&extension, "key", json!({ "key": "y" }));
+    assert_eq!(y_plan.actions, vec![Action::Text("y".to_string())]);
+
+    let one_plan = plan(&extension, "key", json!({ "key": "1" }));
+    assert_eq!(one_plan.actions, vec![Action::Text("1".to_string())]);
+}
+
+#[test]
 fn dismiss_welcome_sends_single_enter_without_intent() {
     // The first-launch welcome panel traps Enter; the plugin exposes
     // `dismiss_welcome` as a single-Enter action so callers don't have to

@@ -57,31 +57,26 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
     (":quit", "exit the REPL"),
 ];
 
-/// Conventional key names plugins generally honor in `send.key("…")`.
-/// Plugins are free to handle anything (so `"\x1b"`, etc., are valid), but
-/// these are the ones worth surfacing as suggestions.
+/// Names the host's `action.key(...)` recognises plus the most common
+/// single-char text tokens that the plugin's generic `key` intent forwards
+/// through `action.text`. Suggestions outside this list would be sent as
+/// literal text (e.g. typing the word "space"), which is almost never what
+/// the operator wants — keep the surface tight.
 const KEY_NAMES: &[(&str, &str)] = &[
     ("enter", "↩ submit"),
     ("escape", "⎋ cancel"),
     ("tab", "tab"),
     ("backspace", "⌫"),
-    ("space", "space"),
     ("up", "↑"),
     ("down", "↓"),
     ("left", "←"),
     ("right", "→"),
-    ("home", "home"),
-    ("end", "end"),
-    ("pageup", "page up"),
-    ("pagedown", "page down"),
-    ("delete", "delete"),
-    ("insert", "insert"),
-    ("y", "yes"),
-    ("n", "no"),
-    ("1", "first numeric option"),
-    ("2", "second numeric option"),
-    ("ctrl-c", "interrupt"),
-    ("ctrl-d", "EOF"),
+    ("ctrl-c", "interrupt (sent as ctrl_c)"),
+    ("ctrl-d", "EOF (sent as ctrl_d)"),
+    ("y", "yes (sent as text)"),
+    ("n", "no (sent as text)"),
+    ("1", "first numeric option (sent as text)"),
+    ("2", "second numeric option (sent as text)"),
 ];
 
 /// Cached plugin names from the most recent `adapter.list` response.

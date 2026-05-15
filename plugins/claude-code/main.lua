@@ -409,4 +409,36 @@ function M.cancel(_input)
   }
 end
 
+-- Generic key/text intent. The REPL's `send.key("…")` and any other
+-- caller that wants to nudge the PTY with a single named key or a short
+-- text token can use this without knowing whether the target is a
+-- recognised key alias or a literal character. Hyphenated control names
+-- (`"ctrl-c"`) are normalised to the underscore form the action enum
+-- expects.
+local KEY_ALIASES = {
+  enter = true, escape = true, tab = true, backspace = true,
+  up = true, down = true, left = true, right = true,
+  ctrl_c = true, ctrl_d = true,
+}
+
+function M.key(input)
+  local raw = (input and input.key) or ""
+  local normalised = raw:gsub("-", "_")
+  if KEY_ALIASES[normalised] then
+    return {
+      actions = {
+        action.key(normalised),
+      },
+    }
+  end
+  -- Fall through: arbitrary single characters or short strings ("y",
+  -- "n", "1", "q") are sent as raw text so the PTY treats them as
+  -- typed input.
+  return {
+    actions = {
+      action.text(raw),
+    },
+  }
+end
+
 return M
