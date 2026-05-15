@@ -16,7 +16,13 @@ use super::ctx::ReplCtx;
 const DSL_COMMANDS: &[(&str, &str)] = &[
     ("plugins()", "list built-in plugins"),
     ("session.spawn(\"\")", "spawn an adapter for a plugin"),
-    ("session.list()", "list known adapters"),
+    ("session.list()", "list adapters (this REPL)"),
+    ("session.live()", "list adapters live on the server"),
+    (
+        "session.attach(\"\")",
+        "attach a server adapter into this REPL",
+    ),
+    ("session.attach(\"all\")", "attach every live adapter"),
     ("session.close()", "close the focused adapter"),
     ("state()", "re-classify the focused adapter"),
     ("send.text(\"\")", "send a prompt to the focused adapter"),
@@ -42,6 +48,8 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
     ("inspect()", "diagnostic dump"),
     (":tabs", "list adapters"),
     (":focus", "switch focus to an adapter id"),
+    (":live", "list adapters live on the server"),
+    (":attach", "attach a server adapter (id or `all`)"),
     (":notifications on", "subscribe to session.* notifications"),
     (":notifications off", "unsubscribe"),
     (":rpc ", "raw JSON-RPC escape hatch"),
@@ -121,7 +129,7 @@ impl Completer for ReplCompleter {
         let token = current_token(prefix);
         let start = prefix_end - token.len();
 
-        // `:focus <TAB>` → list adapter ids.
+        // `:focus <TAB>` → list local adapter ids.
         if prefix.trim_start().starts_with(":focus") {
             let after = prefix.trim_start_matches(":focus").trim_start();
             let after_len = after.len();
@@ -143,6 +151,41 @@ impl Completer for ReplCompleter {
                     ..Default::default()
                 })
                 .collect();
+        }
+
+        // `:attach <TAB>` → `all` plus locally-known adapter ids. Server-side
+        // live ids are discoverable via `:live` itself; surfacing them here
+        // would require a live-cache the completer doesn't own yet.
+        if prefix.trim_start().starts_with(":attach") {
+            let after = prefix.trim_start_matches(":attach").trim_start();
+            let after_len = after.len();
+            let after_start = prefix_end - after_len;
+            let span = Span::new(after_start, prefix_end);
+            let mut suggestions: Vec<Suggestion> = Vec::new();
+            if "all".starts_with(after) {
+                suggestions.push(Suggestion {
+                    value: "all".to_string(),
+                    description: Some("attach every live adapter".into()),
+                    span,
+                    append_whitespace: false,
+                    ..Default::default()
+                });
+            }
+            let ctx = self.ctx.lock().ok();
+            if let Some(ctx) = ctx {
+                for tab in &ctx.adapters {
+                    if tab.id.starts_with(after) {
+                        suggestions.push(Suggestion {
+                            value: tab.id.clone(),
+                            description: Some("adapter id".into()),
+                            span,
+                            append_whitespace: false,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            return suggestions;
         }
 
         // `session.spawn("<TAB>` → plugin names.
@@ -285,6 +328,17 @@ mod tests {
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert_eq!(values, vec!["claude-code"]);
+    }
+
+    #[test]
+    fn attach_completer_suggests_all_and_known_ids() {
+        let ctx = ctx_with_adapters(&[("e7", "claude-code")]);
+        let mut completer = ReplCompleter::new(ctx, PluginCache::new());
+        let line = ":attach ";
+        let suggestions = completer.complete(line, line.len());
+        let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
+        assert!(values.contains(&"all"), "expected `all`, got {values:?}");
+        assert!(values.contains(&"e7"), "expected `e7`, got {values:?}");
     }
 
     #[test]

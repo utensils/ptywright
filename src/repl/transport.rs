@@ -16,8 +16,8 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -64,6 +64,11 @@ pub struct RpcClient {
     notifications_tx: Sender<Notification>,
     notifications_rx: Receiver<Notification>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Set to `true` to ask the heartbeat thread to exit on its next tick.
+    /// Drop sets it unconditionally so the thread does not outlive the
+    /// client's last `Arc` reference.
+    heartbeat_stop: Arc<AtomicBool>,
+    heartbeat_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl RpcClient {
@@ -85,6 +90,8 @@ impl RpcClient {
             notifications_tx: notifications_tx.clone(),
             notifications_rx,
             reader_thread: Mutex::new(None),
+            heartbeat_stop: Arc::new(AtomicBool::new(false)),
+            heartbeat_thread: Mutex::new(None),
         });
 
         let reader_thread = std::thread::Builder::new()
@@ -153,6 +160,52 @@ impl RpcClient {
         self.notifications_rx.clone()
     }
 
+    /// Spawn a background thread that periodically pings the server so its
+    /// per-connection notification pump runs even when this client is idle.
+    ///
+    /// The server only polls notifications on the same connection that
+    /// just handled a request, so a REPL parked at a prompt would never see
+    /// `session.changed` events triggered by activity from sibling
+    /// connections. This heartbeat re-asserts `server.set_notifications`
+    /// every `interval`; it is idempotent, cheap, and flushes any queued
+    /// notifications back over the same socket.
+    ///
+    /// Calling this twice is a no-op — the existing thread is kept. The
+    /// thread terminates when the last `Arc<Self>` is dropped (the
+    /// internal `Weak` upgrade fails) or sooner via the stop signal in
+    /// `Drop`.
+    pub fn start_heartbeat(self: &Arc<Self>, interval: Duration) {
+        let mut slot = self.heartbeat_thread.lock().expect("heartbeat mutex");
+        if slot.is_some() {
+            return;
+        }
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let stop = Arc::clone(&self.heartbeat_stop);
+        let handle = std::thread::Builder::new()
+            .name("ptywright-repl-rpc-heartbeat".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let Some(client) = weak.upgrade() else {
+                        return;
+                    };
+                    // `set_notifications` is idempotent and cheap; its only
+                    // purpose here is to trigger the server's per-connection
+                    // poll_notifications so any queued frames get flushed.
+                    let _ = client.call(
+                        "server.set_notifications",
+                        json!({ "enabled": true }),
+                        Duration::from_secs(2),
+                    );
+                }
+            })
+            .expect("spawn rpc heartbeat thread");
+        *slot = Some(handle);
+    }
+
     fn send_frame(&self, payload: &str) -> Result<()> {
         let mut writer = self.writer.lock().expect("writer mutex");
         match self.framing {
@@ -173,6 +226,10 @@ impl RpcClient {
 
 impl Drop for RpcClient {
     fn drop(&mut self) {
+        // Signal the heartbeat thread first so it stops issuing calls while
+        // we tear the rest of the state down.
+        self.heartbeat_stop.store(true, Ordering::Relaxed);
+
         // Cancel any pending callers so they exit with a clean error rather
         // than blocking on a sender that will never write. The reader
         // thread exits naturally once the transport closes — joining here
@@ -187,6 +244,13 @@ impl Drop for RpcClient {
         {
             // Best-effort: a small join is fine, but we cannot block
             // indefinitely or the parent thread may hang on shutdown.
+            let _ = handle;
+        }
+        if let Ok(mut slot) = self.heartbeat_thread.lock()
+            && let Some(handle) = slot.take()
+        {
+            // Heartbeat thread holds a `Weak` so it will not block here;
+            // detaching is safe.
             let _ = handle;
         }
         drop(self.notifications_tx.clone());

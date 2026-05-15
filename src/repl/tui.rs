@@ -13,21 +13,27 @@ use std::time::Duration;
 
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, DefaultHinter, Emacs, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
-    PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, Signal, default_emacs_keybindings,
+    ColumnarMenu, DefaultHinter, Emacs, ExternalPrinter, KeyCode, KeyModifiers, MenuBuilder,
+    Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    default_emacs_keybindings,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::command::{CmdOutcome, parse};
 use super::completer::{PluginCache, ReplCompleter};
 use super::ctx::ReplCtx;
 use super::highlighter::ReplHighlighter;
-use super::transport::RpcClient;
+use super::transport::{Notification, RpcClient};
 use crate::error::{Error, Result};
 use crate::paths::Paths;
 use crate::screen::{ScreenCellStyle, ScreenSnapshot};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the REPL pings the server to keep its notification pump warm.
+/// The server only polls notifications on inbound requests, so a parked
+/// prompt needs a heartbeat for `session.changed` events from other
+/// connections to reach us. See `RpcClient::start_heartbeat`.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Public entry. Builds reedline + prompt and runs the read-eval-print
 /// loop until the user quits with `:quit` / `Ctrl-D`.
@@ -37,11 +43,30 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
 
     // Seed the plugin cache so the very first Tab inside
     // `session.spawn("…")` knows which plugin names exist.
-    if let Ok(value) = client.call("adapter.list", serde_json::json!({}), RPC_TIMEOUT)
+    if let Ok(value) = client.call("adapter.list", json!({}), RPC_TIMEOUT)
         && let Some(names) = extract_plugin_names(&value)
     {
         plugins.set(names);
     }
+
+    // Subscribe to server notifications by default — most users want to
+    // see `session.changed` / `session.exited` events for the adapters
+    // they're watching. The companion heartbeat below keeps the pump
+    // warm so events from sibling connections actually reach us.
+    let _ = client.call(
+        "server.set_notifications",
+        json!({ "enabled": true }),
+        RPC_TIMEOUT,
+    );
+    client.start_heartbeat(HEARTBEAT_INTERVAL);
+
+    // Probe for live adapters once at startup. The user can `:attach <id>`
+    // or `:attach all` to load them into local tabs without losing the
+    // option to start with a clean slate.
+    let live_hint = match client.call("adapter.live", json!({}), RPC_TIMEOUT) {
+        Ok(value) => format_live_hint(&value),
+        Err(_) => None,
+    };
 
     // Persistent history at `~/.ptywright/repl-history` (or wherever
     // `PTYWRIGHT_HOME` points).
@@ -52,6 +77,27 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     let highlighter = Box::new(ReplHighlighter::new());
     let hinter =
         Box::new(DefaultHinter::default().with_style(Style::new().italic().fg(Color::DarkGray)));
+
+    // External printer relays `[notif] …` lines from a background thread
+    // above the prompt without disturbing the line editor. reedline polls
+    // the receiver between events when configured.
+    let external_printer = ExternalPrinter::<String>::default();
+    let notification_sender = external_printer.sender();
+    let notifications_rx = client.notifications();
+    std::thread::Builder::new()
+        .name("ptywright-repl-notif-printer".into())
+        .spawn(move || {
+            // Drop the printer's sender when the channel closes (i.e.,
+            // RpcClient is being torn down) so the print queue does not
+            // grow forever.
+            while let Ok(notification) = notifications_rx.recv() {
+                let line = format_notification(&notification);
+                if notification_sender.send(line).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("spawn notification printer thread");
 
     // Register a columnar completion menu so Tab shows candidates and
     // Tab / Shift-Tab cycle through them.
@@ -80,7 +126,8 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
         .with_history(Box::new(history))
         .with_hinter(hinter)
         .with_menu(menu)
-        .with_edit_mode(edit_mode);
+        .with_edit_mode(edit_mode)
+        .with_external_printer(external_printer);
 
     let prompt = PtywrightPrompt {
         transport_label: transport_label.clone(),
@@ -100,6 +147,9 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
             .dimmed()
             .paint("Type :help for commands · :quit to exit · Tab/Shift-Tab cycles completions",),
     );
+    if let Some(hint) = live_hint {
+        println!("{}", Color::Yellow.paint(hint));
+    }
     println!();
 
     loop {
@@ -157,6 +207,57 @@ fn extract_plugin_names(value: &Value) -> Option<Vec<String>> {
             .iter()
             .filter_map(|p| p.get("name").and_then(Value::as_str).map(str::to_string))
             .collect(),
+    )
+}
+
+/// Build the live-adapter hint shown under the banner. `None` when the
+/// server reports no live adapters (don't waste a banner row).
+fn format_live_hint(value: &Value) -> Option<String> {
+    let adapters = value.get("adapters")?.as_array()?;
+    let mut ids: Vec<String> = Vec::new();
+    for entry in adapters {
+        if entry
+            .get("finished")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(id) = entry.get("adapter").and_then(Value::as_str) {
+            ids.push(id.to_string());
+        }
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    let joined = ids.join(", ");
+    Some(format!(
+        "{} live adapter(s) on the server: {} — `:attach all` to load them, or `:attach <id>`",
+        ids.len(),
+        joined,
+    ))
+}
+
+/// Format a server notification into the dim line surfaced through the
+/// reedline external printer.
+fn format_notification(notification: &Notification) -> String {
+    let session = notification
+        .params
+        .get("session")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let sequence = notification.params.get("sequence").and_then(Value::as_u64);
+    let body = match (notification.method.as_str(), sequence) {
+        ("session.changed", Some(seq)) => format!("session.changed {session} seq={seq}"),
+        ("session.exited", Some(seq)) => format!("session.exited  {session} seq={seq}"),
+        ("session.changed", None) => format!("session.changed {session}"),
+        ("session.exited", None) => format!("session.exited  {session}"),
+        (other, _) => format!("{other} {}", notification.params),
+    };
+    format!(
+        "{} {}",
+        Style::new().dimmed().paint("[notif]"),
+        Style::new().dimmed().paint(body),
     )
 }
 
@@ -373,5 +474,62 @@ impl Prompt for PtywrightPrompt {
 
     fn render_prompt_history_search_indicator(&self, _: PromptHistorySearch) -> Cow<'_, str> {
         Cow::Borrowed("(history) ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_hint_is_none_when_no_adapters() {
+        assert!(format_live_hint(&json!({ "adapters": [] })).is_none());
+        assert!(format_live_hint(&json!({})).is_none());
+    }
+
+    #[test]
+    fn live_hint_lists_running_adapter_ids() {
+        let value = json!({
+            "adapters": [
+                { "adapter": "e1", "plugin": "claude-code", "finished": false, "session": "s1", "sequence": 7 },
+                { "adapter": "e2", "plugin": "claude-code", "finished": false, "session": "s2", "sequence": 2 }
+            ]
+        });
+        let hint = format_live_hint(&value).expect("hint present");
+        assert!(hint.contains("e1"));
+        assert!(hint.contains("e2"));
+        assert!(hint.contains(":attach"));
+    }
+
+    #[test]
+    fn live_hint_skips_finished_adapters() {
+        let value = json!({
+            "adapters": [
+                { "adapter": "e3", "plugin": "claude-code", "finished": true, "session": "s3", "sequence": 99 }
+            ]
+        });
+        assert!(format_live_hint(&value).is_none());
+    }
+
+    #[test]
+    fn notification_line_includes_session_and_sequence() {
+        let notif = Notification {
+            method: "session.changed".to_string(),
+            params: json!({ "session": "s4", "sequence": 42 }),
+        };
+        let line = format_notification(&notif);
+        assert!(line.contains("session.changed"));
+        assert!(line.contains("s4"));
+        assert!(line.contains("seq=42"));
+    }
+
+    #[test]
+    fn notification_line_falls_back_for_unknown_method() {
+        let notif = Notification {
+            method: "future.event".to_string(),
+            params: json!({ "anything": "goes" }),
+        };
+        let line = format_notification(&notif);
+        assert!(line.contains("future.event"));
     }
 }

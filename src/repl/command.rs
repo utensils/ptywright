@@ -52,7 +52,23 @@ pub enum MetaCmd {
     Tabs,
     Focus(String),
     Notifications(bool),
-    Rpc { method: String, params: Value },
+    /// List adapters live on the server (across all connections).
+    Live,
+    /// Attach a server-side adapter into this REPL's local tab list.
+    /// `AttachSpec::All` pulls everything live; `AttachSpec::One` attaches
+    /// a single adapter id and auto-renders its current screen.
+    Attach(AttachSpec),
+    Rpc {
+        method: String,
+        params: Value,
+    },
+}
+
+/// What to attach. Mirrors the `:attach` arg surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachSpec {
+    One(String),
+    All,
 }
 
 /// Outcome of a dispatched command — what the TUI's history pane renders.
@@ -329,6 +345,20 @@ fn parse_meta(rest: &str) -> Result<Cmd> {
             };
             MetaCmd::Notifications(enabled)
         }
+        "live" => MetaCmd::Live,
+        "attach" => {
+            if tail.is_empty() {
+                return Err(Error::Rpc(
+                    ":attach requires an adapter id or `all`".to_string(),
+                ));
+            }
+            let spec = if tail == "all" {
+                AttachSpec::All
+            } else {
+                AttachSpec::One(tail.to_string())
+            };
+            MetaCmd::Attach(spec)
+        }
         "rpc" => {
             let mut split = tail.splitn(2, char::is_whitespace);
             let method = split
@@ -576,6 +606,8 @@ fn dispatch_meta(
             )?;
             Ok(CmdOutcome::Json(result))
         }
+        MetaCmd::Live => session_live(client, timeout),
+        MetaCmd::Attach(spec) => session_attach(spec, client, ctx, timeout),
         MetaCmd::Rpc { method, params } => {
             let result = client.call(&method, params, timeout)?;
             Ok(CmdOutcome::Json(result))
@@ -595,6 +627,20 @@ fn dispatch_dsl(
             Ok(CmdOutcome::Json(result))
         }
         "session.spawn" => session_spawn(call, client, ctx, timeout),
+        "session.live" => session_live(client, timeout),
+        "session.attach" => {
+            let spec = match call.positional.first() {
+                None => AttachSpec::All,
+                Some(Arg::String(s)) if s == "all" => AttachSpec::All,
+                Some(Arg::String(id)) => AttachSpec::One(id.clone()),
+                Some(other) => {
+                    return Err(Error::Rpc(format!(
+                        "session.attach expects an adapter id or \"all\", got {other}"
+                    )));
+                }
+            };
+            session_attach(spec, client, ctx, timeout)
+        }
         "session.list" => {
             let line = if ctx.adapters.is_empty() {
                 "(no adapters)".to_string()
@@ -709,6 +755,97 @@ fn session_spawn(
         ctx.focus = Some(adapter.to_string());
     }
     Ok(CmdOutcome::Json(result))
+}
+
+fn session_live(client: &RpcClient, timeout: Duration) -> Result<CmdOutcome> {
+    let result = client.call("adapter.live", json!({}), timeout)?;
+    Ok(CmdOutcome::Json(result))
+}
+
+fn session_attach(
+    spec: AttachSpec,
+    client: &RpcClient,
+    ctx: &mut ReplCtx,
+    timeout: Duration,
+) -> Result<CmdOutcome> {
+    match spec {
+        AttachSpec::One(id) => {
+            // Verify the adapter exists server-side and learn its plugin
+            // name in one round-trip. `adapter.state` is cheap and returns
+            // the full classified state too, which the tab strip uses.
+            let state_resp = client.call("adapter.state", json!({ "adapter": id }), timeout)?;
+            let plugin = state_resp
+                .get("plugin")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            ctx.upsert_adapter(&id, &plugin);
+            if let Some(label) = state_resp
+                .get("state")
+                .and_then(|s| s.get("state"))
+                .and_then(Value::as_str)
+            {
+                ctx.set_state_label(&id, Some(label.to_string()));
+            }
+            ctx.focus = Some(id.clone());
+            // Auto-render the current screen so attach feels like tmux
+            // attach: you immediately see what the agent is doing.
+            let snap_val = client.call(
+                "adapter.snapshot",
+                json!({ "adapter": id, "redact": false }),
+                timeout,
+            )?;
+            let snapshot: crate::screen::ScreenSnapshot = serde_json::from_value(snap_val)
+                .map_err(|error| Error::Rpc(format!("decode adapter.snapshot: {error}")))?;
+            Ok(CmdOutcome::Screen {
+                adapter: id,
+                snapshot,
+            })
+        }
+        AttachSpec::All => {
+            let live = client.call("adapter.live", json!({}), timeout)?;
+            let adapters = live
+                .get("adapters")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut attached = Vec::new();
+            for entry in adapters {
+                if entry
+                    .get("finished")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let id = match entry.get("adapter").and_then(Value::as_str) {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => continue,
+                };
+                let plugin = entry
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                ctx.upsert_adapter(&id, &plugin);
+                attached.push(id);
+            }
+            if let Some(last) = attached.last() {
+                ctx.focus = Some(last.clone());
+            }
+            let line = if attached.is_empty() {
+                "(no live adapters on the server)".to_string()
+            } else {
+                format!(
+                    "attached {} adapter(s): {} (focus → {})",
+                    attached.len(),
+                    attached.join(", "),
+                    attached.last().cloned().unwrap_or_default(),
+                )
+            };
+            Ok(CmdOutcome::Line(line))
+        }
+    }
 }
 
 fn session_close(
@@ -941,7 +1078,10 @@ pub fn help_text() -> &'static str {
      Sessions:\n\
        plugins()                       list built-in plugins\n\
        session.spawn(\"name\")         spawn an adapter for the named plugin\n\
-       session.list()                  list known adapters\n\
+       session.list()                  list known adapters (this REPL)\n\
+       session.live()                  list adapters live on the server\n\
+       session.attach(\"id\")          attach a server adapter into this REPL\n\
+       session.attach(\"all\")          attach every live adapter\n\
        session.close(id?)              close the focused (or named) adapter\n\
        state()                         re-classify the focused adapter\n\
      \n\
@@ -957,8 +1097,9 @@ pub fn help_text() -> &'static str {
        inspect()                        diagnostic dump\n\
      \n\
      Meta:\n\
-       :tabs       :focus <id>   :notifications on|off\n\
-       :rpc <method> {json}       :quit       :help\n"
+       :tabs       :focus <id>   :live   :attach <id|all>\n\
+       :notifications on|off     :rpc <method> {json}\n\
+       :quit       :help\n"
 }
 
 // ---- tests -------------------------------------------------------------
@@ -1105,6 +1246,32 @@ mod tests {
     fn parse_meta_notifications_rejects_garbage() {
         let error = parse(":notifications maybe").unwrap_err();
         assert!(error.to_string().contains("on|off"), "{error}");
+    }
+
+    #[test]
+    fn parse_meta_live() {
+        assert_eq!(parse(":live").unwrap(), Cmd::Meta(MetaCmd::Live));
+    }
+
+    #[test]
+    fn parse_meta_attach_specific_id() {
+        let cmd = parse(":attach e1").unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Meta(MetaCmd::Attach(AttachSpec::One("e1".into())))
+        );
+    }
+
+    #[test]
+    fn parse_meta_attach_all() {
+        let cmd = parse(":attach all").unwrap();
+        assert_eq!(cmd, Cmd::Meta(MetaCmd::Attach(AttachSpec::All)));
+    }
+
+    #[test]
+    fn parse_meta_attach_requires_argument() {
+        let error = parse(":attach").unwrap_err();
+        assert!(error.to_string().contains(":attach"), "{error}");
     }
 
     #[test]
@@ -1270,6 +1437,117 @@ mod tests {
             panic!()
         };
         assert!(value["plugins"].is_array());
+    }
+
+    #[test]
+    fn dispatch_session_live_returns_server_list() {
+        let (client, _server, mut ctx) = in_process_client();
+        let outcome = dispatch(
+            parse("session.live()").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("session.live dispatch");
+        match outcome {
+            CmdOutcome::Json(value) => assert!(value["adapters"].is_array()),
+            other => panic!("expected json outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatch_session_attach_all_pulls_running_adapters() {
+        let (client, _server, mut ctx_seed) = in_process_client();
+        // Spawn one adapter through the same server, then forget about it
+        // locally so the next ctx has to discover it via attach.
+        let _ = dispatch(
+            parse(r#"session.spawn("claude-code", program="/bin/sh")"#).unwrap(),
+            &client,
+            &mut ctx_seed,
+            Duration::from_secs(5),
+        )
+        .expect("seed spawn");
+
+        let mut fresh = ReplCtx::new();
+        let outcome = dispatch(
+            parse(":attach all").unwrap(),
+            &client,
+            &mut fresh,
+            Duration::from_secs(5),
+        )
+        .expect("attach all");
+        let CmdOutcome::Line(line) = outcome else {
+            panic!("expected Line outcome from :attach all")
+        };
+        assert!(line.contains("attached"), "{line}");
+        assert!(!fresh.adapters.is_empty(), "no adapters were attached");
+        assert!(fresh.focus.is_some(), "focus was not set");
+
+        // Close it through whichever ctx still has the id so the PTY exits.
+        let id = fresh.adapters[0].id.clone();
+        let _ = dispatch(
+            parse(&format!("session.close(\"{id}\")")).unwrap(),
+            &client,
+            &mut fresh,
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatch_session_attach_specific_id_returns_screen() {
+        let (client, _server, mut ctx_seed) = in_process_client();
+        let spawn = dispatch(
+            parse(r#"session.spawn("claude-code", program="/bin/sh")"#).unwrap(),
+            &client,
+            &mut ctx_seed,
+            Duration::from_secs(5),
+        )
+        .expect("seed spawn");
+        let CmdOutcome::Json(value) = spawn else {
+            panic!("expected json outcome from spawn")
+        };
+        let id = value["adapter"].as_str().expect("adapter id").to_string();
+
+        let mut fresh = ReplCtx::new();
+        let outcome = dispatch(
+            parse(&format!(":attach {id}")).unwrap(),
+            &client,
+            &mut fresh,
+            Duration::from_secs(5),
+        )
+        .expect("attach single");
+        let CmdOutcome::Screen { adapter, .. } = outcome else {
+            panic!("expected Screen outcome from :attach <id>")
+        };
+        assert_eq!(adapter, id);
+        assert_eq!(fresh.focus.as_deref(), Some(id.as_str()));
+        assert!(fresh.adapter(&id).is_some());
+
+        let _ = dispatch(
+            parse("session.close()").unwrap(),
+            &client,
+            &mut fresh,
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn dispatch_session_attach_rejects_unknown_id() {
+        let (client, _server, mut ctx) = in_process_client();
+        let error = dispatch(
+            parse(":attach nope").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.to_lowercase().contains("adapter") || text.contains("nope"),
+            "expected unknown-adapter error, got: {text}"
+        );
     }
 
     #[test]
