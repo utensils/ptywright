@@ -25,6 +25,7 @@ pub mod snapshot;
 pub mod socket;
 pub mod spawn;
 pub mod transport;
+pub mod tui;
 
 /// Wire framing for the JSON-RPC transport. Mirrors the server-side
 /// `RpcFraming` enum in `src/main.rs`.
@@ -56,9 +57,32 @@ pub struct ReplArgs {
 
 /// Entry point invoked by `Commands::Repl` in `src/main.rs`. Builds the
 /// transport, wires shared state, and hands off to the TUI event loop.
-pub fn run(_args: ReplArgs) -> Result<ExitCode> {
-    // Implementation is built up incrementally in follow-up commits on this
-    // branch. Returning early here keeps the feature wire-able from the CLI
-    // without forcing all submodules to land in a single change.
+pub fn run(args: ReplArgs) -> Result<ExitCode> {
+    // `_child_guard` is held for the lifetime of the function so a stdio
+    // child is killed and reaped on REPL exit. Socket transports get
+    // `None` because no child was spawned.
+    let _child_guard;
+    let (reader, writer, label) = match args.transport {
+        Transport::Socket(path) => {
+            let transport = socket::connect(&path)?;
+            _child_guard = None;
+            (
+                transport.reader,
+                transport.writer,
+                format!("socket:{}", path.display()),
+            )
+        }
+        Transport::Stdio(command) => {
+            let label = format!(
+                "stdio:{}",
+                command.first().map(String::as_str).unwrap_or("")
+            );
+            let (reader, writer, guard) = spawn::spawn(&command)?.into_parts();
+            _child_guard = Some(guard);
+            (reader, writer, label)
+        }
+    };
+    let client = transport::RpcClient::new(reader, writer, args.framing);
+    tui::run(client, label)?;
     Ok(ExitCode::SUCCESS)
 }

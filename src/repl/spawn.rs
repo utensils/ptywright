@@ -19,7 +19,16 @@ use crate::error::{Error, Result};
 pub struct ChildTransport {
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
-    _guard: ChildGuard,
+    pub guard: ChildGuard,
+}
+
+impl ChildTransport {
+    /// Split the transport into its three owned halves. The guard *must*
+    /// be kept alive for the lifetime of the I/O halves — dropping it
+    /// kills the child and severs both pipes.
+    pub fn into_parts(self) -> (Box<dyn Read + Send>, Box<dyn Write + Send>, ChildGuard) {
+        (self.reader, self.writer, self.guard)
+    }
 }
 
 /// Owns the spawned child process and the stderr-tee thread. Dropping the
@@ -79,7 +88,7 @@ pub fn spawn(command: &[String]) -> Result<ChildTransport> {
     Ok(ChildTransport {
         reader: Box::new(stdout),
         writer: Box::new(stdin),
-        _guard: ChildGuard {
+        guard: ChildGuard {
             child: Some(child),
             stderr_thread: Some(stderr_thread),
         },
@@ -118,7 +127,7 @@ mod tests {
         let ChildTransport {
             reader,
             mut writer,
-            _guard,
+            guard: _guard,
         } = transport;
 
         writer.write_all(b"hello-stdio\n").expect("write");
@@ -147,7 +156,7 @@ mod tests {
         let ChildTransport {
             reader,
             writer,
-            _guard,
+            guard: _guard,
         } = transport;
         let client = RpcClient::new(reader, writer, Framing::Ndjson);
         let result = client
