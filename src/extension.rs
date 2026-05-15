@@ -84,11 +84,21 @@ pub struct ClassifyContext<'a> {
     /// Session sequence observed when this context was assembled.
     pub sequence: u64,
     /// Last intent the host applied through the extension, if any.
+    ///
+    /// Skipped from serialisation when `None` so the Lua side sees the field
+    /// as absent (and therefore nil) rather than an `Option`-tagged value.
+    /// mlua's serde adapter encodes `Option::None` as a tagged table when
+    /// the field is present, which Lua's `or` operator treats as truthy and
+    /// falls through to return the table rather than the fallback string.
+    /// Skipping the field sidesteps the problem entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_intent: Option<&'a str>,
     /// How long the current screen has been stable, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stable_ms: Option<u64>,
     /// Threshold (in milliseconds) the host uses to treat a screen as "settled
     /// after a completed turn". Forwarded so plugins can reuse the same value.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_turn_stable_ms: Option<u64>,
 }
 
@@ -434,5 +444,68 @@ mod tests {
             Ok(_) => panic!("unknown built-in should not load"),
             Err(error) => assert!(matches!(error, Error::Lua(_))),
         }
+    }
+
+    /// Regression: serialising a [`ClassifyContext`] with `last_intent = None`
+    /// through mlua's serde adapter once produced a tagged Option value on the
+    /// Lua side. The Lua classifier's `or` fallback (`input.last_intent or
+    /// "starting"`) then short-circuited to that truthy table instead of the
+    /// fallback string, the host's deserialiser saw a non-string `state`
+    /// field, and the whole call returned `plugin_error`. The fix is to skip
+    /// `Option::None` fields when serialising the context; the Lua side reads
+    /// missing fields as nil and the fallback works as intended.
+    #[test]
+    fn classify_context_serialises_with_omitted_none_fields() {
+        let ctx = ClassifyContext {
+            screen: "",
+            body_text: "",
+            status_text: "",
+            transcript: "",
+            sequence: 0,
+            last_intent: None,
+            stable_ms: None,
+            completed_turn_stable_ms: None,
+        };
+        let value = serde_json::to_value(ctx).expect("serialise ClassifyContext");
+        let object = value
+            .as_object()
+            .expect("ClassifyContext serialises to an object");
+        assert!(
+            !object.contains_key("last_intent"),
+            "None last_intent must be omitted; got {value}"
+        );
+        assert!(
+            !object.contains_key("stable_ms"),
+            "None stable_ms must be omitted; got {value}"
+        );
+        assert!(
+            !object.contains_key("completed_turn_stable_ms"),
+            "None completed_turn_stable_ms must be omitted; got {value}"
+        );
+    }
+
+    /// Regression: end-to-end version of the test above. Calling
+    /// `ExtensionHandle::state()` against a freshly-spawned session (empty
+    /// screen + `last_intent = None`) used to fall through the host call,
+    /// fail to deserialise, and return the `plugin_error` fallback. The
+    /// classifier should now succeed and report `starting`.
+    #[test]
+    #[cfg(unix)]
+    fn handle_state_with_empty_screen_classifies_as_starting_not_plugin_error()
+    -> std::result::Result<(), Error> {
+        // /bin/sh -lc "sleep 30" gives us a session that exists but never
+        // writes anything, so the classifier sees an empty screen.
+        let target = crate::target::Target::new("/bin/sh").args(["-lc", "sleep 30"]);
+        let session = Session::spawn(crate::session::SessionConfig::new(target))?;
+        let extension = LuaExtension::built_in("claude-code")?;
+        let handle = ExtensionHandle::start(Box::new(extension), session, 300);
+        let state = handle.state();
+        assert_eq!(state.state, "starting", "evidence: {}", state.evidence);
+        assert!(
+            !state.evidence.starts_with("plugin failed"),
+            "plugin should not error on empty screen: {}",
+            state.evidence
+        );
+        Ok(())
     }
 }
