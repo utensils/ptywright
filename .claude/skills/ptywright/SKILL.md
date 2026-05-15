@@ -139,11 +139,15 @@ Defaults: `rows=24, cols=80, timeout_ms=30000`. Transcript is bounded in memory 
 | --- | --- | --- |
 | `claude.start` | `{program?="claude", args?, cwd?, env?, rows?=40, cols?=120}` | `{claude, state}` |
 | `claude.send_prompt` | `{claude, prompt}` | `{state}` |
-| `claude.wait_turn` | `{claude, timeout_ms?}` | classification + evidence |
-| `claude.approve` / `claude.deny` / `claude.cancel` | `{claude}` | `{state}` |
+| `claude.wait_turn` | `{claude, timeout_ms?}` | `{state}` (classification + evidence) |
+| `claude.approve` | `{claude}` | `{approved: true}` — no state; re-query `claude.state` to inspect |
+| `claude.deny` | `{claude}` | `{denied: true}` — no state; re-query `claude.state` to inspect |
+| `claude.cancel` | `{claude}` | `{state}` |
 | `claude.state` | `{claude}` | `{state}` |
 
 The adapter classifies states (`Starting`, `Ready`, `Thinking`, `WaitingForPermission`, `WaitingForPlanApproval`, `CompletedTurn`, etc.) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine.
+
+> **Known classifier issue (Claude Code 2.1.142, May 2026):** the built-in Lua plugin reports `waiting_for_permission` at confidence ~0.84 on the *idle* input screen because the status-bar string `⏵⏵ bypass permissions on (shift+tab to cycle)` contains the substring `permissions`. Until `plugins/claude-code/main.lua` is taught to exclude status-bar lines, automated drivers that branch on `waiting_for_permission` against current Claude Code releases will misfire. Workaround: drive Claude Code through the generic `session.*` primitives (see the [end-to-end pattern](#drive-claude-code-end-to-end)) and use `⏺` (answer-bullet) + `screen_stable` as the turn-end signal. Capture a fixture under `tests/fixtures/claude_code/` before fixing.
 
 #### `plugin.*`
 
@@ -346,6 +350,51 @@ sys.exit(0 if snap["state"] == "completed_turn" else 1)
 ```
 
 Run it with `python3 drive_claude.py` from any cwd — the script handles ids, framing, and state branching for you. Swap in `claude.deny` for plan rejection tests, or call `claude.cancel` before the loop ends to exercise mid-turn cancellation.
+
+#### Workaround: drive via `session.*` until the classifier is fixed
+
+While the `waiting_for_permission` false-positive is unresolved (see above), the most reliable way to drive Claude Code is through generic PTY primitives. This trades the adapter's automated turn classification for a hand-rolled completion matcher — and gives you full transcript access in exchange.
+
+```python
+# drive_claude_session.py — bypass the classifier, drive Claude through session.*
+import json, os, subprocess, time
+proc = subprocess.Popen(
+    ["ptywright", "serve", "--stdio"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    text=True, bufsize=1, env={**os.environ, "PTYWRIGHT_LOG": "warn"},
+)
+def rpc(rid, method, params=None):
+    proc.stdin.write(json.dumps({"jsonrpc":"2.0","id":rid,"method":method,"params":params or {}})+"\n")
+    proc.stdin.flush()
+    return json.loads(proc.stdout.readline())["result"]
+
+rpc(0, "server.capabilities")
+sid = rpc(1, "session.create", {
+    "program": "claude",
+    "args": ["--model", "haiku", "--permission-mode", "bypassPermissions"],
+    "cwd": "/path/to/repo", "rows": 48, "cols": 160,
+    "transcript_max_chars": 524288,
+})["session"]
+
+# Idle prompt: `❯` visible + screen stable.
+rpc(2, "session.wait", {"session":sid,"matcher":{"type":"all","value":[
+    {"type":"contains_text","value":"❯"},
+    {"type":"screen_stable","value":{"min_ms":800}}]},"timeout_ms":20000})
+
+rpc(3, "session.input", {"session":sid,"action":{"type":"paste","value":"What is ptywright? One sentence."}})
+rpc(4, "session.input", {"session":sid,"action":{"type":"key","value":"enter"}})
+
+# Turn complete: `⏺` (answer bullet) on screen, then settle.
+rpc(5, "session.wait", {"session":sid,"matcher":{"type":"contains_text","value":"⏺"},"timeout_ms":120000})
+rpc(6, "session.wait", {"session":sid,"matcher":{"type":"screen_stable","value":{"min_ms":1500}},"timeout_ms":15000})
+
+print(rpc(7, "session.snapshot", {"session":sid,"redact":False})["plain_text"])
+rpc(99, "session.kill", {"session":sid})
+```
+
+Why this matcher pair? `⏺` is Claude's answer-block bullet — it only renders when Claude has produced its response. Pinning to specific completion verbs is brittle: Claude Code 2.1.x rotates the verb per turn (`Cogitated for 3s`, `Churned for 11s`, `Baked for 9s`, `Unravelling…`). The bullet + stable-screen pair is verb-agnostic and held across the Claude Code 2.0 and 2.1 versions we've exercised.
+
+For the `--permission-mode bypassPermissions` flag to take effect on first launch in a new directory, the workspace must already be trusted — Claude Code only auto-skips the trust dialog in `--print` mode. Reuse a directory you've previously approved interactively, or drive the trust prompt explicitly via `session.input` actions.
 
 ### Claude Code adapter test matrix
 
