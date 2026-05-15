@@ -69,8 +69,15 @@ pub struct RpcServer {
 /// We keep the plugin name alongside the handle so `adapter.list` /
 /// `adapter.inspect` responses can include it without forcing every plugin to
 /// re-expose its manifest through the Extension trait.
+///
+/// `session` is a stable id allocated at `adapter.start` time so notification
+/// subscribers can correlate `session.changed` / `session.exited` events with
+/// the adapter that owns the underlying PTY. The id is allocated from the
+/// same counter as `session.create` sessions, so it is unique within the
+/// server process and never collides with directly-spawned sessions.
 struct ExtensionEntry {
     plugin: String,
+    session: String,
     handle: ExtensionHandle,
 }
 
@@ -311,6 +318,9 @@ impl RpcServer {
 
     fn poll_notifications(&mut self) -> Result<Vec<String>> {
         let mut messages = Vec::new();
+
+        // Shared sessions first (allocated via `session.create`). Snapshot the
+        // current list under the lock so we can release it before emitting.
         let mut sessions = self
             .shared
             .inner
@@ -318,12 +328,30 @@ impl RpcServer {
             .expect("rpc shared state poisoned")
             .sessions
             .iter()
-            .map(|(id, session)| (id.clone(), Arc::clone(session)))
+            .map(|(id, session)| (id.clone(), session.sequence(), session.is_finished()))
             .collect::<Vec<_>>();
-        sessions.sort_by(|(left, _), (right, _)| left.cmp(right));
+        sessions.sort_by(|(left, ..), (right, ..)| left.cmp(right));
 
-        for (id, session) in sessions {
-            let sequence = session.sequence();
+        // Adapter-backed sessions. Each `adapter.start` allocates a session id
+        // and stashes it on the entry so we can surface change/exit events
+        // here without registering the (non-`Arc`) session into the shared
+        // map.
+        let mut adapter_sessions = self
+            .extensions
+            .values()
+            .map(|entry| {
+                let session = entry.handle.session();
+                (
+                    entry.session.clone(),
+                    session.sequence(),
+                    session.is_finished(),
+                )
+            })
+            .collect::<Vec<_>>();
+        adapter_sessions.sort_by(|(left, ..), (right, ..)| left.cmp(right));
+        sessions.append(&mut adapter_sessions);
+
+        for (id, sequence, finished) in sessions {
             if self.last_notified_sequences.get(&id).copied() != Some(sequence) {
                 self.last_notified_sequences.insert(id.clone(), sequence);
                 messages.push(serialize_response(json!({
@@ -335,7 +363,7 @@ impl RpcServer {
                     },
                 }))?);
             }
-            if session.is_finished() && self.notified_exits.insert(id.clone()) {
+            if finished && self.notified_exits.insert(id.clone()) {
                 messages.push(serialize_response(json!({
                     "jsonrpc": JSONRPC_VERSION,
                     "method": "session.exited",
@@ -737,16 +765,19 @@ impl RpcServer {
         );
         let state = handle.state();
         let id = self.allocate_extension_id();
+        let session_id = self.allocate_session_id();
         self.extensions.insert(
             id.clone(),
             ExtensionEntry {
                 plugin: params.plugin.clone(),
+                session: session_id.clone(),
                 handle,
             },
         );
         Ok(json!({
             "adapter": id,
             "plugin": params.plugin,
+            "session": session_id,
             "state": state,
         }))
     }
@@ -875,6 +906,7 @@ impl RpcServer {
         Ok(json!({
             "adapter": params.adapter,
             "plugin": entry.plugin,
+            "session": entry.session,
             "state": entry.handle.state(),
             "plain_text": plain_text,
             "body_text": body_text,
@@ -1315,6 +1347,64 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn notifications_report_adapter_session_changes() {
+        // Adapter-spawned PTYs are not registered in `shared.sessions`, but
+        // the notification poller still surfaces their progress under the
+        // `session` id returned by `adapter.start`. The REPL client relies on
+        // this to keep its live screen-preview pane current without polling.
+        let mut server = RpcServer::new();
+        let _ = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+            )
+            .expect("enable notifications");
+        let start_messages = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":2,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'adapter-notify\\n' && cat"]}}"#,
+            )
+            .expect("adapter.start");
+        let start_response: Value =
+            serde_json::from_str(&start_messages[0]).expect("json response");
+        let adapter = start_response["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start must return an adapter id");
+        let session = start_response["result"]["session"]
+            .as_str()
+            .expect("adapter.start must return the allocated session id")
+            .to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_changed = false;
+        while std::time::Instant::now() < deadline && !saw_changed {
+            let poll_messages = server
+                .handle_line_messages(&format!(
+                    r#"{{"jsonrpc":"2.0","id":3,"method":"adapter.state","params":{{"adapter":"{adapter}"}}}}"#,
+                ))
+                .expect("poll for notifications");
+            for message in poll_messages {
+                if message.contains("\"method\":\"session.changed\"") && message.contains(&session)
+                {
+                    saw_changed = true;
+                    break;
+                }
+            }
+            if !saw_changed {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        assert!(
+            saw_changed,
+            "expected session.changed notification for adapter session `{session}` within 5s"
+        );
+
+        // Drain and close.
+        let _ = server.handle_line_messages(&format!(
+            r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#,
+        ));
+    }
+
+    #[test]
     fn unknown_method_returns_method_not_found() {
         let mut server = RpcServer::new();
         let response = handle(
@@ -1492,6 +1582,14 @@ mod tests {
             start["result"]["state"].is_object(),
             "adapter.start must return an initial state snapshot"
         );
+        let start_session = start["result"]["session"]
+            .as_str()
+            .expect("adapter.start must return the allocated session id")
+            .to_string();
+        assert!(
+            start_session.starts_with('s'),
+            "adapter session ids share the `s<n>` namespace with session.create; got `{start_session}`"
+        );
 
         // Poll adapter.transcript instead of sleeping so the test stays
         // deterministic when the suite runs in parallel. The fixture line
@@ -1550,6 +1648,10 @@ mod tests {
         );
         assert_eq!(inspect["result"]["plugin"], "claude-code");
         assert_eq!(inspect["result"]["adapter"], adapter);
+        assert_eq!(
+            inspect["result"]["session"], start_session,
+            "adapter.inspect must echo the same session id adapter.start allocated"
+        );
         assert!(inspect["result"]["body_text"].is_string());
         assert!(inspect["result"]["status_text"].is_string());
 

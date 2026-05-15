@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - LSP back-to-back framing and `session.changed` notification integration tests in `tests/cli_tests.rs`.
 - `PluginManifest::default_target` (optional `{ program, args }`) for plugins to declare a sensible default spawn target. `adapter.start` falls back to this when callers omit `program`.
 - `BUILTIN_PLUGINS` registry (a `&[BuiltinPlugin { manifest, source }]` slice) plus a thin `builtin_manifests()` accessor over it. Adding a new built-in Lua plugin is a single struct-literal entry — the manifest constructor and embedded Lua source travel together, replacing the previous hardcoded match arm in `LuaExtension::built_in`.
+- `adapter.start` and `adapter.inspect` responses include `"session"` — the id allocated for the adapter's underlying PTY. Combined with `server.set_notifications`, this lets clients correlate `session.changed` / `session.exited` events with the spawning adapter without an extra round-trip.
+- `session.changed` and `session.exited` notifications now fire for adapter-spawned PTYs (previously only `session.create`-spawned sessions notified). Adapter session ids share the `s<n>` namespace with directly-created sessions.
 - `tests/lua_classifier_tests.rs` and `tests/lua_plugin_intents.rs` integration tests covering the claude-code Lua plugin through the generic `Extension` / `ExtensionHandle` surface.
 
 ### Changed
