@@ -91,7 +91,7 @@ cargo test --locked
 cargo run -- --help
 ```
 
-**`repl` feature** (interactive REPL client, `ptywright repl`) is on by default. To verify the lean build without `reedline` / `ratatui` / `crossbeam-channel` / `nu-ansi-term`:
+**`repl` feature** (interactive REPL client, `ptywright repl`) is on by default. To verify the lean build without `reedline` / `crossbeam-channel` / `nu-ansi-term`:
 
 ```bash
 cargo check --locked --no-default-features
@@ -142,13 +142,13 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by plugins. Installs the `ptywright.action.*` / `ptywright.matcher.*` host helpers gated on manifest-declared permissions.
   - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, workspace-trust dialog detection, and usage-output parsing. There is no Rust shim wrapping it.
 - REPL client (gated `#[cfg(feature = "repl")]`, on by default — opt out with `cargo build --no-default-features`):
-  - `src/repl/mod.rs` — public entry (`ReplArgs`, `Transport`, `Framing`, `run`) invoked from `Commands::Repl`. Builds the right transport, holds the stdio child guard for the REPL's lifetime, hands off to the TUI.
+  - `src/repl/mod.rs` — public entry (`ReplArgs`, `Transport`, `Framing`, `run`) invoked from `Commands::Repl`. Builds the right transport, holds the stdio child guard for the REPL's lifetime, hands off to the reedline loop in `tui.rs`.
   - `src/repl/transport.rs` — framed JSON-RPC client (`RpcClient`) with NDJSON / LSP framing and a broadcast notification channel. Reader thread demuxes by `id` presence.
   - `src/repl/spawn.rs`, `src/repl/socket.rs` — transport bootstrappers for `--stdio -- <cmd>` and `--socket <path>` respectively. Mirror the server-side cfg split between Unix sockets and Windows named pipes.
   - `src/repl/command.rs` — the DSL lexer/parser/dispatcher (`session.spawn(...)`, `send.text("…")`, `wait(matches(r"…"))`, `:rpc <method> {json}`, `:focus`, `:tabs`, etc.). Intent names like `send_prompt` / `key` / `wait_turn_matcher` are string literals here only — they flow to plugins through the generic `adapter.send` / `adapter.wait` surface.
-  - `src/repl/ctx.rs`, `src/repl/snapshot.rs` — shared `ReplCtx` (tabs, focus, history ring) plus a background "screen pump" that requests `adapter.snapshot` on every `session.changed` notification (with a 500 ms idle backstop).
+  - `src/repl/ctx.rs` — shared `ReplCtx` (tabs, focus) used by the dispatcher and the completer.
   - `src/repl/completer.rs`, `src/repl/highlighter.rs`, `src/repl/history.rs` — `reedline` trait impls (static DSL table + cached plugin names + live adapter ids for completion; nu-ansi-term-styled DSL highlighter; `FileBackedHistory` rooted at `Paths::repl_history_path()`).
-  - `src/repl/render.rs`, `src/repl/tui.rs` — ratatui-based renderer (header + tab strip + screen preview + history pane + input + footer) driven by an in-house line editor that consumes crossterm events and reuses the `Completer`/`Highlighter` traits. **No application-specific identifiers live in any of these modules** — the REPL is a client of the generic `adapter.*` surface.
+  - `src/repl/tui.rs` — **sequential reedline-based REPL**. Each command renders as `pty> <syntax-highlighted DSL>` and the result follows on the next line as `↳ <dim summary>`. Line editing, completion, syntax highlighting, history, and ghost-text hinting are all delegated to reedline; this module owns the read-eval-print loop, the prompt, and how each `CmdOutcome` is printed (including the inline styled `ScreenSnapshot` rendering for `screen.snapshot()` / `view()`). Server-side notifications surface above the prompt via reedline's `ExternalPrinter`. **No application-specific identifiers live in any of these modules** — the REPL is a client of the generic `adapter.*` surface.
 - Tests:
   - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
   - `tests/lua_classifier_tests.rs` — auto-enrolling classifier regression matrix. Loads every `<name>.txt` fixture under `tests/fixtures/claude_code/` with a sibling `<name>.expected.json` and drives it through `LuaExtension::built_in("claude-code")`.

@@ -1,8 +1,8 @@
 //! Interactive REPL client for `ptywright serve`.
 //!
 //! Gated behind the `repl` Cargo feature so default builds stay slim and the
-//! optional `reedline` / `ratatui` / `syntect` dependency stack is only paid
-//! for when the operator opts in.
+//! optional `reedline` / `crossbeam-channel` / `nu-ansi-term` dependency
+//! stack is only paid for when the operator opts in.
 //!
 //! The REPL is a JSON-RPC *client*: it connects to a running `ptywright
 //! serve --socket <path>` (or spawns a child `ptywright serve --stdio`) and

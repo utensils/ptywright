@@ -69,7 +69,7 @@ See [JSON-RPC](./json-rpc.md) for methods and payloads.
 
 ## `ptywright repl`
 
-Interactive REPL client for a running `ptywright serve`. Shipped as the default-on `repl` Cargo feature — pass `--no-default-features` at build time to opt out of the `reedline` / `ratatui` / `crossbeam-channel` / `nu-ansi-term` dependencies.
+Interactive REPL client for a running `ptywright serve`. Shipped as the default-on `repl` Cargo feature — pass `--no-default-features` at build time to opt out of the `reedline` / `crossbeam-channel` / `nu-ansi-term` dependencies.
 
 ```bash
 # Connect to a running daemon (Unix domain socket or Windows named pipe).
@@ -90,7 +90,7 @@ Options:
 
 If neither `--socket` nor `--stdio` is supplied, the REPL connects to the default socket at `~/.ptywright/socket`.
 
-The REPL renders a `ratatui` chrome (header, tab strip, live screen preview, scrollable history pane, syntax-highlighted input, footer) and drives the generic `adapter.*` JSON-RPC surface from a small friendly DSL. The most common forms:
+The REPL is a sequential `reedline`-based loop: each command is rendered as `pty> <syntax-highlighted DSL>` and the result follows on the next line as `↳ <dim summary>`. Line editing, completion, syntax highlighting, history, and ghost-text hinting are delegated to reedline; the REPL drives the generic `adapter.*` JSON-RPC surface from a small friendly DSL. The most common forms:
 
 ```text
 plugins()                              # list built-in plugins
@@ -165,13 +165,13 @@ ptywright keeps configuration, log files, and other per-user state under `~/.pty
 
 ### Per-mode log sinks
 
-| Subcommand                           | Stderr | File | Notes                                                                                                                                                                             |
-| ------------------------------------ | :----: | :--: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ptywright run`                      |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY.                                                                                               |
-| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                                                                                                                             |
-| `ptywright serve --socket`           |   ✓    |  ✓   | Same sinks as `--stdio`.                                                                                                                                                          |
-| `ptywright repl`                     |   ✓    |  ✓   | Uses the oneshot init. The REPL owns the screen via ratatui's alternate buffer, so any stderr writes appear in scrollback after the TUI exits rather than corrupting the live UI. |
-| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                                                                                                                |
+| Subcommand                           | Stderr | File | Notes                                                                                                                                                                                                                           |
+| ------------------------------------ | :----: | :--: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ptywright run`                      |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY.                                                                                                                                             |
+| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                                                                                                                                                                           |
+| `ptywright serve --socket`           |   ✓    |  ✓   | Same sinks as `--stdio`.                                                                                                                                                                                                        |
+| `ptywright repl`                     |   ✓    |  ✓   | Uses the oneshot init. The REPL is a sequential reedline loop that writes its prompt to stdout interleaved with the operator's commands; stderr is rare in normal use, but any messages that do land share the same scrollback. |
+| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                                                                                                                                                              |
 
 ### Environment variables
 

@@ -1594,6 +1594,23 @@ mod tests {
             .expect("session id B")
             .to_string();
 
+        // Helper: scan a batch of JSON-RPC messages for a
+        // `session.changed` notification mentioning adapter B's session
+        // id. Same shape as the sister test
+        // `notifications_report_adapter_session_changes` uses.
+        let saw_in = |messages: &[String]| {
+            messages.iter().any(|message| {
+                message.contains("\"method\":\"session.changed\"") && message.contains(&session_b)
+            })
+        };
+        // The B-start handler runs `poll_notifications` itself before
+        // returning. Under llvm-cov instrumentation (slow PTY spawn)
+        // the printf can land before that pass executes, so the very
+        // first `session.changed` for B may already be in `start_b`
+        // rather than any subsequent poll. Check the start batch as
+        // the seed for `saw_b`.
+        let mut saw_b = saw_in(&start_b);
+
         // Hold adapter A's per-entry mutex from this thread to mimic
         // an in-flight `adapter.wait`. Acquire the Arc first under a
         // brief outer-state lock; drop the outer guard before locking
@@ -1608,22 +1625,18 @@ mod tests {
         };
         let _held = arc_a.lock().expect("hold adapter A mutex");
 
-        // Give both PTY reader threads a moment to deliver their printf.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-
         // Drive the notification pump via the cheapest read-only method
         // — `server.capabilities` is what the REPL's heartbeat uses for
         // exactly this reason. With the bug present the call deadlocks
-        // here forever.
+        // here forever (waiting on adapter A's mutex). With `try_lock`
+        // the contended A entry is skipped and B's notification flows
+        // through normally.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut saw_b = false;
         while std::time::Instant::now() < deadline && !saw_b {
             let messages = server
                 .handle_line_messages(r#"{"jsonrpc":"2.0","id":99,"method":"server.capabilities"}"#)
                 .expect("poll via capabilities");
-            saw_b = messages.iter().any(|message| {
-                message.contains("\"method\":\"session.changed\"") && message.contains(&session_b)
-            });
+            saw_b = saw_in(&messages);
             if !saw_b {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
