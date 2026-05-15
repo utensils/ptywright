@@ -40,6 +40,12 @@ pub struct MatchResult {
     pub snapshot: ScreenSnapshot,
     /// Tail of the transcript used for the final decision.
     pub transcript_tail: String,
+    /// How long the current screen sequence had been stable when the matcher
+    /// fired. Forwarded by [`Session::wait_for`](crate::session::Session::wait_for)
+    /// so classifiers can reason about actual stability rather than a
+    /// configured threshold — important for adapters whose wait matcher does
+    /// not include `screen_stable`.
+    pub stable_for: Duration,
 }
 
 /// Predicate for screen/transcript state.

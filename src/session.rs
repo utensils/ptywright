@@ -226,6 +226,7 @@ impl Session {
                     elapsed: started.elapsed(),
                     snapshot,
                     transcript_tail,
+                    stable_for: context.stable_for,
                 });
             }
 

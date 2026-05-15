@@ -430,11 +430,16 @@ fn prints_version() {
 fn end_to_end_session_round_trip_with_echo_tui_fixture() {
     use std::io::{BufRead, BufReader};
 
+    // stderr is `Stdio::null()` (not `piped()`) to match the rest of this
+    // file. Capturing stderr without draining it lets the server's pipe
+    // buffer fill on chatty `RUST_LOG`/`PTYWRIGHT_LOG` configurations and
+    // deadlocks the child — the very kind of CI hang we don't want in this
+    // round-trip test.
     let mut child = bin()
         .args(["serve", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn ptywright serve --stdio");
 

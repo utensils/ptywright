@@ -298,6 +298,13 @@ impl ExtensionHandle {
 
     /// Wait until the plugin's matcher for `intent` is satisfied or the
     /// timeout expires, then classify and return the resulting state.
+    ///
+    /// The actual `stable_for` duration from the underlying
+    /// [`MatchResult`](crate::matcher::MatchResult) is forwarded to the
+    /// classifier as `stable_ms` so plugins see real screen stability rather
+    /// than a configured threshold — this matters for adapters whose wait
+    /// matcher does not include `screen_stable` and would otherwise classify
+    /// against a stale assumption.
     pub fn wait(
         &self,
         intent: &str,
@@ -306,11 +313,12 @@ impl ExtensionHandle {
     ) -> Result<ExtensionStateSnapshot> {
         let matcher = self.extension.wait_matcher(intent, &params)?;
         let result = self.session.wait_for(&matcher, timeout)?;
+        let stable_ms = u64::try_from(result.stable_for.as_millis()).unwrap_or(u64::MAX);
         self.classify(
             &result.snapshot.plain_text,
             &result.transcript_tail,
             result.sequence,
-            Some(self.completed_turn_stable_ms),
+            Some(stable_ms),
         )
     }
 
@@ -377,7 +385,15 @@ impl ExtensionHandle {
 /// body-only because they don't have a meaningful status bar to peel off.
 #[must_use]
 pub fn split_status_bar(screen: &str, status_rows: usize) -> (String, String) {
-    let lines: Vec<&str> = screen.split('\n').collect();
+    // `split_terminator` does not emit a trailing empty element when `screen`
+    // ends in `\n`. `split('\n')` would, which shifts the cutoff up by one
+    // and lets the topmost status row leak into `body` on any fixture that
+    // ends with a newline (which most of them do). The fixture-driven
+    // classifier matrix would still pass under either split today, but the
+    // body/status partition is meant to mirror the rendered rows; if a future
+    // status string contains a keyword the classifier matches on, the leak
+    // would re-introduce the false-positives this split exists to prevent.
+    let lines: Vec<&str> = screen.split_terminator('\n').collect();
     if lines.is_empty() {
         return (String::new(), String::new());
     }
@@ -418,6 +434,25 @@ mod tests {
         assert!(!body.contains("status line two"));
         assert!(status.contains("status line one"));
         assert!(status.contains("status line two"));
+    }
+
+    #[test]
+    fn split_status_bar_ignores_trailing_newline() {
+        // Regression: a screen that ends with `\n` would split into one extra
+        // (empty) element under `split('\n')`, pushing the cutoff up and
+        // leaking the top status row into body. With `split_terminator` the
+        // partition is independent of whether the screen carries a trailing
+        // newline.
+        let nine_lines = "L0\nL1\nL2\nL3\nL4\nL5\nL6\nL7\nL8";
+        let nine_lines_with_nl = format!("{nine_lines}\n");
+        let (body_a, status_a) = split_status_bar(nine_lines, 3);
+        let (body_b, status_b) = split_status_bar(&nine_lines_with_nl, 3);
+        assert_eq!(body_a, body_b, "trailing newline must not shift body");
+        assert_eq!(status_a, status_b, "trailing newline must not shift status");
+        assert!(body_a.contains("L5"), "body should end at L5");
+        assert!(!body_a.contains("L6"), "L6 belongs to status");
+        assert!(status_a.contains("L6"));
+        assert!(status_a.contains("L8"));
     }
 
     #[test]
