@@ -18,6 +18,8 @@ pub mod matcher;
 pub mod paths;
 pub mod plugin;
 pub mod redaction;
+#[cfg(feature = "repl")]
+pub mod repl;
 pub mod rpc;
 pub mod screen;
 pub mod session;

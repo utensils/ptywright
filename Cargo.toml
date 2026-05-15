@@ -17,6 +17,18 @@ categories = ["command-line-utilities", "development-tools", "api-bindings"]
 # `ptywright-echo-tui` doesn't break interactive workflows.
 default-run = "ptywright"
 
+[features]
+default = []
+# Interactive REPL client (`ptywright repl`). Off by default to keep the
+# baseline binary small and dependency-light. Enable with
+# `cargo build --features repl`.
+repl = [
+    "dep:crossbeam-channel",
+    "dep:ratatui",
+    "dep:reedline",
+    "dep:syntect",
+]
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4", features = ["derive"] }
@@ -34,6 +46,12 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 vt100 = "0.16.2"
+
+# Optional dependencies, only pulled in by the `repl` feature.
+crossbeam-channel = { version = "0.5", optional = true }
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
+reedline = { version = "0.47", optional = true, default-features = false }
+syntect = { version = "5", optional = true, default-features = false, features = ["default-fancy"] }
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"
