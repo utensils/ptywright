@@ -1,5 +1,7 @@
 # ptywright — Agent Instructions
 
+`AGENTS.md` is the canonical agent guide for this repository; `CLAUDE.md` is a symlink to it. Edits to either file land in `AGENTS.md` — keep that in mind when opening it as `CLAUDE.md`.
+
 ptywright is a Rust CLI and library for driving interactive terminal applications through PTYs. The project is intentionally early, but the direction is a cross-platform automation toolkit with a generic core and application-specific adapters layered above it.
 
 ## Product intent
@@ -46,6 +48,7 @@ Use test-driven development for behavior changes wherever practical:
 - For PTY behavior, use deterministic fixture commands and platform-aware test helpers instead of sleeps or host-specific shell assumptions.
 - Keep tests cross-platform unless a test is explicitly gated with `#[cfg(...)]` and the limitation is documented.
 - Do not mark a milestone complete until tests and docs for that milestone are updated.
+- When changing `claude_code` adapter behavior, regenerate or hand-update the relevant fixtures under `tests/fixtures/claude_code/` in the same PR and explain the diff (e.g. "captured against Claude Code <version>" or "manual edit to cover X transition") in the PR description.
 
 ## Cross-platform requirements
 
@@ -94,9 +97,10 @@ Run a single test:
 cargo test --test cli_tests <test_name>   # one integration test in tests/cli_tests.rs
 cargo test <module>::<test_name>          # one unit test inside a src/ module
 cargo test <substring> -- --nocapture     # filter by substring and show stdout
+cargo test --doc                          # rustdoc examples in public APIs
 ```
 
-The default build embeds Lua 5.4 via `mlua` with the `vendored` feature, so source builds outside the Nix devshell need a working C compiler.
+The default build embeds Lua 5.4 via `mlua` with the `vendored` feature, so source builds outside the Nix devshell need a working C compiler. The Rust toolchain is pinned in `rust-toolchain.toml`; rustup will fetch the pinned channel automatically when building outside Nix.
 
 ## Current architecture
 
@@ -114,6 +118,9 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/transcript.rs` — bounded in-memory transcript capture plus explicit raw file streaming opt-in.
   - `src/redaction.rs` — redaction helpers, caller-supplied additions, and the default RPC redaction policy.
   - `src/rpc.rs` — JSON-RPC server, shared `RpcServerState`, NDJSON + LSP framing, stdio and local IPC transports.
+  - `src/paths.rs` — `~/.ptywright/` runtime directory resolution and per-layout accessors. `PTYWRIGHT_HOME` overrides the root.
+  - `src/config.rs` — `~/.ptywright/config.toml` loader with forgiving defaults and forward-compatible parsing.
+  - `src/logging.rs` — `tracing` init with daily rotation, configurable retention, redaction-aware writers, and mode-specific helpers (`init_for_run`, `init_for_serve_stdio`, `init_for_serve_socket`, `init_for_oneshot`). **Never write logs to stdout in `serve --stdio` mode** — stdout is reserved for JSON-RPC framing. The per-mode helpers enforce this for you; if you add a new entrypoint, pick one of them rather than calling `tracing_subscriber::fmt()` directly.
   - `src/error.rs` — crate-wide `Error` / `Result`.
 - Plugin and adapter layer (application-specific code lives here, not in the generic layers):
   - `src/plugin.rs` — plugin manifests, permission declarations, runtime metadata enum, and built-in `claude_code_manifest`.
@@ -129,6 +136,8 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `flake.nix` — Nix package, app, formatter, and devshell.
 
 When adding behavior, decide first which layer it belongs to. Claude-specific logic must not land in the generic modules; new generic primitives should not import from `adapters/`.
+
+When exploring the repo, ignore build artifacts: `target/` (Cargo output) and `result` / `result-*` (Nix build symlinks). Both are gitignored and contain nothing worth grepping.
 
 ## Git workflow
 

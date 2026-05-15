@@ -33,7 +33,17 @@ printf '{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}\n' | \
   ptywright serve --stdio
 ```
 
-`serve --stdio` uses stdin/stdout for JSON-RPC. NDJSON is the default framing; `--framing lsp` enables LSP-style `Content-Length` frames. stdout is protocol-only in this mode. On macOS/Linux, `serve --socket /tmp/ptywright.sock` exposes the same protocol over a local Unix socket.
+`serve --stdio` uses stdin/stdout for JSON-RPC. NDJSON is the default framing; `--framing lsp` enables LSP-style `Content-Length` frames. stdout is protocol-only in this mode. `serve --socket /tmp/ptywright.sock` exposes the same protocol over a local Unix domain socket on macOS/Linux, or over a named pipe (`\\.\pipe\ptywright`-style path) on Windows — both share the same flag.
+
+## Runtime directory
+
+ptywright keeps configuration and rotated log files under `~/.ptywright/`. Override the root with `PTYWRIGHT_HOME=/some/path`, and tune the log filter at runtime with `PTYWRIGHT_LOG`:
+
+```bash
+PTYWRIGHT_LOG="info,ptywright::rpc=debug" ptywright serve --stdio
+```
+
+See the [Runtime directory guide](./runtime-directory.md) for the full layout, config schema, log rotation/retention rules, and per-mode sink behavior.
 
 ## Enable shell completions
 

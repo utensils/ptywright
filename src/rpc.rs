@@ -869,9 +869,12 @@ fn rpc_error_from_error(error: Error) -> (RpcErrorCode, String) {
     let code = match error {
         Error::Timeout => RpcErrorCode::Timeout,
         Error::Closed | Error::ReaderEnded => RpcErrorCode::SessionClosed,
-        Error::Pty(_) | Error::Io(_) | Error::Json(_) | Error::Lua(_) | Error::Rpc(_) => {
-            RpcErrorCode::InternalError
-        }
+        Error::Pty(_)
+        | Error::Io(_)
+        | Error::Json(_)
+        | Error::Lua(_)
+        | Error::Rpc(_)
+        | Error::Config(_) => RpcErrorCode::InternalError,
     };
     (code, error.to_string())
 }

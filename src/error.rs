@@ -30,4 +30,7 @@ pub enum Error {
     /// RPC protocol error.
     #[error("rpc error: {0}")]
     Rpc(String),
+    /// Failed to parse the on-disk config file.
+    #[error("config error: {0}")]
+    Config(String),
 }

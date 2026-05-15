@@ -9,11 +9,14 @@ ptywright/
 ├── src/
 │   ├── action.rs      # serializable input/lifecycle actions
 │   ├── adapters/      # app-specific adapters such as Claude Code
+│   ├── config.rs      # ~/.ptywright/config.toml loader
 │   ├── error.rs       # public error/result types
 │   ├── lib.rs         # public library surface
+│   ├── logging.rs     # tracing init with rotation, retention, and redaction
 │   ├── main.rs        # clap CLI entrypoint
 │   ├── lua_plugin.rs  # trusted Lua plugin runtime for adapter orchestration
 │   ├── matcher.rs     # screen/transcript predicates
+│   ├── paths.rs       # ~/.ptywright runtime directory resolution
 │   ├── rpc.rs         # JSON-RPC server and framing helpers
 │   ├── screen.rs      # terminal engine seam, parser, and snapshots
 │   ├── session.rs     # PTY-backed process lifecycle
@@ -83,6 +86,8 @@ The first implementation uses:
 - Plugin manifest, permission, and runtime types for trusted extensions.
 - Embedded Lua for built-in adapter orchestration, currently used by the Claude Code adapter.
 - Dynamic shell completion generation through `clap_complete`.
+- A per-user runtime directory at `~/.ptywright/` for config and rotated log files. See [Runtime directory](./runtime-directory.md).
+- Structured logging through `tracing` with daily-rotated files, configurable retention, and per-record redaction so ptywright-owned diagnostics never leak secrets to disk or stderr.
 
 The public API hides backend crate types so ptywright can evolve the PTY or terminal parser later. Screen snapshots expose portable cell/style/mode metadata instead of `vt100` types.
 

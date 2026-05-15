@@ -5,8 +5,9 @@ use std::process::ExitCode;
 
 mod run_terminal;
 use ptywright::{
-    DESCRIPTION, NAME, RpcServerState, TerminalSize, serve_lsp, serve_lsp_with_state, serve_ndjson,
-    serve_ndjson_with_state,
+    Config, DESCRIPTION, LogGuard, LoggingConfig, NAME, Paths, RpcServerState, TerminalSize,
+    init_for_oneshot, init_for_run, init_for_serve_socket, init_for_serve_stdio, serve_lsp,
+    serve_lsp_with_state, serve_ndjson, serve_ndjson_with_state,
 };
 
 #[derive(Debug, Parser)]
@@ -40,7 +41,8 @@ enum Commands {
         /// Use stdin/stdout for JSON-RPC. Stdout is protocol-only in this mode.
         #[arg(long)]
         stdio: bool,
-        /// Listen on a local Unix socket path. Unix-only; use --stdio on Windows for now.
+        /// Listen on a local IPC path: Unix domain socket on macOS/Linux, named pipe on Windows
+        /// (e.g. \\.\pipe\ptywright). Use --stdio for single-client stdin/stdout transport.
         #[arg(long)]
         socket: Option<PathBuf>,
         /// JSON-RPC message framing to use.
@@ -98,6 +100,18 @@ fn cli_error_message(error: &ptywright::Error) -> String {
 
 fn run() -> ptywright::Result<ExitCode> {
     let cli = Cli::parse();
+    let paths = Paths::from_env();
+    let config = match Config::load_or_default(&paths.config_path()) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("ptywright: {error}; falling back to default config");
+            Config::default()
+        }
+    };
+    // Hold the guard for the lifetime of this function; dropped at exit so
+    // tracing-appender flushes its non-blocking buffers.
+    let _log_guard = init_logging_for(cli.command.as_ref(), &paths, &config.logging);
+
     match cli.command {
         Some(Commands::Run {
             rows,
@@ -116,6 +130,28 @@ fn run() -> ptywright::Result<ExitCode> {
             println!();
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+fn init_logging_for(
+    command: Option<&Commands>,
+    paths: &Paths,
+    logging: &LoggingConfig,
+) -> LogGuard {
+    match command {
+        Some(Commands::Run { .. }) => init_for_run(paths, logging),
+        Some(Commands::Serve { stdio, socket, .. }) => {
+            if *stdio {
+                init_for_serve_stdio(paths, logging)
+            } else if socket.is_some() {
+                init_for_serve_socket(paths, logging)
+            } else {
+                // No transport selected — serve_command will return an error
+                // shortly. Use minimal logging until then.
+                init_for_oneshot(logging)
+            }
+        }
+        Some(Commands::Completions { .. }) | None => init_for_oneshot(logging),
     }
 }
 
@@ -227,7 +263,7 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
 
     let listener = UnixListener::bind(path)?;
     let state = RpcServerState::new();
-    eprintln!("ptywright: listening on {}", path.display());
+    tracing::info!(socket = %path.display(), "ptywright: listening on local socket");
     for stream in listener.incoming() {
         let stream = stream?;
         let input = stream.try_clone()?;
@@ -238,8 +274,7 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
                 RpcFraming::Lsp => serve_lsp_with_state(input, stream, state),
             };
             if let Err(error) = result {
-                let message = ptywright::RedactionPolicy::default().redact(&error.to_string());
-                eprintln!("ptywright: socket client error: {message}");
+                tracing::warn!(error = %error, "socket client error");
             }
         });
     }
@@ -253,7 +288,7 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
     let name = path.as_os_str().to_fs_name::<GenericFilePath>()?;
     let listener = ListenerOptions::new().name(name).create_sync()?;
     let state = RpcServerState::new();
-    eprintln!("ptywright: listening on {}", path.display());
+    tracing::info!(socket = %path.display(), "ptywright: listening on named pipe");
     for stream in listener.incoming() {
         let stream = stream?;
         let (input, output) = stream.split();
@@ -264,8 +299,7 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
                 RpcFraming::Lsp => serve_lsp_with_state(input, output, state),
             };
             if let Err(error) = result {
-                let message = ptywright::RedactionPolicy::default().redact(&error.to_string());
-                eprintln!("ptywright: socket client error: {message}");
+                tracing::warn!(error = %error, "socket client error");
             }
         });
     }
