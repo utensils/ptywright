@@ -206,19 +206,118 @@ See the [Claude Code adapter guide](../guide/claude-code.md) for state semantics
 
 `plugin.capabilities` reports `embedded_lua: true` and includes built-in plugin manifests in `builtin_plugins`, including the `claude-code` Lua adapter. See [Plugins and extensions](./plugins.md) for manifest fields, runtime names, and permission names.
 
-### Other session methods
+### `session.snapshot`
 
-| Method               | Params                                         | Result                         |
-| -------------------- | ---------------------------------------------- | ------------------------------ |
-| `session.snapshot`   | `{ "session": "s1" }`                          | Current `ScreenSnapshot`.      |
-| `session.transcript` | `{ "session": "s1" }`                          | `{ "text": "..." }`.           |
-| `session.resize`     | `{ "session": "s1", "rows": 40, "cols": 120 }` | `{ "resized": true }`.         |
-| `session.kill`       | `{ "session": "s1" }`                          | `{ "killed": true }`.          |
-| `session.close`      | `{ "session": "s1" }`                          | Kills and removes the session. |
+Return the latest parsed terminal screen for a session. Redacts sensitive-looking text by default.
 
-`session.snapshot` and `session.transcript` redact sensitive-looking text by default. Pass `"redact": false` in params to opt into raw output for trusted local debugging. Callers may also pass a `redaction` object with `enabled`, `replacement`, `extra_literals`, and `extra_regexes` fields to add trusted-local redaction rules for a single read.
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "method": "session.snapshot",
+  "params": { "session": "s1" }
+}
+```
 
-`raw_transcript_path` streams raw PTY bytes directly to a file and is always explicit opt-in. The default mode creates a new file and refuses to overwrite; `raw_transcript_append: true` appends to an existing file. Raw transcript files are unredacted sensitive data and should be protected by the caller.
+Result is a `ScreenSnapshot` with the same shape as `session.wait`'s `snapshot` field (size, cursor, sequence, plain_text, cells, alternate_screen, application_cursor, application_keypad, title).
+
+| Field       | Required | Meaning                                                                                                                              |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `session`   | yes      | Session ID returned by `session.create`.                                                                                             |
+| `redact`    | no       | Default `true`. Set `false` to opt into raw, unredacted screen text for trusted-local debugging.                                     |
+| `redaction` | no       | Optional `{ enabled, replacement, extra_literals, extra_regexes }` object adding caller-supplied redaction rules for this read only. |
+
+### `session.transcript`
+
+Return the in-memory transcript for a session. Bounded by `transcript_max_chars` (default 128 KiB of UTF-8 chars) at session creation. Redacts sensitive-looking text by default.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "session.transcript",
+  "params": { "session": "s1" }
+}
+```
+
+Result:
+
+```json
+{ "text": "ready\n" }
+```
+
+Accepts the same `redact` and `redaction` params as `session.snapshot`.
+
+### `session.resize`
+
+Update the PTY's terminal size. Pixel dimensions are optional and default to `0`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "session.resize",
+  "params": { "session": "s1", "rows": 40, "cols": 120 }
+}
+```
+
+Result:
+
+```json
+{ "resized": true }
+```
+
+| Field          | Required | Meaning                             |
+| -------------- | -------- | ----------------------------------- |
+| `session`      | yes      | Session ID.                         |
+| `rows`         | yes      | New terminal rows.                  |
+| `cols`         | yes      | New terminal cols.                  |
+| `pixel_width`  | no       | Optional pixel width, default `0`.  |
+| `pixel_height` | no       | Optional pixel height, default `0`. |
+
+### `session.kill`
+
+Kill the underlying child process. The session ID stays registered so callers can still read its final snapshot/transcript.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "session.kill",
+  "params": { "session": "s1" }
+}
+```
+
+Result:
+
+```json
+{ "killed": true }
+```
+
+### `session.close`
+
+Kill the child process and remove the session ID from the server registry. Subsequent reads against the ID return `-32602` invalid params.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "session.close",
+  "params": { "session": "s1" }
+}
+```
+
+Result:
+
+```json
+{ "closed": true }
+```
+
+### Redaction notes
+
+`session.snapshot` and `session.transcript` redact by default. Pass `"redact": false` for raw output, or `redaction: { ... }` to add per-call rules. See each method's params table.
+
+`raw_transcript_path` streams raw PTY bytes directly to a file and is always explicit opt-in. The default mode creates a new file and refuses to overwrite; `raw_transcript_append: true` appends to an existing file. On Unix, ptywright opens the file with mode `0o600` so only the owner can read it; Windows uses default ACLs. Raw transcript files are unredacted sensitive data and remain the caller's responsibility to protect.
 
 RPC error messages are redacted with the default policy before they are serialized. CLI-level diagnostics printed by ptywright also redact through the default policy.
 
