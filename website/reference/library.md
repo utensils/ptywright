@@ -232,12 +232,12 @@ assert_eq!(config.logging.format, LogFormat::Text);
 
 ptywright wires `tracing` differently per CLI mode so output contracts (stdout-only JSON-RPC, no stderr corruption during `run`) are upheld. Pick the right helper for your entrypoint and hold the returned `LogGuard` for the lifetime of the process so the non-blocking writer can flush at exit.
 
-| Function                  | Sinks                | When to use                                                |
-| ------------------------- | -------------------- | ---------------------------------------------------------- |
-| `init_for_run`            | file only            | Tools that bridge a raw PTY to the user's terminal.        |
-| `init_for_serve_stdio`    | file + stderr        | JSON-RPC servers that own stdout for protocol framing.     |
-| `init_for_serve_socket`   | file + stderr        | Local-IPC servers (Unix sockets, Windows named pipes).     |
-| `init_for_oneshot`        | stderr only          | Short-lived commands (`--help`, `--version`, completions). |
+| Function                | Sinks         | When to use                                                |
+| ----------------------- | ------------- | ---------------------------------------------------------- |
+| `init_for_run`          | file only     | Tools that bridge a raw PTY to the user's terminal.        |
+| `init_for_serve_stdio`  | file + stderr | JSON-RPC servers that own stdout for protocol framing.     |
+| `init_for_serve_socket` | file + stderr | Local-IPC servers (Unix sockets, Windows named pipes).     |
+| `init_for_oneshot`      | stderr only   | Short-lived commands (`--help`, `--version`, completions). |
 
 ```rust
 use ptywright::{Config, Paths, init_for_serve_stdio};

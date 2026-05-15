@@ -100,19 +100,19 @@ ptywright keeps configuration, log files, and other per-user state under `~/.pty
 
 ### Per-mode log sinks
 
-| Subcommand                | Stderr | File | Notes                                                                  |
-| ------------------------- | :----: | :--: | ---------------------------------------------------------------------- |
-| `ptywright run`           |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY. |
-| `ptywright serve --stdio` |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                  |
-| `ptywright serve --socket`|   ✓    |  ✓   | Same sinks as `--stdio`.                                               |
-| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                     |
+| Subcommand                           | Stderr | File | Notes                                                                               |
+| ------------------------------------ | :----: | :--: | ----------------------------------------------------------------------------------- |
+| `ptywright run`                      |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY. |
+| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                               |
+| `ptywright serve --socket`           |   ✓    |  ✓   | Same sinks as `--stdio`.                                                            |
+| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                  |
 
 ### Environment variables
 
-| Variable          | Purpose                                                                                       |
-| ----------------- | --------------------------------------------------------------------------------------------- |
-| `PTYWRIGHT_HOME`  | Root for the runtime directory. Overrides the default `~/.ptywright/`.                        |
-| `PTYWRIGHT_LOG`   | `tracing-subscriber` `EnvFilter` directive. Overrides `[logging] level` from the config file. |
+| Variable         | Purpose                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------- |
+| `PTYWRIGHT_HOME` | Root for the runtime directory. Overrides the default `~/.ptywright/`.                        |
+| `PTYWRIGHT_LOG`  | `tracing-subscriber` `EnvFilter` directive. Overrides `[logging] level` from the config file. |
 
 ```bash
 PTYWRIGHT_LOG="info,ptywright::rpc=debug" ptywright serve --stdio

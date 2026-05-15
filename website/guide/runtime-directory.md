@@ -57,12 +57,12 @@ A copy of this template lives at [`config.example.toml`](https://github.com/uten
 
 ptywright uses [`tracing`](https://docs.rs/tracing/) with daily-rotated files written through a non-blocking background writer. Each CLI mode wires the right combination of sinks so the output contracts of the binary are upheld:
 
-| Mode                    | Stderr | File | Notes                                                              |
-| ----------------------- | :----: | :--: | ------------------------------------------------------------------ |
-| `ptywright run`         |   ✗    |  ✓   | The `run` command bridges raw bytes to your terminal — extra stderr would corrupt the live PTY. |
-| `ptywright serve --stdio` |   ✓    |  ✓   | stdout is reserved for JSON-RPC framing and is never written.      |
-| `ptywright serve --socket` |   ✓    |  ✓   | Same as `--stdio`.                                                 |
-| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                 |
+| Mode                                 | Stderr | File | Notes                                                                                           |
+| ------------------------------------ | :----: | :--: | ----------------------------------------------------------------------------------------------- |
+| `ptywright run`                      |   ✗    |  ✓   | The `run` command bridges raw bytes to your terminal — extra stderr would corrupt the live PTY. |
+| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is reserved for JSON-RPC framing and is never written.                                   |
+| `ptywright serve --socket`           |   ✓    |  ✓   | Same as `--stdio`.                                                                              |
+| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                              |
 
 ### File names and rotation
 
