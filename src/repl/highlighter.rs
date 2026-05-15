@@ -278,4 +278,73 @@ mod tests {
         let out = kinds("transcript.snapshot(redact=false)");
         assert!(out.iter().any(|(k, s)| *k == Kind::Keyword && s == "false"));
     }
+
+    #[test]
+    fn negative_integer_keeps_int_kind() {
+        // The lexer accepts a leading `-` as part of an integer; the
+        // highlighter must mirror that or `count=-5` paints the digits
+        // separately from the sign.
+        let out = kinds("send.intent(\"x\", count=-5)");
+        assert!(out.iter().any(|(k, s)| *k == Kind::Int && s == "-5"));
+    }
+
+    #[test]
+    fn unterminated_string_does_not_panic_and_returns_string_kind() {
+        // The user is mid-typing — the highlighter must paint the
+        // partial token as a String span so the open quote is visible
+        // rather than swallowed as Other.
+        let out = kinds(r#"send.text("hello"#);
+        assert!(out.iter().any(|(k, _)| *k == Kind::String));
+    }
+
+    #[test]
+    fn unterminated_raw_regex_does_not_panic() {
+        let out = kinds(r#"wait(matches(r"^x"#);
+        assert!(out.iter().any(|(k, _)| *k == Kind::Regex));
+    }
+
+    #[test]
+    fn punctuation_kind_assigned_to_dot_paren_comma_equals() {
+        let out = kinds("session.spawn(\"x\", rows=24)");
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "."));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "("));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == ","));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "="));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == ")"));
+    }
+
+    #[test]
+    fn leading_whitespace_does_not_disable_meta_prefix() {
+        // The TUI input strip pads the prompt with a leading space
+        // sometimes; the highlighter should still treat `:foo` as Meta
+        // because the first non-whitespace byte is a colon.
+        let out = kinds("   :tabs");
+        assert!(out.iter().any(|(k, s)| *k == Kind::Meta && s == ":tabs"));
+    }
+
+    #[test]
+    fn highlighter_handle_returns_styled_text_in_kind_order() {
+        // The reedline-facing `highlight` impl pushes one styled span
+        // per scan token. Confirm the impl doesn't drop tokens.
+        let h = ReplHighlighter::new();
+        let styled = h.highlight("session.spawn(\"x\")", 0);
+        // 7 tokens: `session`, `.`, `spawn`, `(`, `"x"`, `)`, …
+        assert!(
+            styled.buffer.len() >= 6,
+            "expected ≥6 styled spans, got {}",
+            styled.buffer.len()
+        );
+    }
+
+    #[test]
+    fn style_for_assigns_distinct_styles_per_kind() {
+        // Style equality is a poor man's "the table is wired up" smoke
+        // test — if a future contributor adds a Kind and forgets to
+        // extend `style_for`, the default `Style::new()` would silently
+        // un-style it.
+        assert_ne!(style_for(Kind::Method), style_for(Kind::Other));
+        assert_ne!(style_for(Kind::String), style_for(Kind::Regex));
+        assert_ne!(style_for(Kind::Int), style_for(Kind::Duration));
+        assert_ne!(style_for(Kind::Meta), style_for(Kind::Keyword));
+    }
 }

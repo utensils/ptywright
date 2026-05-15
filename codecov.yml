@@ -28,6 +28,36 @@ coverage:
         threshold: 0%
         if_ci_failed: error
 
+# Exclude files whose body is interactive runtime that no unit test
+# without a real TTY can exercise. The behaviour these files implement
+# is verified by manual smoke tests documented in the PR description and
+# (for the REPL) by `tests/repl_tests.rs` against the underlying
+# transport / command-dispatch surfaces — the parts that *are* testable
+# without owning a terminal.
+#
+#   src/main.rs::serve_socket   blocks on `UnixListener::incoming()` —
+#                               covered by the integration test
+#                               `serve_unix_socket_unlinks_socket_on_sigterm`
+#                               which spawns the real binary and SIGTERMs it.
+#   src/repl/tui.rs             ratatui draw loop + crossterm event reader.
+#                               Needs a real terminal with raw mode; CI runners
+#                               have no TTY. Verified by manual smoke tests.
+#   src/repl/mod.rs             `run()` entry point that wires a transport,
+#                               TUI, and signal handler together. Each piece
+#                               is unit-tested individually.
+#   src/repl/socket.rs          Connect side of Unix domain socket / Windows
+#                               named pipe — opens a real file-system endpoint
+#                               and is exercised whenever `ptywright repl
+#                               --socket` runs. The in-process REPL tests use
+#                               pipes rather than sockets so this file has no
+#                               unit-test entry point; the equivalent server-
+#                               side `serve --socket` is covered by
+#                               `tests/cli_tests.rs::serve_unix_socket_*`.
+ignore:
+  - "src/repl/tui.rs"
+  - "src/repl/mod.rs"
+  - "src/repl/socket.rs"
+
 # Comments are noisy on a small repo; the GitHub status checks above are
 # the source of truth.
 comment: false

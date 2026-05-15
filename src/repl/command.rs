@@ -1603,4 +1603,371 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("no focused adapter"), "{error}");
     }
+
+    // ---- helper-level tests (pure, no RPC client) ----------------------
+    //
+    // The blocks below exercise the parser-adjacent helpers and the
+    // pure branches of the dispatcher that don't need a live RPC server.
+    // They're cheap, deterministic, and they cover the slice of
+    // `command.rs` that the in-process dispatcher tests above can't
+    // reach without an actual adapter.
+
+    fn call(path: &str, positional: Vec<Arg>) -> DslCall {
+        DslCall {
+            path: path.split('.').map(str::to_string).collect(),
+            positional,
+            kwargs: BTreeMap::new(),
+        }
+    }
+
+    fn call_kw(path: &str, kwargs: Vec<(&str, Arg)>) -> DslCall {
+        DslCall {
+            path: path.split('.').map(str::to_string).collect(),
+            positional: Vec::new(),
+            kwargs: kwargs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn arg_display_formats_every_variant() {
+        // `Arg::fmt` is used inside every "expected X, got Y" error
+        // message, so a missing branch turns into an opaque panic at
+        // runtime rather than a friendly diagnostic.
+        assert_eq!(format!("{}", Arg::String("a".into())), r#""a""#);
+        assert_eq!(format!("{}", Arg::Regex("a".into())), r#"r"a""#);
+        assert_eq!(
+            format!("{}", Arg::Duration(Duration::from_millis(250))),
+            "250ms"
+        );
+        assert_eq!(format!("{}", Arg::Int(42)), "42");
+        assert_eq!(format!("{}", Arg::Bool(true)), "true");
+        assert_eq!(format!("{}", Arg::Null), "null");
+        assert_eq!(
+            format!("{}", Arg::Call(call("matches", vec![]))),
+            "matches(...)"
+        );
+    }
+
+    #[test]
+    fn matcher_to_params_handles_bare_regex_and_duration() {
+        let (intent, params) = matcher_to_params(Arg::Regex("foo".into())).unwrap();
+        assert_eq!(intent, "wait_turn_matcher");
+        assert_eq!(params["pattern"], "foo");
+
+        let (intent, params) =
+            matcher_to_params(Arg::Duration(Duration::from_millis(500))).unwrap();
+        assert_eq!(intent, "wait_turn_matcher");
+        assert_eq!(params["stable_ms"], 500);
+    }
+
+    #[test]
+    fn matcher_to_params_recognises_nested_matches_and_screen_stable() {
+        let inner = call("matches", vec![Arg::Regex("ready".into())]);
+        let (intent, params) = matcher_to_params(Arg::Call(inner)).unwrap();
+        assert_eq!(intent, "wait_turn_matcher");
+        assert_eq!(params["pattern"], "ready");
+
+        let inner = call(
+            "screen_stable",
+            vec![Arg::Duration(Duration::from_millis(250))],
+        );
+        let (intent, params) = matcher_to_params(Arg::Call(inner)).unwrap();
+        assert_eq!(intent, "wait_turn_matcher");
+        assert_eq!(params["stable_ms"], 250);
+    }
+
+    #[test]
+    fn matcher_to_params_rejects_unknown_call_and_wrong_arg_types() {
+        let unknown = call("teleport", vec![Arg::Regex("x".into())]);
+        let error = matcher_to_params(Arg::Call(unknown)).unwrap_err();
+        assert!(error.to_string().contains("teleport"), "{error}");
+
+        let error = matcher_to_params(Arg::String("hi".into())).unwrap_err();
+        assert!(error.to_string().contains("matcher"), "{error}");
+    }
+
+    #[test]
+    fn expect_one_string_reports_missing_and_wrong_type() {
+        let empty = call("send.text", vec![]);
+        let error = expect_one_string(&empty, "send.text").unwrap_err();
+        assert!(error.to_string().contains("send.text"), "{error}");
+
+        let wrong = call("send.text", vec![Arg::Int(7)]);
+        let error = expect_one_string(&wrong, "send.text").unwrap_err();
+        assert!(error.to_string().contains("string"), "{error}");
+    }
+
+    #[test]
+    fn expect_one_regex_accepts_string_or_regex_and_rejects_others() {
+        let regex = call("wait.matches", vec![Arg::Regex("foo".into())]);
+        assert_eq!(expect_one_regex(&regex, "wait.matches").unwrap(), "foo");
+
+        let string = call("wait.matches", vec![Arg::String("foo".into())]);
+        assert_eq!(expect_one_regex(&string, "wait.matches").unwrap(), "foo");
+
+        let bool_arg = call("wait.matches", vec![Arg::Bool(true)]);
+        let error = expect_one_regex(&bool_arg, "wait.matches").unwrap_err();
+        assert!(error.to_string().contains("regex/string"), "{error}");
+
+        let empty = call("wait.matches", vec![]);
+        let error = expect_one_regex(&empty, "wait.matches").unwrap_err();
+        assert!(error.to_string().contains("regex"), "{error}");
+    }
+
+    #[test]
+    fn expect_one_duration_only_accepts_durations() {
+        let dur = call(
+            "wait.screen_stable",
+            vec![Arg::Duration(Duration::from_millis(100))],
+        );
+        assert_eq!(
+            expect_one_duration(&dur, "wait.screen_stable").unwrap(),
+            Duration::from_millis(100)
+        );
+
+        let str_arg = call("wait.screen_stable", vec![Arg::String("100".into())]);
+        let error = expect_one_duration(&str_arg, "wait.screen_stable").unwrap_err();
+        assert!(error.to_string().contains("duration"), "{error}");
+
+        let empty = call("wait.screen_stable", vec![]);
+        let error = expect_one_duration(&empty, "wait.screen_stable").unwrap_err();
+        assert!(error.to_string().contains("duration"), "{error}");
+    }
+
+    #[test]
+    fn kwarg_helpers_return_typed_values_or_none() {
+        let c = call_kw(
+            "session.spawn",
+            vec![
+                ("program", Arg::String("/bin/sh".into())),
+                ("rows", Arg::Int(24)),
+                ("verbose", Arg::Bool(true)),
+            ],
+        );
+        assert_eq!(string_kwarg(&c, "program").as_deref(), Some("/bin/sh"));
+        assert_eq!(int_kwarg(&c, "rows"), Some(24));
+        assert_eq!(bool_kwarg(&c, "verbose"), Some(true));
+
+        // Wrong types silently return None — the dispatcher then errors
+        // with a usage message rather than coercing a bool into a string.
+        assert!(string_kwarg(&c, "rows").is_none());
+        assert!(int_kwarg(&c, "program").is_none());
+        assert!(bool_kwarg(&c, "rows").is_none());
+
+        // Missing key is always None.
+        assert!(string_kwarg(&c, "missing").is_none());
+    }
+
+    #[test]
+    fn duration_kwarg_distinguishes_missing_present_and_wrong_type() {
+        let none = call_kw("wait", vec![]);
+        assert_eq!(duration_kwarg(&none, "timeout").unwrap(), None);
+
+        let dur = call_kw(
+            "wait",
+            vec![("timeout", Arg::Duration(Duration::from_secs(2)))],
+        );
+        assert_eq!(
+            duration_kwarg(&dur, "timeout").unwrap(),
+            Some(Duration::from_secs(2))
+        );
+
+        let wrong = call_kw("wait", vec![("timeout", Arg::Int(2000))]);
+        let error = duration_kwarg(&wrong, "timeout").unwrap_err();
+        assert!(error.to_string().contains("duration"), "{error}");
+    }
+
+    #[test]
+    fn arg_to_json_and_kwargs_to_json_roundtrip_every_variant() {
+        let kwargs: BTreeMap<String, Arg> = [
+            ("s".to_string(), Arg::String("hi".into())),
+            ("re".to_string(), Arg::Regex("^x$".into())),
+            ("d".to_string(), Arg::Duration(Duration::from_millis(750))),
+            ("i".to_string(), Arg::Int(-3)),
+            ("b".to_string(), Arg::Bool(false)),
+            ("n".to_string(), Arg::Null),
+        ]
+        .into_iter()
+        .collect();
+        let value = kwargs_to_json(&kwargs);
+        assert_eq!(value["s"], "hi");
+        assert_eq!(value["re"], "^x$");
+        assert_eq!(value["d"], 750); // Duration is serialised as ms
+        assert_eq!(value["i"], -3);
+        assert_eq!(value["b"], false);
+        assert!(value["n"].is_null());
+
+        // Nested call collapses to its path string so that arbitrary
+        // user-supplied `intent` payloads stay JSON-safe even if
+        // they contain a stray DSL call.
+        let nested = Arg::Call(call("foo.bar", vec![Arg::Int(1)]));
+        let value = arg_to_json(&nested);
+        assert_eq!(value, json!("foo.bar(...)"));
+    }
+
+    #[test]
+    fn parse_session_attach_with_string_and_default() {
+        let cmd = parse(r#"session.attach("e7")"#).unwrap();
+        let Cmd::Dsl(call) = cmd else { panic!() };
+        assert_eq!(call.path, vec!["session", "attach"]);
+        assert_eq!(call.positional, vec![Arg::String("e7".into())]);
+
+        // `session.attach()` with no positional arg means "all".
+        let cmd = parse("session.attach()").unwrap();
+        let Cmd::Dsl(call) = cmd else { panic!() };
+        assert!(call.positional.is_empty());
+    }
+
+    #[test]
+    fn parse_raw_string_preserves_backslashes() {
+        // Raw strings are the canonical way to write regexes in this DSL;
+        // they must not interpret `\n` as newline.
+        let cmd = parse(r#"wait(matches(r"a\n\t"))"#).unwrap();
+        let Cmd::Dsl(call) = cmd else { panic!() };
+        let Arg::Call(inner) = &call.positional[0] else {
+            panic!()
+        };
+        assert_eq!(inner.positional, vec![Arg::Regex(r"a\n\t".into())]);
+    }
+
+    #[test]
+    fn parse_negative_integer_kwarg() {
+        let cmd = parse("send.intent(\"x\", count=-5)").unwrap();
+        let Cmd::Dsl(call) = cmd else { panic!() };
+        assert_eq!(call.kwargs.get("count"), Some(&Arg::Int(-5)));
+    }
+
+    #[test]
+    fn dispatch_unknown_command_returns_help_hint() {
+        // Pure error-path branch: the dispatcher's catch-all reports a
+        // friendly "try :help" hint rather than panicking on an unknown
+        // DSL path. No RPC client is needed because the error fires
+        // before any network call.
+        let (client, _server, mut ctx) = in_process_client();
+        let error = dispatch(
+            parse("session.fly()").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("session.fly"), "{text}");
+        assert!(text.contains(":help"), "{text}");
+    }
+
+    #[test]
+    fn dispatch_session_attach_with_non_string_arg_errors() {
+        // The `session.attach(...)` DSL form takes a string id or
+        // `"all"`. A duration or int is a parse-time error message,
+        // exercised here to lock the wording.
+        let (client, _server, mut ctx) = in_process_client();
+        let error = dispatch(
+            parse("session.attach(42)").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("session.attach"), "{error}");
+    }
+
+    #[test]
+    fn dispatch_meta_focus_unknown_id_errors() {
+        let (client, _server, mut ctx) = in_process_client();
+        ctx.upsert_adapter("e1", "claude-code");
+        let error = dispatch(
+            parse(":focus e9").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("e9"), "{error}");
+    }
+
+    #[test]
+    fn dispatch_meta_focus_sets_ctx_focus() {
+        let (client, _server, mut ctx) = in_process_client();
+        ctx.upsert_adapter("e1", "claude-code");
+        ctx.upsert_adapter("e2", "claude-code");
+        let outcome = dispatch(
+            parse(":focus e2").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let CmdOutcome::Line(line) = outcome else {
+            panic!()
+        };
+        assert!(line.contains("e2"), "{line}");
+        assert_eq!(ctx.focus.as_deref(), Some("e2"));
+    }
+
+    #[test]
+    fn dispatch_session_list_renders_empty_and_populated() {
+        let (client, _server, mut ctx) = in_process_client();
+        let outcome = dispatch(
+            parse("session.list()").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let CmdOutcome::Line(line) = outcome else {
+            panic!()
+        };
+        assert!(line.contains("no adapters"), "{line}");
+
+        ctx.upsert_adapter("e1", "claude-code");
+        let outcome = dispatch(
+            parse("session.list()").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let CmdOutcome::Line(line) = outcome else {
+            panic!()
+        };
+        assert!(line.contains("e1"), "{line}");
+        assert!(line.contains("claude-code"), "{line}");
+    }
+
+    #[test]
+    fn dispatch_meta_tabs_empty_renders_placeholder() {
+        let (client, _server, mut ctx) = in_process_client();
+        let outcome = dispatch(
+            parse(":tabs").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let CmdOutcome::Line(line) = outcome else {
+            panic!()
+        };
+        assert!(line.contains("no adapters"), "{line}");
+    }
+
+    #[test]
+    fn dispatch_help_returns_help_outcome() {
+        let (client, _server, mut ctx) = in_process_client();
+        let outcome = dispatch(
+            parse(":help").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let CmdOutcome::ShowHelp(text) = outcome else {
+            panic!("expected ShowHelp, got {outcome:?}")
+        };
+        assert!(text.contains("plugins()"), "help missing top-line cmds");
+        assert!(text.contains("send.key"), "help missing send.key entry");
+    }
 }
