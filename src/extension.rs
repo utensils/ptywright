@@ -34,8 +34,10 @@ pub const STATUS_BAR_ROWS: usize = 3;
 /// Snapshot of an extension's classified state.
 ///
 /// The `state` field is a plugin-defined string so the generic core does not
-/// have to know any specific adapter's vocabulary. Confidence, evidence, and
-/// sequence follow the Milestone 16 convention from the Claude Code adapter.
+/// have to know any specific plugin's vocabulary. Plugins return a
+/// confidence score in `[0.0, 1.0]`, a human-readable `evidence` string, the
+/// session `sequence` observed at classification time, and an optional list
+/// of ranked runner-up `candidates`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionStateSnapshot {
     /// Plugin-defined classification, e.g. `"ready"`, `"thinking"`, etc.
@@ -161,11 +163,11 @@ pub trait Extension {
 
 /// Trusted Lua [`Extension`] implementation backed by a [`LuaPlugin`].
 ///
-/// The plugin must export `classify`, the intent functions named by the
-/// adapter shim, and matcher constructors named by the adapter shim (e.g.
-/// `wait_turn_matcher`). Exported function names are caller-driven so the
-/// generic Extension contract does not bake in any specific adapter's
-/// vocabulary.
+/// The plugin must export `classify` plus any intent functions and
+/// `wait_*_matcher` functions it wants callers to be able to invoke through
+/// [`ExtensionHandle::send`] / [`ExtensionHandle::wait`]. Exported function
+/// names are caller-driven; the generic Extension contract does not bake in
+/// any specific plugin's vocabulary.
 pub struct LuaExtension {
     plugin: LuaPlugin,
     manifest: PluginManifest,

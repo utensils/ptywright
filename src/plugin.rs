@@ -331,9 +331,18 @@ mod tests {
             .find(|plugin| plugin.name == "claude-code")
             .expect("claude-code is registered as a built-in plugin");
         assert_eq!(claude.runtime, Some(PluginRuntime::Lua));
-        assert_eq!(
-            claude.default_target.as_ref().map(|t| t.program.as_str()),
-            Some("claude")
+        let default_target = claude
+            .default_target
+            .as_ref()
+            .expect("claude-code declares a default spawn target");
+        assert_eq!(default_target.program, "claude");
+        // Locking in "interactive only": the default args must stay empty
+        // so a future edit can't silently add `-p` / `--print` and break
+        // every caller that relies on the interactive TUI.
+        assert!(
+            default_target.args.is_empty(),
+            "claude-code default_target.args must stay empty (no `-p`/`--print`); got {:?}",
+            default_target.args,
         );
     }
 

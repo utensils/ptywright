@@ -180,9 +180,9 @@ impl Session {
     /// [`Action::Paste`] writes raw bytes so callers driving programs that
     /// have NOT enabled bracketed paste (cat, plain shells, generic
     /// REPLs) don't get `ESC[200~` literals echoed back at them. Modern
-    /// TUIs (Claude Code v2.1+, vim, fish, …) set `CSI ? 2004 h` to opt
-    /// in, and the Claude Code Lua plugin uses the bracketed variant for
-    /// `send_prompt` so a trailing Enter is interpreted as a submit
+    /// TUIs (vim, fish, and other recent readline-style frontends) set
+    /// `CSI ? 2004 h` to opt in; the bracketed variant is preferred against
+    /// those receivers so a trailing Enter is interpreted as a submit
     /// rather than absorbed into the paste tokeniser.
     fn write_bracketed_paste(&self, bytes: &[u8]) -> Result<()> {
         self.write_all(&bracketed_paste_payload(bytes))
@@ -449,8 +449,9 @@ mod tests {
         // Generic `Action::Paste` must NOT inject bracketed-paste markers —
         // callers driving programs that have not enabled bracketed paste
         // (cat, plain shells, REPLs) would see literal `ESC[200~` bytes
-        // echoed back. The bracketed framing lives on `BracketedPaste`
-        // (used by the Claude Code Lua plugin's `send_prompt`).
+        // echoed back. The bracketed framing lives on `BracketedPaste` and
+        // is used by plugins driving receivers that opt into
+        // `CSI ? 2004 h` (vim, fish, and other modern readline-style TUIs).
         //
         // A POSIX shell `read` is line-buffered (canonical mode), so we
         // send `Paste` + `Enter` together to flush. We then assert the

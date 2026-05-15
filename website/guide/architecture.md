@@ -1,6 +1,6 @@
 # Architecture
 
-ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior, including the interactive Claude Code adapter, sits above reusable terminal primitives. The generic `Extension` trait is the seam between those primitives and any specific TUI's classifier and intents.
+ptywright is an early PTY/TUI automation runtime. The core is intentionally generic: application-specific behavior lives in trusted Lua plugins under `plugins/<name>/`, on top of reusable terminal primitives. The generic `Extension` trait is the seam between those primitives and any specific TUI's classifier and intents.
 
 ## Repository layout
 
@@ -8,18 +8,19 @@ ptywright is an early PTY/TUI automation runtime. The core is intentionally gene
 ptywright/
 ├── src/
 │   ├── action.rs      # serializable input/lifecycle actions
-│   ├── adapters/      # app-specific adapter shims (currently claude_code.rs)
 │   ├── config.rs      # ~/.ptywright/config.toml loader
 │   ├── error.rs       # public error/result types
-│   ├── extension.rs   # Extension trait, ExtensionHandle, ExtensionStateSnapshot
+│   ├── extension.rs   # Extension trait, ExtensionHandle, ExtensionStateSnapshot,
+│   │                  #   LuaExtension, built-in source registry
 │   ├── lib.rs         # public library surface
 │   ├── logging.rs     # tracing init with rotation, retention, and redaction
 │   ├── main.rs        # clap CLI entrypoint
-│   ├── lua_plugin.rs  # trusted Lua plugin runtime for adapter orchestration
+│   ├── lua_plugin.rs  # trusted Lua plugin runtime
 │   ├── matcher.rs     # screen/transcript predicates
 │   ├── paths.rs       # ~/.ptywright runtime directory resolution
-│   ├── plugin.rs      # plugin manifest, permissions, host capabilities
-│   ├── rpc.rs         # JSON-RPC server and framing helpers
+│   ├── plugin.rs      # plugin manifest, permissions, default_target,
+│   │                  #   built-in manifest registry
+│   ├── rpc.rs         # JSON-RPC server (adapter.* + session.* + plugin.*)
 │   ├── screen.rs      # terminal engine seam, parser, and snapshots
 │   ├── session.rs     # PTY-backed process lifecycle
 │   ├── target.rs      # spawn configuration
