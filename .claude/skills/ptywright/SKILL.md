@@ -449,7 +449,7 @@ These are the scenarios worth driving repeatedly while the plugin is still harde
 | Permission approve | Prompt that triggers `Bash`/`Edit` permission UI | `waiting_for_permission` → `approve` → `completed_turn` |
 | Permission deny | Same setup, call `adapter.send {intent: "deny"}` | adapter recovers to `ready` or returns `completed_turn` with denial evidence |
 | Plan approve | Prompt that triggers plan mode | `waiting_for_plan_approval` → `approve` → `thinking` → `completed_turn` |
-| Mid-turn cancel | After `adapter.wait` returns `thinking`, call `adapter.send {intent: "cancel"}` | transitions through `cancelling`, ends with stable state |
+| Mid-turn cancel | After `adapter.wait` returns `thinking`, call `adapter.send {intent: "cancel"}` | transitions through `cancelling`, ends with stable state. `cancelling` is reported until `adapter.wait` returns with a stable-enough screen; `adapter.state` polling alone will stay on `cancelling` until the next mutating intent. |
 | Crash recovery | `adapter.start` with a bogus `program` | `error` / `plugin_error` returned with evidence; subsequent calls reject the dead adapter |
 | Long turn | Prompt that takes >60s; loop `adapter.wait` with `timeout_ms: 30000` | repeated `thinking` until `completed_turn`; no spurious `completed_turn` from premature stable-screen |
 

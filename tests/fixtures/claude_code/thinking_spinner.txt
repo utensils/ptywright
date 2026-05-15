@@ -1,0 +1,14 @@
+ ▐▛███▜▌   Claude Code v2.1.142
+▝▜█████▛▘  Opus 4.7 · Claude Max
+  ▘▘ ▝▝    ~/Projects/sample
+
+❯ Count slowly from 1 to 30, one per line. Plain prose only, no tools.
+
+✶ Razzle-dazzling…
+
+
+
+────────────────────────────────────────────────────────────────────────
+❯
+  user @ host /Users/me/Projects/sample                       [Opus 4.7]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

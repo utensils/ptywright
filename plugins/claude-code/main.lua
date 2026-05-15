@@ -63,22 +63,57 @@ local function has_input_prompt(screen)
   return false
 end
 
+-- A line is considered a Claude Code 2.1.x "thinking" indicator if it is
+-- short and ends with the Unicode horizontal ellipsis `…` (U+2026, three
+-- bytes in UTF-8). Claude renders a single status line of the form
+-- `<spinner> <Verb>…` while a turn is in flight, where the spinner glyph
+-- rotates through `✶`, `✻`, `✺`, `·`, `•` (and braille animations) and
+-- the verb is a randomized whimsy word (Razzle-dazzling, Cogitating,
+-- Brewing, Pondering, …). The verb changes per turn and per release, so
+-- matching specific words is fragile — but the trailing ellipsis and
+-- short line length are both stable signals. User-typed input lines
+-- starting with `❯` are skipped to avoid false-positives on prose
+-- containing ellipsis.
+local ELLIPSIS = "…"
+local USER_PROMPT_GLYPH = "❯"
+local THINKING_LINE_MAX_BYTES = 80
+
+local function line_ends_with_ellipsis(line)
+  local n = #line
+  return n >= #ELLIPSIS and string.sub(line, n - #ELLIPSIS + 1, n) == ELLIPSIS
+end
+
+local function has_thinking_spinner_line(text)
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local trimmed = trim(line)
+    if #trimmed > 0 and #trimmed <= THINKING_LINE_MAX_BYTES then
+      if string.sub(trimmed, 1, #USER_PROMPT_GLYPH) ~= USER_PROMPT_GLYPH then
+        if line_ends_with_ellipsis(trimmed) then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
 local function has_active_work_indicator(text)
-  return contains_any(text, {
+  -- Direct text hints kept across Claude Code releases.
+  if contains_any(text, {
     "esc to interrupt",
     "thinking",
-    "thinking…",
-    "thinking...",
     "running tool",
-    "running…",
-    "running...",
     "using tool",
     "calling tool",
     "tool use",
     "reading file",
     "editing file",
     "searching",
-  })
+  }) then
+    return true
+  end
+  -- Claude Code 2.1.x spinner-and-ellipsis status line.
+  return has_thinking_spinner_line(text)
 end
 
 local function has_permission_indicator(text)
@@ -166,6 +201,31 @@ function M.classify(input)
 
   if trim(text) == "" then
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
+  end
+
+  -- Recently-sent cancel: report `cancelling` until the screen has been
+  -- quiet for at least the configured stability window. After that the
+  -- classifier falls through to the regular branches and reports
+  -- whatever the post-cancel screen actually shows (usually back at the
+  -- idle prompt, sometimes a completed-turn summary if the interrupt
+  -- arrived right at a boundary). Without this branch the only signal
+  -- that cancel landed is the disappearance of the thinking spinner,
+  -- which is brittle to observe from a polling caller.
+  --
+  -- Note for callers: `adapter.state` polling does not supply
+  -- `stable_ms`, so this branch will fire on every state read until the
+  -- next mutating intent clears `last_intent`. To observe the transition
+  -- out of cancelling, call `adapter.wait` after `cancel`; the wait
+  -- matcher returns once the screen has been stable for the configured
+  -- threshold and then this branch falls through to the normal idle /
+  -- completed-turn classification.
+  if last_intent == "cancelling" and stable_ms < completed_turn_stable_ms then
+    return state_snapshot(
+      "cancelling",
+      0.72,
+      "cancel intent recently applied; screen not yet stable",
+      sequence
+    )
   end
 
   -- Plan-approval dialogs in the Claude Code TUI sometimes straddle the

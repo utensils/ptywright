@@ -591,3 +591,206 @@ fn end_to_end_session_round_trip_with_echo_tui_fixture() {
     drop(stdin);
     let _ = child.wait();
 }
+
+/// Verify LSP framing handles back-to-back requests on a single
+/// connection. NDJSON splits on `\n` so message boundaries are free; LSP
+/// framing needs `Content-Length: N\r\n\r\n<N bytes>` per message and has
+/// historically been the surface that exposes framing-state bugs (header
+/// re-use, payload truncation, multi-byte boundary skipping). Two
+/// requests with different payload sizes is the smallest combination
+/// that catches header-state regressions.
+#[test]
+fn serve_stdio_lsp_handles_two_back_to_back_requests() {
+    use std::io::BufReader;
+
+    fn write_lsp_message(out: &mut impl Write, payload: &[u8]) {
+        write!(out, "Content-Length: {}\r\n\r\n", payload.len()).expect("write headers");
+        out.write_all(payload).expect("write payload");
+    }
+
+    fn read_lsp_message(reader: &mut BufReader<impl Read>) -> serde_json::Value {
+        // Read headers line-by-line until the blank `\r\n` separator. The
+        // spec allows additional headers; we only care about Content-Length.
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            let n = std::io::BufRead::read_line(reader, &mut header).expect("read header line");
+            assert!(n > 0, "stream closed inside header block");
+            if header == "\r\n" {
+                break;
+            }
+            if let Some(rest) = header
+                .strip_prefix("Content-Length:")
+                .or_else(|| header.strip_prefix("content-length:"))
+            {
+                content_length = rest.trim().parse().expect("parse content-length");
+            }
+        }
+        assert!(content_length > 0, "server returned empty Content-Length");
+        let mut buf = vec![0u8; content_length];
+        std::io::Read::read_exact(reader, &mut buf).expect("read payload bytes");
+        serde_json::from_slice(&buf).expect("payload is json")
+    }
+
+    let mut child = bin()
+        .args(["serve", "--stdio", "--framing", "lsp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ptywright serve --framing lsp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    // First request: short payload — `server.capabilities`.
+    let first = br#"{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}"#;
+    write_lsp_message(&mut stdin, first);
+    let r1 = read_lsp_message(&mut stdout);
+    assert_eq!(r1["id"], 1);
+    assert!(r1["result"]["methods"].is_array());
+
+    // Second request: longer payload — `adapter.list` plus an explicit
+    // params object so the JSON is materially different in size from the
+    // first message. A framing-state bug that re-reads the prior
+    // Content-Length would either truncate this message or split it
+    // across "boundaries" and fail to parse.
+    let second = br#"{"jsonrpc":"2.0","id":2,"method":"adapter.list","params":{}}"#;
+    write_lsp_message(&mut stdin, second);
+    let r2 = read_lsp_message(&mut stdout);
+    assert_eq!(r2["id"], 2);
+    assert!(
+        r2["result"]["plugins"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "expected at least one plugin in adapter.list response; got {r2}",
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Verify `server.set_notifications` actually enables server-originated
+/// `session.changed` deliveries on the current connection and that the
+/// response to a request always precedes any queued notification.
+#[test]
+#[cfg(unix)]
+fn serve_stdio_emits_session_changed_after_opt_in() {
+    use std::io::{BufRead, BufReader};
+
+    let mut child = bin()
+        .args(["serve", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ptywright serve --stdio");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    let mut read_line = || -> serde_json::Value {
+        let mut buf = String::new();
+        let n = stdout.read_line(&mut buf).expect("read line");
+        assert!(n > 0, "server closed stdout");
+        serde_json::from_str(buf.trim()).expect("json line")
+    };
+
+    let write = |stdin: &mut std::process::ChildStdin, line: &str| {
+        stdin.write_all(line.as_bytes()).expect("write");
+        stdin.write_all(b"\n").expect("write newline");
+    };
+
+    // 1. Opt in to notifications. Response must come first.
+    write(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"server.set_notifications","params":{"enabled":true}}"#,
+    );
+    let opt_in = read_line();
+    assert_eq!(opt_in["id"], 1);
+    assert_eq!(opt_in["result"]["enabled"], true);
+
+    // 2. Create a session that immediately writes a byte. The PTY output
+    //    bumps the session sequence and should drive a `session.changed`
+    //    notification on the next message handler turn.
+    let create = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session.create",
+        "params": {
+            "program": "/bin/sh",
+            "args": ["-lc", "printf hello; sleep 2"],
+            "rows": 24,
+            "cols": 80,
+        },
+    });
+    write(&mut stdin, &create.to_string());
+    let create_resp = read_line();
+    assert_eq!(create_resp["id"], 2, "create response: {create_resp}");
+    let session = create_resp["result"]["session"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    // 3. Drive a `session.wait` for the printed bytes. Notifications are
+    //    poll-coalesced at the end of each handler turn, so emitted
+    //    notifications can interleave with subsequent request responses
+    //    (a notification queued by the create handler may arrive before
+    //    the wait response if both are read from stdout in sequence).
+    //    The per-turn ordering guarantee we actually care about is:
+    //    within a single handler invocation the response precedes any
+    //    notifications queued by that same turn. That's enforced in the
+    //    unit tests in src/rpc.rs (`notification_subscriptions_*`); here
+    //    we just verify the wire integration delivers both messages and
+    //    that the wait response is correct.
+    let wait = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session.wait",
+        "params": {
+            "session": session,
+            "matcher": {"type": "contains_text", "value": "hello"},
+            "timeout_ms": 5000,
+        },
+    });
+    write(&mut stdin, &wait.to_string());
+
+    let mut saw_response = false;
+    let mut saw_notification = false;
+    for _ in 0..16 {
+        let msg = read_line();
+        if msg["id"] == 3 {
+            assert!(
+                msg["result"]["matched"].as_bool().unwrap_or(false),
+                "wait did not match: {msg}",
+            );
+            saw_response = true;
+        } else if msg["method"] == "session.changed" {
+            assert!(msg["params"]["session"].is_string());
+            assert!(msg["params"]["sequence"].is_number());
+            saw_notification = true;
+        }
+        if saw_response && saw_notification {
+            break;
+        }
+    }
+    assert!(saw_response, "never observed wait response");
+    assert!(
+        saw_notification,
+        "never observed session.changed notification"
+    );
+
+    // 4. Clean up.
+    let kill = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "session.kill",
+        "params": {"session": session},
+    });
+    write(&mut stdin, &kill.to_string());
+    let _ = read_line();
+
+    drop(stdin);
+    let _ = child.wait();
+}
