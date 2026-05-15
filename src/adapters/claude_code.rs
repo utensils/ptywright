@@ -185,15 +185,26 @@ impl ClaudeCodeAdapter {
     }
 
     /// Approve the current Claude Code prompt using the Lua adapter's action plan.
-    pub fn approve(&self) -> Result<()> {
+    ///
+    /// Returns the post-apply state snapshot so callers don't need to round-trip
+    /// a separate `claude.state` query after approving. The snapshot is the
+    /// classifier's read at the moment after the approve action ran; the screen
+    /// has not necessarily settled, so callers that want a stable
+    /// classification should follow up with `wait_turn`.
+    pub fn approve(&self) -> Result<ClaudeCodeStateSnapshot> {
         let plan: ActionPlan = self.plugin.call("approve", &serde_json::json!({}))?;
-        self.apply_actions(&plan.actions)
+        self.apply_actions(&plan.actions)?;
+        self.try_state()
     }
 
     /// Deny the current Claude Code prompt using the Lua adapter's action plan.
-    pub fn deny(&self) -> Result<()> {
+    ///
+    /// Returns the post-apply state snapshot. See [`approve`](Self::approve)
+    /// for the stability caveat.
+    pub fn deny(&self) -> Result<ClaudeCodeStateSnapshot> {
         let plan: ActionPlan = self.plugin.call("deny", &serde_json::json!({}))?;
-        self.apply_actions(&plan.actions)
+        self.apply_actions(&plan.actions)?;
+        self.try_state()
     }
 
     /// Cancel the current turn with the Lua adapter's action plan.
@@ -229,6 +240,14 @@ impl ClaudeCodeAdapter {
 /// false-positive on the `permissions` substring match in
 /// `plugins/claude-code/main.lua`.
 const STATUS_BAR_ROWS: usize = 3;
+
+/// Apply the same body/status split that the classifier uses, for diagnostic
+/// RPC methods like `claude.inspect` that want to surface what the classifier
+/// would have seen. Exposed at crate visibility so `src/rpc.rs` can reuse the
+/// constant + helper without duplicating the threshold logic.
+pub(crate) fn split_status_bar_for_inspect(screen: &str) -> (String, String) {
+    split_status_bar(screen, STATUS_BAR_ROWS)
+}
 
 fn split_status_bar(screen: &str, status_rows: usize) -> (String, String) {
     let lines: Vec<&str> = screen.split('\n').collect();

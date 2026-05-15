@@ -137,6 +137,15 @@ struct ClaudePromptParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct ClaudeReadParams {
+    claude: String,
+    /// Whether to redact sensitive-looking output fields. Defaults to true.
+    redact: Option<bool>,
+    /// Optional caller-supplied redaction additions/replacement for this read.
+    redaction: Option<RedactionPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ClaudeWaitParams {
     claude: String,
     timeout_ms: Option<u64>,
@@ -331,6 +340,9 @@ impl RpcServer {
                     "claude.deny",
                     "claude.cancel",
                     "claude.state",
+                    "claude.snapshot",
+                    "claude.transcript",
+                    "claude.inspect",
                     "plugin.capabilities",
                     "plugin.validate_manifest"
                 ],
@@ -353,6 +365,9 @@ impl RpcServer {
             "claude.deny" => self.claude_deny(request.params),
             "claude.cancel" => self.claude_cancel(request.params),
             "claude.state" => self.claude_state(request.params),
+            "claude.snapshot" => self.claude_snapshot(request.params),
+            "claude.transcript" => self.claude_transcript(request.params),
+            "claude.inspect" => self.claude_inspect(request.params),
             "plugin.capabilities" => Ok(json!(PluginHostCapabilities::current())),
             "plugin.validate_manifest" => self.plugin_validate_manifest(request.params),
             _ => Err((
@@ -600,10 +615,14 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: ClaudeParams = parse_params(params)?;
-        self.claude_adapter(&params.claude)?
+        let state = self
+            .claude_adapter(&params.claude)?
             .approve()
             .map_err(rpc_error_from_error)?;
-        Ok(json!({ "approved": true }))
+        // `approved` is retained as a deprecated alias for callers that
+        // pattern-match against the old `{approved: true}` shape. New callers
+        // should read `state` like every other mutation method.
+        Ok(json!({ "state": state, "approved": true }))
     }
 
     fn claude_deny(
@@ -611,10 +630,11 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: ClaudeParams = parse_params(params)?;
-        self.claude_adapter(&params.claude)?
+        let state = self
+            .claude_adapter(&params.claude)?
             .deny()
             .map_err(rpc_error_from_error)?;
-        Ok(json!({ "denied": true }))
+        Ok(json!({ "state": state, "denied": true }))
     }
 
     fn claude_cancel(
@@ -635,6 +655,91 @@ impl RpcServer {
     ) -> std::result::Result<Value, (RpcErrorCode, String)> {
         let params: ClaudeParams = parse_params(params)?;
         Ok(json!({ "state": self.claude_adapter(&params.claude)?.state() }))
+    }
+
+    /// Pass-through to `session.snapshot` for the adapter's underlying
+    /// session. The adapter owns its session id internally, so callers
+    /// couldn't reach the screen via `session.*` without spawning a parallel
+    /// session. This avoids that for the common case "what was on screen
+    /// when the classifier ran?"
+    fn claude_snapshot(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeReadParams = parse_params(params)?;
+        let adapter = self.claude_adapter(&params.claude)?;
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
+        let mut snapshot = adapter.session().snapshot();
+        if let Some(policy) = policy {
+            snapshot = snapshot.redacted(&policy);
+        }
+        serde_json::to_value(snapshot)
+            .map_err(|error| (RpcErrorCode::InternalError, error.to_string()))
+    }
+
+    /// Pass-through to `session.transcript` for the adapter's underlying
+    /// session. Same motivation as [`claude_snapshot`](Self::claude_snapshot).
+    fn claude_transcript(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeReadParams = parse_params(params)?;
+        let adapter = self.claude_adapter(&params.claude)?;
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
+        let session = adapter.session();
+        let text = if let Some(policy) = policy {
+            session.redacted_transcript(&policy)
+        } else {
+            session.transcript()
+        };
+        Ok(json!({ "text": text }))
+    }
+
+    /// Diagnostic dump: returns `state`, `plain_text`, `body_text`
+    /// (status-bar excluded), `status_text` (just the status bar), and
+    /// `transcript_tail` for the adapter. Designed for "the classifier
+    /// disagreed with what I expected — show me what it saw" without
+    /// setting up a parallel session.* read. Redacted by default.
+    fn claude_inspect(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+        let params: ClaudeReadParams = parse_params(params)?;
+        let adapter = self.claude_adapter(&params.claude)?;
+        let session = adapter.session();
+        let snapshot = session.snapshot();
+        let transcript = session.transcript();
+        let policy = if params.redact.unwrap_or(true) {
+            Some(redaction_policy_for_read(params.redaction)?)
+        } else {
+            None
+        };
+        // 4 KiB tail mirrors what session.wait returns as transcript_tail.
+        let tail_start = transcript.len().saturating_sub(4096);
+        let mut transcript_tail = transcript[tail_start..].to_string();
+        let mut plain_text = snapshot.plain_text.clone();
+        if let Some(policy) = policy {
+            plain_text = policy.redact(&plain_text);
+            transcript_tail = policy.redact(&transcript_tail);
+        }
+        let (body_text, status_text) =
+            crate::adapters::claude_code::split_status_bar_for_inspect(&plain_text);
+        Ok(json!({
+            "state": adapter.state(),
+            "plain_text": plain_text,
+            "body_text": body_text,
+            "status_text": status_text,
+            "transcript_tail": transcript_tail,
+            "sequence": snapshot.sequence,
+        }))
     }
 
     fn plugin_validate_manifest(
@@ -1053,13 +1158,16 @@ mod tests {
 
     #[test]
     fn claude_mutation_methods_for_unknown_adapter_return_invalid_params() {
-        // approve/deny/cancel all share the same lookup path; cover each so a
-        // future refactor that splits the dispatcher cannot silently regress
-        // any one of them.
+        // approve/deny/cancel/inspect/snapshot/transcript all share the same
+        // lookup path; cover each so a future refactor that splits the
+        // dispatcher cannot silently regress any one of them.
         for (id, method) in [
             (20, "claude.approve"),
             (21, "claude.deny"),
             (22, "claude.cancel"),
+            (23, "claude.snapshot"),
+            (24, "claude.transcript"),
+            (25, "claude.inspect"),
         ] {
             let mut server = RpcServer::new();
             let response = handle(
@@ -1104,7 +1212,18 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":2,"method":"claude.approve","params":{{"claude":"{claude}"}}}}"#
             ),
         );
+        // New shape (Milestone 21.6): approve/deny return the post-apply
+        // state snapshot like every other mutation method. `approved`/
+        // `denied` are retained as deprecated aliases for one release.
         assert_eq!(approve["result"]["approved"], true);
+        assert!(
+            approve["result"]["state"].is_object(),
+            "approve must return a state snapshot object"
+        );
+        assert!(
+            approve["result"]["state"]["state"].is_string(),
+            "approve state snapshot must include a state label"
+        );
 
         let deny = handle(
             &mut server,
@@ -1113,6 +1232,14 @@ mod tests {
             ),
         );
         assert_eq!(deny["result"]["denied"], true);
+        assert!(
+            deny["result"]["state"].is_object(),
+            "deny must return a state snapshot object"
+        );
+        assert!(
+            deny["result"]["state"]["state"].is_string(),
+            "deny state snapshot must include a state label"
+        );
 
         // cancel records the cancelling intent on the adapter and returns the
         // resulting state snapshot. The exact classification depends on what
@@ -1135,6 +1262,73 @@ mod tests {
         assert!(
             cancel["result"]["state"]["sequence"].is_number(),
             "state snapshot must include a sequence number"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_read_methods_expose_adapter_session_state() {
+        // Drive the same /bin/sh -lc cat stand-in as the mutation test but
+        // exercise the new diagnostic passthroughs (Milestone 21.7): snapshot
+        // / transcript / inspect must let callers see what the classifier is
+        // looking at without spawning a parallel session.* session.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"claude.start","params":{"program":"/bin/sh","args":["-lc","printf 'inspect-fixture-line\\n' && cat"]}}"#,
+        );
+        let claude = start["result"]["claude"]
+            .as_str()
+            .expect("claude adapter id");
+
+        // Give the shell stand-in a moment to print the fixture line.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let snapshot = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"claude.snapshot","params":{{"claude":"{claude}"}}}}"#
+            ),
+        );
+        assert!(
+            snapshot["result"]["plain_text"].is_string(),
+            "claude.snapshot must return a ScreenSnapshot with plain_text"
+        );
+        assert!(
+            snapshot["result"]["sequence"].is_number(),
+            "claude.snapshot must include a sequence number"
+        );
+
+        let transcript = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"claude.transcript","params":{{"claude":"{claude}","redact":false}}}}"#
+            ),
+        );
+        let text = transcript["result"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("inspect-fixture-line"),
+            "claude.transcript must include the underlying session's bytes; got `{text}`"
+        );
+
+        let inspect = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"claude.inspect","params":{{"claude":"{claude}","redact":false}}}}"#
+            ),
+        );
+        assert!(inspect["result"]["state"].is_object());
+        assert!(inspect["result"]["plain_text"].is_string());
+        assert!(inspect["result"]["body_text"].is_string());
+        assert!(inspect["result"]["status_text"].is_string());
+        assert!(inspect["result"]["transcript_tail"].is_string());
+
+        // Cleanup so the cat process doesn't outlive the test.
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"claude.cancel","params":{{"claude":"{claude}"}}}}"#
+            ),
         );
     }
 
