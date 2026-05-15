@@ -180,7 +180,7 @@
               {
                 category = "check";
                 name = "ci-local";
-                help = "run the same sequence CI runs: fmt-check, check, clippy, test, build";
+                help = "run the same sequence CI runs: fmt-check, check, clippy, test, build (default + --features repl)";
                 command = ''
                   set -euo pipefail
                   cargo fmt --all -- --check
@@ -188,6 +188,12 @@
                   cargo clippy -- -D warnings
                   cargo test
                   cargo build --release
+                  # Optional feature: surface --features repl breakages locally
+                  # before they reach CI. Check + clippy + test mirror the
+                  # extra steps in .github/workflows/ci.yml.
+                  cargo check --features repl
+                  cargo clippy --features repl --tests -- -D warnings
+                  cargo test --features repl
                 '';
               }
               {

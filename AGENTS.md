@@ -91,6 +91,17 @@ cargo test --locked
 cargo run -- --help
 ```
 
+Optional **`repl` feature** (interactive REPL client, `ptywright repl`):
+
+```bash
+cargo check --locked --features repl
+cargo clippy --locked --features repl --tests -- -D warnings
+cargo test --locked --features repl
+cargo run --features repl -- repl --socket ~/.ptywright/socket
+```
+
+CI exercises `--features repl` on Linux (check + clippy + test), macOS (check + test), and Windows (check only). The default build does not pull in the REPL's dependency stack (`reedline`, `ratatui`, `crossbeam-channel`, `nu-ansi-term`).
+
 Run a single test:
 
 ```bash
@@ -131,10 +142,19 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/plugin.rs` — plugin manifests, permission declarations, runtime metadata enum, the `DefaultTarget` field plugins use to declare a default spawn program, and the `BUILTIN_PLUGINS` registry that pairs a manifest constructor with the embedded Lua source for every plugin shipped in the binary. Adding a new built-in plugin is a single `BuiltinPlugin { manifest, source }` entry in that slice.
   - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by plugins. Installs the `ptywright.action.*` / `ptywright.matcher.*` host helpers gated on manifest-declared permissions.
   - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, workspace-trust dialog detection, and usage-output parsing. There is no Rust shim wrapping it.
+- Optional REPL client (gated `#[cfg(feature = "repl")]`, off by default — `cargo build --features repl`):
+  - `src/repl/mod.rs` — public entry (`ReplArgs`, `Transport`, `Framing`, `run`) invoked from `Commands::Repl`. Builds the right transport, holds the stdio child guard for the REPL's lifetime, hands off to the TUI.
+  - `src/repl/transport.rs` — framed JSON-RPC client (`RpcClient`) with NDJSON / LSP framing and a broadcast notification channel. Reader thread demuxes by `id` presence.
+  - `src/repl/spawn.rs`, `src/repl/socket.rs` — transport bootstrappers for `--stdio -- <cmd>` and `--socket <path>` respectively. Mirror the server-side cfg split between Unix sockets and Windows named pipes.
+  - `src/repl/command.rs` — the DSL lexer/parser/dispatcher (`session.spawn(...)`, `send.text("…")`, `wait(matches(r"…"))`, `:rpc <method> {json}`, `:focus`, `:tabs`, etc.). Intent names like `send_prompt` / `key` / `wait_turn_matcher` are string literals here only — they flow to plugins through the generic `adapter.send` / `adapter.wait` surface.
+  - `src/repl/ctx.rs`, `src/repl/snapshot.rs` — shared `ReplCtx` (tabs, focus, history ring) plus a background "screen pump" that requests `adapter.snapshot` on every `session.changed` notification (with a 500 ms idle backstop).
+  - `src/repl/completer.rs`, `src/repl/highlighter.rs`, `src/repl/history.rs` — `reedline` trait impls (static DSL table + cached plugin names + live adapter ids for completion; nu-ansi-term-styled DSL highlighter; `FileBackedHistory` rooted at `Paths::repl_history_path()`).
+  - `src/repl/render.rs`, `src/repl/tui.rs` — ratatui-based renderer (header + tab strip + screen preview + history pane + input + footer) driven by an in-house line editor that consumes crossterm events and reuses the `Completer`/`Highlighter` traits. **No application-specific identifiers live in any of these modules** — the REPL is a client of the generic `adapter.*` surface.
 - Tests:
   - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
   - `tests/lua_classifier_tests.rs` — auto-enrolling classifier regression matrix. Loads every `<name>.txt` fixture under `tests/fixtures/claude_code/` with a sibling `<name>.expected.json` and drives it through `LuaExtension::built_in("claude-code")`.
   - `tests/lua_plugin_intents.rs` — per-intent contract tests (`send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`, `wait_turn_matcher`, the `cancelling` hold-state) driven through the generic `ExtensionHandle` API. Doubles as a reference for plugin authors writing new TUI plugins.
+  - `tests/repl_tests.rs` — gated `#[cfg(feature = "repl")]`. Drives `RpcClient` + `command::dispatch` against an in-process `serve_ndjson_with_state` over pipes: capabilities, full spawn→state→close cycle, raw `:rpc` passthrough, adapter-flavored `session.changed` notifications.
   - `tests/fixtures/claude_code/` — recorded screen fixtures for the classifier; update these when Claude Code's UI shifts. Adding a new fixture is a single-PR documentation-only change: drop a `<name>.txt` and sibling `<name>.expected.json` and the matrix picks them up.
 - Tooling and packaging:
   - `website/` — VitePress docs site.

@@ -1374,7 +1374,10 @@ mod tests {
             .expect("adapter.start must return the allocated session id")
             .to_string();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Generous 10 s deadline keeps the test reliable on busy CI hosts
+        // where parallel `/bin/sh` PTY spawns slow fork+exec; the steady-
+        // state behavior is observed within tens of milliseconds locally.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut saw_changed = false;
         while std::time::Instant::now() < deadline && !saw_changed {
             let poll_messages = server
@@ -1395,7 +1398,7 @@ mod tests {
         }
         assert!(
             saw_changed,
-            "expected session.changed notification for adapter session `{session}` within 5s"
+            "expected session.changed notification for adapter session `{session}` within 10s"
         );
 
         // Drain and close.

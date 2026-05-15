@@ -86,6 +86,34 @@ jobs:
         if: runner.os != 'macOS'
         run: rustup run stable cargo build --release --locked
 
+      # Opt-in REPL feature: keeps the default-build matrix lean while still
+      # exercising the `--features repl` path on every push. Windows is
+      # check-only for v1 — the TUI integration test relies on a unix
+      # `/bin/sh` fixture and is unix-gated at the source level.
+      - name: Check (--features repl, macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" check --locked --features repl
+      - name: Check (--features repl)
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo check --locked --features repl
+      - name: Clippy (--features repl)
+        if: runner.os != 'macOS'
+        run: rustup run stable cargo clippy --locked --features repl --tests -- -D warnings
+      - name: Test (--features repl, macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          export RUSTC="$(rustup which rustc --toolchain stable)"
+          CARGO_BIN="$(rustup which cargo --toolchain stable)"
+          "$CARGO_BIN" test --locked --features repl --lib --bins --tests
+      - name: Test (--features repl)
+        if: runner.os == 'ubuntu-latest'
+        run: rustup run stable cargo test --locked --features repl
+
   coverage:
     runs-on: ubuntu-latest
     continue-on-error: true
