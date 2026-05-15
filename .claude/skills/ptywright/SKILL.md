@@ -65,7 +65,7 @@ Same protocol, but over a local IPC endpoint:
 - **macOS/Linux**: Unix domain socket. Stale socket files are removed on startup; non-socket files are refused.
 - **Windows**: named pipe via the `interprocess` crate. Use a name like `\\.\pipe\ptywright`.
 
-Multiple clients can connect concurrently and share session/Claude-adapter state. Each connection has its own framing/subscription state.
+Multiple clients can connect concurrently. **Only `session.*` ids are shared across connections** (via `RpcServerState`); `claude.*` adapter ids and `adapter.*` extension ids live in per-connection registries and cannot be looked up from a sibling socket client. If you need a long-lived adapter handle, keep one client open and serialise calls through it. Each connection also owns its own framing/subscription state.
 
 ### `ptywright completions <shell>`
 
@@ -478,7 +478,7 @@ ptywright serve --socket /tmp/ptywright.sock &
 nc -U /tmp/ptywright.sock <<<'{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}'
 ```
 
-Multiple `nc -U` clients can talk to the same server; session/Claude-adapter state is shared. Use a process supervisor in production; the binary itself does not daemonize.
+Multiple `nc -U` clients can talk to the same server. Only `session.*` ids are shared across connections; `claude.*` and `adapter.*` ids are per-connection — drive them from the same socket client that called `claude.start` / `adapter.start`. Use a process supervisor in production; the binary itself does not daemonize.
 
 ### Force a clean test environment
 

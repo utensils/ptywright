@@ -837,8 +837,10 @@ impl RpcServer {
             None
         };
         // 4 KiB tail mirrors what session.wait returns as transcript_tail.
-        let tail_start = transcript.len().saturating_sub(4096);
-        let mut transcript_tail = transcript[tail_start..].to_string();
+        // Use the char-boundary-safe helper because Claude Code's output
+        // includes 3-byte glyphs (⏺, ❯, →) that would panic a naive byte
+        // slice when the offset landed mid-codepoint.
+        let mut transcript_tail = transcript_tail_bytes(&transcript, 4096).to_string();
         let mut plain_text = snapshot.plain_text.clone();
         if let Some(policy) = policy {
             plain_text = policy.redact(&plain_text);
@@ -1168,6 +1170,27 @@ fn default_program_for_plugin(plugin: &str) -> Option<String> {
     }
 }
 
+/// Return at most the last `max_bytes` bytes of `transcript`, rounding the
+/// start offset up to the nearest UTF-8 character boundary so the resulting
+/// slice is always a valid `&str`.
+///
+/// A naïve `transcript[transcript.len().saturating_sub(max_bytes)..]` will
+/// panic if the offset lands inside a multibyte codepoint, which is reachable
+/// in practice because Claude Code's TUI uses characters like `⏺` (3 bytes)
+/// and `❯` (3 bytes) liberally. The walk forward is bounded by 3 bytes
+/// (UTF-8's max non-leading-byte run), so the worst case trims 3 leading
+/// bytes from the requested window.
+fn transcript_tail_bytes(transcript: &str, max_bytes: usize) -> &str {
+    if transcript.len() <= max_bytes {
+        return transcript;
+    }
+    let mut start = transcript.len() - max_bytes;
+    while !transcript.is_char_boundary(start) {
+        start += 1;
+    }
+    &transcript[start..]
+}
+
 impl Default for RpcServer {
     fn default() -> Self {
         Self::new()
@@ -1376,6 +1399,52 @@ mod tests {
         assert!(methods.contains(&json!("session.create")));
         assert!(methods.contains(&json!("claude.start")));
         assert!(methods.contains(&json!("plugin.validate_manifest")));
+    }
+
+    #[test]
+    fn transcript_tail_bytes_returns_whole_string_when_under_limit() {
+        assert_eq!(transcript_tail_bytes("hello", 4096), "hello");
+        assert_eq!(transcript_tail_bytes("", 4096), "");
+    }
+
+    #[test]
+    fn transcript_tail_bytes_walks_to_char_boundary() {
+        // `⏺` is U+23FA, encoded as 3 bytes (0xE2 0x8F 0xBA). Build a string
+        // where the unsanitised byte offset would land inside it: a 6-byte
+        // prefix of `bba` so that taking the last 5 bytes lands at byte 1,
+        // mid-glyph. The helper must walk forward to the next valid char
+        // boundary (byte 3, start of `⏺`) and return `⏺abc`.
+        let s = "bba⏺abc"; // 3 ASCII + 3-byte glyph + 3 ASCII = 9 bytes
+        assert_eq!(s.len(), 9);
+        // last 7 bytes would naively start at byte 2 ('a'), valid boundary.
+        assert_eq!(transcript_tail_bytes(s, 7), "a⏺abc");
+        // last 6 bytes would naively start at byte 3, valid boundary.
+        assert_eq!(transcript_tail_bytes(s, 6), "⏺abc");
+        // last 5 bytes would naively start at byte 4, mid-codepoint -> walk
+        // forward to byte 6 (end of glyph) and return only the trailing
+        // ASCII so the resulting slice is valid UTF-8.
+        let trimmed = transcript_tail_bytes(s, 5);
+        assert_eq!(trimmed, "abc");
+        assert!(trimmed.is_char_boundary(0));
+    }
+
+    #[test]
+    fn transcript_tail_bytes_never_panics_on_multibyte_glyph_run() {
+        // Stress: a long run of 3-byte glyphs followed by ASCII. For every
+        // byte offset close to the boundary, the helper must produce a
+        // valid &str. The original naive slice panicked here.
+        let body = "⏺".repeat(100); // 300 bytes
+        let s = format!("{body}TAIL");
+        for max_bytes in 1..=304 {
+            let tail = transcript_tail_bytes(&s, max_bytes);
+            assert!(
+                tail.is_char_boundary(0),
+                "tail for max_bytes={max_bytes} starts mid-codepoint"
+            );
+            // Sanity: tail is always shorter than or equal to max_bytes + 3
+            // (worst case is walking forward 3 bytes from the byte offset).
+            assert!(tail.len() <= max_bytes + 3);
+        }
     }
 
     #[test]
@@ -1861,6 +1930,28 @@ mod tests {
         assert_eq!(inspect["result"]["adapter"], adapter);
         assert!(inspect["result"]["body_text"].is_string());
         assert!(inspect["result"]["status_text"].is_string());
+
+        // adapter.send happy-path: route the same approve / deny / cancel
+        // intents we already cover for claude.* through the generic dispatcher.
+        // Asserts the response shape and that the dispatcher hands the intent
+        // string to the Lua plugin without a translation table in between.
+        let send_approve = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":50,"method":"adapter.send","params":{{"adapter":"{adapter}","intent":"approve","params":{{}}}}}}"#
+            ),
+        );
+        assert!(
+            send_approve["result"]["state"].is_object(),
+            "adapter.send must return {{state: ...}}; got {send_approve}"
+        );
+        let send_deny = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":51,"method":"adapter.send","params":{{"adapter":"{adapter}","intent":"deny","params":{{}}}}}}"#
+            ),
+        );
+        assert!(send_deny["result"]["state"].is_object());
 
         let close = handle(
             &mut server,

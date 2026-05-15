@@ -104,13 +104,19 @@ end
 local function has_trust_indicator(text)
   -- Claude Code's workspace-trust dialog asks "Do you trust the files in
   -- this folder?" with a numbered list (1. Yes, proceed / 2. No, exit).
-  -- Match the question + numbered options together so other prose
-  -- mentioning "trust" doesn't false-positive.
-  return contains(text, "do you trust the files")
-    or (contains(text, "trust the files") and contains_any(text, {
+  -- Require BOTH the question phrasing and at least one numbered-option
+  -- string. The earlier "question OR (phrase + option)" form let any
+  -- assistant prose containing "do you trust the files" classify as
+  -- waiting_for_trust, after which automation might submit `1`+Enter
+  -- against the user's actual conversation. Both branches now demand
+  -- one of the option strings; that means a model that quotes the
+  -- question but does not render the dialog body cannot trigger the
+  -- numeric approve action.
+  return (contains(text, "do you trust the files") or contains(text, "trust the files"))
+    and contains_any(text, {
       "yes, proceed",
       "no, exit",
-    }))
+    })
 end
 
 local function has_usage_screen(text)
