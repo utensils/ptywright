@@ -553,102 +553,96 @@ mod tests {
         assert_eq!(parse_last_intent(&plan), Some(ClaudeCodeState::Cancelling));
     }
 
+    /// Auto-enrolling classifier regression test.
+    ///
+    /// For every `*.txt` fixture under `tests/fixtures/claude_code/`, this
+    /// test loads a sibling `<name>.expected.json` describing the expected
+    /// state, evidence, optional `last_intent`, and a confidence floor, and
+    /// asserts the Lua-backed classifier still matches.
+    ///
+    /// Adding a new fixture is now a documentation-only change: drop the
+    /// two files (text + JSON) into the fixtures directory and this test
+    /// picks them up automatically. Fixtures without a matching
+    /// `.expected.json` are skipped with a warning to leave room for
+    /// exploratory captures that have not been classified yet.
     #[test]
     fn classifier_matches_sanitized_claude_code_fixtures() {
-        let fixtures = [
-            (
-                include_str!("../../tests/fixtures/claude_code/ready.txt"),
-                None,
-                ClaudeCodeState::Ready,
-                "ready prompt text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/thinking.txt"),
-                None,
-                ClaudeCodeState::Thinking,
-                "active work indicator detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/permission.txt"),
-                None,
-                ClaudeCodeState::WaitingForPermission,
-                "permission or approval prompt text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/plan_approval.txt"),
-                None,
-                ClaudeCodeState::WaitingForPlanApproval,
-                "plan approval text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/completed.txt"),
-                Some(ClaudeCodeState::PromptSubmitted),
-                ClaudeCodeState::CompletedTurn,
-                "stable input prompt after prompt submission",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/tool_use.txt"),
-                None,
-                ClaudeCodeState::Thinking,
-                "active work indicator detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/streaming_response.txt"),
-                None,
-                ClaudeCodeState::Thinking,
-                "active work indicator detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/interrupted.txt"),
-                Some(ClaudeCodeState::Cancelling),
-                ClaudeCodeState::WaitingForUserInput,
-                "input prompt glyph detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/permission_bash.txt"),
-                None,
-                ClaudeCodeState::WaitingForPermission,
-                "permission or approval prompt text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/plan_variant.txt"),
-                None,
-                ClaudeCodeState::WaitingForPlanApproval,
-                "plan approval text detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/usage.txt"),
-                Some(ClaudeCodeState::PromptSubmitted),
-                ClaudeCodeState::CompletedTurn,
-                "stable usage screen detected",
-            ),
-            (
-                include_str!("../../tests/fixtures/claude_code/error.txt"),
-                None,
-                ClaudeCodeState::Error,
-                "visible error banner detected",
-            ),
-            // Regression: Claude Code 2.1.142 puts `⏵⏵ bypass permissions on
-            // (shift+tab to cycle)` in the bottom status bar on an idle input
-            // screen. Before status-bar splitting the classifier matched the
-            // `permission` substring and returned `WaitingForPermission` at
-            // 0.84 confidence on an idle screen. The fix in
-            // `split_status_bar` + body/status plumbing must keep this
-            // classified as `WaitingForUserInput` (idle prompt glyph) rather
-            // than a permission dialog.
-            (
-                include_str!("../../tests/fixtures/claude_code/idle_bypass_permissions.txt"),
-                None,
-                ClaudeCodeState::WaitingForUserInput,
-                "input prompt glyph detected",
-            ),
-        ];
+        #[derive(serde::Deserialize)]
+        struct Expectation {
+            state: String,
+            evidence: String,
+            #[serde(default)]
+            last_intent: Option<String>,
+            #[serde(default = "default_min_confidence")]
+            min_confidence: f32,
+        }
 
-        for (index, (fixture, last_intent, expected, evidence)) in fixtures.into_iter().enumerate()
-        {
+        fn default_min_confidence() -> f32 {
+            0.6
+        }
+
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("claude_code");
+
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&fixtures_dir)
+            .unwrap_or_else(|err| panic!("read fixtures dir {}: {err}", fixtures_dir.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("txt"))
+            .collect();
+        entries.sort();
+
+        assert!(
+            !entries.is_empty(),
+            "no .txt fixtures found in {}",
+            fixtures_dir.display()
+        );
+
+        let extension = claude_plugin().expect("load plugin");
+        let mut asserted = 0usize;
+
+        for (index, txt_path) in entries.into_iter().enumerate() {
+            let fixture_name = txt_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| txt_path.display().to_string());
+
+            let expected_path = txt_path.with_extension("expected.json");
+            if !expected_path.exists() {
+                println!(
+                    "skipping fixture {fixture_name}: missing sibling {}",
+                    expected_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("<expected>.json")
+                );
+                continue;
+            }
+
+            let fixture_body = std::fs::read_to_string(&txt_path)
+                .unwrap_or_else(|err| panic!("read fixture {fixture_name}: {err}"));
+            let expected_raw = std::fs::read_to_string(&expected_path)
+                .unwrap_or_else(|err| panic!("read expectations for {fixture_name}: {err}"));
+            let expectation: Expectation = serde_json::from_str(&expected_raw)
+                .unwrap_or_else(|err| panic!("parse expectations for {fixture_name}: {err}"));
+
+            let expected_state = state_from_name(&expectation.state).unwrap_or_else(|| {
+                panic!(
+                    "unknown expected state {:?} in expectations for {fixture_name}",
+                    expectation.state
+                )
+            });
+            let last_intent = expectation.last_intent.as_deref().map(|name| {
+                state_from_name(name).unwrap_or_else(|| {
+                    panic!("unknown last_intent {name:?} in expectations for {fixture_name}")
+                })
+            });
+
             let state = classify_state(
-                &claude_plugin().expect("load plugin"),
-                fixture,
+                &extension,
+                &fixture_body,
                 "",
                 index as u64,
                 last_intent,
@@ -656,17 +650,33 @@ mod tests {
             )
             .unwrap_or_else(|err| {
                 panic!(
-                    "classify fixture {index} via Lua plugin: {err}\n--- fixture body ---\n{fixture}"
+                    "classify fixture {fixture_name} via Lua plugin: {err}\n--- fixture body ---\n{fixture_body}"
                 )
             });
+
             assert_eq!(
-                state.state, expected,
-                "fixture {index} classified with evidence: {}",
-                state.evidence
+                state.state, expected_state,
+                "fixture {fixture_name} classified as {:?} with evidence: {}",
+                state.state, state.evidence
             );
-            assert_eq!(state.evidence, evidence);
-            assert!(state.confidence >= 0.6);
+            assert_eq!(
+                state.evidence, expectation.evidence,
+                "fixture {fixture_name} evidence mismatch"
+            );
+            assert!(
+                state.confidence >= expectation.min_confidence,
+                "fixture {fixture_name} confidence {} below floor {}",
+                state.confidence,
+                expectation.min_confidence
+            );
+            asserted += 1;
         }
+
+        assert!(
+            asserted > 0,
+            "no fixtures had sibling .expected.json files under {}",
+            fixtures_dir.display()
+        );
     }
 
     #[test]
