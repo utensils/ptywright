@@ -206,27 +206,20 @@ fn prepare_file_appender(
     log_dir: &Path,
     max_days: u32,
 ) -> Option<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
-    if let Err(error) = std::fs::create_dir_all(log_dir) {
-        eprintln!(
-            "ptywright: failed to create log directory {}: {error}",
-            log_dir.display()
-        );
-        return None;
-    }
+    // Silent best-effort: logging is never load-bearing. In particular,
+    // `init_for_run` must not write to stderr or it will corrupt the user's
+    // live PTY bridge — so failures here cannot be surfaced through eprintln.
+    // Callers who need to confirm logging is working should inspect
+    // <home>/logs/ directly.
+    std::fs::create_dir_all(log_dir).ok()?;
     cleanup_old_logs(log_dir, max_days);
 
-    let appender = match RollingFileAppender::builder()
+    let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(LOG_PREFIX)
         .filename_suffix(LOG_SUFFIX)
         .build(log_dir)
-    {
-        Ok(a) => a,
-        Err(error) => {
-            eprintln!("ptywright: failed to create log appender: {error}");
-            return None;
-        }
-    };
+        .ok()?;
     Some(tracing_appender::non_blocking(appender))
 }
 
@@ -278,7 +271,14 @@ pub fn cleanup_old_logs(log_dir: &Path, max_days: u32) {
 }
 
 fn is_managed_log(name: &str) -> bool {
+    // RollingFileAppender emits "ptywright.<date>.log". Require the dot
+    // separator after the prefix and the .log suffix so the sweep does not
+    // touch unrelated files that merely share the bare prefix
+    // (e.g. "ptywright-notes.txt").
     name.starts_with(LOG_PREFIX)
+        && name.ends_with(LOG_SUFFIX)
+        && name.as_bytes().get(LOG_PREFIX.len()) == Some(&b'.')
+        && name.len() > LOG_PREFIX.len() + LOG_SUFFIX.len() + 1
 }
 
 /// `MakeWriter` adapter that redacts each formatted record before forwarding.
@@ -323,13 +323,11 @@ impl<W: Write> Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let text = std::str::from_utf8(buf).unwrap_or("");
         let redacted = self.policy.redact(text);
-        let bytes_written = self.inner.write(redacted.as_bytes())?;
-        // Report the original buffer length as consumed — the contract is "we
-        // accepted everything you handed us." Returning the redacted byte
-        // count would confuse callers tracking input progress.
-        if bytes_written == 0 && !buf.is_empty() {
-            return Ok(0);
-        }
+        // Use write_all: the redacted bytes do not correspond to any tail of
+        // `buf`, so a caller observing a short return cannot retry the
+        // remaining content. Looping inside the writer is the only way to
+        // honor the Write contract without silently truncating log records.
+        self.inner.write_all(redacted.as_bytes())?;
         Ok(buf.len())
     }
 
@@ -372,19 +370,35 @@ mod tests {
         let old = dir.join("ptywright.2024-01-01.log");
         let new = dir.join("ptywright.2026-05-14.log");
         let unrelated = dir.join("notes.txt");
+        let prefixed_unrelated = dir.join("ptywright-notes.txt");
+        let suffix_only = dir.join("server.log");
         fs::write(&old, b"old").unwrap();
         fs::write(&new, b"new").unwrap();
         fs::write(&unrelated, b"unrelated").unwrap();
+        fs::write(&prefixed_unrelated, b"prefixed").unwrap();
+        fs::write(&suffix_only, b"suffix").unwrap();
 
-        // Backdate the "old" file by 30 days.
+        // Backdate every "old"-shaped file by 30 days. Surface the error if
+        // mtime setting fails so the cleanup assertion can't pass for the
+        // wrong reason.
         let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        let _ = filetime_set_mtime(&old, thirty_days_ago);
+        filetime_set_mtime(&old, thirty_days_ago).expect("backdate old log");
+        filetime_set_mtime(&prefixed_unrelated, thirty_days_ago).expect("backdate prefixed file");
+        filetime_set_mtime(&suffix_only, thirty_days_ago).expect("backdate suffix-only file");
 
         cleanup_old_logs(&dir, 7);
 
         assert!(!old.exists(), "old ptywright log should be deleted");
         assert!(new.exists(), "recent ptywright log should be retained");
         assert!(unrelated.exists(), "unrelated files must not be touched");
+        assert!(
+            prefixed_unrelated.exists(),
+            "files with the bare 'ptywright' prefix but no '.<date>.log' shape must be preserved"
+        );
+        assert!(
+            suffix_only.exists(),
+            "files with the .log suffix but a different prefix must be preserved"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -396,7 +410,7 @@ mod tests {
         let old = dir.join("ptywright.2020-01-01.log");
         fs::write(&old, b"ancient").unwrap();
         let ten_years_ago = SystemTime::now() - Duration::from_secs(10 * 365 * 86_400);
-        let _ = filetime_set_mtime(&old, ten_years_ago);
+        filetime_set_mtime(&old, ten_years_ago).expect("backdate old log");
 
         cleanup_old_logs(&dir, 0);
 
@@ -405,10 +419,61 @@ mod tests {
     }
 
     #[test]
+    fn is_managed_log_only_matches_appender_output_shape() {
+        // Files the appender actually writes — both must match.
+        assert!(super::is_managed_log("ptywright.2026-05-14.log"));
+        assert!(super::is_managed_log("ptywright.2024-12-31.log"));
+        // Files that share the prefix but are not log records — must not match.
+        assert!(!super::is_managed_log("ptywright-notes.txt"));
+        assert!(!super::is_managed_log("ptywright"));
+        assert!(!super::is_managed_log("ptywright.log"));
+        assert!(!super::is_managed_log("ptywright.txt"));
+        // Unrelated files — must not match.
+        assert!(!super::is_managed_log("server.log"));
+        assert!(!super::is_managed_log("notes.txt"));
+    }
+
+    #[test]
     fn cleanup_ignores_missing_directory() {
         let dir = unique_tempdir("missing");
         // Do not create — function must not panic on ENOENT.
         cleanup_old_logs(&dir, 7);
+    }
+
+    #[test]
+    fn redacting_writer_handles_partial_inner_writes_without_truncation() {
+        // Inner writer that intentionally accepts only one byte per call,
+        // simulating a sink (e.g. a non-blocking pipe under load) that
+        // returns partial writes. RedactingWriter::write must loop until
+        // the full redacted record lands.
+        struct OneByteAtATime {
+            buf: Vec<u8>,
+        }
+        impl io::Write for OneByteAtATime {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                self.buf.push(buf[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = RedactingWriter {
+            inner: OneByteAtATime { buf: Vec::new() },
+            policy: Arc::new(RedactionPolicy::default()),
+        };
+        let input = b"INFO ptywright::run token=abc123def456 done\n";
+        let n = writer.write(input).expect("write");
+        assert_eq!(n, input.len(), "should report the full input as consumed");
+
+        let text = String::from_utf8(writer.inner.buf).expect("utf8");
+        assert!(text.contains("token=[REDACTED]"));
+        assert!(text.contains("done\n"), "trailing bytes must not be lost");
+        assert!(!text.contains("abc123def456"));
     }
 
     #[test]
@@ -520,13 +585,10 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Minimal cross-platform mtime setter without pulling in the `filetime`
-    /// crate just for one test. Falls back to no-op on platforms without the
-    /// expected APIs (the test then assumes the file is "new", which keeps
-    /// the assertion behavior consistent for both old and new files).
+    /// Set a file's mtime via the stable `std::fs::FileTimes` API. Used by
+    /// the cleanup-age test to backdate a log file without pulling in the
+    /// `filetime` crate; supported on every platform ptywright targets.
     fn filetime_set_mtime(path: &Path, target: SystemTime) -> io::Result<()> {
-        // Linux/macOS expose utimensat through libc::utimensat. The simplest
-        // portable approach is to use std::fs::FileTimes (Rust 1.75+).
         let times = std::fs::FileTimes::new().set_modified(target);
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
         file.set_times(times)?;

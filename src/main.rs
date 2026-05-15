@@ -101,16 +101,22 @@ fn cli_error_message(error: &ptywright::Error) -> String {
 fn run() -> ptywright::Result<ExitCode> {
     let cli = Cli::parse();
     let paths = Paths::from_env();
-    let config = match Config::load_or_default(&paths.config_path()) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("ptywright: {error}; falling back to default config");
-            Config::default()
-        }
+    // Capture any config-load failure so it can be reported through the
+    // logging stack (with redaction + per-mode sinks) instead of an
+    // unredacted `eprintln!` that would corrupt the live PTY in `run` mode.
+    let (config, config_load_error) = match Config::load_or_default(&paths.config_path()) {
+        Ok(config) => (config, None),
+        Err(error) => (Config::default(), Some(error)),
     };
     // Hold the guard for the lifetime of this function; dropped at exit so
     // tracing-appender flushes its non-blocking buffers.
     let _log_guard = init_logging_for(cli.command.as_ref(), &paths, &config.logging);
+    if let Some(error) = config_load_error {
+        tracing::warn!(
+            error = %error,
+            "failed to load config; falling back to defaults"
+        );
+    }
 
     match cli.command {
         Some(Commands::Run {
