@@ -67,6 +67,71 @@ Rules:
 
 See [JSON-RPC](./json-rpc.md) for methods and payloads.
 
+## `ptywright repl`
+
+Interactive REPL client for a running `ptywright serve`. Shipped as the default-on `repl` Cargo feature — pass `--no-default-features` at build time to opt out of the `reedline` / `ratatui` / `crossbeam-channel` / `nu-ansi-term` dependencies.
+
+```bash
+# Connect to a running daemon (Unix domain socket or Windows named pipe).
+ptywright serve --socket /tmp/ptywright.sock &
+ptywright repl --socket /tmp/ptywright.sock
+
+# …or spawn a child server and pipe JSON-RPC over its stdio in one command.
+ptywright repl --stdio -- ptywright serve --stdio
+```
+
+Options:
+
+| Option              | Default  | Meaning                                                                |
+| ------------------- | -------- | ---------------------------------------------------------------------- |
+| `--socket PATH`     | —        | Connect to a server listening on `PATH`.                               |
+| `--stdio`           | —        | Spawn a child server (pass its command + args after `--`).             |
+| `--framing FRAMING` | `ndjson` | JSON-RPC framing (`ndjson` or `lsp`). Must match the server's framing. |
+
+If neither `--socket` nor `--stdio` is supplied, the REPL connects to the default socket at `~/.ptywright/socket`.
+
+The REPL renders a `ratatui` chrome (header, tab strip, live screen preview, scrollable history pane, syntax-highlighted input, footer) and drives the generic `adapter.*` JSON-RPC surface from a small friendly DSL. The most common forms:
+
+```text
+plugins()                              # list built-in plugins
+session.spawn("claude-code")           # spawn an adapter
+session.list()                         # local tabs in this REPL
+session.live()                         # all adapters live on the server
+session.attach("e3")                   # adopt a sibling connection's adapter
+session.attach("all")                  # adopt every live adapter at once
+
+send.text("hello")                     # bracketed-paste a prompt
+send.key("shift-tab")                  # send a single named key
+send.intent("approve", { })            # invoke an arbitrary plugin intent
+
+wait(matches(r"❯"))                    # wait for a regex match
+wait(screen_stable(250ms))             # wait for the screen to settle
+
+state()                                # re-classify the focused adapter
+screen.snapshot()                      # render the PTY inline (styled)
+transcript.snapshot()                  # dump the focused adapter's transcript
+inspect()                              # diagnostic adapter dump
+```
+
+`send.key(...)` accepts the full host `Key` surface (see the [Lua extension API](../guide/extensions.md#host-api-exposed-to-lua-plugins)) with hyphens as a convenience: `enter`, `escape`, `tab`, `shift-tab`, `backspace`, `delete`, `space`, the arrows, the navigation cluster (`home`, `end`, `page-up`, `page-down`, `insert`), every `ctrl-a` through `ctrl-z` except the four that alias named keys (`ctrl-h`/`ctrl-i`/`ctrl-j`/`ctrl-m`), and `f1` through `f12`. Single characters that aren't aliases (`"y"`, `"n"`, `"1"`) fall through to typed text so quick acknowledgements work without dropping to `send.text`. Tab completion lists the most common keys (submit/cancel/edit, arrows, navigation) first.
+
+Meta commands prefixed with `:` cover REPL control and a raw JSON-RPC escape hatch:
+
+| Command                  | Effect                                                                                                                                                                      |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `:tabs`                  | List local adapter tabs.                                                                                                                                                    |
+| `:focus <id>`            | Switch focus to an adapter id.                                                                                                                                              |
+| `:live`                  | List adapters live on the server (cross-connection visibility).                                                                                                             |
+| `:attach <id\|all>`      | Adopt a sibling connection's adapter (tmux-style attach). `all` adopts every live adapter; `:attach <id>` auto-renders the adapter's current screen on attach.              |
+| `:notifications on\|off` | Subscribe / unsubscribe to `session.changed` / `session.exited` events. Notifications are enabled by default and rendered above the prompt via reedline's external printer. |
+| `:rpc <method> {json}`   | Send a raw JSON-RPC call and dump the response.                                                                                                                             |
+| `:help`                  | Show the inline help popup.                                                                                                                                                 |
+| `:quit`                  | Exit the REPL (also `Ctrl-D` on an empty prompt).                                                                                                                           |
+
+History is persisted to `~/.ptywright/repl-history` so previous sessions remain reachable through `Ctrl-R` reverse-search.
+
+A 500 ms `server.capabilities` heartbeat keeps the server's per-connection notification pump warm so events from sibling connections actually flush to an idle REPL. The heartbeat call is read-only by design, so it cannot race with a concurrent `:notifications off`.
+
 ## `ptywright completions`
 
 Generate shell completion registration scripts.
@@ -100,12 +165,13 @@ ptywright keeps configuration, log files, and other per-user state under `~/.pty
 
 ### Per-mode log sinks
 
-| Subcommand                           | Stderr | File | Notes                                                                               |
-| ------------------------------------ | :----: | :--: | ----------------------------------------------------------------------------------- |
-| `ptywright run`                      |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY. |
-| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                               |
-| `ptywright serve --socket`           |   ✓    |  ✓   | Same sinks as `--stdio`.                                                            |
-| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                  |
+| Subcommand                           | Stderr | File | Notes                                                                                                                                                                             |
+| ------------------------------------ | :----: | :--: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ptywright run`                      |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY.                                                                                               |
+| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                                                                                                                             |
+| `ptywright serve --socket`           |   ✓    |  ✓   | Same sinks as `--stdio`.                                                                                                                                                          |
+| `ptywright repl`                     |   ✓    |  ✓   | Uses the oneshot init. The REPL owns the screen via ratatui's alternate buffer, so any stderr writes appear in scrollback after the TUI exits rather than corrupting the live UI. |
+| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                                                                                                                |
 
 ### Environment variables
 
