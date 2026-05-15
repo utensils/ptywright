@@ -86,33 +86,34 @@ jobs:
         if: runner.os != 'macOS'
         run: rustup run stable cargo build --release --locked
 
-      # Opt-in REPL feature: keeps the default-build matrix lean while still
-      # exercising the `--features repl` path on every push. Windows is
-      # check-only for v1 — the TUI integration test relies on a unix
-      # `/bin/sh` fixture and is unix-gated at the source level.
-      - name: Check (--features repl, macOS)
+      # Lean baseline build (without the default `repl` feature). Keeps
+      # the `--no-default-features` path green so projects that opt out of
+      # the REPL stack — reedline, ratatui, crossbeam-channel,
+      # nu-ansi-term — don't suddenly stop building. Windows is
+      # check-only for v1.
+      - name: Check (--no-default-features, macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
           export RUSTC="$(rustup which rustc --toolchain stable)"
           CARGO_BIN="$(rustup which cargo --toolchain stable)"
-          "$CARGO_BIN" check --locked --features repl
-      - name: Check (--features repl)
+          "$CARGO_BIN" check --locked --no-default-features
+      - name: Check (--no-default-features)
         if: runner.os != 'macOS'
-        run: rustup run stable cargo check --locked --features repl
-      - name: Clippy (--features repl)
+        run: rustup run stable cargo check --locked --no-default-features
+      - name: Clippy (--no-default-features)
         if: runner.os != 'macOS'
-        run: rustup run stable cargo clippy --locked --features repl --tests -- -D warnings
-      - name: Test (--features repl, macOS)
+        run: rustup run stable cargo clippy --locked --no-default-features -- -D warnings
+      - name: Test (--no-default-features, macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
           export RUSTC="$(rustup which rustc --toolchain stable)"
           CARGO_BIN="$(rustup which cargo --toolchain stable)"
-          "$CARGO_BIN" test --locked --features repl --lib --bins --tests
-      - name: Test (--features repl)
+          "$CARGO_BIN" test --locked --no-default-features --lib --bins --tests
+      - name: Test (--no-default-features)
         if: runner.os == 'ubuntu-latest'
-        run: rustup run stable cargo test --locked --features repl
+        run: rustup run stable cargo test --locked --no-default-features
 
   coverage:
     runs-on: ubuntu-latest

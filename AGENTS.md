@@ -91,16 +91,15 @@ cargo test --locked
 cargo run -- --help
 ```
 
-Optional **`repl` feature** (interactive REPL client, `ptywright repl`):
+**`repl` feature** (interactive REPL client, `ptywright repl`) is on by default. To verify the lean build without `reedline` / `ratatui` / `crossbeam-channel` / `nu-ansi-term`:
 
 ```bash
-cargo check --locked --features repl
-cargo clippy --locked --features repl --tests -- -D warnings
-cargo test --locked --features repl
-cargo run --features repl -- repl --socket ~/.ptywright/socket
+cargo check --locked --no-default-features
+cargo clippy --locked --no-default-features -- -D warnings
+cargo test --locked --no-default-features
 ```
 
-CI exercises `--features repl` on Linux (check + clippy + test), macOS (check + test), and Windows (check only). The default build does not pull in the REPL's dependency stack (`reedline`, `ratatui`, `crossbeam-channel`, `nu-ansi-term`).
+CI exercises both lanes: the default build (with `repl`) and the `--no-default-features` build, on Linux (check + clippy + test), macOS (check + test), and Windows (check only).
 
 Run a single test:
 
@@ -142,7 +141,7 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/plugin.rs` — plugin manifests, permission declarations, runtime metadata enum, the `DefaultTarget` field plugins use to declare a default spawn program, and the `BUILTIN_PLUGINS` registry that pairs a manifest constructor with the embedded Lua source for every plugin shipped in the binary. Adding a new built-in plugin is a single `BuiltinPlugin { manifest, source }` entry in that slice.
   - `src/lua_plugin.rs` — trusted embedded Lua 5.4 runtime (mlua, vendored) used by plugins. Installs the `ptywright.action.*` / `ptywright.matcher.*` host helpers gated on manifest-declared permissions.
   - `plugins/claude-code/main.lua` — the trusted built-in Lua plugin that owns Claude-specific turn detection, stable-screen evidence, workspace-trust dialog detection, and usage-output parsing. There is no Rust shim wrapping it.
-- Optional REPL client (gated `#[cfg(feature = "repl")]`, off by default — `cargo build --features repl`):
+- REPL client (gated `#[cfg(feature = "repl")]`, on by default — opt out with `cargo build --no-default-features`):
   - `src/repl/mod.rs` — public entry (`ReplArgs`, `Transport`, `Framing`, `run`) invoked from `Commands::Repl`. Builds the right transport, holds the stdio child guard for the REPL's lifetime, hands off to the TUI.
   - `src/repl/transport.rs` — framed JSON-RPC client (`RpcClient`) with NDJSON / LSP framing and a broadcast notification channel. Reader thread demuxes by `id` presence.
   - `src/repl/spawn.rs`, `src/repl/socket.rs` — transport bootstrappers for `--stdio -- <cmd>` and `--socket <path>` respectively. Mirror the server-side cfg split between Unix sockets and Windows named pipes.

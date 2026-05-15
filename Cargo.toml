@@ -18,10 +18,10 @@ categories = ["command-line-utilities", "development-tools", "api-bindings"]
 default-run = "ptywright"
 
 [features]
-default = []
-# Interactive REPL client (`ptywright repl`). Off by default to keep the
-# baseline binary small and dependency-light. Enable with
-# `cargo build --features repl`.
+default = ["repl"]
+# Interactive REPL client (`ptywright repl`). Enabled by default; opt out
+# with `cargo build --no-default-features` if you need the lean baseline
+# build without `reedline` / `ratatui` / `crossbeam-channel` / `nu-ansi-term`.
 repl = [
     "dep:crossbeam-channel",
     "dep:nu-ansi-term",
