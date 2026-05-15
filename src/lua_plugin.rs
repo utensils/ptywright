@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use mlua::LuaSerdeExt;
 use serde::{Serialize, de::DeserializeOwned};
@@ -14,6 +15,7 @@ use crate::plugin::{PluginManifest, PluginManifestError, PluginPermission, Plugi
 
 const LUA_INSTRUCTION_HOOK_INTERVAL: u32 = 10_000;
 const LUA_INSTRUCTION_LIMIT: u64 = 5_000_000;
+const LUA_WALL_CLOCK_LIMIT: Duration = Duration::from_secs(5);
 
 /// Trusted Lua plugin runtime used for adapter/orchestration code.
 ///
@@ -25,7 +27,9 @@ pub struct LuaPlugin {
     exports: mlua::RegistryKey,
     permissions: BTreeSet<PluginPermission>,
     instruction_count: Rc<Cell<u64>>,
+    call_started_at: Rc<Cell<Option<Instant>>>,
     instruction_limit: u64,
+    wall_clock_limit: Duration,
 }
 
 impl fmt::Debug for LuaPlugin {
@@ -35,6 +39,7 @@ impl fmt::Debug for LuaPlugin {
             .field("name", &self.name)
             .field("permissions", &self.permissions)
             .field("instruction_limit", &self.instruction_limit)
+            .field("wall_clock_limit", &self.wall_clock_limit)
             .finish_non_exhaustive()
     }
 }
@@ -93,19 +98,16 @@ impl LuaPlugin {
         O: DeserializeOwned,
     {
         self.instruction_count.set(0);
-        let exports: mlua::Table = self
-            .lua
-            .registry_value(&self.exports)
-            .map_err(|error| self.error(error))?;
-        let function: mlua::Function = exports.get(function).map_err(|error| self.error(error))?;
-        let input = self
-            .lua
-            .to_value(input)
-            .map_err(|error| self.error(error))?;
-        let output: mlua::Value = function.call(input).map_err(|error| self.error(error))?;
-        self.lua
-            .from_value(output)
-            .map_err(|error| self.error(error))
+        self.call_started_at.set(Some(Instant::now()));
+        let result = (|| {
+            let exports: mlua::Table = self.lua.registry_value(&self.exports)?;
+            let function: mlua::Function = exports.get(function)?;
+            let input = self.lua.to_value(input)?;
+            let output: mlua::Value = function.call(input)?;
+            self.lua.from_value(output)
+        })();
+        self.call_started_at.set(None);
+        result.map_err(|error| self.error(error))
     }
 
     /// Call an exported Lua function and return raw JSON for tests and generic
@@ -126,16 +128,37 @@ impl LuaPlugin {
         source: &str,
         permissions: BTreeSet<PluginPermission>,
     ) -> Result<Self> {
+        Self::from_source_with_limits(
+            name,
+            source,
+            permissions,
+            LUA_INSTRUCTION_LIMIT,
+            LUA_WALL_CLOCK_LIMIT,
+        )
+    }
+
+    fn from_source_with_limits(
+        name: String,
+        source: &str,
+        permissions: BTreeSet<PluginPermission>,
+        instruction_limit: u64,
+        wall_clock_limit: Duration,
+    ) -> Result<Self> {
         let lua = new_lua().map_err(|error| lua_error(&name, error))?;
-        let instruction_count = install_instruction_limit(&lua, LUA_INSTRUCTION_LIMIT)
-            .map_err(|error| lua_error(&name, error))?;
+        let call_started_at = Rc::new(Cell::new(Some(Instant::now())));
+        let instruction_count = install_execution_limits(
+            &lua,
+            instruction_limit,
+            wall_clock_limit,
+            Rc::clone(&call_started_at),
+        )
+        .map_err(|error| lua_error(&name, error))?;
         install_host_api(&lua, &permissions).map_err(|error| lua_error(&name, error))?;
         instruction_count.set(0);
-        let exports: mlua::Table = lua
-            .load(source)
-            .set_name(&name)
-            .eval()
-            .map_err(|error| lua_error(&name, error))?;
+        call_started_at.set(Some(Instant::now()));
+        let exports_result: mlua::Result<mlua::Table> = lua.load(source).set_name(&name).eval();
+        call_started_at.set(None);
+        let exports = exports_result.map_err(|error| lua_error(&name, error))?;
         let exports = lua
             .create_registry_value(exports)
             .map_err(|error| lua_error(&name, error))?;
@@ -145,7 +168,9 @@ impl LuaPlugin {
             exports,
             permissions,
             instruction_count,
-            instruction_limit: LUA_INSTRUCTION_LIMIT,
+            call_started_at,
+            instruction_limit,
+            wall_clock_limit,
         })
     }
 
@@ -161,9 +186,11 @@ fn new_lua() -> mlua::Result<mlua::Lua> {
     )
 }
 
-fn install_instruction_limit(
+fn install_execution_limits(
     lua: &mlua::Lua,
     instruction_limit: u64,
+    wall_clock_limit: Duration,
+    call_started_at: Rc<Cell<Option<Instant>>>,
 ) -> mlua::Result<Rc<Cell<u64>>> {
     let instruction_count = Rc::new(Cell::new(0_u64));
     let hook_count = Rc::clone(&instruction_count);
@@ -177,6 +204,13 @@ fn install_instruction_limit(
             if next > instruction_limit {
                 return Err(mlua::Error::RuntimeError(
                     "Lua plugin instruction limit exceeded".to_string(),
+                ));
+            }
+            if let Some(started_at) = call_started_at.get()
+                && started_at.elapsed() > wall_clock_limit
+            {
+                return Err(mlua::Error::RuntimeError(
+                    "Lua plugin wall-clock limit exceeded".to_string(),
                 ));
             }
             Ok(mlua::VmState::Continue)
@@ -568,5 +602,30 @@ mod tests {
 
         assert!(matches!(error, Error::Lua(_)));
         assert!(error.to_string().contains("instruction limit exceeded"));
+    }
+
+    #[test]
+    fn lua_plugin_calls_have_wall_clock_limit() {
+        let plugin = LuaPlugin::from_source_with_limits(
+            "wall-clock".to_string(),
+            r#"
+            return {
+              run = function(_input)
+                while true do end
+              end
+            }
+            "#,
+            all_host_permissions().into_iter().collect(),
+            u64::MAX,
+            Duration::from_millis(1),
+        )
+        .expect("load plugin");
+
+        let error = plugin
+            .call_value("run", &json!({}))
+            .expect_err("wall-clock loop should be interrupted");
+
+        assert!(matches!(error, Error::Lua(_)));
+        assert!(error.to_string().contains("wall-clock limit exceeded"));
     }
 }

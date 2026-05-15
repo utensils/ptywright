@@ -8,7 +8,7 @@
 
 ptywright is an early general-purpose PTY/TUI automation toolkit. It is designed to drive interactive terminal applications from code without coupling the core abstractions to any one program.
 
-The library now includes initial target, session, rich screen snapshot, action, temporal matcher, transcript, redaction, JSON-RPC, a Lua-backed interactive Claude Code adapter with stable-screen turn evidence, plugin manifest/runtime primitives, and shell completion primitives backed by real PTYs. The CLI includes `run` for live stdin/stdout PTY debugging, `serve --stdio` for NDJSON or LSP-style JSON-RPC automation, Unix socket serving on macOS/Linux, and `completions` for shell setup. On Windows, `serve --stdio` is the supported automation transport while named-pipe parity is designed.
+The library now includes initial target, session, rich screen snapshot, action, temporal matcher, bounded transcripts with optional raw file streaming, redaction, JSON-RPC, a Lua-backed interactive Claude Code adapter with stable-screen turn evidence, plugin manifest/runtime primitives, and shell completion primitives backed by real PTYs. The CLI includes `run` for live stdin/stdout PTY debugging, `serve --stdio` for NDJSON or LSP-style JSON-RPC automation, multi-client local IPC via Unix sockets on macOS/Linux and named pipes on Windows, and `completions` for shell setup.
 
 Docs: <https://utensils.io/ptywright/>
 
@@ -58,19 +58,18 @@ nix run github:utensils/ptywright -- --help
 3. Terminal screen observation.
 4. Input actions and key sequences.
 5. Matchers and waits.
-6. Bounded transcript capture.
-7. JSON-RPC over stdio or Unix sockets for external automation clients, with NDJSON and LSP-style framing.
+6. Bounded transcript capture with explicit raw transcript file streaming opt-in.
+7. JSON-RPC over stdio or multi-client local IPC for external automation clients, with NDJSON and LSP-style framing.
 8. Interactive Claude Code adapter built on the generic PTY layers with Claude-specific logic in a built-in Lua plugin.
 9. Plugin manifests, permission declarations, and trusted embedded Lua runtime for adapter orchestration, including explicit local plugin loading from Rust APIs.
 10. Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
 11. Rich screen snapshots with cell/style/mode metadata.
-12. Redaction helpers and default RPC redaction for sensitive-looking output.
+12. Redaction helpers with built-in and caller-supplied patterns plus default RPC redaction for sensitive-looking output.
 
 ## Planned layers
 
 1. More Claude Code real-world fixtures and transition tests as upstream Claude Code UI changes.
-2. Windows named-pipe server mode if stdio is not sufficient for Windows local automation.
-3. Optional WASM only if untrusted marketplace-style plugins become a concrete priority.
+2. Optional WASM only if untrusted marketplace-style plugins become a concrete priority.
 
 ## Development
 

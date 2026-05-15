@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod run_terminal;
-use ptywright::{DESCRIPTION, NAME, TerminalSize, serve_lsp, serve_ndjson};
+use ptywright::{
+    DESCRIPTION, NAME, RpcServerState, TerminalSize, serve_lsp, serve_lsp_with_state, serve_ndjson,
+    serve_ndjson_with_state,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -223,22 +226,56 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
     }
 
     let listener = UnixListener::bind(path)?;
+    let state = RpcServerState::new();
     eprintln!("ptywright: listening on {}", path.display());
     for stream in listener.incoming() {
         let stream = stream?;
         let input = stream.try_clone()?;
-        match framing {
-            RpcFraming::Ndjson => serve_ndjson(input, stream)?,
-            RpcFraming::Lsp => serve_lsp(input, stream)?,
-        }
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let result = match framing {
+                RpcFraming::Ndjson => serve_ndjson_with_state(input, stream, state),
+                RpcFraming::Lsp => serve_lsp_with_state(input, stream, state),
+            };
+            if let Err(error) = result {
+                let message = ptywright::RedactionPolicy::default().redact(&error.to_string());
+                eprintln!("ptywright: socket client error: {message}");
+            }
+        });
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
+
+    let name = path.as_os_str().to_fs_name::<GenericFilePath>()?;
+    let listener = ListenerOptions::new().name(name).create_sync()?;
+    let state = RpcServerState::new();
+    eprintln!("ptywright: listening on {}", path.display());
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let (input, output) = stream.split();
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let result = match framing {
+                RpcFraming::Ndjson => serve_ndjson_with_state(input, output, state),
+                RpcFraming::Lsp => serve_lsp_with_state(input, output, state),
+            };
+            if let Err(error) = result {
+                let message = ptywright::RedactionPolicy::default().redact(&error.to_string());
+                eprintln!("ptywright: socket client error: {message}");
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn serve_socket(path: &Path, _framing: RpcFraming) -> ptywright::Result<()> {
     Err(ptywright::Error::Rpc(format!(
-        "--socket is not supported on this platform yet; Windows named-pipe support is planned (requested {})",
+        "--socket is not supported on this platform yet (requested {})",
         path.display()
     )))
 }
