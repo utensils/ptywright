@@ -16,7 +16,7 @@ use crate::plugin::{BUILTIN_PLUGINS, PluginHostCapabilities, PluginManifest, Plu
 use crate::redaction::RedactionPolicy;
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
-use crate::transcript::TranscriptFileConfig;
+use crate::transcript::{TranscriptDelta, TranscriptFileConfig};
 use crate::{NAME, VERSION};
 
 /// `completed_turn_stable_ms` forwarded to plugins via the `ExtensionHandle`.
@@ -115,6 +115,14 @@ pub struct RpcServer {
     shared: RpcServerState,
     notifications_enabled: bool,
     last_notified_sequences: HashMap<String, u64>,
+    /// Per-session cursor into the transcript's monotonic `chars_written`
+    /// counter. Used to drive `session.output` notifications: each tick we
+    /// read the delta since the cursor and advance it, regardless of any
+    /// ring-buffer evictions on the producer side (those surface as
+    /// `dropped: true` in the notification payload). One cursor per
+    /// connection — each `RpcServer` instance is its own subscriber and
+    /// independently catches up after `server.set_notifications`.
+    last_notified_outputs: HashMap<String, u64>,
     notified_exits: HashSet<String>,
 }
 
@@ -219,6 +227,29 @@ struct PluginUnloadParams {
 #[derive(Debug, Deserialize)]
 struct NotificationsParams {
     enabled: bool,
+}
+
+/// One session's notification-relevant snapshot for a single `poll_notifications`
+/// tick. Collected in [`RpcServer::collect_notification_entries`] so the dispatch
+/// loop emits at most one `session.changed`, one `session.output`, and one
+/// `session.exited` per session per tick — and never re-reads session state
+/// while emitting.
+struct SessionNotificationEntry {
+    id: String,
+    sequence: u64,
+    finished: bool,
+    /// Transcript delta since the per-connection cursor, or `None` when the
+    /// cursor is already at `chars_written`. Carries its own next-cursor in
+    /// `TranscriptDelta::cursor` so the emitter advances atomically with the
+    /// payload it sent.
+    output: Option<TranscriptDelta>,
+}
+
+/// Pair of cloned-out registry views taken under one short lock.
+/// See [`RpcServer::snapshot_session_registry`].
+struct SessionRegistrySnapshot {
+    direct: Vec<(String, Arc<Session>)>,
+    adapter_arcs: Vec<Arc<Mutex<ExtensionEntry>>>,
 }
 
 // ---- adapter.* (generic plugin-backed) params ---------------------------
@@ -431,6 +462,7 @@ impl RpcServer {
             shared,
             notifications_enabled: false,
             last_notified_sequences: HashMap::new(),
+            last_notified_outputs: HashMap::new(),
             notified_exits: HashSet::new(),
         }
     }
@@ -480,65 +512,17 @@ impl RpcServer {
 
     fn poll_notifications(&mut self) -> Result<Vec<String>> {
         let mut messages = Vec::new();
+        let mut entries = self.collect_notification_entries();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
 
-        // Shared sessions first (allocated via `session.create`). Snapshot the
-        // current list under the lock so we can release it before emitting.
-        let mut sessions = self
-            .shared
-            .inner
-            .lock()
-            .expect("rpc shared state poisoned")
-            .sessions
-            .iter()
-            .map(|(id, session)| (id.clone(), session.sequence(), session.is_finished()))
-            .collect::<Vec<_>>();
-        sessions.sort_by(|(left, ..), (right, ..)| left.cmp(right));
+        for entry in entries {
+            let SessionNotificationEntry {
+                id,
+                sequence,
+                finished,
+                output,
+            } = entry;
 
-        // Adapter-backed sessions live in shared state so every connection
-        // sees the same set. Clone the Arcs out under one short lock,
-        // then read each entry's session metadata without holding the
-        // outer registry lock for the duration of the iteration.
-        //
-        // **Use `try_lock` rather than `lock`** when reading each adapter
-        // entry: a long-running `adapter.wait` holds the same per-entry
-        // mutex for the entire wait duration (up to `timeout_ms`,
-        // defaulting to 120 s — see `adapter_wait`). A `lock()` here
-        // would block this whole notification-poll behind the wait,
-        // which in turn stalls every other connection's `session.changed`
-        // / `session.exited` flow (including the heartbeat-driven flush
-        // from idle REPLs). Skipping a contended entry means we miss one
-        // tick for that adapter — the next inbound request from any
-        // connection re-polls and catches up — but the other adapters'
-        // notifications keep flowing.
-        let adapter_arcs: Vec<Arc<Mutex<ExtensionEntry>>> = self
-            .shared
-            .inner
-            .lock()
-            .expect("rpc shared state poisoned")
-            .extensions
-            .values()
-            .cloned()
-            .collect();
-        let mut adapter_sessions: Vec<(String, u64, bool)> = adapter_arcs
-            .into_iter()
-            .filter_map(|arc| match arc.try_lock() {
-                Ok(entry) => {
-                    let session = entry.handle.session();
-                    Some((
-                        entry.session.clone(),
-                        session.sequence(),
-                        session.is_finished(),
-                    ))
-                }
-                // Entry is busy — almost always an in-flight `adapter.wait`.
-                // Skip it for this tick rather than block all of polling.
-                Err(_) => None,
-            })
-            .collect();
-        adapter_sessions.sort_by(|(left, ..), (right, ..)| left.cmp(right));
-        sessions.append(&mut adapter_sessions);
-
-        for (id, sequence, finished) in sessions {
             if self.last_notified_sequences.get(&id).copied() != Some(sequence) {
                 self.last_notified_sequences.insert(id.clone(), sequence);
                 messages.push(serialize_response(json!({
@@ -550,6 +534,27 @@ impl RpcServer {
                     },
                 }))?);
             }
+
+            if let Some(delta) = output {
+                self.last_notified_outputs.insert(id.clone(), delta.cursor);
+                let mut params = json!({
+                    "session": id,
+                    "sequence": sequence,
+                    "output": delta.text,
+                });
+                if delta.dropped {
+                    params
+                        .as_object_mut()
+                        .expect("params object")
+                        .insert("dropped".to_string(), json!(true));
+                }
+                messages.push(serialize_response(json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session.output",
+                    "params": params,
+                }))?);
+            }
+
             if finished && self.notified_exits.insert(id.clone()) {
                 messages.push(serialize_response(json!({
                     "jsonrpc": JSONRPC_VERSION,
@@ -563,6 +568,69 @@ impl RpcServer {
         }
 
         Ok(messages)
+    }
+
+    /// Snapshot every session (directly-spawned and adapter-backed) into the
+    /// data we need to emit a single notification batch: id, current
+    /// sequence, finished flag, and the transcript delta since this
+    /// connection's cursor.
+    ///
+    /// **Locking note.** Adapter entries are read with `try_lock` because a
+    /// long-running `adapter.wait` holds the same per-entry mutex for the
+    /// entire wait (up to `timeout_ms`, default 120 s). A blocking `lock()`
+    /// here would stall every other connection's `session.*` flow behind a
+    /// single contended adapter. Skipping a busy entry means we miss one
+    /// tick — the next inbound request re-polls and catches up.
+    fn collect_notification_entries(&self) -> Vec<SessionNotificationEntry> {
+        let mut entries = Vec::new();
+        let snapshot = self.snapshot_session_registry();
+
+        for (id, session) in snapshot.direct {
+            entries.push(self.build_notification_entry(id, session.as_ref()));
+        }
+
+        for arc in snapshot.adapter_arcs {
+            let Ok(entry) = arc.try_lock() else { continue };
+            let id = entry.session.clone();
+            let session = entry.handle.session();
+            entries.push(self.build_notification_entry(id, session));
+        }
+
+        entries
+    }
+
+    /// One-lock snapshot of the shared session registry. Cloning the Arcs out
+    /// under a brief lock lets the caller iterate without holding the registry
+    /// lock across per-session reads (which take their own internal locks and
+    /// would otherwise serialise behind it).
+    fn snapshot_session_registry(&self) -> SessionRegistrySnapshot {
+        let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        SessionRegistrySnapshot {
+            direct: shared
+                .sessions
+                .iter()
+                .map(|(id, session)| (id.clone(), Arc::clone(session)))
+                .collect(),
+            adapter_arcs: shared.extensions.values().cloned().collect(),
+        }
+    }
+
+    fn build_notification_entry(&self, id: String, session: &Session) -> SessionNotificationEntry {
+        let sequence = session.sequence();
+        let finished = session.is_finished();
+        let cursor = self.last_notified_outputs.get(&id).copied().unwrap_or(0);
+        // Notifications fire without a caller-supplied redaction policy, so
+        // we apply the host default — same policy `adapter.transcript`
+        // applies when `redact` is omitted. Subscribers that want raw bytes
+        // can still call `adapter.transcript { redact: false }`.
+        let delta = session.redacted_transcript_delta_since(cursor, &RedactionPolicy::default());
+        let output = (delta.cursor > cursor).then_some(delta);
+        SessionNotificationEntry {
+            id,
+            sequence,
+            finished,
+            output,
+        }
     }
 
     fn handle_request(&mut self, request: Request) -> std::result::Result<Value, RpcErrorPayload> {
@@ -612,7 +680,7 @@ impl RpcServer {
                     "plugin.load",
                     "plugin.unload"
                 ],
-                "notifications": ["session.changed", "session.exited"]
+                "notifications": ["session.changed", "session.output", "session.exited"]
             })),
             "server.set_notifications" => self.server_set_notifications(request.params),
             "session.create" => self.session_create(request.params),

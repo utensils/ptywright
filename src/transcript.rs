@@ -55,7 +55,26 @@ impl Default for TranscriptConfig {
 pub struct Transcript {
     config: TranscriptConfig,
     chars: VecDeque<char>,
+    /// Total chars ever pushed, never decremented when the ring buffer evicts.
+    /// Stable cursor for subscribers asking "what's new since cursor N?" —
+    /// see [`Transcript::delta_since`].
+    chars_written: u64,
     raw_file: Option<File>,
+}
+
+/// Output appended to a [`Transcript`] since a subscriber's cursor.
+///
+/// `dropped` is set when the unseen range exceeded the ring buffer's retention
+/// window — `text` then carries the buffer tail rather than the full delta.
+#[derive(Debug, Clone)]
+pub struct TranscriptDelta {
+    /// Newly-appended text since the caller's cursor.
+    pub text: String,
+    /// Cursor to pass on the next call to advance past this delta.
+    pub cursor: u64,
+    /// True if the bounded buffer dropped some of the unseen range before we
+    /// could return it. `text` is the (smaller) tail that survived.
+    pub dropped: bool,
 }
 
 impl Transcript {
@@ -69,6 +88,7 @@ impl Transcript {
         Ok(Self {
             config,
             chars: VecDeque::new(),
+            chars_written: 0,
             raw_file,
         })
     }
@@ -82,6 +102,7 @@ impl Transcript {
         let text = String::from_utf8_lossy(bytes);
         for ch in text.chars() {
             self.chars.push_back(ch);
+            self.chars_written = self.chars_written.saturating_add(1);
             while self.chars.len() > self.config.max_chars {
                 self.chars.pop_front();
             }
@@ -103,6 +124,39 @@ impl Transcript {
             .iter()
             .skip(len.saturating_sub(max_chars))
             .collect()
+    }
+
+    /// Total chars ever pushed since this transcript was created. Survives
+    /// ring-buffer evictions so subscribers can carry a stable cursor.
+    #[must_use]
+    pub const fn chars_written(&self) -> u64 {
+        self.chars_written
+    }
+
+    /// Text appended since `cursor`. Returns an empty delta when the caller is
+    /// already at `chars_written()`.
+    #[must_use]
+    pub fn delta_since(&self, cursor: u64) -> TranscriptDelta {
+        let total = self.chars_written;
+        if cursor >= total {
+            return TranscriptDelta {
+                text: String::new(),
+                cursor: total,
+                dropped: false,
+            };
+        }
+        let unseen = (total - cursor) as usize;
+        let buffered = self.chars.len();
+        let (text, dropped) = if unseen > buffered {
+            (self.chars.iter().collect(), true)
+        } else {
+            (self.chars.iter().skip(buffered - unseen).collect(), false)
+        };
+        TranscriptDelta {
+            text,
+            cursor: total,
+            dropped,
+        }
     }
 }
 
@@ -147,6 +201,52 @@ mod tests {
 
         assert_eq!(transcript.text(), "world");
         assert_eq!(transcript.tail(3), "rld");
+    }
+
+    #[test]
+    fn delta_since_returns_appended_text_and_advances_cursor() {
+        let mut transcript = Transcript::default();
+        let initial = transcript.delta_since(0);
+        assert_eq!(initial.text, "");
+        assert_eq!(initial.cursor, 0);
+        assert!(!initial.dropped);
+
+        transcript.push_bytes(b"hello").expect("push hello");
+        let after_hello = transcript.delta_since(0);
+        assert_eq!(after_hello.text, "hello");
+        assert_eq!(after_hello.cursor, 5);
+        assert!(!after_hello.dropped);
+
+        transcript.push_bytes(b" world").expect("push world");
+        let after_world = transcript.delta_since(after_hello.cursor);
+        assert_eq!(after_world.text, " world");
+        assert_eq!(after_world.cursor, 11);
+        assert!(!after_world.dropped);
+
+        let idempotent = transcript.delta_since(after_world.cursor);
+        assert_eq!(idempotent.text, "");
+        assert_eq!(idempotent.cursor, 11);
+    }
+
+    #[test]
+    fn delta_since_flags_dropped_when_unseen_range_exceeds_buffer() {
+        // Tiny ring buffer so eviction is easy to trigger. `chars_written`
+        // still counts every push, so the cursor stays meaningful — the delta
+        // just flags that some of the unseen range was lost.
+        let mut transcript = Transcript::new(TranscriptConfig {
+            max_chars: 4,
+            raw_file: None,
+        })
+        .expect("create transcript");
+        transcript.push_bytes(b"abcdefgh").expect("push bytes");
+
+        let delta = transcript.delta_since(0);
+        assert!(delta.dropped, "lossy delta should flag dropped=true");
+        assert_eq!(
+            delta.text, "efgh",
+            "dropped delta carries the surviving tail"
+        );
+        assert_eq!(delta.cursor, 8);
     }
 
     #[test]

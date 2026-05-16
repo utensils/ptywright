@@ -203,3 +203,90 @@ fn notifications_subscription_fires_for_adapter_sessions() {
         Duration::from_secs(5),
     );
 }
+
+#[test]
+fn capabilities_advertises_session_output_notification() {
+    let (client, _server) = in_process_client();
+    let capabilities = client
+        .call("server.capabilities", json!({}), Duration::from_secs(5))
+        .expect("server.capabilities");
+    let notifications = capabilities["notifications"]
+        .as_array()
+        .expect("notifications array");
+    let names: Vec<&str> = notifications.iter().filter_map(|n| n.as_str()).collect();
+    assert!(
+        names.contains(&"session.output"),
+        "capabilities.notifications must include `session.output`; got {names:?}",
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn session_output_notification_carries_emitted_text() {
+    let (client, _server) = in_process_client();
+    let notifications = client.notifications();
+
+    let _ = client
+        .call(
+            "server.set_notifications",
+            json!({ "enabled": true }),
+            Duration::from_secs(5),
+        )
+        .expect("enable notifications");
+
+    // Spawn a tiny fixture that emits a distinctive token then idles so the
+    // PTY stays open long enough for the notification to flush. `cat` keeps
+    // the child alive without further output.
+    let start = client
+        .call(
+            "adapter.start",
+            json!({
+                "plugin": "claude-code",
+                "program": "/bin/sh",
+                "args": ["-lc", "printf 'output-notif-fixture\\n' && cat"],
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("adapter.start");
+    let adapter = start["adapter"].as_str().expect("adapter id").to_string();
+    let session = start["session"].as_str().expect("session id").to_string();
+
+    // Poke the server periodically so notification polling flushes between
+    // requests — mirrors the existing `session.changed` integration test.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut collected = String::new();
+    let mut last_sequence: u64 = 0;
+    while std::time::Instant::now() < deadline && !collected.contains("output-notif-fixture") {
+        let _ = client.call(
+            "adapter.state",
+            json!({ "adapter": adapter }),
+            Duration::from_secs(5),
+        );
+        if let Ok(notification) = notifications.recv_timeout(Duration::from_millis(100))
+            && notification.method == "session.output"
+            && notification.params["session"] == session.as_str()
+        {
+            let seq = notification.params["sequence"]
+                .as_u64()
+                .expect("sequence field");
+            assert!(
+                seq >= last_sequence,
+                "session.output sequences must be monotonic; got {seq} after {last_sequence}",
+            );
+            last_sequence = seq;
+            if let Some(text) = notification.params["output"].as_str() {
+                collected.push_str(text);
+            }
+        }
+    }
+    assert!(
+        collected.contains("output-notif-fixture"),
+        "expected session.output to carry fixture text within 5s; got: {collected:?}",
+    );
+
+    let _ = client.call(
+        "adapter.close",
+        json!({ "adapter": adapter }),
+        Duration::from_secs(5),
+    );
+}
