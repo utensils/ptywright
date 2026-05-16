@@ -38,7 +38,13 @@ pub const STATUS_BAR_ROWS: usize = 3;
 /// confidence score in `[0.0, 1.0]`, a human-readable `evidence` string, the
 /// session `sequence` observed at classification time, and an optional list
 /// of ranked runner-up `candidates`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `#[non_exhaustive]` is set so future plugin-driven additions (richer
+/// candidate metadata, classifier latency, …) can land without
+/// source-breaking downstream Rust callers — construct via the public
+/// builders or struct-update syntax (`..Default::default()`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ExtensionStateSnapshot {
     /// Plugin-defined classification, e.g. `"ready"`, `"thinking"`, etc.
     pub state: String,
