@@ -41,6 +41,44 @@ local function state_snapshot(state, confidence, evidence, sequence, metadata)
   }
 end
 
+-- Best-effort plugin-side redaction for text that we expose through
+-- `ExtensionStateSnapshot.metadata` (permission dialog summaries today).
+-- The host applies `RedactionPolicy::default()` to screen/transcript reads
+-- but state-shaped responses (adapter.state / send / wait) don't go
+-- through that filter. Without this guard, a permission prompt for a
+-- Bash command can carry a `token=…` / `sk-…` / `AKIA…` value in the
+-- metadata summary even when callers rely on default-redacted reads.
+-- Mirror the most common Rust-side patterns; document on the wire that
+-- callers handling secrets must apply their own redaction layer for
+-- guarantees beyond best-effort.
+local SECRET_PATTERNS = {
+  -- `token=value`, `password=value`, `api_key=value` — keep the prefix.
+  "([Tt]oken%s*=%s*)([^%s\"']+)",
+  "([Pp]assword%s*=%s*)([^%s\"']+)",
+  "([Aa]pi[_-]?[Kk]ey%s*=%s*)([^%s\"']+)",
+  "([Ss]ecret%s*=%s*)([^%s\"']+)",
+  -- Anthropic / OpenAI style API key prefixes.
+  "()(sk%-[%w%-_]+)",
+  "()(sk%-ant%-[%w%-_]+)",
+  -- AWS access key id.
+  "()(AKIA[%w]+)",
+}
+
+local function redact_secret_patterns(text)
+  if text == nil or text == "" then
+    return text
+  end
+  for _, pattern in ipairs(SECRET_PATTERNS) do
+    text = (text:gsub(pattern, function(prefix, _value)
+      if prefix == nil or prefix == "" then
+        return "[REDACTED]"
+      end
+      return prefix .. "[REDACTED]"
+    end))
+  end
+  return text
+end
+
 -- Strip a single leading "$" so a number prefixed by a currency glyph still
 -- parses as a number. Returns the trailing slice, never nil. Cheap to call.
 local function strip_dollar(text)
@@ -206,13 +244,22 @@ local function parse_permission_dialog(text)
   end
 
   local options = {}
-  -- Lua patterns are byte-oriented, so the multi-byte `❯` selector glyph
-  -- can't sit in a `[...]` class. We instead anchor on "first digit
-  -- followed by '. '" anywhere in the line and let the leading bytes be
-  -- whatever they are. Reliable across both numbered-list variants Claude
-  -- Code ships (`❯ 1. Yes` and `  2. Yes, and don't ask again`).
+  -- Numbered options are anchored to the *start of a line* (after optional
+  -- whitespace and the `❯` / `>` selector glyph), not "anywhere in the
+  -- line." Without that anchor, a visible command summary like
+  -- `echo '1. hello'` would be picked up as an option and the actual
+  -- Enter/Esc labels below could fail to parse. Lua patterns can't
+  -- represent the multi-byte `❯` in a `[...]` class, so strip it (and
+  -- the `>` ASCII fallback) up front, then anchor with `^`.
+  local selector_glyph = "❯"
   for _, line in ipairs(lines) do
-    local body = line:match("%d+%.%s+(.+)$")
+    local trimmed = trim(line)
+    if trimmed:sub(1, #selector_glyph) == selector_glyph then
+      trimmed = trim(trimmed:sub(#selector_glyph + 1))
+    elseif trimmed:sub(1, 1) == ">" then
+      trimmed = trim(trimmed:sub(2))
+    end
+    local body = trimmed:match("^%d+%.%s+(.+)$")
     if body then
       table.insert(options, trim(body))
     end
@@ -233,6 +280,9 @@ local function parse_permission_dialog(text)
   end
   if #options > 0 then
     permission.options = options
+  end
+  if permission.summary then
+    permission.summary = redact_secret_patterns(permission.summary)
   end
   if next(permission) == nil then
     return nil
