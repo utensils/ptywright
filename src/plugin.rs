@@ -166,10 +166,37 @@ impl PluginManifest {
             ))
         })?;
         let source_path = manifest_dir.join(entrypoint_path);
-        let source = std::fs::read_to_string(&source_path).map_err(|error| {
+        // Canonicalize both sides and assert the resolved entrypoint stays
+        // inside the manifest's directory. Catches symlink-escape cases the
+        // string-level `..` / absolute check above can't see (a sibling
+        // `Normal("foo")` component that happens to be a symlink pointing
+        // outside the plugin directory). `canonicalize` requires the path
+        // to exist; we resolve the manifest's directory first so a missing
+        // entrypoint produces a clearer "failed to read" error below
+        // rather than a generic "no such file" from the canonicalize call.
+        let manifest_dir_real = manifest_dir.canonicalize().map_err(|error| {
+            Error::Config(format!(
+                "failed to canonicalize plugin manifest directory `{}`: {error}",
+                manifest_dir.display()
+            ))
+        })?;
+        let source_real = source_path.canonicalize().map_err(|error| {
+            Error::Config(format!(
+                "failed to canonicalize plugin entrypoint `{}`: {error}",
+                source_path.display()
+            ))
+        })?;
+        if !source_real.starts_with(&manifest_dir_real) {
+            return Err(Error::Config(format!(
+                "plugin manifest `{}` entrypoint `{entrypoint}` escapes the manifest's directory (resolved to `{}`)",
+                manifest_path.display(),
+                source_real.display()
+            )));
+        }
+        let source = std::fs::read_to_string(&source_real).map_err(|error| {
             Error::Config(format!(
                 "failed to read plugin entrypoint `{}`: {error}",
-                source_path.display()
+                source_real.display()
             ))
         })?;
         Ok((manifest, source))
@@ -491,5 +518,143 @@ mod tests {
             .expect("default_target serialised");
         assert_eq!(target.get("program"), Some(&json!("x")));
         assert!(target.get("args").is_none(), "empty args should be skipped");
+    }
+
+    // ---- load_from_toml_path negative paths ---------------------------
+
+    fn write_temp_manifest(dir: &std::path::Path, manifest_body: &str, lua_body: &str) {
+        std::fs::write(dir.join("manifest.toml"), manifest_body).expect("write manifest");
+        std::fs::write(dir.join("main.lua"), lua_body).expect("write lua");
+    }
+
+    #[test]
+    fn load_from_toml_path_rejects_absolute_entrypoint() {
+        let dir = tempdir_for_test("plugin-abs-entrypoint");
+        write_temp_manifest(
+            &dir,
+            r#"
+name = "abs"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "/etc/passwd"
+permissions = []
+"#,
+            "-- unused",
+        );
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("absolute entrypoint must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a relative path"),
+            "error should explain the rejection: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_rejects_parent_traversal() {
+        let dir = tempdir_for_test("plugin-parent-traversal");
+        write_temp_manifest(
+            &dir,
+            r#"
+name = "escape"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "../escape.lua"
+permissions = []
+"#,
+            "-- unused",
+        );
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("`..` in entrypoint must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a relative path"),
+            "error should explain the rejection: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_rejects_missing_entrypoint() {
+        // Manifest declares a runtime but no entrypoint — validation should
+        // reject before path resolution even runs.
+        let dir = tempdir_for_test("plugin-missing-entrypoint");
+        std::fs::write(
+            dir.join("manifest.toml"),
+            r#"
+name = "no-entry"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+permissions = []
+"#,
+        )
+        .expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("manifest with runtime but no entrypoint must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("entrypoint") || msg.contains("invalid plugin manifest"),
+            "error should mention the missing entrypoint: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_from_toml_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        // A normal-looking entrypoint that is actually a symlink pointing
+        // outside the manifest's directory. String-level checks pass; the
+        // canonicalization check should catch it.
+        let parent = tempdir_for_test("plugin-symlink-parent");
+        let plugin_dir = parent.join("inside");
+        let target_dir = parent.join("outside");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        std::fs::create_dir_all(&target_dir).expect("create target dir");
+        std::fs::write(target_dir.join("escape.lua"), "-- outside").expect("write outside lua");
+        // entrypoint points to a symlink whose target is outside the plugin dir.
+        symlink(target_dir.join("escape.lua"), plugin_dir.join("main.lua"))
+            .expect("create escaping symlink");
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "symlink-escape"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "main.lua"
+permissions = []
+"#,
+        )
+        .expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&plugin_dir.join("manifest.toml"))
+            .expect_err("symlink escaping the plugin directory must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes the manifest's directory"),
+            "error should explain the escape: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Per-test temp directory under `std::env::temp_dir()`. Returned path is
+    /// not auto-cleaned on panic but the negative tests don't write enough
+    /// to matter; each test best-effort removes itself.
+    fn tempdir_for_test(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ptywright-plugin-test-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
 }

@@ -46,6 +46,15 @@ struct RpcSharedState {
     /// out of the shared registry, drop the outer lock, then serialize
     /// per-adapter access without blocking unrelated work.
     extensions: HashMap<String, Arc<Mutex<ExtensionEntry>>>,
+    /// Read-only sibling map: adapter id → plugin manifest name. Updated
+    /// in lock-step with `extensions` whenever an adapter starts or
+    /// closes. Lets `plugin.unload` check live-adapter binding without
+    /// per-adapter `Mutex<ExtensionEntry>` locks — a `try_lock` against a
+    /// busy adapter (e.g. one in the middle of an `adapter.wait`) would
+    /// silently report "not bound" and let the unload race past the
+    /// documented guarantee. Reading the plugin name out of this map is
+    /// O(1) and never contends with handler work.
+    adapter_plugin: HashMap<String, String>,
     /// Plugin manifests + Lua sources known to this server. Built-in
     /// plugins are seeded on construction; trusted-local third-party plugins
     /// arrive through CLI `--plugin <manifest.toml>` flags or the
@@ -92,6 +101,7 @@ impl Default for RpcSharedState {
         Self {
             sessions: HashMap::new(),
             extensions: HashMap::new(),
+            adapter_plugin: HashMap::new(),
             registered_plugins,
             allow_plugin_load: false,
             next_session: 1,
@@ -885,13 +895,15 @@ impl RpcServer {
                 .into());
         }
         // Refuse to unload while any adapter is still bound to this plugin.
-        // Use `try_lock` so a long-running `adapter.wait` does not stall the
-        // unload check; if every entry can be inspected and none reference
-        // the plugin, unload proceeds.
-        let bound = shared.extensions.values().any(|arc| match arc.try_lock() {
-            Ok(entry) => entry.plugin == params.plugin,
-            Err(_) => false,
-        });
+        // Read the sibling adapter_plugin map (adapter id → plugin name,
+        // maintained without per-adapter mutex protection) so a long-running
+        // `adapter.wait` on any adapter cannot make the bound check race. A
+        // previous `try_lock`-based check returned "not bound" on contention
+        // and let unload race past the documented "live adapters" guarantee.
+        let bound = shared
+            .adapter_plugin
+            .values()
+            .any(|plugin| plugin == &params.plugin);
         if bound {
             return Err((
                 RpcErrorCode::InvalidParams,
@@ -1142,6 +1154,9 @@ impl RpcServer {
                     handle,
                 })),
             );
+            shared
+                .adapter_plugin
+                .insert(id.clone(), params.plugin.clone());
         }
         Ok(json!({
             "adapter": id,
@@ -1312,6 +1327,10 @@ impl RpcServer {
         self.check_adapter_permission("adapter.close", &params.adapter)?;
         let removed = {
             let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            // Remove from both the live-handle registry and the sibling
+            // adapter_plugin map atomically under the same lock so
+            // plugin.unload never sees a half-removed adapter.
+            shared.adapter_plugin.remove(&params.adapter);
             shared.extensions.remove(&params.adapter)
         };
         if let Some(entry_arc) = removed {
@@ -2694,6 +2713,9 @@ mod tests {
                     handle: ext_handle,
                 })),
             );
+            shared
+                .adapter_plugin
+                .insert(adapter_id.clone(), "stub-no-input".to_string());
         }
 
         let mut server = RpcServer::with_state(state);

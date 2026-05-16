@@ -956,7 +956,14 @@ fn plugin_load_denied_without_allow_flag() {
     );
 }
 
+// `cfg(unix)` because adapter.start spawns the echo manifest's
+// `default_target.program = "/bin/sh"`; the Windows CI job runs
+// `cargo test --locked` (see .github/workflows/ci.yml) and would fail to
+// spawn /bin/sh. The other two tests in this section only exercise
+// `adapter.list` / `plugin.load` which don't spawn a child, so they stay
+// cross-platform.
 #[test]
+#[cfg(unix)]
 fn plugin_load_allowed_with_flag_drives_full_lifecycle() {
     let manifest_path = echo_plugin_manifest_path();
     let manifest_str = manifest_path.to_str().expect("manifest path is utf8");
