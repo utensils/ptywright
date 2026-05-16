@@ -1,0 +1,20 @@
+ ▐▛███▜▌   Claude Code v2.1.142
+▝▜█████▛▘  Haiku 4.5 · Claude Max
+  ▘▘ ▝▝    ~/Projects/sample
+
+❯ Summarize what classify() returns for each state.
+
+⏺ Looking at classify():
+  1. waiting_for_permission — Dialog states triggered by structural
+     patterns: workspace-trust questions, permission dialogs with anchors
+     like "Do you want to proceed?", or plan headers followed by numbered
+     lists. Each has its own intent function for approval and denial.
+  2. completed_turn — Empty input prompt visible after a turn.
+  3. thinking — Spinner glyph plus ellipsis on the active work line.
+
+✻ Brewed for 2s
+
+────────────────────────────────────────────────────────────────────────
+❯
+  user @ host /Users/me/Projects/sample                       [Haiku 4.5]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

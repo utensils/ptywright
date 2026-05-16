@@ -84,6 +84,8 @@ fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
 
 ⏺ 4
 
+✻ Brewed for 0.4s
+
 ❯
 ────────────────────────────────────────────────────────────────────────
   user @ host /workspace                                  [Haiku 4.5]
@@ -534,7 +536,7 @@ fn classifier_detects_completed_turn_after_prompt_submission() {
     let extension = claude_plugin();
     let state = classify_state(
         &extension,
-        "work completed\n>",
+        "work completed\n\n✻ Brewed for 0.3s\n\n>",
         6,
         Some("prompt_submitted"),
         Some(COMPLETED_TURN_STABLE_MS),
@@ -554,20 +556,24 @@ fn classifier_completed_turn_paths() {
     //       supplies stable_ms >= completed_turn_stable_ms. The matcher
     //       has already proven the screen settled, so we trust it.
     //   (b) Poll path (confidence ~0.7): fires from adapter.state when
-    //       BOTH the answer bullet `⏺` AND an empty input prompt line
-    //       (`❯` / `>` alone on a line) are visible. The empty prompt
-    //       only reappears after Claude returns to idle, so it's a
-    //       stronger "actually done" signal than the bullet alone.
+    //       the answer bullet `⏺` + the tea-verb completion marker
+    //       `✻ <Verb> for <duration>` + an empty input prompt line are
+    //       all visible. The marker is the TUI's own end-of-turn signal —
+    //       it never appears between tool calls or during preambles, so
+    //       requiring it eliminates the "preamble-before-tool" false
+    //       positive (bullet + empty prompt visible for a frame while
+    //       the spinner hasn't repainted yet).
     //
-    // The bullet-alone case (which the script needs polling to discover
-    // mid-stream) must NOT fire completed_turn — it would terminate the
-    // stream before the rest of a multi-line answer arrives.
+    // Two mid-stream cases must NOT fire completed_turn — either would
+    // terminate the stream before the rest of the answer arrives.
     let extension = claude_plugin();
 
-    // (a) Stable path — answer + empty prompt + stable_ms supplied.
+    let completed_screen = "⏺ work completed\n\n✻ Brewed for 0.3s\n\n>";
+
+    // (a) Stable path — completion screen + stable_ms supplied.
     let stable = classify_state(
         &extension,
-        "⏺ work completed\n>",
+        completed_screen,
         6,
         Some("prompt_submitted"),
         Some(COMPLETED_TURN_STABLE_MS),
@@ -578,10 +584,10 @@ fn classifier_completed_turn_paths() {
         "stable input prompt after prompt submission"
     );
 
-    // (b) Poll path — answer + empty prompt, no stable_ms.
+    // (b) Poll path — completion screen, no stable_ms.
     let poll = classify_state(
         &extension,
-        "⏺ work completed\n>",
+        completed_screen,
         6,
         Some("prompt_submitted"),
         None,
@@ -610,6 +616,23 @@ fn classifier_completed_turn_paths() {
     assert_ne!(
         mid_stream.state, "completed_turn",
         "mid-stream (answer bullet but no empty prompt) must not fire completed_turn"
+    );
+
+    // (d) Preamble-before-tool-use — answer bullet + empty prompt visible
+    // but NO completion marker yet (Claude rendered a preamble line and
+    // is about to start a tool call; the spinner happens to be between
+    // repaints this frame). Must NOT fire completed_turn — that was the
+    // live regression from the claude-stream demo.
+    let preamble = classify_state(
+        &extension,
+        "⏺ I'll explore the project structure and read the key files.\n\n>",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        preamble.state, "completed_turn",
+        "preamble (bullet + empty prompt but no ✻ marker) must not fire completed_turn"
     );
 }
 
