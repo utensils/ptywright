@@ -159,34 +159,37 @@ impl PluginManifest {
                 manifest_path.display()
             )));
         }
-        let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        // Canonicalize the manifest file first so a bare-filename path like
+        // `--plugin manifest.toml` (where `Path::parent()` would return
+        // `Some("")` and `"".canonicalize()` would fail with `NotFound`)
+        // resolves through the same code path as `./plugins/echo/manifest.toml`.
+        // The manifest existed when we read it above, so canonicalize cannot
+        // fail for legitimate "no such directory" reasons here.
+        let manifest_real = manifest_path.canonicalize().map_err(|error| {
+            Error::Config(format!(
+                "failed to canonicalize plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        let manifest_dir_real = manifest_real.parent().ok_or_else(|| {
             Error::Config(format!(
                 "plugin manifest `{}` has no parent directory",
                 manifest_path.display()
             ))
         })?;
-        let source_path = manifest_dir.join(entrypoint_path);
-        // Canonicalize both sides and assert the resolved entrypoint stays
-        // inside the manifest's directory. Catches symlink-escape cases the
-        // string-level `..` / absolute check above can't see (a sibling
+        let source_path = manifest_dir_real.join(entrypoint_path);
+        // Canonicalize the resolved entrypoint and assert it stays inside
+        // the manifest's directory. Catches symlink-escape cases the
+        // string-level `..` / absolute check above can't see (a
         // `Normal("foo")` component that happens to be a symlink pointing
-        // outside the plugin directory). `canonicalize` requires the path
-        // to exist; we resolve the manifest's directory first so a missing
-        // entrypoint produces a clearer "failed to read" error below
-        // rather than a generic "no such file" from the canonicalize call.
-        let manifest_dir_real = manifest_dir.canonicalize().map_err(|error| {
-            Error::Config(format!(
-                "failed to canonicalize plugin manifest directory `{}`: {error}",
-                manifest_dir.display()
-            ))
-        })?;
+        // outside the plugin directory).
         let source_real = source_path.canonicalize().map_err(|error| {
             Error::Config(format!(
                 "failed to canonicalize plugin entrypoint `{}`: {error}",
                 source_path.display()
             ))
         })?;
-        if !source_real.starts_with(&manifest_dir_real) {
+        if !source_real.starts_with(manifest_dir_real) {
             return Err(Error::Config(format!(
                 "plugin manifest `{}` entrypoint `{entrypoint}` escapes the manifest's directory (resolved to `{}`)",
                 manifest_path.display(),
@@ -600,6 +603,41 @@ permissions = []
             msg.contains("entrypoint") || msg.contains("invalid plugin manifest"),
             "error should mention the missing entrypoint: {msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_accepts_bare_filename_relative_to_cwd() {
+        // Regression: `--plugin manifest.toml` (or `plugin.load
+        // {"manifest_path": "manifest.toml"}`) from the plugin's directory
+        // previously broke because `Path::new("manifest.toml").parent()`
+        // returns `Some("")` and `"".canonicalize()` fails with NotFound.
+        // The loader now canonicalizes the manifest itself first so the
+        // bare-filename case resolves through the same code path as an
+        // explicit `./manifest.toml`.
+        let dir = tempdir_for_test("plugin-bare-filename");
+        write_temp_manifest(
+            &dir,
+            r#"
+name = "bare"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "main.lua"
+permissions = []
+"#,
+            "return { classify = function() return { state = 'x', confidence = 1.0, evidence = '' } end }",
+        );
+        // chdir into the manifest's directory so the path passed in is a
+        // bare relative filename with no parent component.
+        let prev_cwd = std::env::current_dir().expect("save cwd");
+        std::env::set_current_dir(&dir).expect("cd into plugin dir");
+        let bare = std::path::PathBuf::from("manifest.toml");
+        let result = PluginManifest::load_from_toml_path(&bare);
+        std::env::set_current_dir(&prev_cwd).expect("restore cwd");
+        let (manifest, source) = result.expect("bare relative manifest path must load from cwd");
+        assert_eq!(manifest.name, "bare");
+        assert!(source.contains("classify"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
