@@ -243,9 +243,19 @@ local function parse_status_bar(text)
     return nil
   end
   local status = {}
-  local model = text:match("%[([^%]]+)%]")
-  if model then
-    status.model = trim(model)
+  -- Match the *last* `[...]` rather than the first. Claude renders the
+  -- model at the end of the cwd row (`user @ host /path [Haiku 4.5]`)
+  -- and a future TUI tweak that introduced an earlier bracketed token
+  -- (e.g. a `[?]` help chip or a key-hint pill) would otherwise quietly
+  -- shadow the model string. Walking the iterator and keeping the last
+  -- capture is cheap on a 3-row status bar and stays robust to those
+  -- insertions.
+  local last_bracket
+  for bracketed in string.gmatch(text, "%[([^%]]+)%]") do
+    last_bracket = bracketed
+  end
+  if last_bracket then
+    status.model = trim(last_bracket)
   end
   local lowered = lower(text)
   if contains(lowered, "bypass permissions on") then
@@ -263,18 +273,27 @@ end
 
 -- Merge two metadata tables (either may be nil). Plain shallow merge —
 -- callers structure their metadata under disjoint top-level keys (`usage`,
--- `status`, `permission`, …) so a deep merge is unnecessary.
+-- `status`, `permission`, …) so a deep merge is unnecessary. Returns a
+-- fresh table rather than mutating `a` in place; if a future refactor
+-- ever calls the merger more than once per classify (e.g. for memoised
+-- closures), per-branch writes won't bleed back into the shared
+-- `status_metadata` captured in the classify scope.
 local function merge_metadata(a, b)
-  if a == nil then
-    return b
+  if a == nil and b == nil then
+    return nil
   end
-  if b == nil then
-    return a
+  local merged = {}
+  if a ~= nil then
+    for key, value in pairs(a) do
+      merged[key] = value
+    end
   end
-  for key, value in pairs(b) do
-    a[key] = value
+  if b ~= nil then
+    for key, value in pairs(b) do
+      merged[key] = value
+    end
   end
-  return a
+  return merged
 end
 
 local function has_welcome_screen(text)
