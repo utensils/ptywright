@@ -277,6 +277,64 @@ fn wait_turn_matcher_includes_v2_trust_dialog_anchors() {
 }
 
 #[test]
+fn wait_cancel_settled_matcher_returns_screen_stable_threshold() {
+    // After `cancel` the classifier holds in `cancelling` until the screen
+    // has been stable for `completed_turn_stable_ms`. A caller who wants to
+    // wait for the post-cancel transition has no first-class way to express
+    // that without re-implementing the threshold themselves — surface it as
+    // a named matcher so the plugin stays the source of truth for what
+    // "cancel landed" means.
+    let extension = claude_plugin();
+    let matcher = wait_matcher(
+        &extension,
+        "wait_cancel_settled_matcher",
+        json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+    );
+
+    assert!(matches!(
+        matcher,
+        Matcher::ScreenStable {
+            min_ms: COMPLETED_TURN_STABLE_MS
+        }
+    ));
+
+    let snapshot = ScreenSnapshot {
+        size: TerminalSize::new(3, 20),
+        cursor: CursorState {
+            row: 1,
+            col: 2,
+            visible: true,
+        },
+        sequence: 1,
+        plain_text: "post-cancel prompt".to_string(),
+        cells: Vec::new(),
+        alternate_screen: false,
+        application_cursor: false,
+        application_keypad: false,
+        title: None,
+    };
+    assert!(
+        !matcher.is_match_with_context(
+            &snapshot,
+            "",
+            MatcherContext {
+                stable_for: Duration::from_millis(COMPLETED_TURN_STABLE_MS - 1),
+                process_exited: false,
+            },
+        ),
+        "matcher must not fire before the stable threshold elapses"
+    );
+    assert!(matcher.is_match_with_context(
+        &snapshot,
+        "",
+        MatcherContext {
+            stable_for: Duration::from_millis(COMPLETED_TURN_STABLE_MS),
+            process_exited: false,
+        },
+    ));
+}
+
+#[test]
 fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
     let extension = claude_plugin();
     let matcher = wait_matcher(

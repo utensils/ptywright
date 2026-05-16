@@ -324,6 +324,16 @@ function M.send_prompt(input)
   }
 end
 
+function M.wait_cancel_settled_matcher(input)
+  -- After `cancel`, the classifier holds in `cancelling` until the screen
+  -- has been quiet for `completed_turn_stable_ms`. Mirror that exact
+  -- threshold here so callers waiting for the transition see the same
+  -- behaviour as the classifier — no risk of the wait firing while the
+  -- classifier still reports `cancelling`.
+  local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
+  return matcher.screen_stable(completed_turn_stable_ms)
+end
+
 function M.wait_turn_matcher(input)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
   -- Boundary anchors: any single one of these is enough to wake the wait.
