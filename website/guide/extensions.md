@@ -144,7 +144,7 @@ A plugin manifest declared as TOML can be loaded into a `ptywright serve` instan
 
 ### At server startup: `--plugin <manifest.toml>`
 
-Pass the flag to `ptywright serve` (repeatable). The flag works with any transport (`--stdio`, `--socket`, or the default per-user socket). The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths and `..` traversal are rejected.
+Pass the flag to `ptywright serve` (repeatable). The flag works with any transport (`--stdio`, `--socket`, or the default per-user socket). The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths, `..` traversal, and symlinks that resolve outside the manifest's own directory are all rejected.
 
 ```bash
 ptywright serve --socket ~/.ptywright/sockets/default.sock \

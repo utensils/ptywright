@@ -229,7 +229,7 @@ See the [Extensions guide](../guide/extensions.md) for plugin authoring and the 
 
 `plugin.capabilities` reports `embedded_lua: true` and includes built-in plugin manifests in `builtin_plugins`, including the `claude-code` Lua adapter. See [Plugins and extensions](./plugins.md) for manifest fields, runtime names, and permission names.
 
-`plugin.load` registers a trusted-local third-party plugin from a TOML manifest file on disk. The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths and `..` components in the entrypoint are rejected. Built-in plugins (claude-code) cannot be replaced — a name collision returns an error.
+`plugin.load` registers a trusted-local third-party plugin from a TOML manifest file on disk. The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths, `..` components, and symlinks that resolve outside the manifest's own directory are all rejected. Built-in plugins (claude-code) cannot be replaced — a name collision returns an error.
 
 `plugin.unload` deregisters a previously loaded third-party plugin. Built-in plugins cannot be unloaded. Plugins with live adapters bound to them are rejected; callers must `adapter.close` first.
 
