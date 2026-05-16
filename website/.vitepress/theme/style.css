@@ -1,95 +1,330 @@
 @import 'tailwindcss';
 
 /*
- * ptywright — terminal blueprint palette
+ * ptywright — Operator palette
  *
- * Cyan models PTY/screen observation, amber models user input, and deep ink
- * keeps the docs feeling like a terminal without sacrificing readability.
+ * Mono-typographic, chartreuse-accented, neutral grays in both modes. The
+ * dark/light pair mirrors the Operator artboards exported from Claude Design:
+ * dark uses deep ink + bone text; light uses cool gray-white + deep olive.
+ * Chartreuse (#c6f24e) is the single highlight color across both modes.
+ *
+ * The PTY frame (.op-pty-*) is intentionally hard-coded dark in both modes
+ * so the terminal always reads as a real terminal sitting on the page.
  */
 
 :root {
-  --pty-cyan: #0891b2;
-  --pty-cyan-soft: #67e8f9;
-  --pty-cyan-deep: #155e75;
-  --pty-amber: #f59e0b;
-  --pty-amber-soft: #fde68a;
-  --pty-ink: #0f172a;
-  --pty-ink-soft: #1e293b;
-  --pty-paper: #f8fafc;
-  --pty-paper-blue: #eef8fb;
+  /* Operator — chartreuse highlight + olive readable variant */
+  --op-accent: #c6f24e;
+  --op-accent-t: #3d4f1f; /* readable on light bg */
+  --op-amber: #a8530b;
+  --op-cyan: #1a607a;
 
-  --vp-c-brand-1: var(--pty-cyan-deep);
-  --vp-c-brand-2: var(--pty-cyan);
-  --vp-c-brand-3: #164e63;
-  --vp-c-brand-soft: rgba(8, 145, 178, 0.14);
+  /* Light surface */
+  --op-bg: #f4f5f3;
+  --op-bg-2: #eceee9;
+  --op-surface: #ffffff;
+  --op-surface-2: #fafbf8;
+  --op-ink: #0a0b0d;
+  --op-ink-2: #1c1e22;
+  --op-mid: #3a3d3a;
+  --op-mute: #6e716c;
+  --op-dim: #9ea29c;
+  --op-rule: #dfe1dc;
+  --op-rule-2: #cfd2cc;
+  --op-grid: rgba(10, 11, 13, 0.022);
+  --op-hl-bg: rgba(198, 242, 78, 0.18);
+  --op-pill-bd: #bcd97a;
+  --op-btn-bg: #0a0b0d;
+  --op-btn-fg: #f4f5f3;
 
-  --vp-c-bg: #fbfdff;
-  --vp-c-bg-alt: var(--pty-paper-blue);
-  --vp-c-bg-soft: #f0f9ff;
-  --vp-c-bg-elv: #ffffff;
+  --op-mono:
+    'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 
-  --vp-home-hero-name-color: transparent;
-  --vp-home-hero-name-background: linear-gradient(
-    120deg,
-    #155e75 0%,
-    #0891b2 48%,
-    #f59e0b 100%
-  );
-  --vp-home-hero-image-background-image:
-    radial-gradient(
-      circle at 28% 24%,
-      rgba(8, 145, 178, 0.28) 0%,
-      transparent 55%
-    ),
-    radial-gradient(
-      circle at 74% 68%,
-      rgba(245, 158, 11, 0.22) 0%,
-      transparent 58%
-    );
-  --vp-home-hero-image-filter: blur(54px);
+  /* VitePress brand mapping (light) */
+  --vp-c-brand-1: var(--op-accent-t);
+  --vp-c-brand-2: #5f7f24;
+  --vp-c-brand-3: var(--op-accent-t);
+  --vp-c-brand-soft: rgba(198, 242, 78, 0.22);
 
-  --vp-button-brand-border: var(--pty-cyan-deep);
-  --vp-button-brand-text: #ffffff;
-  --vp-button-brand-bg: var(--pty-cyan-deep);
-  --vp-button-brand-hover-border: #164e63;
-  --vp-button-brand-hover-text: #ffffff;
-  --vp-button-brand-hover-bg: #164e63;
-  --vp-button-brand-active-border: #164e63;
-  --vp-button-brand-active-text: #ffffff;
-  --vp-button-brand-active-bg: #164e63;
+  --vp-c-bg: var(--op-bg);
+  --vp-c-bg-alt: var(--op-bg-2);
+  --vp-c-bg-soft: var(--op-surface-2);
+  --vp-c-bg-elv: var(--op-surface);
 
-  --vp-code-block-bg: #ecfeff;
-  --vp-code-line-highlight-color: rgba(8, 145, 178, 0.11);
-  --vp-c-text-code: var(--pty-cyan-deep);
+  --vp-c-text-1: var(--op-ink-2);
+  --vp-c-text-2: var(--op-mid);
+  --vp-c-text-3: var(--op-mute);
+
+  --vp-c-divider: var(--op-rule);
+  --vp-c-gutter: var(--op-rule);
+
+  --vp-c-text-code: var(--op-accent-t);
+  --vp-code-block-bg: var(--op-surface);
+
+  --vp-font-family-base:
+    'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --vp-font-family-mono: var(--op-mono);
+
+  --vp-home-hero-name-color: var(--op-ink-2);
+  --vp-home-hero-name-background: none;
+  --vp-home-hero-image-background-image: none;
+  --vp-home-hero-image-filter: none;
+
+  /* Brand button = ink slab (mirrors design's primary action) */
+  --vp-button-brand-border: var(--op-ink);
+  --vp-button-brand-text: var(--op-btn-fg);
+  --vp-button-brand-bg: var(--op-btn-bg);
+  --vp-button-brand-hover-border: var(--op-ink-2);
+  --vp-button-brand-hover-text: var(--op-btn-fg);
+  --vp-button-brand-hover-bg: var(--op-ink-2);
+  --vp-button-brand-active-border: var(--op-ink-2);
+  --vp-button-brand-active-text: var(--op-btn-fg);
+  --vp-button-brand-active-bg: var(--op-ink-2);
 }
 
 .dark {
-  --vp-c-brand-1: var(--pty-cyan-soft);
-  --vp-c-brand-2: #22d3ee;
-  --vp-c-brand-3: var(--pty-cyan);
-  --vp-c-brand-soft: rgba(103, 232, 249, 0.14);
+  --op-bg: #0a0b0d;
+  --op-bg-2: #08090b;
+  --op-surface: #101115;
+  --op-surface-2: #0c0d10;
+  --op-ink: #f4f4ee;
+  --op-ink-2: #d6d6cf;
+  --op-mid: #bdbdb5;
+  --op-mute: #86877f;
+  --op-dim: #5b5c55;
+  --op-rule: #1c1e22;
+  --op-rule-2: #2a2c31;
+  --op-grid: rgba(255, 255, 255, 0.018);
+  --op-hl-bg: rgba(198, 242, 78, 0.08);
+  --op-pill-bd: rgba(198, 242, 78, 0.28);
+  --op-btn-bg: var(--op-accent);
+  --op-btn-fg: #0a0b0d;
+  --op-accent-t: var(--op-accent);
 
-  --vp-c-bg: #08111f;
-  --vp-c-bg-alt: var(--pty-ink);
-  --vp-c-bg-soft: #111c2f;
-  --vp-c-bg-elv: var(--pty-ink-soft);
+  --vp-c-brand-1: var(--op-accent);
+  --vp-c-brand-2: #d2f56b;
+  --vp-c-brand-3: var(--op-accent);
+  --vp-c-brand-soft: rgba(198, 242, 78, 0.14);
 
-  --vp-button-brand-text: #07111f;
-  --vp-button-brand-bg: var(--pty-cyan-soft);
-  --vp-button-brand-border: var(--pty-cyan-soft);
-  --vp-button-brand-hover-text: #07111f;
-  --vp-button-brand-hover-bg: #22d3ee;
-  --vp-button-brand-hover-border: #22d3ee;
+  --vp-c-bg: var(--op-bg);
+  --vp-c-bg-alt: var(--op-bg-2);
+  --vp-c-bg-soft: var(--op-surface-2);
+  --vp-c-bg-elv: var(--op-surface);
 
-  --vp-code-block-bg: #0c1a2b;
-  --vp-c-text-code: var(--pty-cyan-soft);
+  --vp-c-text-1: var(--op-ink);
+  --vp-c-text-2: var(--op-mid);
+  --vp-c-text-3: var(--op-mute);
+
+  --vp-c-divider: var(--op-rule);
+  --vp-c-gutter: var(--op-rule);
+
+  --vp-c-text-code: var(--op-accent);
+  --vp-code-block-bg: var(--op-surface);
+
+  --vp-button-brand-border: var(--op-accent);
+  --vp-button-brand-text: #0a0b0d;
+  --vp-button-brand-bg: var(--op-accent);
+  --vp-button-brand-hover-border: #d2f56b;
+  --vp-button-brand-hover-text: #0a0b0d;
+  --vp-button-brand-hover-bg: #d2f56b;
+  --vp-button-brand-active-border: #d2f56b;
+  --vp-button-brand-active-text: #0a0b0d;
+  --vp-button-brand-active-bg: #d2f56b;
 }
 
+/* Global type system — mono chrome + Inter prose.
+ *
+ * Mono (JetBrains) is the default body font and is forced on every chrome
+ * surface below (nav, sidebar, headings, code, tables, hero, footer) so the
+ * site reads like the artboards. Sustained doc prose (`.vp-doc p, li`) is
+ * pulled back onto Inter further down for readability — long-form mono
+ * paragraphs are hard on the eyes even when the rest of the page is mono.
+ */
+html,
+body {
+  background: var(--op-bg);
+  font-family: var(--op-mono);
+}
+
+.VPNav,
+.VPNavBar,
+.VPNavBarTitle,
+.VPNavBarMenu,
+.VPNavBarMenuLink,
+.VPNavBarMenuGroup,
+.VPNavBarSearch,
+.VPSidebar,
+.VPSidebarItem .text,
+.VPDocAsideOutline,
+.VPDocOutlineItem,
+.VPFooter,
+.VPHero .name,
+.VPHero .text,
+.VPHero .tagline,
+.VPFeature .title {
+  font-family: var(--op-mono) !important;
+}
+
+/* Standard doc body keeps Inter for prose readability */
+.vp-doc p,
+.vp-doc li {
+  font-family: var(--vp-font-family-base);
+}
+
+/* ── Nav bar ──────────────────────────────────────────────────────────── */
+
+.VPNavBar {
+  border-bottom: 1px solid var(--op-rule);
+  background: var(--op-bg) !important;
+}
+
+.VPNavBar.has-sidebar .content,
+.VPNavBar .content {
+  background: transparent !important;
+}
+
+.VPNavBarTitle .title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--op-ink);
+}
+
+.VPNavBarTitle .logo {
+  display: none; /* replaced by ::before chartreuse square */
+}
+
+.VPNavBarTitle .title::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--op-accent);
+  border-radius: 1px;
+  box-shadow: 0 0 0 1px rgba(61, 79, 31, 0.2);
+}
+
+.VPNavBarMenuLink {
+  color: var(--op-mute) !important;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+}
+.VPNavBarMenuLink:hover,
+.VPNavBarMenuLink.active {
+  color: var(--op-ink) !important;
+}
+.VPNavBarMenuLink.active {
+  border-bottom: 2px solid var(--op-accent);
+}
+
+/* ── Sidebar (docs) ───────────────────────────────────────────────────── */
+
+.VPSidebar {
+  background: var(--op-bg-2) !important;
+  border-right: 1px solid var(--op-rule);
+}
+
+.VPSidebarItem .text {
+  font-size: 12.5px;
+  color: var(--op-mid);
+  letter-spacing: 0.01em;
+}
+
+.VPSidebarItem.is-active > .item .text,
+.VPSidebarItem.is-active > .item .link.active .text {
+  color: var(--op-ink) !important;
+}
+
+.VPSidebarItem.level-0 > .item .text {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--op-mute) !important;
+  font-weight: 500;
+}
+
+.VPSidebarItem.level-0 > .item .text::before {
+  content: '§ ';
+  color: var(--op-accent-t);
+}
+
+.VPSidebarItem .link.active .text {
+  border-left: 2px solid var(--op-accent);
+  background: var(--op-hl-bg);
+  margin-left: -12px;
+  padding-left: 10px;
+}
+
+/* ── Doc layout typography ────────────────────────────────────────────── */
+
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3 {
+  font-family: var(--op-mono);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--op-ink);
+}
+
+.vp-doc h1 {
+  font-size: 44px;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  margin-bottom: 18px;
+}
+
+.vp-doc h2 {
+  font-size: 22px;
+  line-height: 1.2;
+  margin: 48px 0 16px;
+  padding: 0;
+  border-top: none;
+  position: relative;
+  counter-increment: op-h2;
+}
+
+.vp-doc h2::before {
+  content: counter(op-h2, decimal-leading-zero) ' ›';
+  display: inline-block;
+  margin-right: 12px;
+  color: var(--op-accent-t);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+.vp-doc h3 {
+  font-size: 15px;
+  margin: 28px 0 12px;
+  letter-spacing: -0.005em;
+}
+
+.vp-doc {
+  counter-reset: op-h2;
+}
+
+.vp-doc :not(pre) > code {
+  font-family: var(--op-mono);
+  font-size: 12.5px;
+  color: var(--op-accent-t);
+  background: var(--op-hl-bg);
+  border-radius: 3px;
+  padding: 1px 6px;
+  border: none;
+}
+
+/* Code blocks — chartreuse→amber left bar, mono SH/RS tab */
 .vp-doc div[class*='language-'] {
   position: relative;
-  border-radius: 10px;
+  border-radius: 6px;
   overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 18%, transparent);
+  border: 1px solid var(--op-rule);
+  background: var(--op-surface);
+  margin: 14px 0 20px;
 }
 
 .vp-doc div[class*='language-']::before {
@@ -99,171 +334,223 @@
   width: 3px;
   background: linear-gradient(
     180deg,
-    var(--pty-cyan-soft) 0%,
-    var(--pty-amber) 100%
+    var(--op-accent) 0%,
+    var(--op-amber) 100%
   );
   z-index: 2;
   pointer-events: none;
 }
 
-.vp-code-group .tabs {
-  border-radius: 10px 10px 0 0;
-  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 16%, transparent);
-  background: color-mix(in srgb, var(--vp-c-brand-2) 5%, var(--vp-c-bg-soft));
-}
-
-.vp-code-group .tabs input:checked + label {
-  color: #06111f;
-  background: var(--pty-amber-soft);
-}
-
-.VPFeature {
-  border-radius: 16px;
-  border-color: color-mix(in srgb, var(--vp-c-brand-2) 18%, transparent);
-  background: linear-gradient(
-    145deg,
-    color-mix(in srgb, var(--vp-c-brand-2) 4%, var(--vp-c-bg-soft)) 0%,
-    color-mix(in srgb, var(--pty-amber) 3%, var(--vp-c-bg)) 100%
-  );
-  transition:
-    transform 0.2s ease,
-    box-shadow 0.2s ease,
-    border-color 0.2s ease;
-}
-
-.VPFeature:hover {
-  transform: translateY(-2px);
-  border-color: color-mix(in srgb, var(--vp-c-brand-2) 45%, transparent);
-  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.09);
-}
-
-.dark .VPFeature:hover {
-  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.42);
-}
-
-.VPFeature .icon {
-  background: color-mix(in srgb, var(--pty-amber) 16%, transparent);
-  border-radius: 10px;
-}
-
-.VPHero .main .platform-strip {
-  width: 100%;
-  max-width: 34rem;
-  margin: 1.25rem 0 0;
-}
-
-.VPHero .main .actions {
-  margin-top: 1.15rem;
-}
-
-.platform-strip {
-  padding: 1rem 1.1rem;
-  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 18%, transparent);
-  border-radius: 18px;
-  background:
-    linear-gradient(
-      135deg,
-      color-mix(in srgb, var(--vp-c-brand-2) 10%, transparent) 0%,
-      color-mix(in srgb, var(--pty-amber) 8%, transparent) 100%
-    ),
-    var(--vp-c-bg-soft);
-}
-
-.platform-strip-label {
-  display: inline-block;
-  margin-bottom: 0.85rem;
-  font-size: 0.78rem;
-  font-weight: 800;
-  letter-spacing: 0.1em;
+.vp-doc div[class*='language-'] .lang {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 4px 12px;
+  font-family: var(--op-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--vp-c-text-2);
+  color: var(--op-mute);
+  border-left: 1px solid var(--op-rule);
+  border-bottom: 1px solid var(--op-rule);
+  background: var(--op-surface-2);
+  z-index: 2;
 }
 
-.platform-pills {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.7rem;
+.vp-doc div[class*='language-'] pre {
+  padding: 14px 18px;
+  background: transparent !important;
 }
 
-.platform-pill {
-  display: inline-flex;
-  align-items: center;
-  min-height: 2.35rem;
-  padding: 0.55rem 0.85rem;
-  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 16%, transparent);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--vp-c-bg) 88%, transparent);
-  color: var(--vp-c-text-1);
-  font-family: var(--vp-font-family-mono);
-  font-size: 0.84rem;
-  font-weight: 700;
+.vp-doc div[class*='language-'] code {
+  font-family: var(--op-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
 }
 
-.platform-pill::before {
-  content: '●';
-  margin-right: 0.5rem;
-  color: var(--pty-amber);
-  font-size: 0.65rem;
-}
-
-.platform-pill-muted {
-  color: var(--vp-c-text-2);
-}
-
-.vp-doc a {
-  text-decoration-color: color-mix(
-    in srgb,
-    var(--vp-c-brand-2) 55%,
-    transparent
-  );
-  text-underline-offset: 2px;
-}
-
-.vp-doc a:hover {
-  text-decoration-color: var(--vp-c-brand-2);
-}
-
+/* Tables — datasheet look */
 .vp-doc table {
   display: table;
   width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 10px 0 24px;
+  border: 1px solid var(--op-rule);
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-family: var(--op-mono);
 }
 
 .vp-doc table th {
-  background: color-mix(in srgb, var(--vp-c-brand-2) 9%, var(--vp-c-bg-soft));
-  font-weight: 700;
+  text-align: left;
+  padding: 10px 14px;
+  background: var(--op-surface-2);
+  color: var(--op-mute);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--op-rule);
+  font-weight: 500;
+}
+
+.vp-doc table td {
+  padding: 10px 14px;
+  color: var(--op-ink-2);
+  border-bottom: 1px solid var(--op-rule);
+  vertical-align: top;
 }
 
 .vp-doc table tr:nth-child(2n) {
-  background: color-mix(in srgb, var(--vp-c-brand-2) 3%, transparent);
+  background: var(--op-hl-bg);
+  background: color-mix(in srgb, var(--op-accent) 4%, transparent);
 }
 
-.vp-doc .custom-block.tip {
-  border-color: var(--vp-c-brand-2);
-  background: color-mix(in srgb, var(--vp-c-brand-2) 8%, transparent);
+.vp-doc table tr:last-child td {
+  border-bottom: none;
 }
 
+/* Callouts */
+.vp-doc .custom-block {
+  border-radius: 6px;
+  border: 1px solid var(--op-pill-bd);
+  background: var(--op-hl-bg);
+  padding: 18px 22px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--op-ink-2);
+}
+
+.vp-doc .custom-block .custom-block-title {
+  color: var(--op-accent-t);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-family: var(--op-mono);
+}
+.vp-doc .custom-block.tip .custom-block-title::before {
+  content: '↳ ';
+}
+.vp-doc .custom-block.warning {
+  border-color: rgba(168, 83, 11, 0.4);
+  background: rgba(168, 83, 11, 0.08);
+}
+
+/* Links — wrapped in :where() so the rule has 0 specificity for selectors
+ * (only the `a` type weighs in). This keeps prose links chartreuse while
+ * letting component-scoped classes like `.op-btn-pri` win without `!important`.
+ */
+:where(.vp-doc) a {
+  color: var(--op-accent-t);
+  text-decoration-color: color-mix(in srgb, var(--op-accent) 60%, transparent);
+  text-underline-offset: 2px;
+  font-weight: 500;
+}
+:where(.vp-doc) a:hover {
+  text-decoration-color: var(--op-accent);
+}
+
+:where(.dark .vp-doc) a {
+  color: var(--op-accent);
+}
+
+/* Right TOC (outline) */
+.VPDocAsideOutline .outline-marker {
+  background-color: var(--op-accent) !important;
+}
+.VPDocAsideOutline .outline-link {
+  font-family: var(--op-mono);
+  font-size: 12px;
+  color: var(--op-mid);
+}
+.VPDocAsideOutline .outline-title {
+  color: var(--op-mute);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+.VPDocAsideOutline .outline-title::before {
+  content: '// ';
+  color: var(--op-accent-t);
+}
+
+/* Pager */
+.pager-link {
+  background: var(--op-surface-2) !important;
+  border: 1px solid var(--op-rule) !important;
+  border-radius: 6px;
+}
+.pager-link .desc {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--op-mute);
+  font-family: var(--op-mono);
+}
+.pager-link .title {
+  font-family: var(--op-mono);
+  font-size: 14px;
+  color: var(--op-ink-2);
+  font-weight: 500;
+}
+
+/* Footer */
+.VPFooter {
+  border-top: 1px solid var(--op-rule);
+  background: var(--op-bg) !important;
+  color: var(--op-mute);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+/* ── Home page (Operator) — markdown content full-bleed ───────────────── */
+
+.op-home .VPHome {
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.op-home .VPHome .container {
+  max-width: none !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+/* The home component itself paints from edge to edge. */
+.op-home .vp-doc,
+.op-home .VPContent .vp-doc {
+  max-width: none;
+  padding: 0;
+  margin: 0;
+}
+
+.op-home .VPHomeHero,
+.op-home .VPHomeFeatures {
+  display: none;
+}
+
+/* Existing terminal helper class kept for any inline use */
 .terminal {
-  border: 1px solid color-mix(in srgb, var(--vp-c-brand-2) 20%, transparent);
-  border-radius: 14px;
+  border: 1px solid var(--op-rule);
+  border-radius: 6px;
   padding: 1rem;
-  background: var(--vp-code-block-bg);
-  font-family: var(--vp-font-family-mono);
+  background: var(--op-surface);
+  font-family: var(--op-mono);
+  font-size: 12.5px;
   overflow-x: auto;
 }
-
 .terminal .prompt {
-  color: var(--vp-c-brand-1);
-  font-weight: 800;
+  color: var(--op-accent-t);
+  font-weight: 600;
+}
+.dark .terminal .prompt {
+  color: var(--op-accent);
 }
 
-.terminal .comment {
-  color: var(--vp-c-text-2);
-}
-
-@media (max-width: 640px) {
-  .platform-pill {
-    width: 100%;
-    justify-content: center;
-    border-radius: 14px;
+/* Keyframes shared by hero PTY frame + schematic */
+@keyframes op-blink {
+  50% {
+    opacity: 0;
   }
 }
