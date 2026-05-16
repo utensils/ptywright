@@ -41,6 +41,44 @@ local function state_snapshot(state, confidence, evidence, sequence, metadata)
   }
 end
 
+-- Best-effort plugin-side redaction for text that we expose through
+-- `ExtensionStateSnapshot.metadata` (permission dialog summaries today).
+-- The host applies `RedactionPolicy::default()` to screen/transcript reads
+-- but state-shaped responses (adapter.state / send / wait) don't go
+-- through that filter. Without this guard, a permission prompt for a
+-- Bash command can carry a `token=…` / `sk-…` / `AKIA…` value in the
+-- metadata summary even when callers rely on default-redacted reads.
+-- Mirror the most common Rust-side patterns; document on the wire that
+-- callers handling secrets must apply their own redaction layer for
+-- guarantees beyond best-effort.
+local SECRET_PATTERNS = {
+  -- `token=value`, `password=value`, `api_key=value` — keep the prefix.
+  "([Tt]oken%s*=%s*)([^%s\"']+)",
+  "([Pp]assword%s*=%s*)([^%s\"']+)",
+  "([Aa]pi[_-]?[Kk]ey%s*=%s*)([^%s\"']+)",
+  "([Ss]ecret%s*=%s*)([^%s\"']+)",
+  -- Anthropic / OpenAI style API key prefixes.
+  "()(sk%-[%w%-_]+)",
+  "()(sk%-ant%-[%w%-_]+)",
+  -- AWS access key id.
+  "()(AKIA[%w]+)",
+}
+
+local function redact_secret_patterns(text)
+  if text == nil or text == "" then
+    return text
+  end
+  for _, pattern in ipairs(SECRET_PATTERNS) do
+    text = (text:gsub(pattern, function(prefix, _value)
+      if prefix == nil or prefix == "" then
+        return "[REDACTED]"
+      end
+      return prefix .. "[REDACTED]"
+    end))
+  end
+  return text
+end
+
 -- Strip a single leading "$" so a number prefixed by a currency glyph still
 -- parses as a number. Returns the trailing slice, never nil. Cheap to call.
 local function strip_dollar(text)
@@ -148,6 +186,108 @@ local function has_permission_indicator(text)
     "yes, and don't ask again",
     "yes, and don’t ask again",
   })
+end
+
+-- Parse the permission dialog into `{ permission = { tool?, summary?,
+-- options } }`. Claude Code ships two layouts today:
+--   numbered list:    "Bash command\n  cmd\nDo you want to proceed?\n
+--                       ❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No"
+--   Enter/Esc style:  "Allow Bash command: cmd\n[Enter] Approve  [Esc] Deny"
+-- Both forms expose the tool name (the word before "command" / "tool"),
+-- the command summary text, and the explicit options the user can pick.
+-- Lossy vs. `--permission-prompt-tool stdio`'s structured control_request
+-- — the dialog has no JSON payload here — but enough to apply simple
+-- policy gates from a calling consumer. Returns nil when nothing parsed.
+local function parse_permission_dialog(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local permission = {}
+  -- Collect lines so we can anchor the tool / summary extraction to
+  -- the actual dialog rows rather than running text:match over the
+  -- whole screen (which would let prior conversation or prose like
+  -- "He used a Bash command earlier" leak into permission.tool).
+  local lines = {}
+  for line in string.gmatch(text, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  for idx, line in ipairs(lines) do
+    local trimmed = trim(line)
+    -- Enter/Esc layout: "Allow Bash command: cargo test" on one line.
+    local enter_tool, enter_summary = trimmed:match("^[Aa]llow ([%w%-]+) command:%s*(.+)$")
+    if not enter_tool then
+      enter_tool, enter_summary = trimmed:match("^[Aa]llow ([%w%-]+) tool:%s*(.+)$")
+    end
+    if enter_tool then
+      permission.tool = permission.tool or enter_tool
+      if not permission.summary then
+        permission.summary = trim(enter_summary)
+      end
+    end
+    -- Numbered layout: a line that *is* "<Tool> command" (or "tool"),
+    -- with no extra preamble, followed by the command body on the next
+    -- non-empty line. Anchoring on the exact line shape rejects matches
+    -- against prior prose mentioning the word "command".
+    local list_tool = trimmed:match("^([%w%-]+) command$") or trimmed:match("^([%w%-]+) tool$")
+    if list_tool then
+      permission.tool = permission.tool or list_tool
+      for follow_idx = idx + 1, #lines do
+        local follow = trim(lines[follow_idx])
+        if follow ~= "" then
+          if not contains(lower(follow), "do you want to proceed") then
+            permission.summary = permission.summary or follow
+          end
+          break
+        end
+      end
+    end
+  end
+
+  local options = {}
+  -- Numbered options are anchored to the *start of a line* (after optional
+  -- whitespace and the `❯` / `>` selector glyph), not "anywhere in the
+  -- line." Without that anchor, a visible command summary like
+  -- `echo '1. hello'` would be picked up as an option and the actual
+  -- Enter/Esc labels below could fail to parse. Lua patterns can't
+  -- represent the multi-byte `❯` in a `[...]` class, so strip it (and
+  -- the `>` ASCII fallback) up front, then anchor with `^`.
+  local selector_glyph = "❯"
+  for _, line in ipairs(lines) do
+    local trimmed = trim(line)
+    if trimmed:sub(1, #selector_glyph) == selector_glyph then
+      trimmed = trim(trimmed:sub(#selector_glyph + 1))
+    elseif trimmed:sub(1, 1) == ">" then
+      trimmed = trim(trimmed:sub(2))
+    end
+    local body = trimmed:match("^%d+%.%s+(.+)$")
+    if body then
+      table.insert(options, trim(body))
+    end
+  end
+  if #options == 0 then
+    -- Enter/Esc bracketed layout: preserve whichever label the TUI
+    -- actually rendered rather than normalising to Approve / Deny.
+    -- Plugin authors who'd rather see normalised labels can post-process
+    -- the metadata themselves.
+    local enter_label = text:match("%[Enter%]%s*([%w%-]+)")
+    if enter_label then
+      table.insert(options, enter_label)
+    end
+    local esc_label = text:match("%[Esc%]%s*([%w%-]+)")
+    if esc_label then
+      table.insert(options, esc_label)
+    end
+  end
+  if #options > 0 then
+    permission.options = options
+  end
+  if permission.summary then
+    permission.summary = redact_secret_patterns(permission.summary)
+  end
+  if next(permission) == nil then
+    return nil
+  end
+  return { permission = permission }
 end
 
 local function has_plan_indicator(text)
@@ -399,7 +539,13 @@ function M.classify(input)
   end
 
   if has_permission_indicator(body_text) then
-    return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence)
+    -- Parse against the unlowered *full screen* — the dialog tool/summary
+    -- live in the body but the numbered options can land in the bottom
+    -- rows that `body_text` strips, and we want all three fields when
+    -- present. Original case matters for the tool name and summary
+    -- ("Bash command: cargo test").
+    local permission_metadata = parse_permission_dialog(screen)
+    return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
   end
 
   if has_active_work_indicator(body_text) then
