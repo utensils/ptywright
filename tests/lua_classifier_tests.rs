@@ -30,6 +30,12 @@ struct Expectation {
     last_intent: Option<String>,
     #[serde(default = "default_min_confidence")]
     min_confidence: f32,
+    /// Optional structured plugin metadata that the classifier should attach
+    /// to `ExtensionStateSnapshot::metadata`. When present, the matrix asserts
+    /// deep equality against the parsed classifier output. Fixtures that
+    /// don't need a metadata check leave the field absent.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 fn default_min_confidence() -> f32 {
@@ -133,6 +139,17 @@ fn classifier_matches_sanitized_claude_code_fixtures() {
             state.confidence,
             expectation.min_confidence
         );
+        if let Some(expected_metadata) = expectation.metadata.as_ref() {
+            let actual = state.metadata.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "fixture {fixture_name} expected metadata {expected_metadata} but classifier returned none"
+                )
+            });
+            assert_eq!(
+                actual, expected_metadata,
+                "fixture {fixture_name} metadata mismatch"
+            );
+        }
         asserted += 1;
     }
 
