@@ -21,7 +21,23 @@ export default defineConfig({
       'link',
       { rel: 'icon', href: '/ptywright/favicon.svg', type: 'image/svg+xml' },
     ],
-    ['meta', { name: 'theme-color', content: '#0a0b0d' }],
+    // Two theme-color tags so mobile browser UI tracks the active mode.
+    [
+      'meta',
+      {
+        name: 'theme-color',
+        content: '#f4f5f3',
+        media: '(prefers-color-scheme: light)',
+      },
+    ],
+    [
+      'meta',
+      {
+        name: 'theme-color',
+        content: '#0a0b0d',
+        media: '(prefers-color-scheme: dark)',
+      },
+    ],
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'ptywright' }],
     ['meta', { property: 'og:description', content: description }],

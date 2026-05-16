@@ -5,6 +5,7 @@
 //
 // The PTY frame block (.op-pty-*) is intentionally hard-coded dark in both
 // modes — design intent: a real terminal sitting on the page.
+import { withBase } from 'vitepress'
 import RuntimeSchematic from './RuntimeSchematic.vue'
 
 const ptyLines = [
@@ -73,10 +74,10 @@ const ptyLines = [
           pipelines — one vocabulary across all three.
         </p>
         <div class="op-actions">
-          <a class="op-btn-pri" href="/ptywright/guide/installation"
+          <a class="op-btn-pri" :href="withBase('/guide/installation')"
             >$ cargo add ptywright</a
           >
-          <a class="op-btn-sec" href="/ptywright/guide/architecture"
+          <a class="op-btn-sec" :href="withBase('/guide/architecture')"
             >read the spec →</a
           >
         </div>
@@ -510,5 +511,13 @@ const ptyLines = [
   color: var(--op-mid);
   font-size: 12px;
   line-height: 1.55;
+}
+
+/* Respect prefers-reduced-motion — freeze the blinking PTY cursor. */
+@media (prefers-reduced-motion: reduce) {
+  .op-cursor {
+    animation: none;
+    opacity: 1;
+  }
 }
 </style>

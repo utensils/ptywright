@@ -714,4 +714,15 @@ const annotations = [
 .is-dark .op-schem-cargo {
   color: var(--op-accent);
 }
+
+/* Respect prefers-reduced-motion — drop the SMIL <animateMotion> dots so the
+ * diagram is fully static. Static paths + arrowheads still convey the
+ * observation and control pipelines without continuous motion.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .op-schem-dot,
+  .op-schem-dot-back {
+    display: none;
+  }
+}
 </style>
