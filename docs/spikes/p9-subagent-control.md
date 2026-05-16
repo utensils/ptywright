@@ -30,8 +30,8 @@ These are the questions the spike needs to answer before code goes in. Each maps
    - Drives whether `task.list` should return a structured `{ id, name, state }` shape or just a flat list of names.
 
 5. **Does background task state ever reach the classifier as a top-level state worth detecting?**
-   - E.g. "task X failed and is blocking the prompt." If so, we'd add a new classifier state (currently 9; would become 10).
-   - Or it stays in the metadata channel established by P5 and doesn't earn a top-level state.
+   - E.g. "task X failed and is blocking the prompt." If so, we'd add a new classifier state to the existing set (`starting`, `cancelling`, `waiting_for_trust`, `waiting_for_plan_approval`, `waiting_for_permission`, `thinking`, `error`, `completed_turn`, `ready`, `waiting_for_user_input` — see `plugins/claude-code/main.lua`).
+   - Or it stays in the metadata channel established by the usage-screen parser PR and doesn't earn a top-level state.
 
 ## Recommended workflow for the spike
 
@@ -64,7 +64,7 @@ Assuming the TUI exposes a task panel reachable by some key or slash command, ex
 
 Once questions 1–5 above are answered:
 
-- **Small** (S, ~half-day): if the TUI surfaces tasks via existing primitives the plugin already knows (modal dialog, numbered options) — looks like the permission-dialog parser (P10) writ slightly larger.
+- **Small** (S, ~half-day): if the TUI surfaces tasks via existing primitives the plugin already knows (modal dialog, numbered options) — looks like the permission-dialog parser in `plugins/claude-code/main.lua::parse_permission_dialog` writ slightly larger.
 - **Medium** (M, ~1–2 days): if a new classifier state is required, or if "stop" chains multiple intents through a confirmation dialog.
 - **Large** (L, week): if the TUI uses an interactive selection model (arrow-key cursor on a list, modal focus switches) that doesn't map to existing intent shapes — would need new action primitives in the host.
 
