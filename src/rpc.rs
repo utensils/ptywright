@@ -1228,9 +1228,17 @@ impl RpcServer {
                 .map(|t| t.args.clone())
                 .unwrap_or_default()
         });
+        // Geometry resolution order: explicit caller value, then manifest's
+        // declared headless preset, then the host's last-resort `40x120`.
+        // The manifest preset matters for TUI plugins whose classifier
+        // depends on line wrapping (claude-code in particular renders
+        // status-bar / prompt anchors at column-sensitive positions and
+        // ships a 200x60 preset for that reason).
+        let manifest_rows = manifest_default.as_ref().and_then(|t| t.rows);
+        let manifest_cols = manifest_default.as_ref().and_then(|t| t.cols);
         let size = TerminalSize {
-            rows: params.rows.unwrap_or(40),
-            cols: params.cols.unwrap_or(120),
+            rows: params.rows.or(manifest_rows).unwrap_or(40),
+            cols: params.cols.or(manifest_cols).unwrap_or(120),
             pixel_width: params.pixel_width.unwrap_or(0),
             pixel_height: params.pixel_height.unwrap_or(0),
         };
@@ -2237,6 +2245,80 @@ mod tests {
                 ),
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adapter_start_uses_manifest_geometry_when_caller_omits_rows_cols() {
+        // The claude-code manifest declares a 200x60 classifier-stable
+        // headless preset. `adapter.start` with no `rows` / `cols` must
+        // honour it instead of falling through to the host's last-resort
+        // 40x120. Using `/bin/sh` as the program keeps the test
+        // claude-binary-independent.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-c","sleep 5"]}}"#,
+        );
+        let adapter = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start must succeed");
+
+        let snapshot = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.snapshot","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+        let size = &snapshot["result"]["size"];
+        assert_eq!(
+            size["rows"].as_u64(),
+            Some(60),
+            "manifest's rows preset must drive adapter.start when caller omits rows; got {snapshot}"
+        );
+        assert_eq!(
+            size["cols"].as_u64(),
+            Some(200),
+            "manifest's cols preset must drive adapter.start when caller omits cols; got {snapshot}"
+        );
+
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adapter_start_explicit_rows_cols_override_manifest_geometry() {
+        // Caller-supplied geometry wins over the manifest preset — same
+        // contract as `program` / `args` overrides.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-c","sleep 5"],"rows":30,"cols":100}}"#,
+        );
+        let adapter = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start must succeed");
+
+        let snapshot = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.snapshot","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+        assert_eq!(snapshot["result"]["size"]["rows"].as_u64(), Some(30));
+        assert_eq!(snapshot["result"]["size"]["cols"].as_u64(), Some(100));
+
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
     }
 
     #[test]

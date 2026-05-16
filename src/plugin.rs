@@ -76,7 +76,15 @@ impl PluginPermission {
 /// Plugins declare this in their manifest so the host can wire
 /// `adapter.start` to a sensible default without baking application-specific
 /// mappings into the RPC layer. Callers may still override by passing
-/// `program` / `args` explicitly.
+/// `program` / `args` (or `rows` / `cols`) explicitly.
+///
+/// `rows` / `cols` carry the plugin's recommended headless terminal size.
+/// They matter for TUI plugins whose classifier behaviour depends on line
+/// wrapping (claude-code, for instance, parses status bars and prompt
+/// glyphs whose visual location shifts with the column count). A
+/// classifier-stable preset is strongly preferred to whatever the host
+/// happens to default to (`80x24`), so plugins that have one should
+/// declare it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefaultTarget {
     /// PTY program to spawn when the caller does not specify one.
@@ -84,6 +92,14 @@ pub struct DefaultTarget {
     /// Extra CLI arguments appended to the default program.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Recommended terminal row count for headless / classifier-stable
+    /// operation. Used by `adapter.start` when the caller omits `rows`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+    /// Recommended terminal column count for headless / classifier-stable
+    /// operation. Used by `adapter.start` when the caller omits `cols`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
 }
 
 /// Declarative extension manifest.
@@ -357,6 +373,17 @@ pub fn claude_code_manifest() -> PluginManifest {
         default_target: Some(DefaultTarget {
             program: "claude".to_string(),
             args: Vec::new(),
+            // Claude Code 2.1.x renders its status bar, prompt glyphs (`>`,
+            // `❯`), and turn-boundary anchors at column positions that
+            // shift with the terminal width. The 80×24 host default wraps
+            // many of those lines and destabilises the classifier. A
+            // 200×60 preset comfortably fits the status bar, the
+            // "Total cost: …" usage screen, and the longest tool-use
+            // status lines without wrapping. Callers that need a
+            // different geometry (visible attachment, tighter CI sandbox)
+            // override with `rows` / `cols` on `adapter.start`.
+            rows: Some(60),
+            cols: Some(200),
         }),
     }
 }
@@ -482,6 +509,20 @@ mod tests {
             "claude-code default_target.args must stay empty (no `-p`/`--print`); got {:?}",
             default_target.args,
         );
+        // Lock in the headless preset so a future edit can't silently revert
+        // to the host's `40x120` default. claude-code's classifier reads
+        // column-sensitive anchors (status bar, `❯` / `>` prompt, "Total
+        // cost: …") and a 200x60 viewport keeps those off the wrap line.
+        assert_eq!(
+            default_target.cols,
+            Some(200),
+            "claude-code must declare its classifier-stable cols preset"
+        );
+        assert_eq!(
+            default_target.rows,
+            Some(60),
+            "claude-code must declare its classifier-stable rows preset"
+        );
     }
 
     #[test]
@@ -512,6 +553,8 @@ mod tests {
             default_target: Some(DefaultTarget {
                 program: "x".to_string(),
                 args: Vec::new(),
+                rows: None,
+                cols: None,
             }),
         };
         let value = serde_json::to_value(&manifest).expect("serialize manifest");
