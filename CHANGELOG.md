@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `ExtensionStateSnapshot` gained an opaque `metadata: Option<serde_json::Value>` channel for plugins to attach structured parsing of the screen alongside the state label. Omitted on the wire when empty.
 - `claude-code` classifier now parses the `/usage` panel when it reports `completed_turn` and attaches `{ usage: { cost_usd, api_duration_s, wall_duration_s, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, lines_added, lines_removed } }`. Every field is best-effort and absent when the pattern didn't match, so a future TUI tweak that drops one of the lines just leaves that key out instead of breaking classification.
+- `claude-code` classifier also parses the bottom status bar on every state and attaches `{ status: { model?, permission_mode? } }`. `model` comes from the `[Model Name]` brackets Claude renders in the status; `permission_mode` is one of `bypass` / `auto` / `plan` based on the `⏵⏵ … on` hint. Callers can read the running model and current permission mode without re-scraping the screen.
 - Classifier fixture matrix (`tests/lua_classifier_tests.rs`) now honours an optional `metadata` field on `<fixture>.expected.json`; fixtures that need a structured assertion declare the expected JSON inline.
 
 ## [0.1.1] - 2026-05-15
