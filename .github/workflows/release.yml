@@ -116,6 +116,18 @@ jobs:
       - name: Generate checksums
         run: cd artifacts && sha256sum * > SHA256SUMS
 
+      # Strip the `v` prefix so the release body can pin
+      # `cargo install ptywright --version <bare>` to this exact release.
+      # Without this, the rendered note would say "cargo install ptywright"
+      # and silently track *whatever* version is latest on crates.io at the
+      # time of install — confusing when reading an old release's notes.
+      - name: Compute version (strip leading v)
+        id: ver
+        shell: bash
+        run: |
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -171,7 +183,7 @@ jobs:
             ### Cargo install (crates.io)
 
             ```bash
-            cargo install ptywright
+            cargo install ptywright --version ${{ steps.ver.outputs.version }} --locked
             ```
 
             ### Nix flake (macOS + Linux)
