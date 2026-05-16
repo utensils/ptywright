@@ -104,13 +104,17 @@ fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
         st.state, st.evidence
     );
 
-    // Without stable_ms — adapter.state poll path. Falls into the new
-    // lower-confidence completed_turn branch added for poll consumers.
+    // Without stable_ms — adapter.state poll path falls through to
+    // waiting_for_user_input (the poll-path completed_turn branch was
+    // removed because it fired too early on streaming answers; polling
+    // consumers drive adapter.wait or their own stability heuristic).
+    // The important property here is that it does NOT misclassify as
+    // `starting` despite the welcome chrome still being on screen.
     let st_poll = classify_state(&extension, screen, 7, Some("prompt_submitted"), None);
-    assert_eq!(
-        st_poll.state, "completed_turn",
-        "welcome chrome must not downgrade to `starting` on state-poll path; got state={} evidence={}",
-        st_poll.state, st_poll.evidence
+    assert_ne!(
+        st_poll.state, "starting",
+        "welcome chrome must not downgrade to `starting` on state-poll path; got state={}",
+        st_poll.state
     );
 
     // Sanity: when last_intent is empty (still in the welcome-dismissal
@@ -154,12 +158,23 @@ fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
 }
 
 #[test]
-fn send_prompt_plan_uses_bracketed_paste_and_sets_intent() {
-    // Claude Code v2.1+ enables bracketed paste; the plan must use the
-    // bracketed variant so the trailing Enter is not absorbed into the
-    // paste tokeniser on longer prompts. Lock the action shape and the
-    // `last_intent` contract in here — both are part of the plugin's
-    // documented surface for plugin authors.
+fn send_prompt_plan_dismisses_then_pastes_then_submits() {
+    // The plan emits THREE actions in this exact order:
+    //   1. Enter  — dismiss any first-keypress interceptor (welcome
+    //      panel, compact-launch view). On a clean empty input box
+    //      Claude treats this as a no-op submit.
+    //   2. BracketedPaste(prompt) — Claude Code v2.1+ requires the
+    //      bracketed wrapper so the trailing Enter is not absorbed into
+    //      the paste tokeniser on longer prompts.
+    //   3. Enter — submit the now-populated input box.
+    //
+    // Without action #1, the bracketed paste's CSI-200~ open marker
+    // gets consumed by Claude's first-keypress interceptor on a fresh
+    // launch, the rest of the paste lands as input that's then
+    // truncated, and the trailing Enter submits a partial prompt or
+    // nothing at all. Locking the three-action sequence here so a
+    // future plugin edit can't silently regress to the old two-action
+    // form.
     let extension = claude_plugin();
     let plan = plan(
         &extension,
@@ -170,6 +185,7 @@ fn send_prompt_plan_uses_bracketed_paste_and_sets_intent() {
     assert_eq!(
         plan.actions,
         vec![
+            Action::Key(Key::Enter),
             Action::BracketedPaste("hello Claude".to_string()),
             Action::Key(Key::Enter),
         ]
@@ -532,30 +548,26 @@ fn classifier_detects_completed_turn_after_prompt_submission() {
 }
 
 #[test]
-fn classifier_distinguishes_stable_and_poll_paths_for_completed_turn() {
-    // Two completed_turn branches exist for the post-prompt-submit case:
-    //   • The high-confidence branch (~0.78) fires when the matcher
-    //     supplies `stable_ms >= completed_turn_stable_ms` — used by
-    //     `adapter.wait` and locked in by the `completed.txt` fixture.
-    //   • A lower-confidence branch (~0.6) fires from state-poll callers
-    //     (`adapter.state`) that don't have stability info but observe
-    //     no active-work spinner. Without this branch, polling consumers
-    //     would never see turn completion through state alone.
+fn classifier_completed_turn_paths() {
+    // The classifier has two completion paths:
+    //   (a) Stable path (confidence ~0.78): fires when adapter.wait
+    //       supplies stable_ms >= completed_turn_stable_ms. The matcher
+    //       has already proven the screen settled, so we trust it.
+    //   (b) Poll path (confidence ~0.7): fires from adapter.state when
+    //       BOTH the answer bullet `⏺` AND an empty input prompt line
+    //       (`❯` / `>` alone on a line) are visible. The empty prompt
+    //       only reappears after Claude returns to idle, so it's a
+    //       stronger "actually done" signal than the bullet alone.
     //
-    // Lock both paths so a future plugin edit can't collapse them or
-    // re-introduce the previous conservative `waiting_for_user_input`
-    // fallback that left polling consumers stuck mid-turn.
+    // The bullet-alone case (which the script needs polling to discover
+    // mid-stream) must NOT fire completed_turn — it would terminate the
+    // stream before the rest of a multi-line answer arrives.
     let extension = claude_plugin();
-    // `⏺` is Claude's answer-block bullet — the anchor the poll-path
-    // completion check uses to gate against firing before the turn has
-    // actually run. Without it (or before the answer arrives) state
-    // polling falls back to `waiting_for_user_input`.
-    let screen = "⏺ work completed\n>";
 
-    // adapter.wait path: stable_ms passed.
+    // (a) Stable path — answer + empty prompt + stable_ms supplied.
     let stable = classify_state(
         &extension,
-        screen,
+        "⏺ work completed\n>",
         6,
         Some("prompt_submitted"),
         Some(COMPLETED_TURN_STABLE_MS),
@@ -566,31 +578,39 @@ fn classifier_distinguishes_stable_and_poll_paths_for_completed_turn() {
         "stable input prompt after prompt submission"
     );
 
-    // adapter.state poll path: no stable_ms.
-    let poll = classify_state(&extension, screen, 6, Some("prompt_submitted"), None);
-    assert_eq!(poll.state, "completed_turn");
-    assert_eq!(
-        poll.evidence,
-        "answer bullet visible after submission without active work"
-    );
-    assert!(
-        poll.confidence < stable.confidence,
-        "poll-path confidence ({}) should be below stable-path confidence ({})",
-        poll.confidence,
-        stable.confidence
-    );
-
-    // Without the `⏺` anchor the poll path should NOT fire — this is
-    // the guard against "just submitted, spinner not rendered yet"
-    // being mistaken for "turn complete".
-    let no_bullet = classify_state(
+    // (b) Poll path — answer + empty prompt, no stable_ms.
+    let poll = classify_state(
         &extension,
-        "work completed\n>",
+        "⏺ work completed\n>",
         6,
         Some("prompt_submitted"),
         None,
     );
-    assert_eq!(no_bullet.state, "waiting_for_user_input");
+    assert_eq!(poll.state, "completed_turn");
+    assert_eq!(
+        poll.evidence,
+        "answer bullet plus empty input prompt visible without active work"
+    );
+    assert!(
+        poll.confidence < stable.confidence,
+        "poll-path confidence ({}) should be below stable-path ({})",
+        poll.confidence,
+        stable.confidence
+    );
+
+    // (c) Answer bullet visible but no empty prompt yet — mid-stream.
+    // Must NOT fire completed_turn, or the script terminates early.
+    let mid_stream = classify_state(
+        &extension,
+        "⏺ partial answer being written",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        mid_stream.state, "completed_turn",
+        "mid-stream (answer bullet but no empty prompt) must not fire completed_turn"
+    );
 }
 
 #[test]

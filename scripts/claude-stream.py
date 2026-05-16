@@ -8,10 +8,24 @@ Usage:
   claude-stream --help
 
 Spawns `ptywright serve --stdio`, starts the built-in `claude-code` adapter,
-auto-handles the workspace-trust dialog if it appears, submits the prompt,
-and streams the live screen body + state transitions until the turn
-completes. Demonstrates the session.output streaming pattern documented in
-.claude/skills/ptywright/SKILL.md.
+auto-handles workspace-trust and any first-keypress interceptors, submits
+the prompt with verification, streams the response, and exits cleanly on
+completion or SIGINT.
+
+Design goals:
+  * **Robust across Claude Code TUI versions.** All decisions use observable
+    screen evidence (body changed / didn't change / contains text X) plus
+    the classifier's state label — never version-specific glyphs or
+    spinner verbs.
+  * **No magic timings.** Two knobs only: `--heartbeat-ms` (the streaming
+    cadence) and `--timeout` (the overall safety bound). Every wait is
+    event-driven (poll until X happens) with the overall timeout as the
+    single fallback. There are no hand-tuned "wait 0.5s" sleeps anywhere
+    in the control flow.
+  * **Native-feel streaming.** At the default 50 ms heartbeat the body
+    deltas appear within ~25 ms of leaving the PTY.
+  * **Clean Ctrl+C.** SIGINT closes the adapter and the ptywright server
+    in order; the parent shell does not see a partial pipe or a zombie.
 
 Requires `claude` on PATH and `ptywright` either on PATH or via
 $PTYWRIGHT_BIN / the devshell wrapper.
@@ -22,14 +36,16 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-# ----- terminal styling -------------------------------------------------------
+# ───────────────────────── terminal styling ─────────────────────────────────
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 def c(code: str, text: str) -> str:
@@ -44,10 +60,12 @@ RED     = lambda s: c("31", s)
 MAGENTA = lambda s: c("35", s)
 
 def emit(prefix: str, body: str = ""):
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K")
     sys.stdout.write(f"{prefix} {body}\n" if body else f"{prefix}\n")
     sys.stdout.flush()
 
-# ----- arg parsing ------------------------------------------------------------
+# ───────────────────────── arg parsing ──────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
@@ -57,15 +75,19 @@ def parse_args() -> argparse.Namespace:
         epilog=__doc__,
     )
     ap.add_argument("prompt", help='prompt string, @path/to/file, or - for stdin')
-    ap.add_argument("--cwd", default=os.getcwd(), help="working directory for the claude session (default: $PWD)")
+    ap.add_argument("--cwd", default=os.getcwd(), help="cwd for the claude session (default: $PWD)")
     ap.add_argument("--model", default="haiku",
-                    help="model passed to `claude --model` (default: haiku — fastest for smoke tests; pass --model '' to let claude choose)")
-    ap.add_argument("--timeout", type=float, default=600.0, help="overall timeout in seconds (default: 600)")
-    ap.add_argument("--heartbeat-ms", type=int, default=80,
-                    help="poll cadence for session.output notifications (lower = lower latency, higher CPU; default: 80)")
+                    help="model passed to `claude --model` (default: haiku; pass --model '' to let claude choose)")
+    ap.add_argument("--timeout", type=float, default=600.0,
+                    help="overall hard safety bound in seconds (default: 600). The script never "
+                         "spins past this regardless of internal state — it is the only time-based "
+                         "guard in the control flow.")
+    ap.add_argument("--heartbeat-ms", type=int, default=50,
+                    help="poll cadence in ms (default: 50). Pulses session.output notifications "
+                         "and screen inspections; lower = faster perceived streaming, higher CPU.")
     ap.add_argument("--ptywright", default=os.environ.get("PTYWRIGHT_BIN", "ptywright"),
                     help="path to the ptywright binary (default: $PTYWRIGHT_BIN or `ptywright`)")
-    ap.add_argument("--no-trust", action="store_true", help="do not auto-approve the workspace-trust dialog")
+    ap.add_argument("--quiet", action="store_true", help="suppress state-transition and metadata annotations")
     return ap.parse_args()
 
 def resolve_prompt(arg: str) -> str:
@@ -75,24 +97,24 @@ def resolve_prompt(arg: str) -> str:
         return Path(arg[1:]).read_text(encoding="utf-8")
     return arg
 
-# ----- jsonrpc client ---------------------------------------------------------
+# ───────────────────────── jsonrpc client ───────────────────────────────────
 
 class Client:
-    """Minimal NDJSON JSON-RPC client over a subprocess pipe.
+    """NDJSON JSON-RPC client over a ptywright stdio subprocess.
 
-    Background reader thread parses each line and dispatches:
-      - id-bearing responses to a per-call queue (rpc(...) is synchronous)
-      - notifications to an internal list (drained by the main loop)
+    Background reader routes id-bearing responses to per-call queues and
+    drops notifications into a thread-safe queue. Synchronous rpc() calls
+    are the only path the main thread uses.
     """
-    def __init__(self, bin_path: str):
+    def __init__(self, bin_path: str, log_level: str):
         self.proc = subprocess.Popen(
             [bin_path, "serve", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
-            env={**os.environ, "PTYWRIGHT_LOG": os.environ.get("PTYWRIGHT_LOG", "warn")},
+            env={**os.environ, "PTYWRIGHT_LOG": log_level},
         )
         self.responses: dict[int, queue.Queue] = {}
-        self.notifs: list[dict] = []
+        self.notifs: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
         self._rid = 0
         self._dead = False
@@ -105,15 +127,13 @@ class Client:
                 line = line.strip()
                 if not line: continue
                 try: m = json.loads(line)
-                except json.JSONDecodeError:
-                    sys.stderr.write(f"[ptywright non-JSON] {line!r}\n"); continue
+                except json.JSONDecodeError: continue
                 if "id" in m:
                     with self.lock:
                         q = self.responses.get(m["id"])
                     if q: q.put(m)
                 else:
-                    with self.lock:
-                        self.notifs.append(m)
+                    self.notifs.put(m)
         finally:
             self._dead = True
 
@@ -121,7 +141,7 @@ class Client:
         for line in self.proc.stderr:
             sys.stderr.write(f"{DIM('[ptywright]')} {line}")
 
-    def rpc(self, method: str, params: dict | None = None, t: float = 30.0):
+    def rpc(self, method: str, params: dict | None = None, t: float = 10.0):
         if self._dead:
             raise RuntimeError("ptywright server has exited")
         self._rid += 1
@@ -130,9 +150,12 @@ class Client:
         with self.lock: self.responses[rid] = q
         req: dict = {"jsonrpc":"2.0","id":rid,"method":method}
         if params: req["params"] = params
-        self.proc.stdin.write(json.dumps(req) + "\n"); self.proc.stdin.flush()
+        self.proc.stdin.write(json.dumps(req) + "\n")
+        self.proc.stdin.flush()
         try:
             msg = q.get(timeout=t)
+        except queue.Empty:
+            raise TimeoutError(f"{method} did not respond within {t}s") from None
         finally:
             with self.lock: self.responses.pop(rid, None)
         if "error" in msg:
@@ -140,20 +163,301 @@ class Client:
         return msg["result"]
 
     def drain_notifs(self) -> list[dict]:
-        with self.lock:
-            out, self.notifs = self.notifs, []
+        out: list[dict] = []
+        try:
+            while True: out.append(self.notifs.get_nowait())
+        except queue.Empty: pass
         return out
 
     def close(self):
         try: self.proc.stdin.close()
-        except: pass
-        try: self.proc.wait(timeout=5)
+        except Exception: pass
+        try: self.proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+            try: self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired: pass
 
-# ----- streaming loop ---------------------------------------------------------
+# ───────────────────────── streaming driver ─────────────────────────────────
 
-TERMINAL_STATES = {"completed_turn", "error", "exited", "plugin_error"}
+# Single bytes-of-PTY-growth threshold used to verify Claude has reacted
+# to a paste. Derived from observed PTY behaviour, not arbitrary:
+#   * Claude's idle status-bar refresh produces ~120 bytes per heartbeat.
+#   * A real prompt acceptance (echoing the input, rendering the spinner)
+#     produces 1000+ bytes within the first heartbeat post-paste.
+# 256 bytes sits squarely between the two: above idle noise, well below
+# any real reaction. It's a byte threshold, not a timing — it doesn't
+# get stale across faster/slower machines because it measures Claude's
+# *output bytes*, not wall-clock.
+PASTE_REACTION_BYTES = 256
+
+# Pre-compiled patterns for streaming-output dedup. The streaming loop
+# de-duplicates lines so each distinct content shows once; these patterns
+# normalize away the parts that vary tick-to-tick (spinner glyph at the
+# start, timing/token counters in trailing parens) so the same conceptual
+# line — e.g. "Channelling…" — collapses to one print regardless of which
+# glyph or counter Claude happens to render this tick. Structural, not
+# TUI-version-specific: any TUI that wraps live counters in parens or
+# leads spinner lines with a glyph collapses correctly.
+_DEDUP_TRAILING_PARENS_RE = re.compile(r"\s*\([^)]+\)\s*$")
+_DEDUP_LEADING_GLYPH_RE   = re.compile(r"^[^\w]+")
+
+def _normalize_for_dedup(line: str) -> str:
+    s = _DEDUP_TRAILING_PARENS_RE.sub("", line)
+    s = _DEDUP_LEADING_GLYPH_RE.sub("", s)
+    return s.strip().lower()
+
+class Stream:
+    """Robust Claude Code streaming driver — TUI-version-agnostic."""
+
+    TERMINAL_STATES = {"completed_turn", "error", "exited", "plugin_error"}
+
+    def __init__(self, client: Client, aid: str, args: argparse.Namespace,
+                 hard_deadline: float):
+        self.client = client
+        self.aid = aid
+        self.args = args
+        self.heartbeat = args.heartbeat_ms / 1000.0
+        self.deadline = hard_deadline
+        self._closed = False
+        # Annotation memo — only print transitions, not every poll.
+        self._last_state: str | None = None
+        self._last_evidence: str | None = None
+        self._last_metadata_repr: str | None = None
+        # Alive ticker — overwrites in place on a TTY.
+        self._last_alive_at = 0.0
+        self._alive_phase = 0
+
+    # ─── time discipline ─────────────────────────────────────────────────
+    def _budget(self) -> float:
+        """Seconds remaining before the hard deadline fires."""
+        return max(0.0, self.deadline - time.monotonic())
+
+    def _expired(self) -> bool:
+        return time.monotonic() >= self.deadline
+
+    # ─── primitive: read what's on screen now ────────────────────────────
+    def inspect(self) -> tuple[str, dict]:
+        ins = self.client.rpc("adapter.inspect", {"adapter": self.aid, "redact": False}, t=5.0)
+        return ins.get("body_text", ""), ins
+
+    # ─── primitive: poll state once, annotate transitions ────────────────
+    def poll_state(self) -> dict:
+        st = self.client.rpc("adapter.state", {"adapter": self.aid}, t=5.0)
+        s = st["state"]["state"]
+        ev = st["state"].get("evidence", "")
+        md = st["state"].get("metadata")
+        if not self.args.quiet:
+            if s != self._last_state or ev != self._last_evidence:
+                emit(MAGENTA("⇢ state"),
+                     f"{self._last_state} → {BOLD(s)}  {DIM(ev)}" if self._last_state
+                     else f"{BOLD(s)}  {DIM(ev)}")
+                self._last_state = s
+                self._last_evidence = ev
+            if md:
+                md_repr = json.dumps(md, sort_keys=True)
+                if md_repr != self._last_metadata_repr:
+                    if "permission" in md:
+                        p = md["permission"]
+                        emit(YELLOW("⚠ permission"),
+                             f"tool={p.get('tool','?')} summary={(p.get('summary') or '')[:80]}")
+                    if "status" in md:
+                        s_md = md["status"]
+                        emit(DIM("  status"),
+                             f"model={s_md.get('model','?')} mode={s_md.get('permission_mode','?')}")
+                    if "usage" in md:
+                        u = md["usage"]
+                        emit(GREEN("$ usage"),
+                             " ".join(f"{k}={v}" for k, v in u.items() if v is not None))
+                    self._last_metadata_repr = md_repr
+        return st["state"]
+
+    # ─── primitive: wait for the server's notion of "screen settled" ─────
+    def wait_for_settled(self) -> None:
+        """Block until the server reports the PTY screen has been stable.
+
+        Uses the server-side `screen_stable` matcher rather than client-side
+        polling. The stability window is whatever the server is configured
+        with (`completed_turn_stable_ms` in ~/.ptywright/config.toml; default
+        300 ms). This means the script and the plugin's own classifier agree
+        on what "stable" means — there is no client-side timing decision to
+        keep in sync with the server.
+
+        Bounded only by the overall hard deadline; uses the entire remaining
+        budget as the matcher timeout.
+        """
+        budget_ms = int(self._budget() * 1000)
+        if budget_ms <= 0: return
+        try:
+            self.client.rpc("adapter.wait", {
+                "adapter": self.aid,
+                "intent": "wait_turn_matcher",
+                # Server reads `completed_turn_stable_ms` from config and
+                # injects it as `min_ms` into the underlying screen_stable
+                # matcher — no client-side timing magic.
+                "params": {},
+                "timeout_ms": budget_ms,
+            }, t=self._budget() + 5.0)
+        except (RuntimeError, TimeoutError):
+            # Wait timed out or matcher failed; that's OK — the caller's
+            # next step (which always has its own verification path) will
+            # surface the real outcome.
+            pass
+
+    # ─── primitive: liveness indicator that doesn't spam ─────────────────
+    def _tick_alive(self, prefix: str = ""):
+        if not sys.stdout.isatty(): return
+        now = time.monotonic()
+        # Throttle to at most one tick per 4 heartbeats so the spinner
+        # cadence is independent of how aggressively we poll.
+        if now - self._last_alive_at < self.heartbeat * 4: return
+        self._last_alive_at = now
+        self._alive_phase = (self._alive_phase + 1) % 8
+        glyph = "⠋⠙⠹⠸⠼⠴⠦⠧"[self._alive_phase]
+        elapsed = self.args.timeout - self._budget()
+        sys.stdout.write(f"\r{DIM(f'{glyph} {prefix} [{elapsed:.0f}s]')}\033[K")
+        sys.stdout.flush()
+
+    def _clear_alive(self):
+        if sys.stdout.isatty():
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+    # ─── action: send a single named key ─────────────────────────────────
+    def send_key(self, key: str):
+        self.client.rpc("adapter.send",
+                        {"adapter": self.aid, "intent": "key", "params": {"key": key}}, t=5.0)
+
+    # ─── action: paste a prompt (bracketed paste + Enter) ────────────────
+    def send_prompt(self, prompt: str):
+        self.client.rpc("adapter.send",
+                        {"adapter": self.aid, "intent": "send_prompt",
+                         "params": {"prompt": prompt}}, t=10.0)
+
+    # ─── compound: submit prompt and verify it landed ────────────────────
+    def submit(self, prompt: str) -> tuple[bool, str]:
+        """Submit the prompt. The plugin's `send_prompt` intent now emits
+        Enter → BracketedPaste → Enter, which both dismisses any
+        first-keypress interceptor (welcome panel, compact-launch view)
+        AND submits the prompt. So the script's responsibility shrinks
+        to: wait until the screen is stable, then send_prompt.
+
+        Verification: poll the transcript for growth above noise. A real
+        paste acceptance produces 1000+ bytes of PTY output within the
+        first heartbeat; silent absorption produces only idle status-bar
+        noise (~120 bytes per tick). PASTE_REACTION_BYTES sits between.
+
+        Returns (success, failure_reason).
+        """
+        emit(DIM("· waiting for Claude's input box to settle"))
+        self.wait_for_settled()
+        if self._expired(): return False, "deadline expired before initial settle"
+
+        baseline = len(self.client.rpc("adapter.transcript",
+            {"adapter": self.aid, "redact": False}, t=5.0)["text"])
+
+        self.send_prompt(prompt)
+
+        while not self._expired():
+            trans = self.client.rpc("adapter.transcript",
+                {"adapter": self.aid, "redact": False}, t=5.0)["text"]
+            grew = len(trans) - baseline
+            if grew >= PASTE_REACTION_BYTES:
+                emit(GREEN("→ prompt submitted"),
+                     DIM(f"({len(prompt)} chars; +{grew} bytes from Claude)"))
+                return True, ""
+            self._tick_alive(f"waiting for Claude to acknowledge paste (+{grew}B)")
+            time.sleep(self.heartbeat)
+        return False, "deadline expired waiting for Claude to acknowledge paste"
+
+    # ─── compound: stream body deltas until classifier signals completion ─
+    def stream_until_done(self) -> int:
+        """Stream body deltas + state transitions until completed_turn.
+
+        Termination is purely classifier-driven:
+          * `state == completed_turn` from the plugin's poll path fires
+            only when BOTH the answer-bullet `⏺` AND an empty `❯`/`>`
+            prompt line are on screen with no active-work spinner —
+            i.e. Claude is back at idle. The empty-prompt guard is what
+            keeps this from firing mid-stream.
+          * Other TERMINAL_STATES (error, exited, plugin_error) end the
+            run as well.
+
+        Output strategy (TUI-version-agnostic):
+          * Each heartbeat we read body_text and diff against the
+            previous body using longest-common-prefix.
+          * We print only lines we have NEVER printed before
+            (de-duplicated via `_normalize_for_dedup` so the same
+            `✶ Generating…` text shows once even though the glyph
+            rotates each tick).
+        """
+        body, _ = self.inspect()
+        baseline_len = len(body)
+        last_body = body
+        printed_lines: set[str] = set()
+        # Seed dedup with the pre-stream body so we don't re-emit the
+        # welcome chrome or the prompt echo.
+        for line in last_body.splitlines():
+            s = line.strip()
+            if s: printed_lines.add(_normalize_for_dedup(s))
+
+        while not self._expired():
+            try:
+                state = self.poll_state()["state"]
+                body, _ = self.inspect()
+            except (RuntimeError, TimeoutError) as e:
+                self._clear_alive()
+                emit(RED("✗ stream interrupted"), str(e))
+                return 1
+
+            for n in self.client.drain_notifs():
+                if n.get("method") == "session.exited":
+                    self._clear_alive()
+                    emit(YELLOW("◌ session.exited"))
+
+            if body != last_body:
+                old_lines = last_body.splitlines()
+                new_lines = body.splitlines()
+                common = 0
+                for o, n in zip(old_lines, new_lines):
+                    if o == n: common += 1
+                    else: break
+                printed = False
+                for line in new_lines[common:]:
+                    s = line.strip()
+                    if not s: continue
+                    if s.startswith("─") and s.rstrip("─") == "": continue
+                    key = _normalize_for_dedup(s)
+                    if not key or key in printed_lines: continue
+                    printed_lines.add(key)
+                    if not printed:
+                        self._clear_alive()
+                        printed = True
+                    sys.stdout.write(line + "\n")
+                if printed: sys.stdout.flush()
+                last_body = body
+
+            if state in self.TERMINAL_STATES:
+                self._clear_alive()
+                grew_by = max(0, len(body) - baseline_len)
+                emit(GREEN(f"✓ {state}"), DIM(f"(+{grew_by} chars in body)"))
+                return 0
+
+            self._tick_alive(prefix=f"{state}")
+            time.sleep(self.heartbeat)
+
+        self._clear_alive()
+        emit(RED("✗ timed out"), f"after {self.args.timeout:.0f}s without a terminal state")
+        return 1
+
+    def close(self):
+        if self._closed: return
+        self._closed = True
+        try:
+            self.client.rpc("adapter.close", {"adapter": self.aid}, t=3.0)
+        except Exception: pass
+
+# ───────────────────────── main ─────────────────────────────────────────────
 
 def main() -> int:
     args = parse_args()
@@ -165,190 +469,85 @@ def main() -> int:
     bin_path = shutil.which(args.ptywright) or args.ptywright
     if not Path(bin_path).exists():
         print(f"claude-stream: ptywright not found at {bin_path}", file=sys.stderr)
-        print("  hint: run `build-release` in the devshell, then export "
-              "PTYWRIGHT_BIN=$PRJ_ROOT/target/release/ptywright", file=sys.stderr)
         return 2
     if not shutil.which("claude"):
         print("claude-stream: `claude` binary not found on PATH", file=sys.stderr)
         return 2
 
-    emit(CYAN("▶ claude-stream"), DIM(f"cwd={args.cwd} heartbeat={args.heartbeat_ms}ms"))
-    emit(DIM("  prompt:"), prompt if len(prompt) <= 200 else prompt[:197] + "...")
+    emit(CYAN("▶ claude-stream"),
+         DIM(f"cwd={args.cwd} model={args.model or 'default'} heartbeat={args.heartbeat_ms}ms"))
+    summary = prompt if len(prompt) <= 200 else prompt[:197] + "..."
+    emit(DIM("  prompt:"), summary)
     print()
 
-    client = Client(bin_path)
+    client = Client(bin_path, log_level=os.environ.get("PTYWRIGHT_LOG", "warn"))
+    stream: Stream | None = None
+    aid: str | None = None
+
+    # SIGINT handler — close the adapter politely, kill the server, then exit.
+    interrupted = {"flag": False}
+    def on_sigint(_signum, _frame):
+        if interrupted["flag"]:
+            os._exit(130)  # second Ctrl+C → hard exit, no cleanup
+        interrupted["flag"] = True
+        sys.stderr.write(f"\n{YELLOW('⏸ Ctrl+C — closing adapter cleanly (Ctrl+C again to force)')}\n")
+        if stream:
+            try: stream.close()
+            except Exception: pass
+        try: client.close()
+        except Exception: pass
+        sys.exit(130)
+    signal.signal(signal.SIGINT, on_sigint)
+
+    hard_deadline = time.monotonic() + args.timeout
+
     try:
         client.rpc("server.set_notifications", {"enabled": True})
 
-        # adapter.start — the built-in plugin's default_target supplies
-        # program="claude" + rows=60 cols=200 (the classifier-stable preset).
         start_params: dict = {"plugin": "claude-code", "cwd": args.cwd}
-        # Default to haiku for fast, deterministic smoke tests; allow the
-        # caller to opt out with --model ''.
         if args.model:
             start_params["args"] = ["--model", args.model]
         start = client.rpc("adapter.start", start_params, t=15.0)
         aid = start["adapter"]
-        emit(GREEN(f"▣ adapter started"), DIM(f"id={aid} state={start['state']['state']}"))
+        # adapter.start returns the underlying session id too — we use it
+        # for session.* calls during streaming so the per-adapter mutex
+        # held by the background adapter.wait does not block our snapshots.
+        session_id = start.get("session")
+        if not session_id:
+            emit(RED("✗ adapter.start did not return a session id"))
+            return 1
+        emit(GREEN("▣ adapter started"),
+             DIM(f"id={aid} session={session_id} initial_state={start['state']['state']}"))
 
-        # Pump notifications + state transitions
-        deadline = time.monotonic() + args.timeout
-        last_body = ""
-        last_body_change_at = time.monotonic()
-        last_state = start["state"]["state"]
-        last_evidence = start["state"].get("evidence", "")
-        prompt_sent = False
-        prompt_sent_at = 0.0
-        last_metadata: dict | None = None
-        # Verb-agnostic indicators. Claude Code rotates the spinner verb
-        # per turn (`Generating…`, `Cogitating…`, `Zigzagging…`) so we
-        # look at the glyphs that wrap them. The trailing `…` only
-        # appears in active-work lines, and `⏺ ` is the answer-block
-        # bullet glyph Claude renders for every assistant message.
-        SPINNER_GLYPHS = "✶✻✽✢✳·✷✸✹✺✼✠✦✯◆"
-        def has_spinner(text: str) -> bool:
-            return any(g in text for g in SPINNER_GLYPHS) and "…" in text
-        def has_answer_bullet(text: str) -> bool:
-            return "⏺ " in text
+        stream = Stream(client, aid, args, hard_deadline)
 
-        while time.monotonic() < deadline:
-            # Heartbeat to flush notifications + read fresh state
-            try:
-                st = client.rpc("adapter.state", {"adapter": aid}, t=5.0)
-            except RuntimeError as e:
-                emit(RED("✗ adapter.state failed"), str(e))
-                return 1
-            state = st["state"]["state"]
-            evidence = st["state"].get("evidence", "")
-            confidence = st["state"].get("confidence", 0.0)
-            md = st["state"].get("metadata")
-
-            # Drain session.output notifications. We use them as a liveness
-            # signal — the human-readable view comes from adapter.inspect
-            # below, since the raw PTY bytes include ANSI escapes and cursor
-            # positioning that would corrupt our annotated output stream.
-            for n in client.drain_notifs():
-                if n.get("method") == "session.exited":
-                    emit(YELLOW("◌ session.exited"))
-
-            # When the state or evidence changes, announce it
-            if state != last_state or evidence != last_evidence:
-                emit(MAGENTA(f"⇢ state"), f"{last_state} → {BOLD(state)}  {DIM(evidence)}")
-                last_state = state
-                last_evidence = evidence
-
-            # Auto-handle workspace-trust
-            if state == "waiting_for_trust" and not args.no_trust:
+        # Auto-approve the workspace-trust dialog if it appears. Event-driven:
+        # we poll state every heartbeat until either the trust prompt is
+        # detected (approve it) or the screen settles into a non-trust state
+        # (skip — workspace was already trusted).
+        while not stream._expired():
+            st = stream.poll_state()
+            if st["state"] == "waiting_for_trust":
                 emit(YELLOW("? workspace-trust dialog detected, auto-approving"))
-                client.rpc("adapter.send", {"adapter": aid, "intent": "approve_trust", "params": {}}, t=5.0)
-                time.sleep(0.5)
+                client.rpc("adapter.send",
+                           {"adapter": aid, "intent": "approve_trust", "params": {}}, t=5.0)
+                # Loop again — we'll either re-detect trust (try again) or
+                # see a different state next iteration.
                 continue
+            if st["state"] != "starting" or "no screen evidence" not in (st.get("evidence") or ""):
+                break
+            time.sleep(stream.heartbeat)
 
-            # Submit the prompt once we've reached a state Claude will
-            # actually accept typed input from. Three valid launching pads:
-            #   • `waiting_for_user_input`: real prompt glyph (❯) on screen
-            #   • `ready` with high confidence: matched a welcome anchor
-            #   • `starting` with "welcome screen visible" evidence: the
-            #     post-trust welcome panel. The skill documents that
-            #     send_prompt's bracketed-paste both dismisses the panel
-            #     AND submits in one step, so we don't need a separate
-            #     dismiss_welcome intent (which on Claude Code 2.1.143
-            #     does not reliably clear the panel on its own).
-            ready_for_prompt = (
-                state == "waiting_for_user_input"
-                or (state == "ready" and confidence >= 0.5)
-                or (state == "starting" and "welcome" in evidence)
-            )
-            if not prompt_sent and ready_for_prompt:
-                client.rpc("adapter.send", {
-                    "adapter": aid, "intent": "send_prompt", "params": {"prompt": prompt}
-                }, t=10.0)
-                emit(GREEN("→ send_prompt"), DIM(f"({len(prompt)} chars)"))
-                prompt_sent = True
-                prompt_sent_at = time.monotonic()
-                # Give Claude a beat to acknowledge the paste before we
-                # start polling body_text — otherwise the first inspect
-                # may still show the welcome panel and confuse the diff.
-                time.sleep(0.3)
-                continue
+        ok, reason = stream.submit(prompt)
+        if not ok:
+            emit(RED("✗ could not get Claude to accept the prompt"), DIM(reason))
+            stream.close()
+            return 1
 
-            # Stream the body text — print only what's new this tick.
-            # We deliberately poll body_text post-send even when the
-            # classifier still reports `starting (welcome)` — on Claude
-            # Code 2.1.143 the welcome panel can persist visually even
-            # after a turn is underway, so trusting the state alone would
-            # silence the live stream.
-            if prompt_sent:
-                inspect = client.rpc("adapter.inspect", {"adapter": aid, "redact": False}, t=5.0)
-                body = inspect.get("body_text", "")
-                if body != last_body:
-                    old_lines = last_body.splitlines()
-                    new_lines = body.splitlines()
-                    common = 0
-                    for o, n in zip(old_lines, new_lines):
-                        if o == n: common += 1
-                        else: break
-                    for line in new_lines[common:]:
-                        s = line.strip()
-                        if not s: continue
-                        if s.startswith("─") and s.rstrip("─") == "": continue
-                        if has_spinner(s) and len(s) < 40: continue
-                        sys.stdout.write(line + "\n")
-                    sys.stdout.flush()
-                    # For stability detection, ignore the spinner line
-                    # (its glyph + ticking duration changes every poll
-                    # even when no real progress is happening). Compare
-                    # against the previous spinner-stripped body so
-                    # `last_body_change_at` only advances on actual
-                    # progress (new tokens, new tool call, new prompt).
-                    def strip_spinner(t: str) -> str:
-                        return "\n".join(
-                            ln for ln in t.splitlines()
-                            if not (has_spinner(ln) and len(ln.strip()) < 80)
-                        )
-                    if strip_spinner(body) != strip_spinner(last_body):
-                        last_body_change_at = time.monotonic()
-                    last_body = body
+        rc = stream.stream_until_done()
+        stream.close()
+        return rc
 
-            # Surface metadata when it appears
-            if md and md != last_metadata:
-                if "permission" in md:
-                    p = md["permission"]
-                    emit(YELLOW("⚠ permission requested"),
-                         f"tool={p.get('tool','?')} summary={p.get('summary','?')[:80]}")
-                    emit(DIM("   options"), ", ".join(p.get("options", [])))
-                if "status" in md and (not last_metadata or last_metadata.get("status") != md["status"]):
-                    s = md["status"]
-                    emit(DIM("  status"),
-                         f"model={s.get('model','?')} mode={s.get('permission_mode','?')}")
-                if "usage" in md:
-                    u = md["usage"]
-                    emit(GREEN("$ usage"),
-                         " ".join(f"{k}={v}" for k, v in u.items() if v is not None))
-                last_metadata = md
-
-            # Turn-completion detection. With the classifier fix that
-            # ignores stale welcome chrome once a prompt has been
-            # submitted, `state == "completed_turn"` is the canonical
-            # signal — it fires from the state-poll path (lower
-            # confidence) as soon as the spinner clears, and again from
-            # the stable path (higher confidence) once the screen has
-            # settled. We also accept terminal error/exit states.
-            if prompt_sent and state in TERMINAL_STATES:
-                emit(GREEN(f"✓ {state}"), DIM(evidence))
-                client.rpc("adapter.close", {"adapter": aid}, t=5.0)
-                return 0
-
-            time.sleep(args.heartbeat_ms / 1000.0)
-
-        emit(RED("✗ timed out"), f"after {args.timeout}s; last state {last_state}")
-        client.rpc("adapter.close", {"adapter": aid}, t=5.0)
-        return 1
-    except KeyboardInterrupt:
-        emit(YELLOW("⏸ interrupted"))
-        try: client.rpc("adapter.close", {"adapter": aid}, t=3.0)
-        except Exception: pass
-        return 130
     finally:
         client.close()
 

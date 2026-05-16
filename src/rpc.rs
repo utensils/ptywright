@@ -1278,7 +1278,20 @@ impl RpcServer {
         };
         let mut target = Target::new(program).args(args).size(size);
         target.cwd = params.cwd;
-        target.env = params.env;
+        // Env resolution: start from the manifest's declared default env
+        // (TUI knobs the plugin needs to keep its classifier stable), then
+        // overlay the caller's env. Caller wins on conflict; manifest
+        // keys the caller omits are inherited. To clear a manifest
+        // default the caller passes that key with whatever override
+        // value they want.
+        if let Some(default_env) = manifest_default.as_ref().map(|t| &t.env) {
+            for (k, v) in default_env {
+                target.env.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in params.env {
+            target.env.insert(k, v);
+        }
         let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
         let handle = ExtensionHandle::start(
             Box::new(extension),

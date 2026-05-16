@@ -98,6 +98,41 @@ local function has_error_indicator(screen)
   return false
 end
 
+-- Returns true if the body contains a line that is *just* an input
+-- prompt glyph (`>` or `❯`) with optional whitespace — the universal
+-- "Claude is back at idle, ready for the next turn" signal. Used by the
+-- poll-path `completed_turn` branch in classify().
+--
+-- Two byte-level gotchas this implementation works around:
+--
+--   1. `❯` is U+276F encoded as 3 bytes (`\xe2\x9d\xaf`). Lua patterns
+--      operate on bytes; a character class like `[>❯]` does NOT match
+--      the multi-byte sequence as a unit — it would only match `>` or
+--      the individual bytes `\xe2` / `\x9d` / `\xaf`. So we iterate the
+--      glyphs and embed each one literally in its own pattern, which
+--      DOES match the full byte sequence.
+--   2. Claude Code 2.1.x pads the empty prompt with U+00A0 NBSP for
+--      visual alignment. Lua's `%s` only matches ASCII whitespace; we
+--      add NBSP explicitly so the trailing `❯\xa0 ` pattern matches.
+local WS = "[%s\194\160]"
+local PROMPT_GLYPHS = { ">", "❯" }
+
+local function has_empty_input_prompt_line(text)
+  if not text or text == "" then return false end
+  for _, glyph in ipairs(PROMPT_GLYPHS) do
+    -- Pattern: (start | newline) + WS* + literal-glyph + WS* + (newline | end)
+    local p1 = "^" .. WS .. "*" .. glyph .. WS .. "*\n"
+    local p2 = "\n" .. WS .. "*" .. glyph .. WS .. "*\n"
+    local p3 = "\n" .. WS .. "*" .. glyph .. WS .. "*$"
+    local p4 = "^" .. WS .. "*" .. glyph .. WS .. "*$"
+    if text:match(p1) then return true end
+    if text:match(p2) then return true end
+    if text:match(p3) then return true end
+    if text:match(p4) then return true end
+  end
+  return false
+end
+
 local function has_input_prompt(screen)
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = trim(line)
@@ -159,30 +194,45 @@ local function has_thinking_spinner_line(text)
 end
 
 local function has_active_work_indicator(text)
-  -- Direct text hints kept across Claude Code releases.
+  -- Phrases the TUI renders ONLY during active work. Each is paired
+  -- with a structural hint so it doesn't match the same words in
+  -- assistant prose:
+  --   * "esc to interrupt"   — control hint shown only while a turn is
+  --                            in flight (Claude never writes this in
+  --                            answer text)
+  --   * "(esc to interrupt)" — bracketed variant
+  -- The bare word "thinking" alone (and "running tool", "reading file",
+  -- "searching" etc.) was removed in favor of the structural anchors
+  -- below — those bare words frequently appear in assistant prose when
+  -- Claude explains its own behavior, blocking the classifier from
+  -- ever reaching `completed_turn` on those turns.
   if contains_any(text, {
     "esc to interrupt",
-    "thinking",
-    "running tool",
-    "using tool",
-    "calling tool",
-    "tool use",
-    "reading file",
-    "editing file",
-    "searching",
   }) then
     return true
   end
-  -- Claude Code 2.1.x spinner-and-ellipsis status line.
+  -- Claude Code 2.1.x spinner-and-ellipsis status line. This is the
+  -- primary signal — a spinner glyph at line start + verb + ellipsis
+  -- is unique to the live status line and cannot appear in answer
+  -- prose because the spinner glyphs are not in any natural text.
   return has_thinking_spinner_line(text)
 end
 
 local function has_permission_indicator(text)
+  -- Specific dialog anchors only — words like "permission" / "allow" /
+  -- "approve" appear frequently in Claude's answer prose (e.g. when
+  -- summarizing the plugin's own code), so matching them in isolation
+  -- false-positives on the answer body and blocks the classifier from
+  -- ever reaching `completed_turn`. The anchors here are phrases Claude
+  -- only renders inside permission dialogs:
+  --   * "Do you want to proceed?" — universal numbered-dialog header
+  --   * "[Enter] Approve" / "[Esc] Deny" — bracketed-button dialog
+  --   * "Yes, and don't ask again this session" — option text unique to
+  --     the permission dialog's "remember" option
   return contains_any(text, {
-    "do you want to proceed",
-    "permission",
-    "allow",
-    "approve",
+    "do you want to proceed?",
+    "[enter] approve",
+    "[esc] deny",
     "yes, and don't ask again",
     "yes, and don’t ask again",
   })
@@ -291,12 +341,21 @@ local function parse_permission_dialog(text)
 end
 
 local function has_plan_indicator(text)
-  return contains(text, "plan") and contains_any(text, {
-    "approve",
-    "accept",
-    "proceed",
-    "looks good",
-  })
+  -- Structural pattern: a "plan" header on its own line followed by
+  -- a numbered list within a line or two. Both fixtures match this:
+  --   plan_approval.txt: "Plan ready:\n1. Update tests"
+  --   plan_variant.txt:  "Plan\n  1. Update tests"
+  --
+  -- Word-level matchers (like "approve plan to proceed") false-positive
+  -- on assistant prose that quotes the dialog text, blocking the
+  -- classifier from ever reaching `completed_turn` on turns that
+  -- summarise the plugin's own behaviour. The numbered-list-following-
+  -- "plan"-header pattern is dialog-unique because prose mentions of
+  -- "plan" don't continue with "1." on the next render row.
+  if text:match("\nplan[^\n]*\n%s*1[%.%)]") then return true end
+  -- Match at start-of-text too (in case the body starts with "Plan").
+  if text:match("^plan[^\n]*\n%s*1[%.%)]") then return true end
+  return false
 end
 
 local function has_trust_indicator(text)
@@ -566,9 +625,39 @@ function M.classify(input)
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
   end
 
-  if contains_any(body_text, { "what would you like", "how can i help", "type a message" }) then
-    return state_snapshot("ready", 0.74, "ready prompt text detected", sequence)
+  -- Poll-path completed_turn — fires when adapter.state polling sees
+  -- the "Claude is back at idle after answering" pattern: answer bullet
+  -- present + empty input prompt visible + no active work spinner.
+  --
+  -- Gated on `stable_ms < completed_turn_stable_ms` so callers driving
+  -- `adapter.wait` (which always supplies a stable_ms >= the threshold)
+  -- fall through to the higher-confidence stable-path branches below
+  -- and get the matcher-gated answer instead. This branch exists for
+  -- polling consumers that don't have screen-stability evidence.
+  if last_intent == "prompt_submitted"
+      and (stable_ms == 0 or completed_turn_stable_ms == 0 or stable_ms < completed_turn_stable_ms)
+      and not has_active_work_indicator(body_text)
+      and contains(body, "⏺")
+      and has_empty_input_prompt_line(body)
+  then
+    return state_snapshot(
+      "completed_turn",
+      0.7,
+      "answer bullet plus empty input prompt visible without active work",
+      sequence
+    )
   end
+
+  -- The previous "ready prompt text" branch matched assistant prose
+  -- (any answer mentioning "how can I help" or "what would you like"),
+  -- which blocked the classifier from reaching `completed_turn` on
+  -- turns that summarized Claude Code's own help text. Distinguishing
+  -- the actual ready screen from prose is brittle — older Claude Code
+  -- showed the question as standalone text below a clean banner, but
+  -- 2.1.x dropped it from the compact welcome view entirely. The
+  -- `waiting_for_user_input` branch below (which gates on the prompt
+  -- glyph being visible) covers the same intent without the false
+  -- positive, so we collapse `ready` into it.
 
   if has_input_prompt(screen) then
     if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms and not has_active_work_indicator(body_text) then
@@ -589,24 +678,7 @@ function M.classify(input)
     if has_welcome_screen(body_text) and last_intent ~= "prompt_submitted" then
       return state_snapshot("starting", 0.7, "welcome screen visible", sequence)
     end
-    -- Post-submit, no spinner, with at least one rendered answer bullet
-    -- (`⏺`) in the body: Claude has produced a response and is back at
-    -- the input prompt. State-poll callers (no `stable_ms`) need this
-    -- branch — without it, polling consumers would never see turn
-    -- completion through state alone (only through `adapter.wait`).
-    --
-    -- The `⏺` anchor is what guards against firing before the turn has
-    -- actually run: right after `send_prompt`, the spinner may not have
-    -- rendered yet, and without an answer-bullet check this branch
-    -- would mistake "just submitted, still loading" for "finished".
-    -- Confidence is below the stable-screen path's 0.78 so callers
-    -- that compare can still prefer the matcher-gated answer.
-    if last_intent == "prompt_submitted"
-        and not has_active_work_indicator(body_text)
-        and contains(body, "⏺")
-    then
-      return state_snapshot("completed_turn", 0.6, "answer bullet visible after submission without active work", sequence)
-    end
+
     return state_snapshot("waiting_for_user_input", 0.62, "input prompt glyph detected", sequence)
   end
 
@@ -620,9 +692,19 @@ function M.send_prompt(input)
   -- prompt races against Claude's input tokeniser: the bytes land but
   -- the Enter gets absorbed and the prompt sits un-submitted. The
   -- generic `action.paste(...)` still exists for callers / plugins
+  --
+  -- The leading Enter handles Claude Code 2.1.x's first-keypress
+  -- interceptors (welcome panel, compact-launch view). On a clean
+  -- input box Claude treats Enter on empty input as a no-op submit;
+  -- on a welcome / interceptor screen it dismisses the overlay and
+  -- focuses the input box, so the bracketed paste that follows lands
+  -- in the right place. Without this leading Enter, callers had to
+  -- send their own Enter and synchronise on stability before pasting,
+  -- which is fragile across machine speeds and Claude Code versions.
   -- driving programs that have not opted into bracketed paste.
   return {
     actions = {
+      action.key("enter"),
       action.bracketed_paste(input.prompt or ""),
       action.key("enter"),
     },

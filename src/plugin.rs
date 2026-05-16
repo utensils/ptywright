@@ -114,14 +114,26 @@ pub struct DefaultTarget {
     /// operation. Used by `adapter.start` when the caller omits `cols`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
+    /// Default environment variables to set when spawning the target.
+    /// Useful for TUI knobs the plugin needs to keep the classifier
+    /// stable (e.g. disabling alternate-screen or prompt-history features
+    /// the host can't see through). Caller-supplied `env` in
+    /// `adapter.start` overrides any keys declared here; keys the caller
+    /// does not mention are inherited from this map. Omitted on the wire
+    /// when empty.
+    ///
+    /// `BTreeMap` matches `Target::env` so the host can merge the two
+    /// without converting between map types.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl DefaultTarget {
     /// Build a `DefaultTarget` with the required `program` set and all
     /// optional fields at their defaults (`args` empty, `rows` / `cols`
-    /// `None`). The struct is `#[non_exhaustive]` so external callers
-    /// must enter through this constructor and then mutate the public
-    /// fields they want to set.
+    /// `None`, `env` empty). The struct is `#[non_exhaustive]` so
+    /// external callers must enter through this constructor and then
+    /// mutate the public fields they want to set.
     #[must_use]
     pub fn new(program: impl Into<String>) -> Self {
         Self {
@@ -129,6 +141,7 @@ impl DefaultTarget {
             args: Vec::new(),
             rows: None,
             cols: None,
+            env: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -365,6 +378,12 @@ pub(crate) const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[BuiltinPlugin {
     source: include_str!("../plugins/claude-code/main.lua"),
 }];
 
+/// TOML source for the claude-code manifest, embedded at compile time
+/// so all claude-code-specific configuration lives next to the Lua
+/// plugin (under `plugins/claude-code/`). Parsed by
+/// [`claude_code_manifest`] on each call.
+const CLAUDE_CODE_MANIFEST_TOML: &str = include_str!("../plugins/claude-code/manifest.toml");
+
 /// Manifests for every Lua plugin embedded in this binary.
 ///
 /// Thin convenience wrapper over [`BUILTIN_PLUGINS`] for callers that only
@@ -382,42 +401,19 @@ pub fn builtin_manifests() -> Vec<PluginManifest> {
 
 /// Manifest for the built-in Lua Claude Code adapter.
 ///
-/// One entry in the built-in plugin registry — kept as a named function so
-/// the manifest is readable rather than buried inside the registry builder.
+/// Parses the embedded `plugins/claude-code/manifest.toml` so every
+/// claude-code-specific value (program, args, geometry, env preset,
+/// permissions) lives next to the Lua source under
+/// `plugins/claude-code/` rather than hand-rolled in this file.
+/// Adding or tuning a default for the built-in adapter is a TOML edit;
+/// the version field is stamped from the crate version at compile time
+/// so the manifest doesn't have to track Cargo.toml separately.
 #[must_use]
 pub fn claude_code_manifest() -> PluginManifest {
-    PluginManifest {
-        name: "claude-code".to_string(),
-        kind: PluginKind::Adapter,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        runtime: Some(PluginRuntime::Lua),
-        entrypoint: Some("plugins/claude-code/main.lua".to_string()),
-        permissions: vec![
-            PluginPermission::SessionSpawn,
-            PluginPermission::SessionKill,
-            PluginPermission::SessionResize,
-            PluginPermission::ScreenRead,
-            PluginPermission::TranscriptRead,
-            PluginPermission::InputWrite,
-            PluginPermission::MatcherWait,
-        ],
-        default_target: Some(DefaultTarget {
-            program: "claude".to_string(),
-            args: Vec::new(),
-            // Claude Code 2.1.x renders its status bar, prompt glyphs (`>`,
-            // `❯`), and turn-boundary anchors at column positions that
-            // shift with the terminal width. The host's last-resort
-            // `rows = 40, cols = 120` fallback wraps many of those lines
-            // and destabilises the classifier. A `rows = 60, cols = 200`
-            // preset comfortably fits the status bar, the "Total cost: …"
-            // usage screen, and the longest tool-use status lines without
-            // wrapping. Callers that need a different geometry (visible
-            // attachment, tighter CI sandbox) override with `rows` /
-            // `cols` on `adapter.start`.
-            rows: Some(60),
-            cols: Some(200),
-        }),
-    }
+    let mut manifest: PluginManifest = toml::from_str(CLAUDE_CODE_MANIFEST_TOML)
+        .expect("embedded plugins/claude-code/manifest.toml must parse");
+    manifest.version = env!("CARGO_PKG_VERSION").to_string();
+    manifest
 }
 
 #[cfg(test)]
@@ -582,12 +578,7 @@ mod tests {
             runtime: None,
             entrypoint: None,
             permissions: Vec::new(),
-            default_target: Some(DefaultTarget {
-                program: "x".to_string(),
-                args: Vec::new(),
-                rows: None,
-                cols: None,
-            }),
+            default_target: Some(DefaultTarget::new("x")),
         };
         let value = serde_json::to_value(&manifest).expect("serialize manifest");
         let target = value
@@ -596,6 +587,7 @@ mod tests {
             .expect("default_target serialised");
         assert_eq!(target.get("program"), Some(&json!("x")));
         assert!(target.get("args").is_none(), "empty args should be skipped");
+        assert!(target.get("env").is_none(), "empty env should be skipped");
     }
 
     #[test]
