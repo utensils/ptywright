@@ -1315,11 +1315,18 @@ impl RpcServer {
         // clients would be ambiguous anyway. A future `adapter.cancel`
         // method can break out of the wait without needing the mutex.
         let entry = entry_arc.lock().expect("extension poisoned");
-        let state = entry
+        let (state, outcome) = entry
             .handle
             .wait(&intent, params.params, timeout)
             .map_err(rpc_error_from_error)?;
-        Ok(json!({ "state": state }))
+        let mut response = json!({ "state": state });
+        if let Some(outcome) = outcome {
+            response
+                .as_object_mut()
+                .expect("response object")
+                .insert("matched".to_string(), json!(outcome));
+        }
+        Ok(response)
     }
 
     /// `adapter.snapshot` — passthrough to the adapter's underlying session
@@ -2485,6 +2492,30 @@ mod tests {
         assert!(
             !state_label.is_empty(),
             "adapter.wait response must include a non-empty state label"
+        );
+
+        // Structured matcher result: claude-code's wait_turn_matcher is a
+        // top-level All([Any([...]), ScreenStable]). On the "Total cost:"
+        // anchor the inner Any must surface that branch's contains_text
+        // payload, so callers can reason about which boundary anchor fired
+        // without re-scanning the screen.
+        let matched = &response["result"]["matched"];
+        assert_eq!(
+            matched["kind"], "all",
+            "adapter.wait must surface the structured outcome; got {response}"
+        );
+        let all_branches = matched["matched"].as_array().expect("all branches array");
+        assert!(
+            !all_branches.is_empty(),
+            "All outcome must carry per-branch detail; got {matched}"
+        );
+        let any_branch = all_branches
+            .iter()
+            .find(|branch| branch["kind"] == "any")
+            .expect("All must include the Any anchor branch");
+        assert_eq!(
+            any_branch["matched"]["kind"], "contains_text",
+            "Any branch must record which alternative fired; got {any_branch}"
         );
 
         // Cleanup so the sleep process doesn't outlive the test.

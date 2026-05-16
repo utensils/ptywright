@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `session.output` JSON-RPC notification carrying newly-appended transcript text (default-redacted) plus the sequence number. Fires from the same poll as `session.changed` whenever new output reaches the bounded transcript. Each connection keeps an independent cursor into the transcript's monotonic `chars_written` counter; if a slow subscriber falls behind the ring buffer's retention window, the next emitted notification carries the surviving tail and an explicit `dropped: true` flag. `server.capabilities` advertises `session.output` alongside `session.changed` / `session.exited`. New `Transcript::delta_since(cursor)` / `Session::transcript_delta_since(cursor)` / `Session::redacted_transcript_delta_since(cursor, policy)` powers the same delta access from Rust.
+- `adapter.wait` responses now include a structured `matched` field describing which matcher branch fired (`{ kind, pattern?, capture?, text?, row?, col?, min_ms?, matched? }`). Regex branches surface the first capture group (or full match when no group is declared). Nested `Any` / `All` matchers recurse so callers can correlate the wake-up with the exact alternative they expressed. The Rust API gains `Matcher::describe_match[_with_context]` returning `Option<MatchOutcome>` and a new `outcome: Option<MatchOutcome>` field on `MatchResult`; `ExtensionHandle::wait` now returns `(ExtensionStateSnapshot, Option<MatchOutcome>)`.
 
 ## [0.1.1] - 2026-05-15
 

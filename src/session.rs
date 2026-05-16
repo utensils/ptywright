@@ -290,7 +290,9 @@ impl Session {
                 stable_for: stable_since.elapsed(),
                 process_exited,
             };
-            if matcher.is_match_with_context(&snapshot, &transcript_tail, context) {
+            if let Some(outcome) =
+                matcher.describe_match_with_context(&snapshot, &transcript_tail, context)
+            {
                 return Ok(MatchResult {
                     matched: true,
                     sequence,
@@ -298,6 +300,7 @@ impl Session {
                     snapshot,
                     transcript_tail,
                     stable_for: context.stable_for,
+                    outcome: Some(outcome),
                 });
             }
 
