@@ -31,13 +31,20 @@ local function lower(text)
   return string.lower(text or "")
 end
 
-local function state_snapshot(state, confidence, evidence, sequence)
+local function state_snapshot(state, confidence, evidence, sequence, metadata)
   return {
     state = state,
     confidence = confidence,
     evidence = evidence,
     sequence = sequence,
+    metadata = metadata,
   }
+end
+
+-- Strip a single leading "$" so a number prefixed by a currency glyph still
+-- parses as a number. Returns the trailing slice, never nil. Cheap to call.
+local function strip_dollar(text)
+  return (text:gsub("^%$", ""))
 end
 
 local function has_error_indicator(screen)
@@ -182,6 +189,48 @@ local function has_usage_screen(text)
     and contains_any(text, { "current session", "current week", "total duration" })
 end
 
+-- Parse the "Total cost: $0.0000" / "Usage: 0 input, 0 output, ..." panel
+-- into the structured `usage` table the host exposes on
+-- `ExtensionStateSnapshot::metadata`. Every field is best-effort: keys whose
+-- patterns didn't match are simply absent, so a future TUI tweak that drops
+-- (say) "Total code changes" just leaves the field out instead of breaking
+-- classification. Caller pre-confirms the screen is visible via
+-- `has_usage_screen` — no redundant guard here because that detector runs
+-- against lower-cased text while these patterns must see the original case
+-- to extract literal currency/number tokens.
+local function parse_usage_screen(text)
+  local usage = {}
+  local function maybe_set(key, value)
+    if value then
+      usage[key] = value
+    end
+  end
+  -- "Total cost: $0.0000" — strip the dollar before tonumber so it works
+  -- whether the TUI renders the glyph or not.
+  local cost = text:match("[Tt]otal cost:%s*([%$%-%.%d]+)")
+  if cost then
+    maybe_set("cost_usd", tonumber(strip_dollar(cost)))
+  end
+  -- "Total duration (API): 0s" / "Total duration (wall): 4s".
+  local api_dur = text:match("[Tt]otal duration %(API%):%s*([%-%.%d]+)%s*s")
+  maybe_set("api_duration_s", tonumber(api_dur))
+  local wall_dur = text:match("[Tt]otal duration %(wall%):%s*([%-%.%d]+)%s*s")
+  maybe_set("wall_duration_s", tonumber(wall_dur))
+  -- "Usage: 0 input, 0 output, 0 cache read, 0 cache write".
+  local input_tok, output_tok, cache_read, cache_write = text:match(
+    "[Uu]sage:%s*(%d+)%s*input,%s*(%d+)%s*output,%s*(%d+)%s*cache read,%s*(%d+)%s*cache write"
+  )
+  maybe_set("input_tokens", tonumber(input_tok))
+  maybe_set("output_tokens", tonumber(output_tok))
+  maybe_set("cache_read_tokens", tonumber(cache_read))
+  maybe_set("cache_write_tokens", tonumber(cache_write))
+  -- "Total code changes: 0 lines added, 0 lines removed".
+  local added, removed = text:match("[Tt]otal code changes:%s*(%d+)%s*lines added,%s*(%d+)%s*lines removed")
+  maybe_set("lines_added", tonumber(added))
+  maybe_set("lines_removed", tonumber(removed))
+  return { usage = usage }
+end
+
 local function has_welcome_screen(text)
   -- Claude Code's first-launch welcome panel renders after the workspace
   -- trust dialog is accepted. It shows "Welcome back <user>!" alongside a
@@ -280,7 +329,13 @@ function M.classify(input)
   end
 
   if has_usage_screen(body_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
-    return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence)
+    -- Pull the cost / tokens / duration out of the rendered usage panel
+    -- so callers get a machine-readable view alongside the state. Parsing
+    -- the unlowered body avoids losing currency casing if Claude ever
+    -- ships a tweak that depends on it; `parse_usage_screen` lower-cases
+    -- only the bits it asserts against.
+    local usage_metadata = parse_usage_screen(body)
+    return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
   end
 
   if contains_any(body_text, { "what would you like", "how can i help", "type a message" }) then

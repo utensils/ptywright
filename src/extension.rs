@@ -54,6 +54,15 @@ pub struct ExtensionStateSnapshot {
     /// Empty until plugins start populating it; safe to ignore.
     #[serde(default)]
     pub candidates: Vec<StateCandidate>,
+    /// Opaque plugin-defined metadata attached to this classification.
+    ///
+    /// The host does not interpret it — plugins shape it however they like so
+    /// callers can read structured fields parsed from the screen (cost,
+    /// usage, model, context-window stats, permission-dialog detail, …)
+    /// without re-scraping. Omitted on the wire when empty so the common
+    /// "no metadata" case stays cheap to render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Runner-up classification produced alongside the primary `state`.
@@ -297,6 +306,7 @@ impl ExtensionHandle {
                 evidence: format!("plugin failed: {error}"),
                 sequence: self.session.sequence(),
                 candidates: Vec::new(),
+                metadata: None,
             })
     }
 
@@ -647,6 +657,7 @@ mod tests {
             evidence: "test".into(),
             sequence: 0,
             candidates: Vec::new(),
+            metadata: None,
         };
         let wire = serde_json::to_string(&snapshot).expect("serialize");
         assert!(
