@@ -150,6 +150,69 @@ local function has_permission_indicator(text)
   })
 end
 
+-- Parse the permission dialog into `{ permission = { tool?, summary?,
+-- options } }`. Claude Code ships two layouts today:
+--   numbered list:    "Bash command\n  cmd\nDo you want to proceed?\n
+--                       ❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No"
+--   Enter/Esc style:  "Allow Bash command: cmd\n[Enter] Approve  [Esc] Deny"
+-- Both forms expose the tool name (the word before "command" / "tool"),
+-- the command summary text, and the explicit options the user can pick.
+-- Lossy vs. `--permission-prompt-tool stdio`'s structured control_request
+-- — the dialog has no JSON payload here — but enough to apply simple
+-- policy gates from a calling consumer. Returns nil when nothing parsed.
+local function parse_permission_dialog(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local permission = {}
+  local tool = text:match("([%w%-]+) command") or text:match("([%w%-]+) tool")
+  if tool then
+    permission.tool = tool
+  end
+  local summary = text:match("[Aa]llow [%w%-]+ command:%s*([^\n]+)")
+    or text:match("[Aa]llow [%w%-]+ tool:%s*([^\n]+)")
+    or text:match("[%w%-]+ command\n%s*([^\n]+)")
+    or text:match("[%w%-]+ tool\n%s*([^\n]+)")
+  if summary then
+    summary = trim(summary)
+    -- Reject summaries that are actually the next dialog line
+    -- ("Do you want to proceed?") rather than the command body. Those
+    -- show up when the multi-line layout has no body text — the parser
+    -- shouldn't surface the prompt as the command summary.
+    if summary ~= "" and not contains(lower(summary), "do you want to proceed") then
+      permission.summary = summary
+    end
+  end
+  local options = {}
+  -- Lua patterns are byte-oriented, so the multi-byte `❯` selector glyph
+  -- can't sit in a `[...]` class. We instead anchor on "first digit
+  -- followed by '. '" anywhere in the line and let the leading bytes be
+  -- whatever they are. Reliable across both numbered-list variants Claude
+  -- Code ships (`❯ 1. Yes` and `  2. Yes, and don't ask again`).
+  for line in string.gmatch(text, "[^\n]+") do
+    local body = line:match("%d+%.%s+(.+)$")
+    if body then
+      table.insert(options, trim(body))
+    end
+  end
+  if #options == 0 then
+    -- Enter/Esc bracketed layout.
+    if text:match("%[Enter%]%s*[Aa]pprove") or text:match("%[Enter%]%s*[Aa]llow") then
+      table.insert(options, "Approve")
+    end
+    if text:match("%[Esc%]%s*[Dd]eny") or text:match("%[Esc%]%s*[Dd]ecline") then
+      table.insert(options, "Deny")
+    end
+  end
+  if #options > 0 then
+    permission.options = options
+  end
+  if next(permission) == nil then
+    return nil
+  end
+  return { permission = permission }
+end
+
 local function has_plan_indicator(text)
   return contains(text, "plan") and contains_any(text, {
     "approve",
@@ -380,7 +443,13 @@ function M.classify(input)
   end
 
   if has_permission_indicator(body_text) then
-    return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence)
+    -- Parse against the unlowered *full screen* — the dialog tool/summary
+    -- live in the body but the numbered options can land in the bottom
+    -- rows that `body_text` strips, and we want all three fields when
+    -- present. Original case matters for the tool name and summary
+    -- ("Bash command: cargo test").
+    local permission_metadata = parse_permission_dialog(screen)
+    return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
   end
 
   if has_active_work_indicator(body_text) then

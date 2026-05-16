@@ -2,5 +2,12 @@
   "state": "waiting_for_permission",
   "evidence": "permission or approval prompt text detected",
   "last_intent": null,
-  "min_confidence": 0.6
+  "min_confidence": 0.6,
+  "metadata": {
+    "permission": {
+      "tool": "Bash",
+      "summary": "git status --short",
+      "options": ["Yes", "Yes, and don't ask again", "No"]
+    }
+  }
 }
