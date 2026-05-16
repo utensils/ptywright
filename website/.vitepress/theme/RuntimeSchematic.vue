@@ -260,7 +260,12 @@ const annotations = [
                 fill="none"
                 marker-end="url(#op-arrow)"
               />
-              <path :id="`op-p${ep.i}`" :d="ep.path" fill="none" stroke="none" />
+              <path
+                :id="`op-p${ep.i}`"
+                :d="ep.path"
+                fill="none"
+                stroke="none"
+              />
               <circle r="3" class="op-schem-dot">
                 <animateMotion
                   :dur="`${ep.dur}s`"
@@ -281,7 +286,12 @@ const annotations = [
               fill="none"
               marker-end="url(#op-arrow-back)"
             />
-            <path id="op-dispatch" :d="dispatchPath" fill="none" stroke="none" />
+            <path
+              id="op-dispatch"
+              :d="dispatchPath"
+              fill="none"
+              stroke="none"
+            />
             <circle r="3" class="op-schem-dot-back">
               <animateMotion dur="3.4s" repeatCount="indefinite" begin="0.4s">
                 <mpath href="#op-dispatch" />
@@ -345,11 +355,7 @@ const annotations = [
                   class="op-schem-bracket"
                 />
               </g>
-              <text
-                :x="n.x + 16"
-                :y="n.y + 26"
-                class="op-schem-node-label"
-              >
+              <text :x="n.x + 16" :y="n.y + 26" class="op-schem-node-label">
                 {{ n.label }}
               </text>
               <text :x="n.x + 16" :y="n.y + 46" class="op-schem-node-sub">
@@ -369,20 +375,15 @@ const annotations = [
 
           <!-- Side annotations (left = layer notes; right = pipeline labels) -->
           <g class="op-schem-annotation">
-            <text
-              v-for="(a, i) in annotations"
-              :key="i"
-              x="90"
-              :y="a.y"
-            >
+            <text v-for="(a, i) in annotations" :key="i" x="90" :y="a.y">
               {{ a.text }}
             </text>
           </g>
           <g class="op-schem-annotation" text-anchor="end">
             <text :x="SVG_W - 90" y="380">observation ┐</text>
-            <text :x="SVG_W - 90" y="540">predicates  ┐</text>
-            <text :x="SVG_W - 90" y="640">dispatch    ↑</text>
-            <text :x="SVG_W - 90" y="340">writeback   ↑</text>
+            <text :x="SVG_W - 90" y="540">predicates ┐</text>
+            <text :x="SVG_W - 90" y="640">dispatch ↑</text>
+            <text :x="SVG_W - 90" y="340">writeback ↑</text>
           </g>
 
           <!-- Frame ticks -->
@@ -403,8 +404,8 @@ const annotations = [
           <div class="op-schem-foot-label">// caller</div>
           <div class="op-schem-foot-body">
             Drop into Rust with
-            <span class="op-schem-cargo">cargo add</span>, shell out to the
-            CLI, or speak JSON-RPC from any language.
+            <span class="op-schem-cargo">cargo add</span>, shell out to the CLI,
+            or speak JSON-RPC from any language.
           </div>
         </div>
         <div>
@@ -424,8 +425,8 @@ const annotations = [
         <div>
           <div class="op-schem-foot-label">// adapt</div>
           <div class="op-schem-foot-body">
-            Wrap an app's prompt grammar in a trusted Lua adapter. Claude
-            Code ships in-tree; bring your own TUI next.
+            Wrap an app's prompt grammar in a trusted Lua adapter. Claude Code
+            ships in-tree; bring your own TUI next.
           </div>
         </div>
       </footer>

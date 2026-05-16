@@ -41,10 +41,7 @@ export default defineConfig({
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'ptywright' }],
     ['meta', { property: 'og:description', content: description }],
-    [
-      'link',
-      { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
-    ],
+    ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
     [
       'link',
       {

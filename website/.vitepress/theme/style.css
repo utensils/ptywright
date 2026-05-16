@@ -325,7 +325,11 @@ body {
   position: absolute;
   inset: 0 auto 0 0;
   width: 3px;
-  background: linear-gradient(180deg, var(--op-accent) 0%, var(--op-amber) 100%);
+  background: linear-gradient(
+    180deg,
+    var(--op-accent) 0%,
+    var(--op-amber) 100%
+  );
   z-index: 2;
   pointer-events: none;
 }
@@ -432,11 +436,7 @@ body {
  */
 :where(.vp-doc) a {
   color: var(--op-accent-t);
-  text-decoration-color: color-mix(
-    in srgb,
-    var(--op-accent) 60%,
-    transparent
-  );
+  text-decoration-color: color-mix(in srgb, var(--op-accent) 60%, transparent);
   text-underline-offset: 2px;
   font-weight: 500;
 }

@@ -104,9 +104,7 @@ const ptyLines = [
           <span class="op-pty-btn" />
           <span class="op-pty-btn" />
           <div class="op-pty-tabs">
-            <span class="op-pty-tab is-active"
-              >session-01 · claude-code</span
-            >
+            <span class="op-pty-tab is-active">session-01 · claude-code</span>
             <span class="op-pty-tab">session-02 · zsh</span>
             <span class="op-pty-tab-plus">+</span>
           </div>
@@ -118,14 +116,14 @@ const ptyLines = [
               <span class="op-prompt">{{ l.prompt }}</span>
               <span>
                 {{ l.body }}<span class="op-cyan">{{ l.arg }}</span
-                ><template v-if="l.arg2">{{ l.suffix
-                  }}<span class="op-amber">{{ l.arg2 }}</span
+                ><template v-if="l.arg2"
+                  >{{ l.suffix }}<span class="op-amber">{{ l.arg2 }}</span
                   >{{ l.suffix2 }}</template
                 ><template v-else>{{ l.suffix }}</template>
               </span>
             </div>
             <div class="op-line op-line-out">
-              <span class="op-dim">   ↳</span>
+              <span class="op-dim"> ↳</span>
               <span class="op-dim">
                 {{ l.note }}
                 <span v-if="l.badge" class="op-badge">turn complete</span>
@@ -139,10 +137,12 @@ const ptyLines = [
             >
           </div>
         </div>
-        <pre class="op-ascii">┌── observer ──┬── matcher ──┬── transcript ──┐
+        <pre class="op-ascii">
+┌── observer ──┬── matcher ──┬── transcript ──┐
 │ 80×24 cells  │ regex+temp. │ 64 KiB ring    │
 │ vt100 engine │ on-stable   │ raw stream opt │
-└──────────────┴─────────────┴────────────────┘</pre>
+└──────────────┴─────────────┴────────────────┘</pre
+        >
       </div>
     </section>
 
