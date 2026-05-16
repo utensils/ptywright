@@ -175,7 +175,7 @@
                 category = "check";
                 name = "run-tests";
                 help = "cargo test (matches CI)";
-                command = "cargo test \"$@\"";
+                command = "cargo test --features _test-fixtures \"$@\"";
               }
               {
                 category = "check";
@@ -186,7 +186,7 @@
                   cargo fmt --all -- --check
                   cargo check
                   cargo clippy -- -D warnings
-                  cargo test
+                  cargo test --features _test-fixtures
                   cargo build --release
                   # Lean baseline: keep the `--no-default-features` path
                   # green so callers who opt out of the `repl` stack don't
@@ -194,7 +194,7 @@
                   # .github/workflows/ci.yml.
                   cargo check --no-default-features
                   cargo clippy --no-default-features -- -D warnings
-                  cargo test --no-default-features
+                  cargo test --no-default-features --features _test-fixtures
                 '';
               }
               {
@@ -209,10 +209,10 @@
                   # shimming via `find /nix/store` (which picked random
                   # LLVM majors and broke after store GC).
                   if [ "''${1:-}" = "--html" ]; then
-                    cargo llvm-cov --workspace --html --output-dir target/coverage
+                    cargo llvm-cov --workspace --features _test-fixtures --html --output-dir target/coverage
                     echo "Report: target/coverage/html/index.html"
                   else
-                    cargo llvm-cov --workspace --summary-only
+                    cargo llvm-cov --workspace --features _test-fixtures --summary-only
                   fi
                 '';
               }

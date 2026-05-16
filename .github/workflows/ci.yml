@@ -71,10 +71,10 @@ jobs:
         run: |
           export RUSTC="$(rustup which rustc --toolchain stable)"
           CARGO_BIN="$(rustup which cargo --toolchain stable)"
-          "$CARGO_BIN" test --locked --lib --bins --tests
+          "$CARGO_BIN" test --locked --features _test-fixtures --lib --bins --tests
       - name: Test
         if: runner.os != 'macOS'
-        run: rustup run stable cargo test --locked
+        run: rustup run stable cargo test --locked --features _test-fixtures
       - name: Build (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -110,10 +110,10 @@ jobs:
         run: |
           export RUSTC="$(rustup which rustc --toolchain stable)"
           CARGO_BIN="$(rustup which cargo --toolchain stable)"
-          "$CARGO_BIN" test --locked --no-default-features --lib --bins --tests
+          "$CARGO_BIN" test --locked --no-default-features --features _test-fixtures --lib --bins --tests
       - name: Test (--no-default-features)
         if: runner.os == 'ubuntu-latest'
-        run: rustup run stable cargo test --locked --no-default-features
+        run: rustup run stable cargo test --locked --no-default-features --features _test-fixtures
 
   coverage:
     runs-on: ubuntu-latest
@@ -132,7 +132,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --features _test-fixtures --lcov --output-path lcov.info
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5

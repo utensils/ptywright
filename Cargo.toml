@@ -27,6 +27,12 @@ repl = [
     "dep:nu-ansi-term",
     "dep:reedline",
 ]
+# Internal feature gate for the test-only `ptywright-echo-tui` fixture
+# binary. Not part of the public surface — exists solely so the bin
+# target carries `required-features = ["_test-fixtures"]`, which keeps
+# `cargo install ptywright` from installing the fixture alongside the
+# real CLI. CI test invocations enable it explicitly.
+_test-fixtures = []
 
 [dependencies]
 anyhow = "1.0.102"
@@ -67,3 +73,11 @@ path = "tests/fixtures/echo_tui/main.rs"
 test = false
 doctest = false
 bench = false
+# Gate this test-only fixture behind an internal feature so it is never
+# built by `cargo build` / `cargo install` of a fresh checkout. The
+# integration test in `tests/cli_tests.rs` resolves the binary through
+# `CARGO_BIN_EXE_ptywright-echo-tui`, so CI test runs pass
+# `--features _test-fixtures` to enable it. Without this gate,
+# `cargo install ptywright` would deposit the fixture binary in the
+# user's `~/.cargo/bin` next to the real CLI.
+required-features = ["_test-fixtures"]

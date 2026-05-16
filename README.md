@@ -91,7 +91,7 @@ Useful direct commands:
 cargo fmt --all -- --check
 cargo check --locked
 cargo clippy --locked -- -D warnings
-cargo test --locked
+cargo test --locked --features _test-fixtures
 cargo run -- --help
 ```
 

@@ -75,7 +75,7 @@ Devshell commands:
 | --- | --- | --- |
 | build | `build` / `build-release` | `cargo build` / `cargo build --release` |
 | check | `check` / `clippy` / `fmt` / `fmt-check` | Standard Rust checks |
-| check | `run-tests` | `cargo test` |
+| check | `run-tests` | `cargo test --features _test-fixtures` |
 | check | `ci-local` | fmt-check → check → clippy → test → build |
 | check | `coverage` | `cargo llvm-cov --workspace --summary-only` |
 | run | `ptywright` | `cargo run -- "$@"` |
@@ -87,16 +87,18 @@ Direct Cargo fallback (CI uses `--locked` for Cargo check/clippy/test jobs; mirr
 cargo fmt --all -- --check
 cargo check --locked
 cargo clippy --locked -- -D warnings
-cargo test --locked
+cargo test --locked --features _test-fixtures
 cargo run -- --help
 ```
+
+The `_test-fixtures` feature gates the test-only `ptywright-echo-tui` bin fixture. CI test runs (and `run-tests` / `ci-local` in the devshell) enable it; bare `cargo install ptywright` does not, which keeps the fixture out of users' `~/.cargo/bin`. Without the feature, `cargo test --locked` will fail to compile `tests/cli_tests.rs` because `env!("CARGO_BIN_EXE_ptywright-echo-tui")` won't be set — that's expected and intentional.
 
 **`repl` feature** (interactive REPL client, `ptywright repl`) is on by default. To verify the lean build without `reedline` / `crossbeam-channel` / `nu-ansi-term`:
 
 ```bash
 cargo check --locked --no-default-features
 cargo clippy --locked --no-default-features -- -D warnings
-cargo test --locked --no-default-features
+cargo test --locked --no-default-features --features _test-fixtures
 ```
 
 CI exercises both lanes: the default build (with `repl`) and the `--no-default-features` build, on Linux (check + clippy + test), macOS (check + test), and Windows (check only).

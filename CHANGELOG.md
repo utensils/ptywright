@@ -55,5 +55,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New `Error::PermissionDenied { method, required }` variant in the public library surface.
 - `plugin.load` / `plugin.unload` JSON-RPC methods require the server to have been started with `--allow-plugin-load`; without it both return `-32004 PermissionDenied` with `data.reason = "server_did_not_grant_plugin_load"`. The CLI `--plugin <manifest.toml>` flag works regardless because operators load plugins at startup, which is explicitly trusted.
 
+### Fixed
+
+- `cargo install ptywright` no longer installs the test-only `ptywright-echo-tui` fixture binary alongside the real CLI. The fixture is now gated behind an internal `_test-fixtures` Cargo feature via `required-features`, so it is only built when CI test runs (and the devshell `run-tests` / `ci-local` commands) enable it explicitly.
+
 [Unreleased]: https://github.com/utensils/ptywright/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/utensils/ptywright/releases/tag/v0.1.0
