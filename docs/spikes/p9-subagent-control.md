@@ -8,7 +8,7 @@
 
 Claudette's persistent chat session emits a `task_stop` message to interrupt named background subagents Claude spawns through the Task tool — see `src/agent/harness.rs::send_task_stop` in [`claudette`](https://github.com/utensils/claudette). The current `claude-code` ptywright plugin has no intent to drive that flow, so consumers who'd otherwise drop `claude -p` for a PTY-driven session lose subagent control as a side-effect.
 
-P9 in [the ptywright Claude Code gap plan](../../plans/study-and-understand-the-witty-leaf.md) covers adding plugin intents that drive the same flow through the TUI. The plan flagged it as a one-day spike before sizing because the TUI surface for background tasks is not documented in Claude Code's user-facing help.
+"P9" refers to the ninth item in the ptywright Claude Code gap analysis (the originating planning artifact lives outside the repository — see the PR that introduced this doc for the full context). It covers adding plugin intents that drive the same flow through the TUI. The plan flagged it as a one-day spike before sizing because the TUI surface for background tasks is not documented in Claude Code's user-facing help.
 
 ## What we don't know yet
 
