@@ -132,7 +132,14 @@
   --vp-button-brand-active-bg: #d2f56b;
 }
 
-/* Global type system — mono everywhere, just like the artboards */
+/* Global type system — mono chrome + Inter prose.
+ *
+ * Mono (JetBrains) is the default body font and is forced on every chrome
+ * surface below (nav, sidebar, headings, code, tables, hero, footer) so the
+ * site reads like the artboards. Sustained doc prose (`.vp-doc p, li`) is
+ * pulled back onto Inter further down for readability — long-form mono
+ * paragraphs are hard on the eyes even when the rest of the page is mono.
+ */
 html,
 body {
   background: var(--op-bg);

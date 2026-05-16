@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- VitePress docs site redesigned around the "Operator" direction from Claude Design: monospaced JetBrains Mono throughout, chartreuse (`#c6f24e`) accent, ink-on-bone (light) / bone-on-ink (dark) palette. New homepage components — Operator hero, 4-cell strip, and a `fig.01` runtime schematic SVG diagramming the nine reusable layers (caller → rpc → session → screen/transcript → matcher/action → turn → adapter). Both light and dark modes ship together; the embedded PTY frame stays dark in both modes so it always reads as a real terminal. Existing docs pages inherit the same vocabulary (numbered `01 ›` headings, chartreuse → amber code-block bar, datasheet tables).
+- VitePress docs site redesigned around the "Operator" direction from Claude Design: JetBrains Mono on every chrome surface (nav, sidebar, headings, code, tables, hero, footer) with Inter retained for sustained doc prose, chartreuse (`#c6f24e`) accent, ink-on-bone (light) / bone-on-ink (dark) palette. New homepage components — Operator hero, 4-cell strip, and a `fig.01` runtime schematic SVG diagramming the nine reusable layers (caller → rpc → session → screen/transcript → matcher/action → turn → adapter). Both light and dark modes ship together; the embedded PTY frame stays dark in both modes so it always reads as a real terminal. Existing docs pages inherit the same vocabulary (numbered `01 ›` headings, chartreuse → amber code-block bar, datasheet tables).
 - Initial ptywright skeleton.
 - Minimal Rust CLI that prints help by default and supports `--version`.
 - Minimal library surface for future PTY/TUI automation abstractions.
