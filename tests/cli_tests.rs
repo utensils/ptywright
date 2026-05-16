@@ -862,3 +862,147 @@ fn serve_stdio_emits_session_changed_after_opt_in() {
     drop(stdin);
     let _ = child.wait();
 }
+
+// ---- Trusted-local third-party plugin loading (GH #16) -----------------
+
+/// Path to the canonical `echo` fixture plugin used by the third-party
+/// loading tests.
+fn echo_plugin_manifest_path() -> std::path::PathBuf {
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set during cargo test");
+    std::path::PathBuf::from(manifest)
+        .join("tests")
+        .join("fixtures")
+        .join("plugins")
+        .join("echo")
+        .join("manifest.toml")
+}
+
+#[test]
+fn serve_loads_third_party_plugin_via_cli_flag() {
+    let manifest_path = echo_plugin_manifest_path();
+    let mut child = bin()
+        .args([
+            "serve",
+            "--stdio",
+            "--plugin",
+            manifest_path.to_str().expect("manifest path is utf8"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --plugin");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"adapter.list\"}\n")
+        .expect("write adapter.list");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    assert!(output.status.success(), "serve exited non-zero: {output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json response");
+    let names: Vec<String> = response["result"]["plugins"]
+        .as_array()
+        .expect("plugins array")
+        .iter()
+        .map(|p| p["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "claude-code"),
+        "built-in claude-code must remain visible after --plugin load: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "echo"),
+        "echo plugin must be visible after --plugin load: {names:?}"
+    );
+}
+
+#[test]
+fn plugin_load_denied_without_allow_flag() {
+    let manifest_path = echo_plugin_manifest_path();
+    let request = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"plugin.load\",\"params\":{{\"manifest_path\":{:?}}}}}\n",
+        manifest_path.to_str().expect("manifest path is utf8")
+    );
+    let mut child = bin()
+        .args(["serve", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(request.as_bytes())
+        .expect("write plugin.load");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json response");
+    assert_eq!(
+        response["error"]["code"], -32004,
+        "plugin.load without --allow-plugin-load must return -32004: {response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"], "server_did_not_grant_plugin_load",
+        "data.reason must distinguish server-mode denial: {response}"
+    );
+}
+
+#[test]
+fn plugin_load_allowed_with_flag_drives_full_lifecycle() {
+    let manifest_path = echo_plugin_manifest_path();
+    let manifest_str = manifest_path.to_str().expect("manifest path is utf8");
+    let requests = format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"plugin.load\",\"params\":{{\"manifest_path\":{path:?}}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"adapter.start\",\"params\":{{\"plugin\":\"echo\"}}}}\n",
+        ),
+        path = manifest_str,
+    );
+    let mut child = bin()
+        .args(["serve", "--stdio", "--allow-plugin-load"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --allow-plugin-load");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(requests.as_bytes())
+        .expect("write requests");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    assert!(
+        responses.len() >= 2,
+        "expected at least two responses (plugin.load + adapter.start), got: {responses:?}"
+    );
+    assert_eq!(responses[0]["result"]["plugin"], "echo");
+    assert_eq!(
+        responses[1]["result"]["plugin"],
+        "echo",
+        "adapter.start must instantiate the freshly-loaded echo plugin: {response:?}",
+        response = responses[1]
+    );
+    assert!(
+        responses[1]["result"]["adapter"].is_string(),
+        "adapter.start must allocate an adapter id: {response:?}",
+        response = responses[1]
+    );
+}

@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
 
 /// Extension/plugin category declared by a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +53,24 @@ pub enum PluginPermission {
     MatcherWait,
 }
 
+impl PluginPermission {
+    /// String form used in serde, JSON-RPC error data, and log messages. Stays
+    /// in sync with the `#[serde(rename = "...")]` attributes above so wire
+    /// names and human-readable names cannot drift.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::SessionSpawn => "session.spawn",
+            Self::SessionKill => "session.kill",
+            Self::SessionResize => "session.resize",
+            Self::ScreenRead => "screen.read",
+            Self::TranscriptRead => "transcript.read",
+            Self::InputWrite => "input.write",
+            Self::MatcherWait => "matcher.wait",
+        }
+    }
+}
+
 /// Default PTY target a plugin expects when callers omit the program.
 ///
 /// Plugins declare this in their manifest so the host can wire
@@ -91,6 +112,69 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
+    /// Load a plugin manifest plus its Lua source from a TOML file on disk.
+    ///
+    /// The manifest's `entrypoint` is resolved relative to the directory
+    /// containing the manifest file, so a manifest at
+    /// `/foo/plugins/echo/manifest.toml` with `entrypoint = "main.lua"` loads
+    /// `/foo/plugins/echo/main.lua`. Absolute `entrypoint` paths and
+    /// path-traversing `..` components are rejected to keep the trust model
+    /// honest — the host only reads source files inside the plugin's own
+    /// directory.
+    ///
+    /// Returns the validated manifest and the Lua source as a `String`.
+    pub fn load_from_toml_path(manifest_path: &Path) -> Result<(Self, String)> {
+        let toml_text = std::fs::read_to_string(manifest_path).map_err(|error| {
+            Error::Config(format!(
+                "failed to read plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        let manifest: Self = toml::from_str(&toml_text).map_err(|error| {
+            Error::Config(format!(
+                "failed to parse plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        manifest.validate().map_err(|error| {
+            Error::Config(format!(
+                "invalid plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        let entrypoint = manifest.entrypoint.as_deref().ok_or_else(|| {
+            Error::Config(format!(
+                "plugin manifest `{}` is missing an entrypoint",
+                manifest_path.display()
+            ))
+        })?;
+        let entrypoint_path = Path::new(entrypoint);
+        if entrypoint_path.is_absolute()
+            || entrypoint_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(Error::Config(format!(
+                "plugin manifest `{}` entrypoint `{entrypoint}` must be a relative path inside the manifest's directory",
+                manifest_path.display()
+            )));
+        }
+        let manifest_dir = manifest_path.parent().ok_or_else(|| {
+            Error::Config(format!(
+                "plugin manifest `{}` has no parent directory",
+                manifest_path.display()
+            ))
+        })?;
+        let source_path = manifest_dir.join(entrypoint_path);
+        let source = std::fs::read_to_string(&source_path).map_err(|error| {
+            Error::Config(format!(
+                "failed to read plugin entrypoint `{}`: {error}",
+                source_path.display()
+            ))
+        })?;
+        Ok((manifest, source))
+    }
+
     /// Validate manifest fields and duplicate permissions.
     pub fn validate(&self) -> std::result::Result<(), PluginManifestError> {
         if self.name.trim().is_empty() {

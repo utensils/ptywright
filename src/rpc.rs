@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 use crate::action::Action;
 use crate::error::{Error, Result};
 use crate::extension::{Extension, ExtensionHandle, LuaExtension};
+use crate::lua_plugin::LuaPlugin;
 use crate::matcher::Matcher;
-use crate::plugin::{PluginHostCapabilities, PluginManifest};
+use crate::plugin::{BUILTIN_PLUGINS, PluginHostCapabilities, PluginManifest, PluginPermission};
 use crate::redaction::RedactionPolicy;
 use crate::session::{Session, SessionConfig};
 use crate::target::{Target, TerminalSize};
@@ -45,15 +46,54 @@ struct RpcSharedState {
     /// out of the shared registry, drop the outer lock, then serialize
     /// per-adapter access without blocking unrelated work.
     extensions: HashMap<String, Arc<Mutex<ExtensionEntry>>>,
+    /// Plugin manifests + Lua sources known to this server. Built-in
+    /// plugins are seeded on construction; trusted-local third-party plugins
+    /// arrive through CLI `--plugin <manifest.toml>` flags or the
+    /// `plugin.load` JSON-RPC method.
+    ///
+    /// Keyed by manifest name. Adapter starts look this up to construct a
+    /// fresh `LuaExtension` per `adapter.start` call without re-reading the
+    /// source from disk.
+    registered_plugins: HashMap<String, RegisteredPlugin>,
+    /// Whether the `plugin.load` / `plugin.unload` RPC methods are enabled.
+    /// `false` by default — operators opt in with `ptywright serve
+    /// --allow-plugin-load`. CLI `--plugin` flags work regardless because
+    /// the operator is loading plugins out-of-band at server startup.
+    allow_plugin_load: bool,
     next_session: u64,
     next_extension: u64,
 }
 
+/// One entry in [`RpcSharedState::registered_plugins`].
+///
+/// `builtin: true` plugins are bundled into the binary and refused by
+/// `plugin.unload` — operators cannot unload claude-code through the wire.
+#[derive(Clone)]
+struct RegisteredPlugin {
+    manifest: PluginManifest,
+    source: String,
+    builtin: bool,
+}
+
 impl Default for RpcSharedState {
     fn default() -> Self {
+        let mut registered_plugins = HashMap::new();
+        for entry in BUILTIN_PLUGINS {
+            let manifest = (entry.manifest)();
+            registered_plugins.insert(
+                manifest.name.clone(),
+                RegisteredPlugin {
+                    manifest,
+                    source: entry.source.to_string(),
+                    builtin: true,
+                },
+            );
+        }
         Self {
             sessions: HashMap::new(),
             extensions: HashMap::new(),
+            registered_plugins,
+            allow_plugin_load: false,
             next_session: 1,
             next_extension: 1,
         }
@@ -152,6 +192,21 @@ struct PluginManifestParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct PluginLoadParams {
+    /// Absolute or relative path to a TOML plugin manifest. The entrypoint
+    /// declared in the manifest is read relative to the manifest's parent
+    /// directory.
+    manifest_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginUnloadParams {
+    /// Manifest name to remove from the registry. Built-in plugins cannot
+    /// be unloaded.
+    plugin: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct NotificationsParams {
     enabled: bool,
 }
@@ -223,6 +278,30 @@ struct AdapterReadParams {
     redaction: Option<RedactionPolicy>,
 }
 
+/// Dispatcher-internal error payload.
+///
+/// Carries the JSON-RPC error code, the human-readable message, and an
+/// optional structured `data` value that surfaces on the wire. Callers that
+/// don't need `data` (the common case) construct via the `From<(RpcErrorCode,
+/// String)>` impl so existing 2-tuple call sites coerce automatically through
+/// `?` and `.into()`.
+#[derive(Debug)]
+struct RpcErrorPayload {
+    code: RpcErrorCode,
+    message: String,
+    data: Option<Value>,
+}
+
+impl From<(RpcErrorCode, String)> for RpcErrorPayload {
+    fn from((code, message): (RpcErrorCode, String)) -> Self {
+        Self {
+            code,
+            message,
+            data: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RpcErrorCode {
     ParseError,
@@ -232,6 +311,7 @@ enum RpcErrorCode {
     InternalError,
     Timeout,
     SessionClosed,
+    PermissionDenied,
 }
 
 impl RpcErrorCode {
@@ -244,15 +324,86 @@ impl RpcErrorCode {
             Self::InternalError => -32603,
             Self::Timeout => -32001,
             Self::SessionClosed => -32002,
+            Self::PermissionDenied => -32004,
         }
     }
 }
 
+/// Per-method permission requirements for the `adapter.*` JSON-RPC surface.
+///
+/// Lookup is `O(n)` but `n` is tiny and the table is the single source of
+/// truth: every entry here corresponds to a method handler that calls
+/// [`RpcServer::check_adapter_permission`] (or, for `adapter.start`, a direct
+/// permission check on the manifest before the handle exists).
+///
+/// Methods that do not appear in this table are read-only registry queries
+/// (e.g. `adapter.list`, `adapter.live`) and are allow-by-default. `session.*`
+/// methods operate on directly-created sessions that have no associated plugin
+/// manifest, so they are not gated here — third-party plugin permissioning of
+/// `session.*` is tracked in the ongoing hardening backlog.
+const ADAPTER_METHOD_PERMISSIONS: &[(&str, PluginPermission)] = &[
+    ("adapter.start", PluginPermission::SessionSpawn),
+    ("adapter.send", PluginPermission::InputWrite),
+    ("adapter.wait", PluginPermission::MatcherWait),
+    ("adapter.snapshot", PluginPermission::ScreenRead),
+    ("adapter.transcript", PluginPermission::TranscriptRead),
+    ("adapter.inspect", PluginPermission::ScreenRead),
+    ("adapter.state", PluginPermission::ScreenRead),
+    ("adapter.close", PluginPermission::SessionKill),
+];
+
+/// Look up the required permission for `method`, if any.
+fn required_permission_for(method: &str) -> Option<PluginPermission> {
+    ADAPTER_METHOD_PERMISSIONS
+        .iter()
+        .find(|(name, _)| *name == method)
+        .map(|(_, perm)| perm.clone())
+}
+
 impl RpcServerState {
-    /// Create an empty shared JSON-RPC server state.
+    /// Create an empty shared JSON-RPC server state seeded with every
+    /// built-in plugin from [`BUILTIN_PLUGINS`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register a trusted-local third-party plugin so callers can spawn it
+    /// through `adapter.start` (or list it via `adapter.list`). Validates the
+    /// manifest before insertion and rejects name collisions with already
+    /// registered plugins.
+    ///
+    /// Used by the CLI when callers pass `--plugin <path/to/manifest.toml>`
+    /// to `ptywright serve`, and by the `plugin.load` JSON-RPC handler when
+    /// `--allow-plugin-load` is set.
+    pub fn register_plugin(&self, manifest: PluginManifest, source: String) -> Result<()> {
+        manifest
+            .validate()
+            .map_err(|error| Error::Config(error.to_string()))?;
+        let name = manifest.name.clone();
+        let mut shared = self.inner.lock().expect("rpc shared state poisoned");
+        if shared.registered_plugins.contains_key(&name) {
+            return Err(Error::Config(format!(
+                "plugin `{name}` is already registered"
+            )));
+        }
+        shared.registered_plugins.insert(
+            name,
+            RegisteredPlugin {
+                manifest,
+                source,
+                builtin: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Enable or disable the `plugin.load` / `plugin.unload` JSON-RPC
+    /// methods. Off by default. Operators opt in with the
+    /// `--allow-plugin-load` CLI flag on `ptywright serve`.
+    pub fn set_allow_plugin_load(&self, allow: bool) {
+        let mut shared = self.inner.lock().expect("rpc shared state poisoned");
+        shared.allow_plugin_load = allow;
     }
 }
 
@@ -285,8 +436,7 @@ impl RpcServer {
             Err(error) => {
                 return serialize_response(error_response(
                     None,
-                    RpcErrorCode::ParseError,
-                    format!("parse error: {error}"),
+                    (RpcErrorCode::ParseError, format!("parse error: {error}")).into(),
                 ))
                 .map(Some);
             }
@@ -296,7 +446,7 @@ impl RpcServer {
         let response_required = id.is_some();
         let response = match self.handle_request(request) {
             Ok(result) => success_response(id, result),
-            Err((code, message)) => error_response(id, code, message),
+            Err(payload) => error_response(id, payload),
         };
 
         if response_required {
@@ -405,15 +555,13 @@ impl RpcServer {
         Ok(messages)
     }
 
-    fn handle_request(
-        &mut self,
-        request: Request,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    fn handle_request(&mut self, request: Request) -> std::result::Result<Value, RpcErrorPayload> {
         if request.jsonrpc.as_deref() != Some(JSONRPC_VERSION) {
             return Err((
                 RpcErrorCode::InvalidRequest,
                 "jsonrpc must be \"2.0\"".to_string(),
-            ));
+            )
+                .into());
         }
         let method = request.method.ok_or_else(|| {
             (
@@ -450,7 +598,9 @@ impl RpcServer {
                     "adapter.inspect",
                     "adapter.close",
                     "plugin.capabilities",
-                    "plugin.validate_manifest"
+                    "plugin.validate_manifest",
+                    "plugin.load",
+                    "plugin.unload"
                 ],
                 "notifications": ["session.changed", "session.exited"]
             })),
@@ -476,17 +626,20 @@ impl RpcServer {
             "adapter.close" => self.adapter_close(request.params),
             "plugin.capabilities" => Ok(json!(PluginHostCapabilities::current())),
             "plugin.validate_manifest" => self.plugin_validate_manifest(request.params),
+            "plugin.load" => self.plugin_load(request.params),
+            "plugin.unload" => self.plugin_unload(request.params),
             _ => Err((
                 RpcErrorCode::MethodNotFound,
                 format!("unknown method: {method}"),
-            )),
+            )
+                .into()),
         }
     }
 
     fn server_set_notifications(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: NotificationsParams = parse_params(params)?;
         self.notifications_enabled = params.enabled;
         Ok(json!({ "enabled": self.notifications_enabled }))
@@ -495,7 +648,7 @@ impl RpcServer {
     fn session_create(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: CreateParams = parse_params(params)?;
         let size = TerminalSize {
             rows: params.rows.unwrap_or(24),
@@ -514,7 +667,8 @@ impl RpcServer {
             return Err((
                 RpcErrorCode::InvalidParams,
                 "raw_transcript_append requires raw_transcript_path".to_string(),
-            ));
+            )
+                .into());
         }
         if let Some(path) = params.raw_transcript_path {
             config.transcript.raw_file = Some(
@@ -550,7 +704,7 @@ impl RpcServer {
     fn session_close(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: SessionParams = parse_params(params)?;
         let session = self
             .shared
@@ -568,14 +722,15 @@ impl RpcServer {
             Err((
                 RpcErrorCode::InvalidParams,
                 format!("unknown session: {}", params.session),
-            ))
+            )
+                .into())
         }
     }
 
     fn session_kill(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: SessionParams = parse_params(params)?;
         let session = self.session(&params.session)?;
         session.kill().map_err(rpc_error_from_error)?;
@@ -585,7 +740,7 @@ impl RpcServer {
     fn session_resize(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: ResizeParams = parse_params(params)?;
         let size = TerminalSize {
             rows: params.rows,
@@ -602,7 +757,7 @@ impl RpcServer {
     fn session_input(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: InputParams = parse_params(params)?;
         self.session(&params.session)?
             .send(params.action)
@@ -613,7 +768,7 @@ impl RpcServer {
     fn session_snapshot(
         &self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: SessionReadParams = parse_params(params)?;
         let policy = if params.redact.unwrap_or(true) {
             Some(redaction_policy_for_read(params.redaction)?)
@@ -625,13 +780,13 @@ impl RpcServer {
             snapshot = snapshot.redacted(&policy);
         }
         serde_json::to_value(snapshot)
-            .map_err(|error| (RpcErrorCode::InternalError, error.to_string()))
+            .map_err(|error| (RpcErrorCode::InternalError, error.to_string()).into())
     }
 
     fn session_transcript(
         &self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: SessionReadParams = parse_params(params)?;
         let policy = if params.redact.unwrap_or(true) {
             Some(redaction_policy_for_read(params.redaction)?)
@@ -647,10 +802,7 @@ impl RpcServer {
         Ok(json!({ "text": text }))
     }
 
-    fn session_wait(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    fn session_wait(&self, params: Option<Value>) -> std::result::Result<Value, RpcErrorPayload> {
         let params: WaitParams = parse_params(params)?;
         let result = self
             .session(&params.session)?
@@ -671,16 +823,118 @@ impl RpcServer {
     fn plugin_validate_manifest(
         &self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: PluginManifestParams = parse_params(params)?;
         params
             .manifest
             .validate()
-            .map_err(|error| (RpcErrorCode::InvalidParams, error.to_string()))?;
+            .map_err(|error| -> RpcErrorPayload {
+                (RpcErrorCode::InvalidParams, error.to_string()).into()
+            })?;
         Ok(json!({ "valid": true }))
     }
 
-    fn session(&self, id: &str) -> std::result::Result<Arc<Session>, (RpcErrorCode, String)> {
+    /// `plugin.load` — register a trusted-local third-party plugin from a
+    /// TOML manifest path. Gated by the `allow_plugin_load` server flag,
+    /// which operators set with `ptywright serve --allow-plugin-load`.
+    /// Without that flag the method returns `-32004 PermissionDenied` with
+    /// `data.reason = "server_did_not_grant_plugin_load"` so callers can
+    /// distinguish a server-mode denial from an adapter-permission denial.
+    fn plugin_load(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        self.require_plugin_load_enabled("plugin.load")?;
+        let params: PluginLoadParams = parse_params(params)?;
+        let (manifest, source) = PluginManifest::load_from_toml_path(&params.manifest_path)
+            .map_err(rpc_error_from_error)?;
+        let name = manifest.name.clone();
+        self.shared
+            .register_plugin(manifest, source)
+            .map_err(rpc_error_from_error)?;
+        Ok(json!({ "plugin": name }))
+    }
+
+    /// `plugin.unload` — deregister a previously loaded third-party plugin.
+    /// Built-in plugins (claude-code today) cannot be unloaded — they are
+    /// embedded in the binary and removing them would break clients that
+    /// expect them in the registry. Plugins with live adapters bound to
+    /// them are also rejected; callers must `adapter.close` first.
+    fn plugin_unload(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        self.require_plugin_load_enabled("plugin.unload")?;
+        let params: PluginUnloadParams = parse_params(params)?;
+        let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        let Some(entry) = shared.registered_plugins.get(&params.plugin).cloned() else {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!("unknown plugin: {}", params.plugin),
+            )
+                .into());
+        };
+        if entry.builtin {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!(
+                    "plugin `{}` is built in and cannot be unloaded",
+                    params.plugin
+                ),
+            )
+                .into());
+        }
+        // Refuse to unload while any adapter is still bound to this plugin.
+        // Use `try_lock` so a long-running `adapter.wait` does not stall the
+        // unload check; if every entry can be inspected and none reference
+        // the plugin, unload proceeds.
+        let bound = shared.extensions.values().any(|arc| match arc.try_lock() {
+            Ok(entry) => entry.plugin == params.plugin,
+            Err(_) => false,
+        });
+        if bound {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!(
+                    "plugin `{}` has live adapters; call adapter.close first",
+                    params.plugin
+                ),
+            )
+                .into());
+        }
+        shared.registered_plugins.remove(&params.plugin);
+        Ok(json!({ "unloaded": true }))
+    }
+
+    /// Common gate for the two `plugin.*` mutation methods. Returns a
+    /// `PermissionDenied` payload with a `data.reason` field when the server
+    /// was started without `--allow-plugin-load`.
+    fn require_plugin_load_enabled(
+        &self,
+        method: &str,
+    ) -> std::result::Result<(), RpcErrorPayload> {
+        let allow = self
+            .shared
+            .inner
+            .lock()
+            .expect("rpc shared state poisoned")
+            .allow_plugin_load;
+        if allow {
+            return Ok(());
+        }
+        Err(RpcErrorPayload {
+            code: RpcErrorCode::PermissionDenied,
+            message: format!(
+                "method `{method}` is disabled; restart ptywright serve with --allow-plugin-load"
+            ),
+            data: Some(json!({
+                "method": method,
+                "reason": "server_did_not_grant_plugin_load",
+            })),
+        })
+    }
+
+    fn session(&self, id: &str) -> std::result::Result<Arc<Session>, RpcErrorPayload> {
         self.shared
             .inner
             .lock()
@@ -693,6 +947,7 @@ impl RpcServer {
                     RpcErrorCode::InvalidParams,
                     format!("unknown session: {id}"),
                 )
+                    .into()
             })
     }
 
@@ -715,24 +970,90 @@ impl RpcServer {
     fn extension(
         &self,
         id: &str,
-    ) -> std::result::Result<Arc<Mutex<ExtensionEntry>>, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Arc<Mutex<ExtensionEntry>>, RpcErrorPayload> {
         let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
         shared.extensions.get(id).cloned().ok_or_else(|| {
             (
                 RpcErrorCode::InvalidParams,
                 format!("unknown adapter: {id}"),
             )
+                .into()
         })
+    }
+
+    /// Look up the adapter's manifest and verify it declares the permission
+    /// required by `method`. Returns a `PermissionDenied` error tuple ready to
+    /// hand back from a `*_handler` if the check fails. Methods that have no
+    /// permission requirement registered in [`ADAPTER_METHOD_PERMISSIONS`]
+    /// short-circuit as allow.
+    ///
+    /// Permissions are checked at dispatch time so that an adapter's runtime
+    /// privileges cannot be widened after `adapter.start` — the manifest the
+    /// adapter was started with is the authoritative declaration for the
+    /// lifetime of the handle.
+    fn check_adapter_permission(
+        &self,
+        method: &str,
+        adapter_id: &str,
+    ) -> std::result::Result<(), RpcErrorPayload> {
+        let Some(required) = required_permission_for(method) else {
+            return Ok(());
+        };
+        let entry_arc = self.extension(adapter_id)?;
+        let entry = entry_arc.lock().expect("extension poisoned");
+        if entry
+            .handle
+            .extension()
+            .manifest()
+            .permissions
+            .contains(&required)
+        {
+            Ok(())
+        } else {
+            Err(rpc_error_from_error(Error::PermissionDenied {
+                method: method.to_string(),
+                required,
+            }))
+        }
+    }
+
+    /// Verify a plugin manifest declares the permission required by `method`.
+    /// Used by `adapter.start`, which must check before the
+    /// [`ExtensionHandle`] exists in the registry.
+    fn check_manifest_permission(
+        method: &str,
+        manifest: &PluginManifest,
+    ) -> std::result::Result<(), RpcErrorPayload> {
+        let Some(required) = required_permission_for(method) else {
+            return Ok(());
+        };
+        if manifest.permissions.contains(&required) {
+            Ok(())
+        } else {
+            Err(rpc_error_from_error(Error::PermissionDenied {
+                method: method.to_string(),
+                required,
+            }))
+        }
     }
 
     // ---- adapter.* handlers ---------------------------------------------
 
-    /// `adapter.list` — enumerate the built-in plugin manifests this server
-    /// can instantiate. Reused by introspection clients before calling
-    /// `adapter.start`.
+    /// `adapter.list` — enumerate every plugin this server can instantiate.
+    /// Reads the shared registry so the response includes built-in plugins
+    /// and any trusted-local third-party plugins loaded via CLI `--plugin`
+    /// flags or the `plugin.load` JSON-RPC method.
     fn adapter_list(&self) -> Value {
-        let capabilities = PluginHostCapabilities::current();
-        json!({ "plugins": capabilities.builtin_plugins })
+        let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        let mut plugins: Vec<&PluginManifest> = shared
+            .registered_plugins
+            .values()
+            .map(|entry| &entry.manifest)
+            .collect();
+        // Deterministic ordering so wire output is stable across runs and
+        // does not depend on HashMap iteration order.
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        json!({ "plugins": plugins })
     }
 
     /// `adapter.start` — spawn a PTY session and wrap it in an
@@ -741,9 +1062,29 @@ impl RpcServer {
     fn adapter_start(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterStartParams = parse_params(params)?;
-        let extension = LuaExtension::built_in(&params.plugin).map_err(rpc_error_from_error)?;
+        // Look up the plugin in the shared registry so built-ins and
+        // trusted-local third-party plugins (loaded via CLI `--plugin` or RPC
+        // `plugin.load`) share one code path.
+        let registered = {
+            let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            shared
+                .registered_plugins
+                .get(&params.plugin)
+                .cloned()
+                .ok_or_else(|| -> RpcErrorPayload {
+                    (
+                        RpcErrorCode::InvalidParams,
+                        format!("unknown plugin: {}", params.plugin),
+                    )
+                        .into()
+                })?
+        };
+        Self::check_manifest_permission("adapter.start", &registered.manifest)?;
+        let plugin = LuaPlugin::trusted(&registered.manifest, &registered.source)
+            .map_err(rpc_error_from_error)?;
+        let extension = LuaExtension::new(plugin, registered.manifest.clone());
         // Fall back to the manifest's declared default target when the caller
         // omits `program`. Args follow the same rule independently: an
         // explicit `args` list always wins, otherwise the manifest default's
@@ -752,7 +1093,7 @@ impl RpcServer {
         let program = params
             .program
             .or_else(|| manifest_default.as_ref().map(|t| t.program.clone()))
-            .ok_or_else(|| {
+            .ok_or_else(|| -> RpcErrorPayload {
                 (
                     RpcErrorCode::InvalidParams,
                     format!(
@@ -760,6 +1101,7 @@ impl RpcServer {
                         plugin = params.plugin,
                     ),
                 )
+                    .into()
             })?;
         // Args: explicit caller-supplied Vec (including an explicit empty
         // list) always wins. Only when the field is omitted entirely do we
@@ -811,11 +1153,9 @@ impl RpcServer {
 
     /// `adapter.state` — re-classify and return the current state without
     /// applying any actions.
-    fn adapter_state(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    fn adapter_state(&self, params: Option<Value>) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.state", &params.adapter)?;
         let entry_arc = self.extension(&params.adapter)?;
         let entry = entry_arc.lock().expect("extension poisoned");
         Ok(json!({ "state": entry.handle.state() }))
@@ -828,8 +1168,9 @@ impl RpcServer {
     fn adapter_send(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterSendParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.send", &params.adapter)?;
         let intent = params.intent.clone();
         let entry_arc = self.extension(&params.adapter)?;
         let mut entry = entry_arc.lock().expect("extension poisoned");
@@ -843,11 +1184,9 @@ impl RpcServer {
     /// `adapter.wait` — block until the plugin's named matcher fires or the
     /// timeout expires, then classify and return the resulting state. The
     /// intent defaults to `wait_turn_matcher` so simple callers can omit it.
-    fn adapter_wait(
-        &self,
-        params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    fn adapter_wait(&self, params: Option<Value>) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterWaitParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.wait", &params.adapter)?;
         let intent = params
             .intent
             .unwrap_or_else(|| DEFAULT_WAIT_INTENT.to_string());
@@ -871,8 +1210,9 @@ impl RpcServer {
     fn adapter_snapshot(
         &self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterReadParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.snapshot", &params.adapter)?;
         let entry_arc = self.extension(&params.adapter)?;
         let policy = if params.redact.unwrap_or(true) {
             Some(redaction_policy_for_read(params.redaction)?)
@@ -885,7 +1225,7 @@ impl RpcServer {
             snapshot = snapshot.redacted(&policy);
         }
         serde_json::to_value(snapshot)
-            .map_err(|error| (RpcErrorCode::InternalError, error.to_string()))
+            .map_err(|error| (RpcErrorCode::InternalError, error.to_string()).into())
     }
 
     /// `adapter.transcript` — passthrough to the adapter's underlying session
@@ -893,8 +1233,9 @@ impl RpcServer {
     fn adapter_transcript(
         &self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterReadParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.transcript", &params.adapter)?;
         let entry_arc = self.extension(&params.adapter)?;
         let policy = if params.redact.unwrap_or(true) {
             Some(redaction_policy_for_read(params.redaction)?)
@@ -918,8 +1259,9 @@ impl RpcServer {
     fn adapter_inspect(
         &self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterReadParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.inspect", &params.adapter)?;
         let entry_arc = self.extension(&params.adapter)?;
         let entry = entry_arc.lock().expect("extension poisoned");
         let session = entry.handle.session();
@@ -965,8 +1307,9 @@ impl RpcServer {
     fn adapter_close(
         &mut self,
         params: Option<Value>,
-    ) -> std::result::Result<Value, (RpcErrorCode, String)> {
+    ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.close", &params.adapter)?;
         let removed = {
             let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
             shared.extensions.remove(&params.adapter)
@@ -982,7 +1325,8 @@ impl RpcServer {
             Err((
                 RpcErrorCode::InvalidParams,
                 format!("unknown adapter: {}", params.adapter),
-            ))
+            )
+                .into())
         }
     }
 
@@ -1157,22 +1501,22 @@ fn write_lsp_payload(output: &mut impl Write, payload: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_params<T>(params: Option<Value>) -> std::result::Result<T, (RpcErrorCode, String)>
+fn parse_params<T>(params: Option<Value>) -> std::result::Result<T, RpcErrorPayload>
 where
     T: for<'de> Deserialize<'de>,
 {
     serde_json::from_value(params.unwrap_or_else(|| json!({})))
-        .map_err(|error| (RpcErrorCode::InvalidParams, error.to_string()))
+        .map_err(|error| (RpcErrorCode::InvalidParams, error.to_string()).into())
 }
 
 fn redaction_policy_for_read(
     policy: Option<RedactionPolicy>,
-) -> std::result::Result<RedactionPolicy, (RpcErrorCode, String)> {
+) -> std::result::Result<RedactionPolicy, RpcErrorPayload> {
     let mut policy = policy.unwrap_or_default();
     policy.enabled = true;
     policy
         .validate()
-        .map_err(|error| (RpcErrorCode::InvalidParams, error))?;
+        .map_err(|error| -> RpcErrorPayload { (RpcErrorCode::InvalidParams, error).into() })?;
     Ok(policy)
 }
 
@@ -1184,15 +1528,21 @@ fn success_response(id: Option<Value>, result: Value) -> Value {
     })
 }
 
-fn error_response(id: Option<Value>, code: RpcErrorCode, message: String) -> Value {
-    let message = RedactionPolicy::default().redact(&message);
+fn error_response(id: Option<Value>, payload: RpcErrorPayload) -> Value {
+    let message = RedactionPolicy::default().redact(&payload.message);
+    let mut error = json!({
+        "code": payload.code.code(),
+        "message": message,
+    });
+    // Only surface `data` on the wire when the dispatcher actually attached
+    // a structured payload. Most errors do not.
+    if let Some(data) = payload.data {
+        error["data"] = data;
+    }
     json!({
         "jsonrpc": JSONRPC_VERSION,
         "id": id.unwrap_or(Value::Null),
-        "error": {
-            "code": code.code(),
-            "message": message,
-        },
+        "error": error,
     })
 }
 
@@ -1200,18 +1550,30 @@ fn serialize_response(value: Value) -> Result<String> {
     Ok(serde_json::to_string(&value)?)
 }
 
-fn rpc_error_from_error(error: Error) -> (RpcErrorCode, String) {
-    let code = match error {
-        Error::Timeout => RpcErrorCode::Timeout,
-        Error::Closed | Error::ReaderEnded => RpcErrorCode::SessionClosed,
+fn rpc_error_from_error(error: Error) -> RpcErrorPayload {
+    let message = error.to_string();
+    let (code, data) = match &error {
+        Error::Timeout => (RpcErrorCode::Timeout, None),
+        Error::Closed | Error::ReaderEnded => (RpcErrorCode::SessionClosed, None),
+        Error::PermissionDenied { method, required } => (
+            RpcErrorCode::PermissionDenied,
+            Some(json!({
+                "method": method,
+                "required_permission": required.as_str(),
+            })),
+        ),
         Error::Pty(_)
         | Error::Io(_)
         | Error::Json(_)
         | Error::Lua(_)
         | Error::Rpc(_)
-        | Error::Config(_) => RpcErrorCode::InternalError,
+        | Error::Config(_) => (RpcErrorCode::InternalError, None),
     };
-    (code, error.to_string())
+    RpcErrorPayload {
+        code,
+        message,
+        data,
+    }
 }
 
 #[cfg(test)]
@@ -1219,6 +1581,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::plugin::claude_code_manifest;
 
     fn handle(server: &mut RpcServer, line: &str) -> Value {
         let response = server
@@ -1759,10 +2122,13 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"does-not-exist","program":"/bin/sh"}}"#,
         );
 
-        assert_eq!(response["error"]["code"], -32603);
+        // `adapter.start` now resolves plugins from the shared registry, so a
+        // missing name is a caller error (InvalidParams) rather than an
+        // internal lookup failure.
+        assert_eq!(response["error"]["code"], -32602);
         let message = response["error"]["message"].as_str().unwrap_or("");
         assert!(
-            message.contains("no built-in Lua extension"),
+            message.contains("unknown plugin: does-not-exist"),
             "error message should name the missing plugin; got `{message}`"
         );
     }
@@ -2186,5 +2552,214 @@ mod tests {
         serve_lsp(input.as_bytes(), &mut output).expect("serve lsp");
 
         assert!(output.is_empty());
+    }
+
+    // ---- Permission gating (GH #18) -------------------------------------
+
+    /// Lookup table is the single source of truth; assert each gated method
+    /// maps to the permission documented in the v0.1.0 release plan so an
+    /// accidental table edit shows up as a test failure with a useful name.
+    #[test]
+    fn required_permission_for_known_methods() {
+        assert_eq!(
+            required_permission_for("adapter.start"),
+            Some(PluginPermission::SessionSpawn)
+        );
+        assert_eq!(
+            required_permission_for("adapter.send"),
+            Some(PluginPermission::InputWrite)
+        );
+        assert_eq!(
+            required_permission_for("adapter.wait"),
+            Some(PluginPermission::MatcherWait)
+        );
+        assert_eq!(
+            required_permission_for("adapter.snapshot"),
+            Some(PluginPermission::ScreenRead)
+        );
+        assert_eq!(
+            required_permission_for("adapter.transcript"),
+            Some(PluginPermission::TranscriptRead)
+        );
+        assert_eq!(
+            required_permission_for("adapter.inspect"),
+            Some(PluginPermission::ScreenRead)
+        );
+        assert_eq!(
+            required_permission_for("adapter.state"),
+            Some(PluginPermission::ScreenRead)
+        );
+        assert_eq!(
+            required_permission_for("adapter.close"),
+            Some(PluginPermission::SessionKill)
+        );
+        // Registry-query methods are allow-by-default and must stay out of
+        // the table — adding them silently would block every connection
+        // from listing plugins. Treat their absence as a load-bearing
+        // invariant.
+        assert_eq!(required_permission_for("adapter.list"), None);
+        assert_eq!(required_permission_for("adapter.live"), None);
+        assert_eq!(required_permission_for("session.create"), None);
+        assert_eq!(required_permission_for("server.capabilities"), None);
+    }
+
+    /// `check_manifest_permission` is the path `adapter.start` uses before a
+    /// handle exists in the registry. Exercise both branches.
+    #[test]
+    fn check_manifest_permission_allows_when_declared() {
+        let mut manifest = claude_code_manifest();
+        manifest.permissions = vec![PluginPermission::SessionSpawn];
+        RpcServer::check_manifest_permission("adapter.start", &manifest)
+            .expect("manifest declaring required permission must pass");
+    }
+
+    #[test]
+    fn check_manifest_permission_denies_when_missing() {
+        let mut manifest = claude_code_manifest();
+        manifest.permissions.clear();
+        let err = RpcServer::check_manifest_permission("adapter.start", &manifest)
+            .expect_err("manifest missing the required permission must deny");
+        assert_eq!(err.code, RpcErrorCode::PermissionDenied);
+        assert!(
+            err.message.contains("session.spawn"),
+            "deny message should name the missing permission: {}",
+            err.message
+        );
+        let data = err
+            .data
+            .as_ref()
+            .expect("permission denied must carry data");
+        assert_eq!(data["method"], "adapter.start");
+        assert_eq!(data["required_permission"], "session.spawn");
+    }
+
+    #[test]
+    fn check_manifest_permission_passes_unregistered_methods() {
+        // `adapter.list` is not in the table — any manifest, including one
+        // with zero permissions, should be allowed through.
+        let mut manifest = claude_code_manifest();
+        manifest.permissions.clear();
+        RpcServer::check_manifest_permission("adapter.list", &manifest)
+            .expect("unregistered methods must short-circuit allow");
+    }
+
+    /// End-to-end deny path through the dispatcher: build an adapter with a
+    /// custom manifest that omits `InputWrite`, inject it directly into shared
+    /// state, then call `adapter.send` over the wire and assert the JSON-RPC
+    /// error code is `-32004` with the expected message format.
+    #[test]
+    fn adapter_send_denied_when_manifest_lacks_input_write() {
+        // Stub Lua source: just enough to satisfy ExtensionHandle::start's
+        // initial classify call. We never reach the plugin's send_prompt
+        // because the dispatcher should reject the call first.
+        let stub_source = r#"
+            return {
+              classify = function(_ctx)
+                return { state = "ready", confidence = 1.0, evidence = "stub" }
+              end,
+              send_prompt = function(_input)
+                return { actions = {}, last_intent = "prompt_submitted" }
+              end,
+            }
+        "#;
+        let mut manifest = claude_code_manifest();
+        manifest.name = "stub-no-input".to_string();
+        // Omit InputWrite; keep everything else so initial state classify
+        // succeeds and we can prove the dispatcher denies, not the plugin
+        // runtime.
+        manifest.permissions = vec![
+            PluginPermission::SessionSpawn,
+            PluginPermission::ScreenRead,
+            PluginPermission::TranscriptRead,
+            PluginPermission::MatcherWait,
+        ];
+        let plugin = crate::lua_plugin::LuaPlugin::trusted(&manifest, stub_source)
+            .expect("stub plugin compiles");
+        let extension = LuaExtension::new(plugin, manifest);
+        let mut session_config = SessionConfig::new(Target::new("/bin/sh").args(["-lc", "cat"]));
+        session_config.transcript.max_chars = 1024;
+        let session = Session::spawn(session_config).expect("stub session spawns");
+        let ext_handle = ExtensionHandle::start(Box::new(extension), session, 100);
+
+        let state = RpcServerState::new();
+        let adapter_id = "e1".to_string();
+        let session_id = "s1".to_string();
+        {
+            let mut shared = state.inner.lock().expect("shared poisoned");
+            shared.extensions.insert(
+                adapter_id.clone(),
+                Arc::new(Mutex::new(ExtensionEntry {
+                    plugin: "stub-no-input".to_string(),
+                    session: session_id,
+                    handle: ext_handle,
+                })),
+            );
+        }
+
+        let mut server = RpcServer::with_state(state);
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":7,"method":"adapter.send","params":{"adapter":"e1","intent":"send_prompt","params":{"prompt":"hi"}}}"#,
+        );
+        assert_eq!(response["id"], 7);
+        assert_eq!(
+            response["error"]["code"], -32004,
+            "expected -32004 PermissionDenied, got: {response}"
+        );
+        let message = response["error"]["message"]
+            .as_str()
+            .expect("error message present");
+        assert!(
+            message.contains("adapter.send"),
+            "message should name the method: {message}"
+        );
+        assert!(
+            message.contains("input.write"),
+            "message should name the missing permission: {message}"
+        );
+        // Structured `data` lets programmatic callers react without regex
+        // parsing the human-readable message.
+        assert_eq!(
+            response["error"]["data"]["method"], "adapter.send",
+            "data.method should echo the rejected method: {response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["required_permission"], "input.write",
+            "data.required_permission should name the missing permission: {response}"
+        );
+    }
+
+    /// Control case: when the manifest declares every permission, the
+    /// dispatcher must not block `adapter.send`. Drive a real bash
+    /// claude-code-shaped manifest end-to-end through `adapter.start` +
+    /// `adapter.close` to prove the allow path stays intact.
+    #[test]
+    fn adapter_send_allowed_with_built_in_claude_code_manifest() {
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","cat"]}}"#,
+        );
+        let adapter_id = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter id present")
+            .to_string();
+        let send = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.send","params":{{"adapter":"{adapter_id}","intent":"send_prompt","params":{{"prompt":"hello"}}}}}}"#
+            ),
+        );
+        assert!(
+            send["error"].is_null(),
+            "send should succeed when manifest declares every permission: {send}"
+        );
+        // Cleanup so the cat process exits.
+        handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"adapter.close","params":{{"adapter":"{adapter_id}"}}}}"#
+            ),
+        );
     }
 }
