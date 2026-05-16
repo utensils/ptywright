@@ -576,13 +576,36 @@ function M.classify(input)
     end
     -- The welcome panel renders an input cursor even though Claude won't
     -- treat the first Enter as a prompt submission. Report `starting` so
-    -- callers don't race-send before `dismiss_welcome` is invoked. This
-    -- check runs *after* the completed_turn branch so a real turn boundary
-    -- with welcome chrome still visible (transient just after start) isn't
-    -- demoted back to starting — in practice the welcome chrome is gone
-    -- long before a turn completes, so the ordering here is conservative.
-    if has_welcome_screen(body_text) then
+    -- callers don't race-send before `dismiss_welcome` is invoked.
+    --
+    -- Gate this on `last_intent ~= "prompt_submitted"`: if the caller has
+    -- already submitted a prompt, the welcome chrome is stale visual
+    -- residue from Claude Code 2.1.x not redrawing the screen — the
+    -- adapter is mid-turn or post-turn, not waiting for welcome dismissal.
+    -- Without this gate the classifier oscillates between `thinking` (on
+    -- ticks where the spinner glyph is captured) and `starting` (on ticks
+    -- between spinner frames), which makes turn-boundary polling
+    -- unreliable on real 2.1.x sessions.
+    if has_welcome_screen(body_text) and last_intent ~= "prompt_submitted" then
       return state_snapshot("starting", 0.7, "welcome screen visible", sequence)
+    end
+    -- Post-submit, no spinner, with at least one rendered answer bullet
+    -- (`⏺`) in the body: Claude has produced a response and is back at
+    -- the input prompt. State-poll callers (no `stable_ms`) need this
+    -- branch — without it, polling consumers would never see turn
+    -- completion through state alone (only through `adapter.wait`).
+    --
+    -- The `⏺` anchor is what guards against firing before the turn has
+    -- actually run: right after `send_prompt`, the spinner may not have
+    -- rendered yet, and without an answer-bullet check this branch
+    -- would mistake "just submitted, still loading" for "finished".
+    -- Confidence is below the stable-screen path's 0.78 so callers
+    -- that compare can still prefer the matcher-gated answer.
+    if last_intent == "prompt_submitted"
+        and not has_active_work_indicator(body_text)
+        and contains(body, "⏺")
+    then
+      return state_snapshot("completed_turn", 0.6, "answer bullet visible after submission without active work", sequence)
     end
     return state_snapshot("waiting_for_user_input", 0.62, "input prompt glyph detected", sequence)
   end

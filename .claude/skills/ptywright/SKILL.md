@@ -15,11 +15,13 @@ ptywright spawns interactive terminal programs in a real PTY, parses their scree
 ptywright --help                                              # Top-level help
 ptywright --version                                           # Version
 ptywright run -- /bin/sh -lc 'printf ready'                   # Live PTY bridge (debug only)
-ptywright run --rows 40 --cols 120 -- claude                  # Drive a TUI interactively
+ptywright run --rows 60 --cols 200 -- claude                  # Drive a TUI interactively (claude-code preset)
 ptywright serve --stdio                                       # JSON-RPC over stdio, NDJSON framing
 ptywright serve --stdio --framing lsp                         # JSON-RPC over stdio, LSP framing
 ptywright serve --socket /tmp/ptywright.sock                  # Local IPC, multi-client
 ptywright serve --socket '\\.\pipe\ptywright'                 # Windows named pipe (PowerShell)
+ptywright serve --stdio --plugin ./manifest.toml              # Pre-load a trusted-local third-party plugin
+ptywright serve --stdio --allow-plugin-load                   # Allow runtime plugin.load/unload over RPC
 ptywright completions zsh                                     # Generate completions for a shell
 ```
 
@@ -42,7 +44,7 @@ Live stdin/stdout PTY bridge. Forwards your keyboard to the child and streams th
 
 ```bash
 ptywright run -- /bin/sh -lc 'echo hello'
-ptywright run --rows 40 --cols 120 -- claude
+ptywright run --rows 60 --cols 200 -- claude   # claude-code classifier-stable preset
 ```
 
 Exit status mirrors the child's. Logs go to `~/.ptywright/logs/ptywright.YYYY-MM-DD.log` only — never stderr or stdout in this mode, because either would corrupt the live terminal.
@@ -90,24 +92,30 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}' \
   | jq '.result.methods'
 ```
 
-Live shape (verified against ptywright 0.1.0):
+Live shape (verified against ptywright 0.1.1+):
 
 ```json
 {
   "name": "ptywright",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "framing": ["ndjson", "lsp"],
   "methods": ["server.capabilities", "server.set_notifications",
               "session.create", "session.list", "session.close",
               "session.kill", "session.resize", "session.input",
               "session.snapshot", "session.transcript", "session.wait",
-              "adapter.list", "adapter.start", "adapter.state",
+              "adapter.list", "adapter.live",
+              "adapter.start", "adapter.resume", "adapter.state",
               "adapter.send", "adapter.wait", "adapter.snapshot",
               "adapter.transcript", "adapter.inspect", "adapter.close",
-              "plugin.capabilities", "plugin.validate_manifest"],
-  "notifications": ["session.changed", "session.exited"]
+              "plugin.capabilities", "plugin.validate_manifest",
+              "plugin.load", "plugin.unload"],
+  "notifications": ["session.changed", "session.output", "session.exited"]
 }
 ```
+
+`plugin.load` / `plugin.unload` are gated: the server returns `-32004 PermissionDenied`
+with `data.reason = "server_did_not_grant_plugin_load"` unless launched with
+`--allow-plugin-load`. `--plugin <manifest>` pre-loads at startup regardless.
 
 ### Method catalog
 
@@ -141,22 +149,50 @@ The single plugin-driving surface. Any built-in plugin (today, `claude-code`) is
 | Method | Params | Returns |
 | --- | --- | --- |
 | `adapter.list` | — | `{plugins: [PluginManifest, ...]}` |
+| `adapter.live` | — | `{adapters: [{adapter, plugin, session}, ...]}` (process-wide live registry; useful for a second client attaching) |
 | `adapter.start` | `{plugin, program?, args?, cwd?, env?, rows?, cols?, pixel_width?, pixel_height?}` | `{adapter, plugin, state}` |
+| `adapter.resume` | `{plugin, program?, args?, cwd?, env?, rows?, cols?, prior_adapter?}` | `{adapter, plugin, state}` — same shape as `adapter.start`, but logs the consumer's intent to re-bind a prior adapter (`prior_adapter` is best-effort; if missing or already closed the call still succeeds) |
 | `adapter.state` | `{adapter}` | `{state}` |
 | `adapter.send` | `{adapter, intent, params?}` | `{state}` |
-| `adapter.wait` | `{adapter, intent?="wait_turn_matcher", params?, timeout_ms?=120000}` | `{state}` |
+| `adapter.wait` | `{adapter, intent?="wait_turn_matcher", params?, timeout_ms?=120000}` | `{state, matched}` — `matched` is the structured `MatchOutcome` describing which matcher branch fired (see below); `null` is reserved for future cancellation paths |
 | `adapter.snapshot` | `{adapter, redact?, redaction?}` | `ScreenSnapshot` |
 | `adapter.transcript` | `{adapter, redact?, redaction?}` | `{text}` |
 | `adapter.inspect` | `{adapter, redact?, redaction?}` | `{adapter, plugin, state, plain_text, body_text, status_text, transcript_tail, sequence}` |
 | `adapter.close` | `{adapter}` | `{closed: true}` |
 
-`adapter.start` requires `plugin` (e.g. `"claude-code"`). Each plugin manifest may declare an optional `default_target = {program, args}`; `adapter.start` reads that field when the caller omits `program`. The bundled `claude-code` plugin declares `default_target.program = "claude"`, so `{"plugin": "claude-code"}` is enough to spawn it. Plugins without a `default_target` require the caller to pass `program` explicitly. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params` — for the claude-code plugin the intents are `send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`. `adapter.inspect` applies the same body/status split the classifier uses, so you can reproduce a misclassification report without standing up a parallel `session.*` connection.
+`adapter.start` requires `plugin` (e.g. `"claude-code"`). Each plugin manifest may declare an optional `default_target = {program, args, rows?, cols?}`; `adapter.start` reads it when the caller omits `program` / geometry. The bundled `claude-code` plugin declares `default_target = { program = "claude", rows = 60, cols = 200 }`, so `{"plugin": "claude-code"}` is enough to spawn it with the classifier-stable preset. Plugins without a `default_target` require the caller to pass `program` explicitly. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params` — for the claude-code plugin the intents are `send_prompt`, `steer`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`, `key`. `adapter.inspect` applies the same body/status split the classifier uses, so you can reproduce a misclassification report without standing up a parallel `session.*` connection.
 
-`adapter.wait` automatically injects the host's configured `completed_turn_stable_ms` (300 ms by default) into the matcher params if the caller does not supply one, so generic callers can omit `params` entirely and still get stable-screen turn boundaries — the matcher only fires after the screen has been quiet for the configured window.
+`adapter.wait` automatically injects the host's configured `completed_turn_stable_ms` (300 ms by default) into the matcher params if the caller does not supply one, so generic callers can omit `params` entirely and still get stable-screen turn boundaries — the matcher only fires after the screen has been quiet for the configured window. The claude-code plugin exposes two wait intents: `wait_turn_matcher` (default, fires on turn completion) and `wait_cancel_settled_matcher` (fires when the screen settles after a `cancel` intent).
+
+**`matched` outcome shape** (always present on success):
+
+```json
+{ "kind": "contains_text",       "text": "..." }
+{ "kind": "screen_regex",        "pattern": "...", "capture": "..." }
+{ "kind": "transcript_contains", "text": "..." }
+{ "kind": "transcript_regex",    "pattern": "...", "capture": "..." }
+{ "kind": "cursor_at",           "row": <n>, "col": <n> }
+{ "kind": "screen_stable",       "min_ms": <n> }
+{ "kind": "process_exited" }
+{ "kind": "any", "matched": <child outcome> }
+{ "kind": "all", "matched": [<child outcome>, ...] }
+```
+
+`text` is the literal text that matched; `capture` (regex kinds) is the full match if the regex has no capture group, otherwise group 1. Branch matchers (`any`/`all`) recursively embed the full child outcome(s) under `matched`, so callers can drill into nested matchers without re-running the wait. `all` always emits every branch in source order; `any` emits only the winning branch.
 
 #### Driving the built-in `claude-code` plugin
 
-The plugin classifies states (`starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine. State strings are plugin-defined; the Rust core does not interpret them.
+The plugin classifies states (`starting`, `ready`, `thinking`, `cancelling`, `waiting_for_trust`, `waiting_for_plan_approval`, `waiting_for_permission`, `waiting_for_user_input`, `completed_turn`, `error`; `exited` / `plugin_error` come from the host when the underlying session dies) using **stable-screen evidence** rather than raw string matches — that's the whole point of going through Lua plus the screen engine. State strings are plugin-defined; the Rust core does not interpret them. `prompt_submitted` is a `last_intent` value the plugin tracks internally to know whether a stable input prompt should classify as `completed_turn` — it is not surfaced as a state label.
+
+**Metadata channel.** Every state snapshot may carry an opaque `metadata` object the plugin populates from the rendered screen. The host does not interpret it; consumers read it directly:
+
+| State | Field | Shape |
+| --- | --- | --- |
+| `completed_turn` (on /usage screen) | `metadata.usage` | `{ input_tokens?, output_tokens?, cache_read?, cache_creation?, cost_usd?, duration_s? }` |
+| any | `metadata.status` | `{ model?, permission_mode? }` parsed from the status bar |
+| `waiting_for_permission` | `metadata.permission` | `{ tool?, summary?, options: [string, ...] }` |
+
+All fields are optional / best-effort; `metadata` is omitted entirely on the wire when empty. Pair with the JSONL session file for full fidelity (the dialog has no structured tool input — only summary prose).
 
 `waiting_for_trust` is the workspace-trust dialog: send `intent: "approve_trust"` / `"deny_trust"` through `adapter.send` (they type `1`+Enter or `2`+Enter, since a bare Enter does not accept option 1 on the numbered list).
 
@@ -164,14 +200,20 @@ After a fresh-launch `approve_trust`, Claude Code shows a welcome panel with "We
 
 `send_prompt` writes the prompt as a `bracketed_paste` action (`CSI 200 ~` … `CSI 201 ~`) so Claude Code v2.1+ treats the payload as a single paste and a trailing Enter as a real submit. The generic `paste` action still writes raw bytes — only use `bracketed_paste` against programs that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …); against `cat` or a plain shell the wrapper bytes would land in the child as literal characters.
 
+`steer` is the mid-turn injection variant: same bracketed-paste mechanics as `send_prompt`, but it does **not** set `last_intent = "prompt_submitted"`, so the classifier does not race the steered text against the in-flight turn's completion. Use it for "priority: next" follow-ups while the previous turn is still in `thinking`.
+
 > **Body/status split.** The classifier runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status) so benign status strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` cannot false-positive on substring matches in the body. The `idle_bypass_permissions.txt` fixture under `tests/fixtures/claude_code/` locks this in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test in `tests/lua_classifier_tests.rs` auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` to dump the body/status view the classifier sees when investigating new misclassifications.
 
 #### `plugin.*`
 
-| Method | Params | Returns |
-| --- | --- | --- |
-| `plugin.capabilities` | — | host capabilities including `embedded_lua` and `builtin_plugins` |
-| `plugin.validate_manifest` | `{manifest}` | structural validation result |
+| Method | Params | Returns | Gated? |
+| --- | --- | --- | --- |
+| `plugin.capabilities` | — | host capabilities including `embedded_lua` and `builtin_plugins` | no |
+| `plugin.validate_manifest` | `{manifest}` | structural validation result | no |
+| `plugin.load` | `{manifest_path}` | `{plugin}` — manifest name registered for subsequent `adapter.start` | yes (`--allow-plugin-load`) |
+| `plugin.unload` | `{plugin}` | `{unloaded: true}` — refuses while any live adapter still binds the plugin | yes (`--allow-plugin-load`) |
+
+For trusted-local third-party plugins, the cleanest path is `ptywright serve --stdio --plugin ./manifest.toml` (repeatable, registered at startup) — no `--allow-plugin-load` required. Use the gated runtime methods only when the registration set must change after the server is already running.
 
 ### Action shape
 
@@ -210,10 +252,15 @@ Every successful wait returns evidence: the `sequence` number observed at decisi
 
 Notifications are **opt-in per connection** via `server.set_notifications {enabled: true}`:
 
-- `session.changed` — emitted with the latest coalesced `sequence` after PTY output.
-- `session.exited` — emitted once the child's lifecycle reports exit.
+- `session.changed` — `{session, sequence}` — emitted with the latest coalesced `sequence` after PTY output.
+- `session.output` — `{session, sequence, output, dropped?}` — emitted with the **plain-text delta** the PTY produced since this connection last received an output notification. `output` is already-redacted text by default (see Redaction). `dropped: true` flags that the transcript ring buffer evicted bytes before this connection saw them (raise `transcript_max_chars` if the consumer is too slow). The first emission after `server.set_notifications` skips the pre-subscription buffer — late subscribers get a fresh cursor, not a flood.
+- `session.exited` — `{session, sequence}` — emitted once the child's lifecycle reports exit.
 
-Responses to a request are always written before any queued notification, so an NDJSON consumer can read line-by-line and still get a deterministic stream.
+The `sequence` on `session.output` is the session's current sequence at *poll time*, not a per-byte counter. If multiple PTY writes landed between polls, `output` may span several sequence increments but only the latest counter is reported. Treat it as an upper bound, not an exact alignment.
+
+Responses to a request are always written before any queued notification, so an NDJSON consumer can read line-by-line and still get a deterministic stream. Adapter-backed sessions emit the same three notifications under the same session id that `adapter.start` allocates.
+
+> **Notifications are request-pulled, not pushed.** The server flushes queued notifications immediately after each request response — there is no background push thread. A quiet consumer will never see `session.output` even while bytes accumulate. To stream low-latency output, send a no-op heartbeat (e.g. `session.list`) at the cadence you need; observed latency is roughly `heartbeat_interval / 2` on the median (measured on macOS release builds: 50 ms heartbeat → p50 ≈ 30 ms, p99 ≈ 71 ms end-to-end from PTY emit to client recv). Coalescing is excellent — a 200-line burst arrives as a single notification because the PTY buffer fills before the next flush. Throughput is bounded by `heartbeat_cadence × bytes_per_PTY_drain`: a 64 KiB write at 50 ms cadence delivers in ~7 batches over ~260 ms (~245 KiB/s); raise heartbeat cadence to lift throughput, or rely on the bounded transcript and read it directly with `session.transcript`.
 
 ## Snapshot Shape
 
@@ -317,13 +364,21 @@ The Claude Code plugin is the primary thing we exercise, so this is the pattern 
   "state": {
     "state": "waiting_for_permission",
     "confidence": 0.87,
-    "evidence": "matched 'Do you want to proceed?' with screen_stable 300ms",
-    "sequence": 42
+    "evidence": "permission or approval prompt text detected",
+    "sequence": 42,
+    "metadata": {
+      "permission": {
+        "tool": "Bash",
+        "summary": "Bash command: rm -rf node_modules/",
+        "options": ["Yes", "Yes, and don't ask again this session", "No, and tell Claude what to do differently"]
+      },
+      "status": { "model": "claude-sonnet-4-7", "permission_mode": "default" }
+    }
   }
 }
 ```
 
-State names are `snake_case`: `starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`.
+State names are `snake_case`: `starting`, `ready`, `thinking`, `cancelling`, `waiting_for_trust`, `waiting_for_plan_approval`, `waiting_for_permission`, `waiting_for_user_input`, `completed_turn`, `error` (plus `exited` / `plugin_error` injected by the host on session failure). `metadata` is omitted on the wire when empty.
 
 Run this Python driver against a single stdio server. It uses the generic `adapter.*` surface, captures the real adapter id, loops on `adapter.wait`, branches on the state, handles the workspace-trust dialog explicitly, and gives up cleanly on `error` / `plugin_error`:
 

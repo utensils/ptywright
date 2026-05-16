@@ -61,6 +61,69 @@ fn wait_matcher(extension: &LuaExtension, intent: &str, params: serde_json::Valu
 }
 
 #[test]
+fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
+    // Reproduces the Claude Code 2.1.143 behaviour where the post-trust
+    // welcome panel stays rendered as visual residue even after the user
+    // has submitted a prompt. Without the `last_intent == prompt_submitted`
+    // gate in the welcome branch, this screen oscillates between `thinking`
+    // (on ticks where the spinner glyph is captured) and `starting` (on
+    // ticks between spinner frames) — making turn-boundary polling
+    // unreliable. The fix: once a prompt has been submitted, the welcome
+    // chrome is stale and the classifier falls through to the regular
+    // input-prompt / completed-turn branches.
+    let extension = claude_plugin();
+    let screen = "\
+╭─── Claude Code v2.1.143 ────────────────────────────────────────────╮
+│ Welcome back James!     │ Tips for getting started                  │
+│  ▐▛███▜▌                │ Ask Claude to create a new app            │
+│  ▝▜█████▛▘              │ What's new                                │
+│  ▘▘ ▝▝                  │ /release-notes for more                   │
+╰─────────────────────────────────────────────────────────────────────╯
+
+❯ What is 2+2? Reply with just the digit.
+
+⏺ 4
+
+❯
+────────────────────────────────────────────────────────────────────────
+  user @ host /workspace                                  [Haiku 4.5]
+  ⏵⏵ auto mode on (shift+tab to cycle)
+";
+
+    // With stable_ms >= the stability window — adapter.wait path.
+    let st = classify_state(
+        &extension,
+        screen,
+        7,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+    assert_eq!(
+        st.state, "completed_turn",
+        "welcome chrome must not downgrade to `starting` post-submit (stable path); got state={} evidence={}",
+        st.state, st.evidence
+    );
+
+    // Without stable_ms — adapter.state poll path. Falls into the new
+    // lower-confidence completed_turn branch added for poll consumers.
+    let st_poll = classify_state(&extension, screen, 7, Some("prompt_submitted"), None);
+    assert_eq!(
+        st_poll.state, "completed_turn",
+        "welcome chrome must not downgrade to `starting` on state-poll path; got state={} evidence={}",
+        st_poll.state, st_poll.evidence
+    );
+
+    // Sanity: when last_intent is empty (still in the welcome-dismissal
+    // window) the welcome detection still wins.
+    let st_pre = classify_state(&extension, screen, 7, None, Some(COMPLETED_TURN_STABLE_MS));
+    assert_eq!(
+        st_pre.state, "starting",
+        "before prompt submission, welcome panel still classifies as `starting`; got state={}",
+        st_pre.state
+    );
+}
+
+#[test]
 fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
     // Mid-turn steering injects a follow-up prompt while Claude is still
     // thinking. The action shape is identical to `send_prompt` (bracketed
@@ -469,22 +532,65 @@ fn classifier_detects_completed_turn_after_prompt_submission() {
 }
 
 #[test]
-fn classifier_requires_stable_prompt_for_completed_turn() {
-    // Without the stable_ms threshold being met, an idle prompt right
-    // after prompt_submitted is just waiting_for_user_input — not
-    // completed_turn. Locks the boundary between "rendered idle" and
-    // "settled idle" so a future plugin edit can't relax it.
+fn classifier_distinguishes_stable_and_poll_paths_for_completed_turn() {
+    // Two completed_turn branches exist for the post-prompt-submit case:
+    //   • The high-confidence branch (~0.78) fires when the matcher
+    //     supplies `stable_ms >= completed_turn_stable_ms` — used by
+    //     `adapter.wait` and locked in by the `completed.txt` fixture.
+    //   • A lower-confidence branch (~0.6) fires from state-poll callers
+    //     (`adapter.state`) that don't have stability info but observe
+    //     no active-work spinner. Without this branch, polling consumers
+    //     would never see turn completion through state alone.
+    //
+    // Lock both paths so a future plugin edit can't collapse them or
+    // re-introduce the previous conservative `waiting_for_user_input`
+    // fallback that left polling consumers stuck mid-turn.
     let extension = claude_plugin();
-    let state = classify_state(
+    // `⏺` is Claude's answer-block bullet — the anchor the poll-path
+    // completion check uses to gate against firing before the turn has
+    // actually run. Without it (or before the answer arrives) state
+    // polling falls back to `waiting_for_user_input`.
+    let screen = "⏺ work completed\n>";
+
+    // adapter.wait path: stable_ms passed.
+    let stable = classify_state(
+        &extension,
+        screen,
+        6,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+    assert_eq!(stable.state, "completed_turn");
+    assert_eq!(
+        stable.evidence,
+        "stable input prompt after prompt submission"
+    );
+
+    // adapter.state poll path: no stable_ms.
+    let poll = classify_state(&extension, screen, 6, Some("prompt_submitted"), None);
+    assert_eq!(poll.state, "completed_turn");
+    assert_eq!(
+        poll.evidence,
+        "answer bullet visible after submission without active work"
+    );
+    assert!(
+        poll.confidence < stable.confidence,
+        "poll-path confidence ({}) should be below stable-path confidence ({})",
+        poll.confidence,
+        stable.confidence
+    );
+
+    // Without the `⏺` anchor the poll path should NOT fire — this is
+    // the guard against "just submitted, spinner not rendered yet"
+    // being mistaken for "turn complete".
+    let no_bullet = classify_state(
         &extension,
         "work completed\n>",
         6,
         Some("prompt_submitted"),
         None,
     );
-
-    assert_eq!(state.state, "waiting_for_user_input");
-    assert_eq!(state.evidence, "input prompt glyph detected");
+    assert_eq!(no_bullet.state, "waiting_for_user_input");
 }
 
 #[test]
