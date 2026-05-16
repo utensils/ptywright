@@ -74,9 +74,11 @@ Equivalent direct commands:
 cargo fmt --all -- --check
 cargo check --locked
 cargo clippy --locked -- -D warnings
-cargo test --locked
+cargo test --locked --features _test-fixtures
 cargo build --release --locked
 ```
+
+The `_test-fixtures` Cargo feature gates the test-only `ptywright-echo-tui` fixture binary so `cargo install ptywright` never deposits it into your `~/.cargo/bin` alongside the real CLI. CI test runs (and the devshell `run-tests` / `ci-local` commands) enable it explicitly; bare `cargo install` does not.
 
 ## Documentation
 
