@@ -74,19 +74,17 @@ pub enum MatchOutcome {
     /// [`Matcher::ContainsText`] succeeded.
     ContainsText { text: String },
     /// [`Matcher::ScreenRegex`] succeeded. `capture` is the first capture
-    /// group when one was declared, otherwise the entire match.
-    ScreenRegex {
-        pattern: String,
-        capture: Option<String>,
-    },
+    /// group when one was declared, otherwise the entire match. The host
+    /// always populates this on success — pattern compilation failure is
+    /// reported via a missing outcome (the matcher fails to fire), not by
+    /// emitting a `ScreenRegex` outcome without a capture.
+    ScreenRegex { pattern: String, capture: String },
     /// [`Matcher::TranscriptContains`] succeeded.
     TranscriptContains { text: String },
     /// [`Matcher::TranscriptRegex`] succeeded. `capture` follows the same
-    /// "first group or full match" convention as [`MatchOutcome::ScreenRegex`].
-    TranscriptRegex {
-        pattern: String,
-        capture: Option<String>,
-    },
+    /// "first group or full match" convention as [`MatchOutcome::ScreenRegex`]
+    /// and is always populated on success.
+    TranscriptRegex { pattern: String, capture: String },
     /// [`Matcher::CursorAt`] succeeded.
     CursorAt { row: u16, col: u16 },
     /// [`Matcher::ScreenStable`] threshold was met.
@@ -325,11 +323,19 @@ fn cached_regex_is_match(pattern: &str, text: &str) -> bool {
 /// otherwise the whole match) when `pattern` matches `text`. Shares the regex
 /// cache with [`cached_regex_is_match`] so callers paying for a structured
 /// outcome don't double-compile the pattern.
-fn cached_regex_capture(pattern: &str, text: &str) -> Option<Option<String>> {
+///
+/// The inner unwrap is safe: a successful `Regex::captures` always yields
+/// group 0 (the full match), and we fall back to it when no named group 1
+/// was declared. Returning a flat `Option<String>` avoids forcing callers
+/// to handle an "outer Some, inner None" case that cannot occur.
+fn cached_regex_capture(pattern: &str, text: &str) -> Option<String> {
     with_cached_regex(pattern, |regex| {
         regex.captures(text).map(|captures| {
-            let group = captures.get(1).or_else(|| captures.get(0));
-            group.map(|m| m.as_str().to_string())
+            captures
+                .get(1)
+                .or_else(|| captures.get(0))
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default()
         })
     })
 }
@@ -475,7 +481,7 @@ mod tests {
             panic!("expected ScreenRegex outcome; got {outcome:?}");
         };
         assert_eq!(pattern, r"user=(\w+)");
-        assert_eq!(capture.as_deref(), Some("jdoe"));
+        assert_eq!(capture, "jdoe");
     }
 
     #[test]
@@ -485,7 +491,7 @@ mod tests {
         let Some(MatchOutcome::ScreenRegex { capture, .. }) = outcome else {
             panic!("expected ScreenRegex outcome; got {outcome:?}");
         };
-        assert_eq!(capture.as_deref(), Some("READY"));
+        assert_eq!(capture, "READY");
     }
 
     #[test]
@@ -496,7 +502,7 @@ mod tests {
         let Some(MatchOutcome::TranscriptRegex { capture, .. }) = outcome else {
             panic!("expected TranscriptRegex outcome; got {outcome:?}");
         };
-        assert_eq!(capture.as_deref(), Some("$1.23"));
+        assert_eq!(capture, "$1.23");
     }
 
     #[test]
@@ -560,7 +566,7 @@ mod tests {
     fn describe_match_outcome_serialises_with_kind_tag() {
         let outcome = MatchOutcome::ScreenRegex {
             pattern: "rea.y".to_string(),
-            capture: Some("ready".to_string()),
+            capture: "ready".to_string(),
         };
         let json = serde_json::to_value(&outcome).expect("serialize outcome");
         assert_eq!(json["kind"], "screen_regex");

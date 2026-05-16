@@ -1299,8 +1299,13 @@ impl RpcServer {
     }
 
     /// `adapter.wait` — block until the plugin's named matcher fires or the
-    /// timeout expires, then classify and return the resulting state. The
-    /// intent defaults to `wait_turn_matcher` so simple callers can omit it.
+    /// timeout expires, then classify and return the resulting state plus the
+    /// structured `matched` outcome describing which matcher branch fired.
+    /// The intent defaults to `wait_turn_matcher` so simple callers can omit
+    /// it. Response shape: `{ "state": <state>, "matched": <outcome|null> }`.
+    /// `matched` is reserved as `null` for future cancellation paths that
+    /// surface a `MatchResult` without a satisfying branch; today every
+    /// successful wait carries a populated outcome.
     fn adapter_wait(&self, params: Option<Value>) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterWaitParams = parse_params(params)?;
         self.check_adapter_permission("adapter.wait", &params.adapter)?;
