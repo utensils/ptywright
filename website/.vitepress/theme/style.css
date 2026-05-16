@@ -426,8 +426,11 @@ body {
   background: rgba(168, 83, 11, 0.08);
 }
 
-/* Links */
-.vp-doc a {
+/* Links — wrapped in :where() so the rule has 0 specificity for selectors
+ * (only the `a` type weighs in). This keeps prose links chartreuse while
+ * letting component-scoped classes like `.op-btn-pri` win without `!important`.
+ */
+:where(.vp-doc) a {
   color: var(--op-accent-t);
   text-decoration-color: color-mix(
     in srgb,
@@ -437,11 +440,11 @@ body {
   text-underline-offset: 2px;
   font-weight: 500;
 }
-.vp-doc a:hover {
+:where(.vp-doc) a:hover {
   text-decoration-color: var(--op-accent);
 }
 
-.dark .vp-doc a {
+:where(.dark .vp-doc) a {
   color: var(--op-accent);
 }
 

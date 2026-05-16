@@ -1,7 +1,17 @@
 <script setup lang="ts">
-// fig.01 — the runtime, end to end. Nine nodes wired into a single SVG canvas.
+// fig.01 — the runtime, end to end.
+//
+// Nine nodes mapping to ptywright's actual abstraction layers (see
+// website/guide/architecture.md). Edges show the two architectural pipelines:
+//
+//   observation (down)   — pty bytes flow up through screen + transcript,
+//                          matcher evaluates predicates, turn waits on a match
+//   control     (up)     — turn dispatches actions; actions write back to the
+//                          session — this is the "writeback" feedback loop
+//                          that makes ptywright a *driver*, not just an observer
+//
 // Light and dark variants share geometry; only stroke/fill colors swap via
-// CSS variables exposed by .op-schem-root + .dark scope.
+// CSS variables exposed by .op-schem-root + .is-dark scope.
 import { computed } from 'vue'
 import { useData } from 'vitepress'
 
@@ -28,8 +38,8 @@ const nodes: Node[] = [
     y: 60,
     w: 280,
     h: 64,
-    label: 'AGENT · CLI · LIB · RPC',
-    sub: 'three surfaces, one runtime',
+    label: 'CALLER',
+    sub: 'agent · cli · library · rpc client',
   },
   {
     id: 'rpc',
@@ -48,7 +58,7 @@ const nodes: Node[] = [
     w: 280,
     h: 64,
     label: 'SESSION',
-    sub: 'PTY lifecycle · reader · writer',
+    sub: 'target · pty · reader · writer',
     file: 'SESSION.RS',
   },
   {
@@ -58,7 +68,7 @@ const nodes: Node[] = [
     w: 280,
     h: 76,
     label: 'SCREEN',
-    sub: 'cell · style · mode · cursor',
+    sub: 'vt100 · cell · style · cursor',
     file: 'SCREEN.RS',
   },
   {
@@ -78,7 +88,7 @@ const nodes: Node[] = [
     w: 280,
     h: 76,
     label: 'MATCHER',
-    sub: 'regex · stable · exited',
+    sub: 'regex · stable · exited · timeout',
     file: 'MATCH.RS',
   },
   {
@@ -88,7 +98,7 @@ const nodes: Node[] = [
     w: 280,
     h: 76,
     label: 'ACTION',
-    sub: 'keys · write · resize · int',
+    sub: 'keys · write · paste · resize · int',
     file: 'ACTION.RS',
   },
   {
@@ -97,9 +107,9 @@ const nodes: Node[] = [
     y: 716,
     w: 280,
     h: 64,
-    label: 'TURN',
-    sub: 'orchestrate · capture · respond',
-    file: 'TURN.RS',
+    label: 'TURN · EXTENSION',
+    sub: 'classify · plan · wait · capture',
+    file: 'EXT.RS',
   },
   {
     id: 'adapter',
@@ -112,34 +122,27 @@ const nodes: Node[] = [
   },
 ]
 
-const map = Object.fromEntries(nodes.map((n) => [n.id, n]))
+const map = Object.fromEntries(nodes.map((n) => [n.id, n])) as Record<
+  string,
+  Node
+>
 const cx = (n: Node) => n.x + n.w / 2
 
-const edges: [string, string][] = [
+// Forward edges — observation pipeline + dispatch lineage (top to bottom).
+// Smooth cubic bezier from bottom-center of source to top-center of target.
+const forwardEdges: [string, string][] = [
   ['caller', 'rpc'],
   ['rpc', 'session'],
   ['session', 'screen'],
   ['session', 'trans'],
   ['screen', 'match'],
-  ['trans', 'action'],
-  ['screen', 'action'],
   ['trans', 'match'],
   ['match', 'turn'],
-  ['action', 'turn'],
   ['turn', 'adapter'],
 ]
 
-const annotations = [
-  { y: 206, text: '└ optional · framed protocols' },
-  { y: 320, text: '└ portable-pty · cross-platform' },
-  { y: 450, text: '└ vt100 seam · swappable engine' },
-  { y: 602, text: '└ event-driven · no sleeps' },
-  { y: 748, text: '└ orchestration boundary' },
-  { y: 862, text: '└ trusted lua · permissioned' },
-]
-
-const edgePaths = computed(() =>
-  edges.map(([a, b], i) => {
+const forwardPaths = computed(() =>
+  forwardEdges.map(([a, b], i) => {
     const A = map[a]
     const B = map[b]
     const x1 = cx(A)
@@ -150,6 +153,44 @@ const edgePaths = computed(() =>
     return { i, path, dur: 2.6 + (i % 3) * 0.5, begin: i * 0.22 }
   })
 )
+
+// Dispatch edge — turn → action. Turn is below action in the layout, so the
+// arrow has to curve up the right side of TURN and arc into ACTION's bottom.
+// This is the control path: TURN decides, ACTION runs.
+const dispatchPath = computed(() => {
+  const turn = map.turn
+  const action = map.action
+  const startX = turn.x + turn.w // right edge of turn
+  const startY = turn.y + turn.h / 2 // middle of turn vertically
+  const endX = action.x + action.w / 2 // bottom-center of action
+  const endY = action.y + action.h
+  // C-curve out to the right then back in
+  return `M ${startX} ${startY} C ${startX + 90} ${startY}, ${endX + 110} ${endY + 40}, ${endX} ${endY}`
+})
+
+// Writeback edge — action → session. ACTION sits two rows below SESSION; the
+// curve sweeps up the right side, over the top, into SESSION's right edge.
+// This is the loop that makes ptywright a *driver* rather than a passive
+// observer: every send.key / send.text ends here.
+const writebackPath = computed(() => {
+  const action = map.action
+  const session = map.session
+  const startX = action.x + action.w // right edge of action
+  const startY = action.y + action.h / 2
+  const endX = session.x + session.w // right edge of session
+  const endY = session.y + session.h / 2
+  // Sweep right, then up, then left
+  return `M ${startX} ${startY} C ${startX + 180} ${startY}, ${endX + 180} ${endY}, ${endX} ${endY}`
+})
+
+const annotations = [
+  { y: 206, text: '└ optional · framed protocols' },
+  { y: 320, text: '└ portable-pty · target spawns process' },
+  { y: 450, text: '└ vt100 seam · swappable engine' },
+  { y: 602, text: '└ event-driven · no sleeps' },
+  { y: 748, text: '└ orchestration · classify+plan+wait' },
+  { y: 862, text: '└ trusted lua · permissioned plugins' },
+]
 </script>
 
 <template>
@@ -171,8 +212,8 @@ const edgePaths = computed(() =>
           </h2>
         </div>
         <div class="op-schem-meta">
-          DATA FLOWS TOP TO BOTTOM.<br />
-          ↳ HOVER ANY NODE TO INSPECT.<br />
+          OBSERVATION FLOWS DOWN.<br />
+          ↳ CONTROL LOOPS BACK UP.<br />
           ↳ EACH BOX MAPS TO A FILE IN
           <span class="op-schem-src">SRC/</span>.
         </div>
@@ -197,11 +238,22 @@ const edgePaths = computed(() =>
             >
               <path d="M0,0 L10,5 L0,10 z" class="op-schem-arrow-fill" />
             </marker>
+            <marker
+              id="op-arrow-back"
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="7"
+              markerHeight="7"
+              orient="auto"
+            >
+              <path d="M0,0 L10,5 L0,10 z" class="op-schem-arrow-back-fill" />
+            </marker>
           </defs>
 
-          <!-- Edges -->
+          <!-- Forward (observation) edges with animated chartreuse dots -->
           <g class="op-schem-edges">
-            <template v-for="ep in edgePaths" :key="ep.i">
+            <template v-for="ep in forwardPaths" :key="ep.i">
               <path
                 :d="ep.path"
                 class="op-schem-edge"
@@ -219,6 +271,42 @@ const edgePaths = computed(() =>
                 </animateMotion>
               </circle>
             </template>
+          </g>
+
+          <!-- Dispatch edge — turn → action (control: orchestrator dispatches) -->
+          <g class="op-schem-edges-back">
+            <path
+              :d="dispatchPath"
+              class="op-schem-edge-back"
+              fill="none"
+              marker-end="url(#op-arrow-back)"
+            />
+            <path id="op-dispatch" :d="dispatchPath" fill="none" stroke="none" />
+            <circle r="3" class="op-schem-dot-back">
+              <animateMotion dur="3.4s" repeatCount="indefinite" begin="0.4s">
+                <mpath href="#op-dispatch" />
+              </animateMotion>
+            </circle>
+
+            <!-- Writeback — action → session (side-effect: keys/write hit pty) -->
+            <path
+              :d="writebackPath"
+              class="op-schem-edge-back"
+              fill="none"
+              marker-end="url(#op-arrow-back)"
+              stroke-dasharray="6 4"
+            />
+            <path
+              id="op-writeback"
+              :d="writebackPath"
+              fill="none"
+              stroke="none"
+            />
+            <circle r="3" class="op-schem-dot-back">
+              <animateMotion dur="4.2s" repeatCount="indefinite" begin="1.1s">
+                <mpath href="#op-writeback" />
+              </animateMotion>
+            </circle>
           </g>
 
           <!-- Nodes -->
@@ -279,7 +367,7 @@ const edgePaths = computed(() =>
             </g>
           </g>
 
-          <!-- Side annotations -->
+          <!-- Side annotations (left = layer notes; right = pipeline labels) -->
           <g class="op-schem-annotation">
             <text
               v-for="(a, i) in annotations"
@@ -291,8 +379,10 @@ const edgePaths = computed(() =>
             </text>
           </g>
           <g class="op-schem-annotation" text-anchor="end">
-            <text :x="SVG_W - 90" y="450">observation ┐</text>
-            <text :x="SVG_W - 90" y="602">side-effects ┐</text>
+            <text :x="SVG_W - 90" y="380">observation ┐</text>
+            <text :x="SVG_W - 90" y="540">predicates  ┐</text>
+            <text :x="SVG_W - 90" y="640">dispatch    ↑</text>
+            <text :x="SVG_W - 90" y="340">writeback   ↑</text>
           </g>
 
           <!-- Frame ticks -->
@@ -313,8 +403,8 @@ const edgePaths = computed(() =>
           <div class="op-schem-foot-label">// caller</div>
           <div class="op-schem-foot-body">
             Drop into Rust with
-            <span class="op-schem-cargo">cargo add</span>, shell out to the CLI,
-            or speak JSON-RPC from any language.
+            <span class="op-schem-cargo">cargo add</span>, shell out to the
+            CLI, or speak JSON-RPC from any language.
           </div>
         </div>
         <div>
@@ -334,8 +424,8 @@ const edgePaths = computed(() =>
         <div>
           <div class="op-schem-foot-label">// adapt</div>
           <div class="op-schem-foot-body">
-            Wrap an app's prompt grammar in a trusted Lua adapter. Claude Code
-            ships in-tree; bring your own TUI next.
+            Wrap an app's prompt grammar in a trusted Lua adapter. Claude
+            Code ships in-tree; bring your own TUI next.
           </div>
         </div>
       </footer>
@@ -361,6 +451,8 @@ const edgePaths = computed(() =>
   --schem-dot-stroke: var(--op-accent-t);
   --schem-glow: rgba(198, 242, 78, 0.3);
   --schem-arrow: #aab2a3;
+  --schem-back-edge: #a8530b; /* amber for the control loop */
+  --schem-back-arrow: #a8530b;
 }
 
 .op-schem-root.is-dark {
@@ -371,6 +463,8 @@ const edgePaths = computed(() =>
   --schem-dot-stroke: var(--op-accent);
   --schem-glow: rgba(198, 242, 78, 0.05);
   --schem-arrow: #3d4f1f;
+  --schem-back-edge: #f5a623;
+  --schem-back-arrow: #f5a623;
 }
 
 .op-schem-grid {
@@ -479,14 +573,30 @@ const edgePaths = computed(() =>
   opacity: 0.95;
 }
 
+.op-schem-edge-back {
+  stroke: var(--schem-back-edge);
+  stroke-width: 1.5;
+  opacity: 0.85;
+}
+
 .op-schem-arrow-fill {
   fill: var(--schem-arrow);
+}
+
+.op-schem-arrow-back-fill {
+  fill: var(--schem-back-arrow);
 }
 
 .op-schem-dot {
   fill: var(--op-accent);
   stroke: var(--schem-dot-stroke);
   stroke-width: 1;
+}
+
+.op-schem-dot-back {
+  fill: var(--schem-back-edge);
+  stroke: var(--schem-back-arrow);
+  stroke-width: 0.5;
 }
 
 .op-schem-node-rect {
@@ -512,7 +622,6 @@ const edgePaths = computed(() =>
 }
 .is-dark .op-schem-node-label {
   font-weight: 500;
-  fill: var(--op-ink);
 }
 
 .op-schem-node-sub {
