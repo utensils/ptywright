@@ -231,6 +231,71 @@ local function parse_usage_screen(text)
   return { usage = usage }
 end
 
+-- Parse the bottom status-bar text into the structured `status` table the
+-- host exposes on `ExtensionStateSnapshot::metadata`. Claude Code renders
+-- the active model inside square brackets (`[Haiku 4.5]`) plus a
+-- permission-mode hint (`⏵⏵ bypass permissions on`, `⏵⏵ auto mode on`,
+-- `⏵⏵ plan mode on`, …). Every field is best-effort; the host omits keys
+-- that didn't match. Returns nil only when no fields parsed at all so
+-- callers don't have to special-case an empty table.
+local function parse_status_bar(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local status = {}
+  -- Match the *last* `[...]` rather than the first. Claude renders the
+  -- model at the end of the cwd row (`user @ host /path [Haiku 4.5]`)
+  -- and a future TUI tweak that introduced an earlier bracketed token
+  -- (e.g. a `[?]` help chip or a key-hint pill) would otherwise quietly
+  -- shadow the model string. Walking the iterator and keeping the last
+  -- capture is cheap on a 3-row status bar and stays robust to those
+  -- insertions.
+  local last_bracket
+  for bracketed in string.gmatch(text, "%[([^%]]+)%]") do
+    last_bracket = bracketed
+  end
+  if last_bracket then
+    status.model = trim(last_bracket)
+  end
+  local lowered = lower(text)
+  if contains(lowered, "bypass permissions on") then
+    status.permission_mode = "bypass"
+  elseif contains(lowered, "auto mode on") then
+    status.permission_mode = "auto"
+  elseif contains(lowered, "plan mode on") then
+    status.permission_mode = "plan"
+  end
+  if next(status) == nil then
+    return nil
+  end
+  return { status = status }
+end
+
+-- Merge two metadata tables (either may be nil). Plain shallow merge —
+-- callers structure their metadata under disjoint top-level keys (`usage`,
+-- `status`, `permission`, …) so a deep merge is unnecessary. Returns a
+-- fresh table rather than mutating `a` in place; if a future refactor
+-- ever calls the merger more than once per classify (e.g. for memoised
+-- closures), per-branch writes won't bleed back into the shared
+-- `status_metadata` captured in the classify scope.
+local function merge_metadata(a, b)
+  if a == nil and b == nil then
+    return nil
+  end
+  local merged = {}
+  if a ~= nil then
+    for key, value in pairs(a) do
+      merged[key] = value
+    end
+  end
+  if b ~= nil then
+    for key, value in pairs(b) do
+      merged[key] = value
+    end
+  end
+  return merged
+end
+
 local function has_welcome_screen(text)
   -- Claude Code's first-launch welcome panel renders after the workspace
   -- trust dialog is accepted. It shows "Welcome back <user>!" alongside a
@@ -263,6 +328,23 @@ function M.classify(input)
   local body_text = lower(body)
   local screen_text = lower(screen)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
+
+  -- Parse the bottom status-bar text once and merge it into every branch's
+  -- return. Shadowing the module-level `state_snapshot` keeps each branch
+  -- one-liner without having to thread `status_metadata` through 13 call
+  -- sites. Branches that already attach their own metadata (the
+  -- `completed_turn` usage screen) get a shallow merge with status on top.
+  local outer_state_snapshot = state_snapshot
+  local status_metadata = parse_status_bar(status)
+  local function state_snapshot(state, confidence, evidence, seq, metadata)
+    return outer_state_snapshot(
+      state,
+      confidence,
+      evidence,
+      seq,
+      merge_metadata(status_metadata, metadata)
+    )
+  end
 
   if trim(text) == "" then
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)

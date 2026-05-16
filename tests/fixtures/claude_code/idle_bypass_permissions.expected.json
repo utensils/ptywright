@@ -2,5 +2,11 @@
   "state": "waiting_for_user_input",
   "evidence": "input prompt glyph detected",
   "last_intent": null,
-  "min_confidence": 0.6
+  "min_confidence": 0.6,
+  "metadata": {
+    "status": {
+      "model": "Haiku 4.5",
+      "permission_mode": "bypass"
+    }
+  }
 }
