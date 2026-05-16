@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::action::Action;
 use crate::error::{Error, Result};
 use crate::lua_plugin::LuaPlugin;
-use crate::matcher::Matcher;
+use crate::matcher::{MatchOutcome, Matcher};
 use crate::plugin::{BUILTIN_PLUGINS, PluginManifest};
 use crate::session::Session;
 
@@ -322,7 +322,8 @@ impl ExtensionHandle {
     }
 
     /// Wait until the plugin's matcher for `intent` is satisfied or the
-    /// timeout expires, then classify and return the resulting state.
+    /// timeout expires, then classify and return the resulting state alongside
+    /// the structured outcome describing which matcher branch fired.
     ///
     /// The actual `stable_for` duration from the underlying
     /// [`MatchResult`](crate::matcher::MatchResult) is forwarded to the
@@ -335,17 +336,18 @@ impl ExtensionHandle {
         intent: &str,
         params: Value,
         timeout: Duration,
-    ) -> Result<ExtensionStateSnapshot> {
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
         let params = merge_wait_defaults(params, self.completed_turn_stable_ms);
         let matcher = self.extension.wait_matcher(intent, &params)?;
         let result = self.session.wait_for(&matcher, timeout)?;
         let stable_ms = u64::try_from(result.stable_for.as_millis()).unwrap_or(u64::MAX);
-        self.classify(
+        let state = self.classify(
             &result.snapshot.plain_text,
             &result.transcript_tail,
             result.sequence,
             Some(stable_ms),
-        )
+        )?;
+        Ok((state, result.outcome))
     }
 
     /// Apply an action plan, requiring that the plan supply `last_intent` and

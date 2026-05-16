@@ -1299,8 +1299,13 @@ impl RpcServer {
     }
 
     /// `adapter.wait` — block until the plugin's named matcher fires or the
-    /// timeout expires, then classify and return the resulting state. The
-    /// intent defaults to `wait_turn_matcher` so simple callers can omit it.
+    /// timeout expires, then classify and return the resulting state plus the
+    /// structured `matched` outcome describing which matcher branch fired.
+    /// The intent defaults to `wait_turn_matcher` so simple callers can omit
+    /// it. Response shape: `{ "state": <state>, "matched": <outcome|null> }`.
+    /// `matched` is reserved as `null` for future cancellation paths that
+    /// surface a `MatchResult` without a satisfying branch; today every
+    /// successful wait carries a populated outcome.
     fn adapter_wait(&self, params: Option<Value>) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterWaitParams = parse_params(params)?;
         self.check_adapter_permission("adapter.wait", &params.adapter)?;
@@ -1315,11 +1320,18 @@ impl RpcServer {
         // clients would be ambiguous anyway. A future `adapter.cancel`
         // method can break out of the wait without needing the mutex.
         let entry = entry_arc.lock().expect("extension poisoned");
-        let state = entry
+        let (state, outcome) = entry
             .handle
             .wait(&intent, params.params, timeout)
             .map_err(rpc_error_from_error)?;
-        Ok(json!({ "state": state }))
+        // Always emit `matched` so consumers don't have to branch on key
+        // presence. Today every successful wait carries a `Some(outcome)`;
+        // `null` is reserved for future paths (e.g. cancellation hooks)
+        // that surface a `MatchResult` without a satisfying branch.
+        Ok(json!({
+            "state": state,
+            "matched": outcome,
+        }))
     }
 
     /// `adapter.snapshot` — passthrough to the adapter's underlying session
@@ -2485,6 +2497,30 @@ mod tests {
         assert!(
             !state_label.is_empty(),
             "adapter.wait response must include a non-empty state label"
+        );
+
+        // Structured matcher result: claude-code's wait_turn_matcher is a
+        // top-level All([Any([...]), ScreenStable]). On the "Total cost:"
+        // anchor the inner Any must surface that branch's contains_text
+        // payload, so callers can reason about which boundary anchor fired
+        // without re-scanning the screen.
+        let matched = &response["result"]["matched"];
+        assert_eq!(
+            matched["kind"], "all",
+            "adapter.wait must surface the structured outcome; got {response}"
+        );
+        let all_branches = matched["matched"].as_array().expect("all branches array");
+        assert!(
+            !all_branches.is_empty(),
+            "All outcome must carry per-branch detail; got {matched}"
+        );
+        let any_branch = all_branches
+            .iter()
+            .find(|branch| branch["kind"] == "any")
+            .expect("All must include the Any anchor branch");
+        assert_eq!(
+            any_branch["matched"]["kind"], "contains_text",
+            "Any branch must record which alternative fired; got {any_branch}"
         );
 
         // Cleanup so the sleep process doesn't outlive the test.

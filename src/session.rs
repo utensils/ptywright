@@ -290,7 +290,13 @@ impl Session {
                 stable_for: stable_since.elapsed(),
                 process_exited,
             };
+            // Cheap boolean check first so the polling loop avoids
+            // building a `MatchOutcome` (and running `Regex::captures`)
+            // on every tick. We only pay the structured-outcome cost once,
+            // on the success path immediately below.
             if matcher.is_match_with_context(&snapshot, &transcript_tail, context) {
+                let outcome =
+                    matcher.describe_match_with_context(&snapshot, &transcript_tail, context);
                 return Ok(MatchResult {
                     matched: true,
                     sequence,
@@ -298,6 +304,7 @@ impl Session {
                     snapshot,
                     transcript_tail,
                     stable_for: context.stable_for,
+                    outcome,
                 });
             }
 
