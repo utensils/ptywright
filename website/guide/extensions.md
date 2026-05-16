@@ -159,13 +159,21 @@ The plugins are visible through `adapter.list` and instantiable via `adapter.sta
 These JSON-RPC methods register or deregister plugins from a connected client. They are **disabled by default** — start the server with `--allow-plugin-load` to enable them. Without that flag, both methods return `-32004 PermissionDenied` with `data.reason = "server_did_not_grant_plugin_load"` so callers can distinguish a server-mode denial from per-adapter permission denials.
 
 ```json
-{ "jsonrpc": "2.0", "id": 1, "method": "plugin.load",
-  "params": { "manifest_path": "/abs/path/to/manifest.toml" } }
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "plugin.load",
+  "params": { "manifest_path": "/abs/path/to/manifest.toml" }
+}
 ```
 
 ```json
-{ "jsonrpc": "2.0", "id": 2, "method": "plugin.unload",
-  "params": { "plugin": "echo" } }
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "plugin.unload",
+  "params": { "plugin": "echo" }
+}
 ```
 
 Built-in plugins (claude-code) cannot be unloaded. Plugins with live adapters bound to them are rejected by `plugin.unload` — `adapter.close` them first.

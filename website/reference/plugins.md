@@ -71,15 +71,15 @@ Permissions:
 
 Every `adapter.*` JSON-RPC method consults the bound plugin manifest's declared `permissions` before invoking the handler. The mapping is:
 
-| Method                                                       | Required permission |
-| ------------------------------------------------------------ | ------------------- |
-| `adapter.start`                                              | `session.spawn`     |
-| `adapter.send`                                               | `input.write`       |
-| `adapter.wait`                                               | `matcher.wait`      |
-| `adapter.snapshot` / `adapter.state` / `adapter.inspect`     | `screen.read`       |
-| `adapter.transcript`                                         | `transcript.read`   |
-| `adapter.close`                                              | `session.kill`      |
-| `adapter.list` / `adapter.live`                              | none (read-only)    |
+| Method                                                   | Required permission |
+| -------------------------------------------------------- | ------------------- |
+| `adapter.start`                                          | `session.spawn`     |
+| `adapter.send`                                           | `input.write`       |
+| `adapter.wait`                                           | `matcher.wait`      |
+| `adapter.snapshot` / `adapter.state` / `adapter.inspect` | `screen.read`       |
+| `adapter.transcript`                                     | `transcript.read`   |
+| `adapter.close`                                          | `session.kill`      |
+| `adapter.list` / `adapter.live`                          | none (read-only)    |
 
 A call against a manifest that lacks the required permission returns `-32004 PermissionDenied` with `data = { "method": "...", "required_permission": "..." }`. Plugin authors should declare the minimal set of permissions their plugin actually uses.
 
@@ -151,7 +151,12 @@ ptywright serve --stdio --plugin tests/fixtures/plugins/echo/manifest.toml
 ```
 
 ```json
-{ "jsonrpc": "2.0", "id": 1, "method": "adapter.start", "params": { "plugin": "echo" } }
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "adapter.start",
+  "params": { "plugin": "echo" }
+}
 ```
 
 ## JSON-RPC

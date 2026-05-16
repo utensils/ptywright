@@ -964,6 +964,224 @@ fn plugin_load_denied_without_allow_flag() {
 // cross-platform.
 #[test]
 #[cfg(unix)]
+fn plugin_load_rejects_duplicate_registration() {
+    // Loading the same manifest twice exercises the
+    // `RpcServerState::register_plugin` collision path (Error::Config
+    // "plugin already registered"). The first load via --plugin seeds the
+    // registry; the second via plugin.load (with --allow-plugin-load) must
+    // bounce with -32603 because Error::Config maps to InternalError.
+    let manifest_path = echo_plugin_manifest_path();
+    let manifest_str = manifest_path.to_str().expect("manifest path is utf8");
+    let request = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"plugin.load\",\"params\":{{\"manifest_path\":{manifest_str:?}}}}}\n"
+    );
+    let mut child = bin()
+        .args([
+            "serve",
+            "--stdio",
+            "--allow-plugin-load",
+            "--plugin",
+            manifest_str,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --plugin + --allow-plugin-load");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(request.as_bytes())
+        .expect("write plugin.load");
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json response");
+    assert!(
+        response["error"].is_object(),
+        "second plugin.load must fail when the name is already registered: {response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("already registered"),
+        "error should explain the duplicate registration: {message}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn plugin_unload_rejects_unknown_plugin() {
+    let mut child = bin()
+        .args(["serve", "--stdio", "--allow-plugin-load"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --allow-plugin-load");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"plugin.unload\",\"params\":{\"plugin\":\"never-registered\"}}\n")
+        .expect("write plugin.unload");
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json response");
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "unknown plugin must return InvalidParams: {response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("unknown plugin"),
+        "error should name the unknown plugin: {message}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn plugin_unload_refuses_to_remove_built_in() {
+    // `claude-code` is bundled into BUILTIN_PLUGINS and seeded into the
+    // registry on startup with builtin: true. The unload handler must
+    // refuse to remove it even when --allow-plugin-load is set.
+    let mut child = bin()
+        .args(["serve", "--stdio", "--allow-plugin-load"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --allow-plugin-load");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"plugin.unload\",\"params\":{\"plugin\":\"claude-code\"}}\n")
+        .expect("write plugin.unload");
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json response");
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "built-in unload attempt must return InvalidParams: {response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("built in"),
+        "error should explain the built-in protection: {message}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn plugin_unload_happy_path_removes_third_party() {
+    // Load echo via plugin.load, then unload it, then assert adapter.list
+    // no longer contains it.
+    let manifest_path = echo_plugin_manifest_path();
+    let manifest_str = manifest_path.to_str().expect("manifest path is utf8");
+    let requests = format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"plugin.load\",\"params\":{{\"manifest_path\":{path:?}}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"plugin.unload\",\"params\":{{\"plugin\":\"echo\"}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"adapter.list\"}}\n",
+        ),
+        path = manifest_str,
+    );
+    let mut child = bin()
+        .args(["serve", "--stdio", "--allow-plugin-load"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --allow-plugin-load");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(requests.as_bytes())
+        .expect("write requests");
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    assert_eq!(responses[0]["result"]["plugin"], "echo");
+    assert_eq!(responses[1]["result"]["unloaded"], true);
+    let names: Vec<String> = responses[2]["result"]["plugins"]
+        .as_array()
+        .expect("plugins array")
+        .iter()
+        .map(|p| p["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "echo"),
+        "echo must be gone after plugin.unload: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "claude-code"),
+        "claude-code must remain after unloading echo: {names:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn plugin_unload_refuses_when_adapter_is_bound() {
+    // Load echo, start an adapter against it, then try to unload — the
+    // sibling adapter_plugin map should report the binding without
+    // touching the per-adapter Mutex<ExtensionEntry>, so the unload must
+    // be refused even while the adapter is still alive.
+    let manifest_path = echo_plugin_manifest_path();
+    let manifest_str = manifest_path.to_str().expect("manifest path is utf8");
+    let requests = format!(
+        concat!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"plugin.load\",\"params\":{{\"manifest_path\":{path:?}}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"adapter.start\",\"params\":{{\"plugin\":\"echo\"}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"plugin.unload\",\"params\":{{\"plugin\":\"echo\"}}}}\n",
+        ),
+        path = manifest_str,
+    );
+    let mut child = bin()
+        .args(["serve", "--stdio", "--allow-plugin-load"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright serve --allow-plugin-load");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(requests.as_bytes())
+        .expect("write requests");
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait ptywright serve");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    assert_eq!(responses[0]["result"]["plugin"], "echo");
+    assert!(
+        responses[1]["result"]["adapter"].is_string(),
+        "adapter.start must succeed: {response:?}",
+        response = responses[1]
+    );
+    assert_eq!(
+        responses[2]["error"]["code"],
+        -32602,
+        "plugin.unload while live adapters bound must return InvalidParams: {response:?}",
+        response = responses[2]
+    );
+    let message = responses[2]["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("live adapters"),
+        "error should mention the live-adapter binding: {message}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn plugin_load_allowed_with_flag_drives_full_lifecycle() {
     let manifest_path = echo_plugin_manifest_path();
     let manifest_str = manifest_path.to_str().expect("manifest path is utf8");

@@ -2666,7 +2666,16 @@ mod tests {
     /// custom manifest that omits `InputWrite`, inject it directly into shared
     /// state, then call `adapter.send` over the wire and assert the JSON-RPC
     /// error code is `-32004` with the expected message format.
+    // `cfg(unix)` because the test spawns `/bin/sh` to back the stub
+    // adapter's PTY (we never actually drive that shell — the dispatcher
+    // denies the call before it could matter — but the spawn has to
+    // succeed for the test to build the registry entry). Windows lacks
+    // `/bin/sh`; rather than carry a portable stub binary just for this
+    // assertion, restrict the test to Unix and let the
+    // `check_manifest_permission_denies_when_missing` unit test (which
+    // does not spawn a session) cover the same denial logic on Windows.
     #[test]
+    #[cfg(unix)]
     fn adapter_send_denied_when_manifest_lacks_input_write() {
         // Stub Lua source: just enough to satisfy ExtensionHandle::start's
         // initial classify call. We never reach the plugin's send_prompt
@@ -2755,7 +2764,12 @@ mod tests {
     /// dispatcher must not block `adapter.send`. Drive a real bash
     /// claude-code-shaped manifest end-to-end through `adapter.start` +
     /// `adapter.close` to prove the allow path stays intact.
+    ///
+    /// `cfg(unix)` for the same reason as
+    /// `adapter_send_denied_when_manifest_lacks_input_write`: the test
+    /// spawns `/bin/sh` for the underlying PTY and Windows lacks it.
     #[test]
+    #[cfg(unix)]
     fn adapter_send_allowed_with_built_in_claude_code_manifest() {
         let mut server = RpcServer::new();
         let start = handle(

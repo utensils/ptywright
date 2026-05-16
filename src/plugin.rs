@@ -533,16 +533,29 @@ mod tests {
     #[test]
     fn load_from_toml_path_rejects_absolute_entrypoint() {
         let dir = tempdir_for_test("plugin-abs-entrypoint");
+        // `/etc/passwd` is absolute on Unix but Windows treats `/` paths as
+        // relative-with-root rather than absolute (no drive letter), so
+        // `Path::is_absolute()` would return false there and the test would
+        // miss the early-rejection branch we are trying to exercise. Use a
+        // platform-appropriate absolute path so the rejection fires on both
+        // lanes.
+        #[cfg(windows)]
+        let abs_path = r"C:\Windows\System32\notepad.exe";
+        #[cfg(not(windows))]
+        let abs_path = "/etc/passwd";
         write_temp_manifest(
             &dir,
-            r#"
+            &format!(
+                r#"
 name = "abs"
 kind = "adapter"
 version = "0.1.0"
 runtime = "lua"
-entrypoint = "/etc/passwd"
+entrypoint = "{}"
 permissions = []
 "#,
+                abs_path.replace('\\', r"\\")
+            ),
             "-- unused",
         );
         let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
@@ -677,6 +690,80 @@ permissions = []
             "error should explain the escape: {msg}"
         );
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn permission_as_str_matches_serde_rename() {
+        // Wire-name strings used in error messages and JSON-RPC `data`
+        // payloads must stay in lock-step with the `#[serde(rename = ...)]`
+        // attributes on the enum. Touch each variant so future additions
+        // (e.g. a `Trusted` permission) can't drift silently.
+        assert_eq!(PluginPermission::SessionSpawn.as_str(), "session.spawn");
+        assert_eq!(PluginPermission::SessionKill.as_str(), "session.kill");
+        assert_eq!(PluginPermission::SessionResize.as_str(), "session.resize");
+        assert_eq!(PluginPermission::ScreenRead.as_str(), "screen.read");
+        assert_eq!(PluginPermission::TranscriptRead.as_str(), "transcript.read");
+        assert_eq!(PluginPermission::InputWrite.as_str(), "input.write");
+        assert_eq!(PluginPermission::MatcherWait.as_str(), "matcher.wait");
+    }
+
+    #[test]
+    fn load_from_toml_path_reports_missing_manifest_file() {
+        let dir = tempdir_for_test("plugin-missing-manifest");
+        let missing = dir.join("does-not-exist.toml");
+        let err = PluginManifest::load_from_toml_path(&missing)
+            .expect_err("missing manifest must be reported as Error::Config");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to read plugin manifest"),
+            "error should explain the read failure: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_reports_malformed_toml() {
+        let dir = tempdir_for_test("plugin-malformed-toml");
+        // Missing closing quote and required fields.
+        std::fs::write(dir.join("manifest.toml"), "name = \"unclosed").expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("malformed TOML must be rejected with a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse plugin manifest"),
+            "error should explain the parse failure: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_reports_missing_entrypoint_file() {
+        let dir = tempdir_for_test("plugin-missing-entrypoint-file");
+        // Manifest declares a runtime + entrypoint, but the entrypoint file
+        // is not on disk — the canonicalize step on the resolved source
+        // path must fail with a clear "canonicalize plugin entrypoint" error
+        // rather than a generic "no such file" further downstream.
+        std::fs::write(
+            dir.join("manifest.toml"),
+            r#"
+name = "no-entry-file"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "ghost.lua"
+permissions = []
+"#,
+        )
+        .expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("missing entrypoint file must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("canonicalize plugin entrypoint")
+                || msg.contains("failed to read plugin entrypoint"),
+            "error should explain the entrypoint-resolution failure: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Per-test temp directory under `std::env::temp_dir()`. Returned path is

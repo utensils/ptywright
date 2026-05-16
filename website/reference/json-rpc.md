@@ -220,12 +220,12 @@ See the [Extensions guide](../guide/extensions.md) for plugin authoring and the 
 
 ### Plugin methods
 
-| Method                     | Params                                              | Result                       |
-| -------------------------- | --------------------------------------------------- | ---------------------------- |
-| `plugin.capabilities`      | none                                                | Host plugin capabilities.    |
-| `plugin.validate_manifest` | `{ "manifest": { ... } }`                           | `{ "valid": true }`.         |
-| `plugin.load`              | `{ "manifest_path": "path/to/manifest.toml" }`      | `{ "plugin": "<name>" }`.    |
-| `plugin.unload`            | `{ "plugin": "<name>" }`                            | `{ "unloaded": true }`.      |
+| Method                     | Params                                         | Result                    |
+| -------------------------- | ---------------------------------------------- | ------------------------- |
+| `plugin.capabilities`      | none                                           | Host plugin capabilities. |
+| `plugin.validate_manifest` | `{ "manifest": { ... } }`                      | `{ "valid": true }`.      |
+| `plugin.load`              | `{ "manifest_path": "path/to/manifest.toml" }` | `{ "plugin": "<name>" }`. |
+| `plugin.unload`            | `{ "plugin": "<name>" }`                       | `{ "unloaded": true }`.   |
 
 `plugin.capabilities` reports `embedded_lua: true` and includes built-in plugin manifests in `builtin_plugins`, including the `claude-code` Lua adapter. See [Plugins and extensions](./plugins.md) for manifest fields, runtime names, and permission names.
 
@@ -239,15 +239,15 @@ Both methods require the server to have been started with `--allow-plugin-load`.
 
 Every `adapter.*` method consults the bound plugin manifest's declared `permissions` before invoking the handler. Methods that operate on an adapter require the matching `PluginPermission`:
 
-| Method                                   | Required permission |
-| ---------------------------------------- | ------------------- |
-| `adapter.start`                          | `session.spawn`     |
-| `adapter.send`                           | `input.write`       |
-| `adapter.wait`                           | `matcher.wait`      |
-| `adapter.snapshot` / `adapter.state` / `adapter.inspect` | `screen.read`       |
-| `adapter.transcript`                     | `transcript.read`   |
-| `adapter.close`                          | `session.kill`      |
-| `adapter.list` / `adapter.live`          | none (read-only registry queries) |
+| Method                                                   | Required permission               |
+| -------------------------------------------------------- | --------------------------------- |
+| `adapter.start`                                          | `session.spawn`                   |
+| `adapter.send`                                           | `input.write`                     |
+| `adapter.wait`                                           | `matcher.wait`                    |
+| `adapter.snapshot` / `adapter.state` / `adapter.inspect` | `screen.read`                     |
+| `adapter.transcript`                                     | `transcript.read`                 |
+| `adapter.close`                                          | `session.kill`                    |
+| `adapter.list` / `adapter.live`                          | none (read-only registry queries) |
 
 When a manifest omits the required permission, the call returns `-32004 PermissionDenied` with structured `data` carrying `{ "method": "<name>", "required_permission": "<permission>" }`. Permissions are checked at dispatch time — an adapter's runtime privileges cannot be widened after `adapter.start`.
 
