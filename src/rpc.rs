@@ -537,6 +537,14 @@ impl RpcServer {
 
             if let Some(delta) = output {
                 self.last_notified_outputs.insert(id.clone(), delta.cursor);
+                // `sequence` here is the session's *current* sequence at poll
+                // time. If multiple PTY writes landed between polls, the
+                // delivered `output` may span several sequence increments
+                // but only the latest counter is reported — the notification
+                // batches "everything since the last poll," not "everything
+                // produced at this exact sequence." Subscribers correlating
+                // byte ranges to specific sequence values should treat the
+                // sequence here as an upper bound, not an exact alignment.
                 let mut params = json!({
                     "session": id,
                     "sequence": sequence,
@@ -719,8 +727,35 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: NotificationsParams = parse_params(params)?;
+        let was_enabled = self.notifications_enabled;
         self.notifications_enabled = params.enabled;
+        // When notifications transition from off → on, seed every existing
+        // session's output cursor at the current `chars_written` so the next
+        // `session.output` notification only carries output produced *after*
+        // subscription. Without this, a long-lived REPL that just enabled
+        // notifications would receive the entire retained transcript (up to
+        // `max_chars` ≈ 128 KiB by default) crammed into a single NDJSON
+        // frame — heavy on slow consumers and on any framing layer with a
+        // line-length limit. Subscribers that *want* the historical buffer
+        // can still call `adapter.transcript` explicitly.
+        if !was_enabled && params.enabled {
+            self.seed_output_cursors_at_current_position();
+        }
         Ok(json!({ "enabled": self.notifications_enabled }))
+    }
+
+    fn seed_output_cursors_at_current_position(&mut self) {
+        let snapshot = self.snapshot_session_registry();
+        for (id, session) in snapshot.direct {
+            let cursor = session.transcript_chars_written();
+            self.last_notified_outputs.insert(id, cursor);
+        }
+        for arc in snapshot.adapter_arcs {
+            let Ok(entry) = arc.try_lock() else { continue };
+            let cursor = entry.handle.session().transcript_chars_written();
+            self.last_notified_outputs
+                .insert(entry.session.clone(), cursor);
+        }
     }
 
     fn session_create(
@@ -793,8 +828,7 @@ impl RpcServer {
             .remove(&params.session);
         if let Some(session) = session {
             let _ = session.kill();
-            self.last_notified_sequences.remove(&params.session);
-            self.notified_exits.remove(&params.session);
+            self.forget_session_notification_state(&params.session);
             Ok(json!({ "closed": true }))
         } else {
             Err((
@@ -1407,6 +1441,14 @@ impl RpcServer {
             // an error which we discard. The session is dropped immediately
             // afterwards either way.
             let _ = entry.handle.session().kill();
+            // Adapter sessions share the `s<n>` id namespace with directly-
+            // created sessions, and the notification trackers are keyed on
+            // that id. Drop the per-connection state so long-lived REPL
+            // sessions that spawn and close many adapters don't accumulate
+            // entries forever.
+            let session_id = entry.session.clone();
+            drop(entry);
+            self.forget_session_notification_state(&session_id);
             Ok(json!({ "closed": true }))
         } else {
             Err((
@@ -1415,6 +1457,16 @@ impl RpcServer {
             )
                 .into())
         }
+    }
+
+    /// Drop all per-connection notification tracking state for `session_id`.
+    /// Called by both `session.close` and `adapter.close` so the three
+    /// notification maps stay in lock-step regardless of how a session was
+    /// allocated. Idempotent: missing keys are silently ignored.
+    fn forget_session_notification_state(&mut self, session_id: &str) {
+        self.last_notified_sequences.remove(session_id);
+        self.last_notified_outputs.remove(session_id);
+        self.notified_exits.remove(session_id);
     }
 
     /// `adapter.live` — list every adapter currently registered in shared

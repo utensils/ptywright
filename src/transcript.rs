@@ -145,7 +145,13 @@ impl Transcript {
                 dropped: false,
             };
         }
-        let unseen = (total - cursor) as usize;
+        // Saturate the gap to `usize::MAX` so the comparison below stays
+        // correct on 32-bit targets even when the unseen range exceeds
+        // `usize::MAX` characters (≈ 4 GiB on a 32-bit usize). The ring
+        // buffer is bounded so we'll fall into the `dropped` branch anyway —
+        // we just must not let `as usize` truncate the difference to a
+        // smaller value and silently return a non-dropped slice.
+        let unseen = usize::try_from(total - cursor).unwrap_or(usize::MAX);
         let buffered = self.chars.len();
         let (text, dropped) = if unseen > buffered {
             (self.chars.iter().collect(), true)

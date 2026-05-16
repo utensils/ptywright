@@ -290,3 +290,234 @@ fn session_output_notification_carries_emitted_text() {
         Duration::from_secs(5),
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn session_output_redacts_secret_shaped_tokens_by_default() {
+    // The notification has no caller-supplied redaction parameter, so the
+    // server applies the default `RedactionPolicy` — mirroring the default
+    // for `adapter.transcript`. A bare-eye `token=` value in PTY output
+    // must reach the wire as `[REDACTED]`, not the raw secret. This guards
+    // the user-visible "default-redacted" contract the PR documents.
+    let (client, _server) = in_process_client();
+    let notifications = client.notifications();
+    let _ = client
+        .call(
+            "server.set_notifications",
+            json!({ "enabled": true }),
+            Duration::from_secs(5),
+        )
+        .expect("enable notifications");
+
+    let start = client
+        .call(
+            "adapter.start",
+            json!({
+                "plugin": "claude-code",
+                "program": "/bin/sh",
+                "args": ["-lc", "printf 'token=super-secret\\n' && cat"],
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("adapter.start");
+    let adapter = start["adapter"].as_str().expect("adapter id").to_string();
+    let session = start["session"].as_str().expect("session id").to_string();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut collected = String::new();
+    while std::time::Instant::now() < deadline {
+        let _ = client.call(
+            "adapter.state",
+            json!({ "adapter": adapter }),
+            Duration::from_secs(5),
+        );
+        if let Ok(notification) = notifications.recv_timeout(Duration::from_millis(100))
+            && notification.method == "session.output"
+            && notification.params["session"] == session.as_str()
+            && let Some(text) = notification.params["output"].as_str()
+        {
+            collected.push_str(text);
+            if collected.contains("[REDACTED]") {
+                break;
+            }
+        }
+    }
+
+    assert!(
+        collected.contains("[REDACTED]"),
+        "session.output must redact secret-shaped tokens by default; got {collected:?}"
+    );
+    assert!(
+        !collected.contains("super-secret"),
+        "raw secret leaked through default redaction; got {collected:?}"
+    );
+
+    let _ = client.call(
+        "adapter.close",
+        json!({ "adapter": adapter }),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn session_output_first_emission_skips_pre_subscription_buffer() {
+    // Output produced *before* `server.set_notifications { enabled: true }`
+    // must not arrive in the first delivery — otherwise a long-lived
+    // session would dump its entire 128 KiB retained transcript on
+    // subscription. We seed the per-connection cursor at the current
+    // `chars_written` when notifications flip on, so the very first
+    // payload only carries what landed afterwards.
+    let (client, _server) = in_process_client();
+    let notifications = client.notifications();
+
+    // Start the adapter *before* enabling notifications and let it
+    // produce a known marker. That marker must not appear in subsequent
+    // `session.output` frames.
+    let start = client
+        .call(
+            "adapter.start",
+            json!({
+                "plugin": "claude-code",
+                "program": "/bin/sh",
+                "args": [
+                    "-lc",
+                    "printf 'pre-subscription-marker\\n'; sleep 0.3; printf 'post-subscription-marker\\n'; cat",
+                ],
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("adapter.start");
+    let adapter = start["adapter"].as_str().expect("adapter id").to_string();
+    let session = start["session"].as_str().expect("session id").to_string();
+
+    // Wait long enough for the pre-marker to land in the transcript.
+    let _ = client.call(
+        "adapter.state",
+        json!({ "adapter": adapter }),
+        Duration::from_secs(5),
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    let transcript = client
+        .call(
+            "adapter.transcript",
+            json!({ "adapter": adapter, "redact": false }),
+            Duration::from_secs(5),
+        )
+        .expect("adapter.transcript");
+    let pre_in_transcript = transcript["text"]
+        .as_str()
+        .unwrap_or("")
+        .contains("pre-subscription-marker");
+    assert!(
+        pre_in_transcript,
+        "fixture sequencing assumption: pre-marker must be in the transcript before we subscribe"
+    );
+
+    // Subscribe — this should snap the cursor to current `chars_written`.
+    let _ = client
+        .call(
+            "server.set_notifications",
+            json!({ "enabled": true }),
+            Duration::from_secs(5),
+        )
+        .expect("enable notifications");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut collected = String::new();
+    while std::time::Instant::now() < deadline && !collected.contains("post-subscription-marker") {
+        let _ = client.call(
+            "adapter.state",
+            json!({ "adapter": adapter }),
+            Duration::from_secs(5),
+        );
+        if let Ok(notification) = notifications.recv_timeout(Duration::from_millis(100))
+            && notification.method == "session.output"
+            && notification.params["session"] == session.as_str()
+            && let Some(text) = notification.params["output"].as_str()
+        {
+            collected.push_str(text);
+        }
+    }
+
+    assert!(
+        collected.contains("post-subscription-marker"),
+        "expected post-subscription output to arrive via session.output; got {collected:?}"
+    );
+    assert!(
+        !collected.contains("pre-subscription-marker"),
+        "session.output must not replay pre-subscription buffer; got {collected:?}"
+    );
+
+    let _ = client.call(
+        "adapter.close",
+        json!({ "adapter": adapter }),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn session_output_flags_dropped_when_buffer_evicts_unseen_range() {
+    // Tiny transcript_max_chars guarantees eviction of the unseen range
+    // between subscription and the first delivery, so the next
+    // `session.output` carries `dropped: true` and only the surviving
+    // tail. This exercises the wire-shape branch end-to-end (the unit
+    // test in `transcript::tests` already covers the data-structure side).
+    let (client, _server) = in_process_client();
+    let notifications = client.notifications();
+
+    // Use session.create so we can dial the retention down to 32 chars —
+    // `adapter.start` doesn't take a transcript_max_chars option today
+    // and the default 128 KiB is far too generous for this scenario.
+    // Produce ~1 KiB of output spread across short bursts so the ring
+    // buffer evicts before we ever poll the first notification.
+    let _ = client
+        .call(
+            "server.set_notifications",
+            json!({ "enabled": true }),
+            Duration::from_secs(5),
+        )
+        .expect("enable notifications");
+
+    let create = client
+        .call(
+            "session.create",
+            json!({
+                "program": "/bin/sh",
+                "args": [
+                    "-lc",
+                    "for i in $(seq 1 20); do printf 'output-burst-%02d-padding-padding-padding-padding-padding\\n' \"$i\"; done; cat",
+                ],
+                "transcript_max_chars": 32,
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("session.create");
+    let session = create["session"].as_str().expect("session id").to_string();
+
+    // Wait until we actually see a `dropped: true` notification.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_dropped = false;
+    while std::time::Instant::now() < deadline && !saw_dropped {
+        let _ = client.call("server.capabilities", json!({}), Duration::from_secs(5));
+        if let Ok(notification) = notifications.recv_timeout(Duration::from_millis(100))
+            && notification.method == "session.output"
+            && notification.params["session"] == session.as_str()
+            && notification.params["dropped"].as_bool() == Some(true)
+        {
+            saw_dropped = true;
+        }
+    }
+
+    assert!(
+        saw_dropped,
+        "expected at least one session.output with dropped=true given a 32-char retention buffer fed ~1 KiB of output"
+    );
+
+    let _ = client.call(
+        "session.close",
+        json!({ "session": session }),
+        Duration::from_secs(5),
+    );
+}

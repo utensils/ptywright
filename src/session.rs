@@ -160,6 +160,19 @@ impl Session {
         policy.redact(&self.transcript())
     }
 
+    /// Total chars ever appended to this session's transcript. Survives
+    /// ring-buffer evictions so subscribers can seed a stable cursor when
+    /// they first subscribe — pairs with [`Session::transcript_delta_since`].
+    #[must_use]
+    pub fn transcript_chars_written(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .chars_written()
+    }
+
     /// Newly-appended transcript text since `cursor`. Useful for streaming
     /// `session.output` notifications — see `RpcServer::poll_notifications`.
     /// The returned cursor advances even when the bounded buffer evicted part
