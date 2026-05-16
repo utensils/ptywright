@@ -364,7 +364,7 @@ const annotations = [
               <text
                 v-if="n.file"
                 :x="n.x + n.w - 16"
-                :y="n.y + n.h - 10"
+                :y="n.y + 16"
                 text-anchor="end"
                 class="op-schem-node-file"
               >
