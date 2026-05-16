@@ -87,8 +87,17 @@ impl PluginPermission {
 /// declare it.
 ///
 /// `#[non_exhaustive]` is set so future additions (pixel hints, env hints,
-/// `cwd`) can land without source-breaking downstream callers — construct
-/// via the public constructors or struct-update syntax (`..Default::default()`).
+/// `cwd`) can land without source-breaking downstream callers. From outside
+/// the crate you can no longer construct a literal — use
+/// [`DefaultTarget::new`] (which seeds the required `program` and leaves
+/// the rest at their defaults), then assign optional fields directly:
+///
+/// ```ignore
+/// let mut target = DefaultTarget::new("my-tui");
+/// target.args = vec!["--headless".into()];
+/// target.rows = Some(60);
+/// target.cols = Some(200);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DefaultTarget {
@@ -105,6 +114,23 @@ pub struct DefaultTarget {
     /// operation. Used by `adapter.start` when the caller omits `cols`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
+}
+
+impl DefaultTarget {
+    /// Build a `DefaultTarget` with the required `program` set and all
+    /// optional fields at their defaults (`args` empty, `rows` / `cols`
+    /// `None`). The struct is `#[non_exhaustive]` so external callers
+    /// must enter through this constructor and then mutate the public
+    /// fields they want to set.
+    #[must_use]
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            rows: None,
+            cols: None,
+        }
+    }
 }
 
 /// Declarative extension manifest.
@@ -380,13 +406,14 @@ pub fn claude_code_manifest() -> PluginManifest {
             args: Vec::new(),
             // Claude Code 2.1.x renders its status bar, prompt glyphs (`>`,
             // `❯`), and turn-boundary anchors at column positions that
-            // shift with the terminal width. The 80×24 host default wraps
-            // many of those lines and destabilises the classifier. A
-            // 200×60 preset comfortably fits the status bar, the
-            // "Total cost: …" usage screen, and the longest tool-use
-            // status lines without wrapping. Callers that need a
-            // different geometry (visible attachment, tighter CI sandbox)
-            // override with `rows` / `cols` on `adapter.start`.
+            // shift with the terminal width. The host's last-resort
+            // `rows = 40, cols = 120` fallback wraps many of those lines
+            // and destabilises the classifier. A `rows = 60, cols = 200`
+            // preset comfortably fits the status bar, the "Total cost: …"
+            // usage screen, and the longest tool-use status lines without
+            // wrapping. Callers that need a different geometry (visible
+            // attachment, tighter CI sandbox) override with `rows` /
+            // `cols` on `adapter.start`.
             rows: Some(60),
             cols: Some(200),
         }),
@@ -569,6 +596,42 @@ mod tests {
             .expect("default_target serialised");
         assert_eq!(target.get("program"), Some(&json!("x")));
         assert!(target.get("args").is_none(), "empty args should be skipped");
+    }
+
+    #[test]
+    fn manifest_default_target_round_trips_geometry_when_set() {
+        // Third-party plugins declare headless geometry via the
+        // manifest's default_target rows/cols; the JSON / TOML wire
+        // shape needs to deserialize them back into the struct and
+        // serialise them out unchanged.
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "name": "demo",
+            "kind": "adapter",
+            "version": "0.1.0",
+            "default_target": {
+                "program": "demo-bin",
+                "rows": 60,
+                "cols": 200
+            }
+        }))
+        .expect("parse manifest with geometry");
+        let target = manifest
+            .default_target
+            .as_ref()
+            .expect("default_target present");
+        assert_eq!(target.rows, Some(60));
+        assert_eq!(target.cols, Some(200));
+
+        // Round-trip back to JSON: rows / cols must serialize as plain
+        // integers (not Option-tagged), and Some(_) values must appear on
+        // the wire while None values get skipped via skip_serializing_if.
+        let mut roundtrip = DefaultTarget::new("demo-bin");
+        roundtrip.rows = Some(40);
+        roundtrip.cols = None;
+        let value = serde_json::to_value(&roundtrip).expect("serialize default_target");
+        let object = value.as_object().expect("default_target object");
+        assert_eq!(object.get("rows"), Some(&json!(40)));
+        assert!(object.get("cols").is_none(), "None cols must be skipped");
     }
 
     // ---- load_from_toml_path negative paths ---------------------------
