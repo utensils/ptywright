@@ -128,10 +128,70 @@ The pieces a second adapter would need are exactly what the Claude Code plugin a
    return M
    ```
 
-3. For an embedded build, add a single `BuiltinPlugin { manifest: foo_manifest, source: include_str!("../plugins/foo/main.lua") }` entry to `BUILTIN_PLUGINS` in `src/plugin.rs`. The manifest constructor and the embedded Lua source travel together, so `LuaExtension::built_in(name)` resolves both in one step — no second registration to keep in sync. Alternatively, hand-load from Rust with `LuaPlugin::load_trusted(root, manifest)` followed by `LuaExtension::new(plugin, manifest)`; the entrypoint must resolve to a relative path inside the plugin root after canonicalization. Declaring `default_target = { program = "...", args = [...] }` on the manifest lets `adapter.start` callers omit `program`.
+3. For an embedded build, add a single `BuiltinPlugin { manifest: foo_manifest, source: include_str!("../plugins/foo/main.lua") }` entry to `BUILTIN_PLUGINS` in `src/plugin.rs`. The manifest constructor and the embedded Lua source travel together, so `LuaExtension::built_in(name)` resolves both in one step — no second registration to keep in sync. Declaring `default_target = { program = "...", args = [...] }` on the manifest lets `adapter.start` callers omit `program`.
 
-4. Add recorded screen fixtures under `tests/fixtures/<name>/` with sibling `.expected.json` files. If you wire the same auto-enrolling pattern `tests/lua_classifier_tests.rs` uses for claude-code, fixture additions become single-file changes.
+4. For an out-of-tree third-party plugin, write the manifest as TOML (next to the Lua source) and register it through one of the trusted-local loading paths below. No Rust changes are needed.
+
+5. Add recorded screen fixtures under `tests/fixtures/<name>/` with sibling `.expected.json` files. If you wire the same auto-enrolling pattern `tests/lua_classifier_tests.rs` uses for claude-code, fixture additions become single-file changes.
 
 There is no per-plugin Rust shim. Application-specific state vocabulary, intent verbs, and evidence strings stay entirely in Lua. Rust callers that want a typed state enum can define one locally and convert from the plugin's state string — that translation is application-specific and intentionally not part of the library surface.
 
 Drivers reach the new plugin through the generic surface: `adapter.start {plugin: "<name>"}`, `adapter.send {adapter, intent, params}`, `adapter.wait {adapter, intent, params, timeout_ms}`. The host loop, body/status split, `last_intent` tracking, and timeout policy are reused unchanged.
+
+## Loading trusted-local third-party plugins
+
+A plugin manifest declared as TOML can be loaded into a `ptywright serve` instance two ways. Both share the same trust model: third-party plugins execute in the same embedded Lua runtime as `claude-code`, with the same host helper surface, gated by their declared permissions. **Only load plugins from trusted local sources** — this is not a sandbox for untrusted code.
+
+### At server startup: `--plugin <manifest.toml>`
+
+Pass the flag to `ptywright serve` (repeatable). The flag works with any transport (`--stdio`, `--socket`, or the default per-user socket). The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths and `..` traversal are rejected.
+
+```bash
+ptywright serve --socket ~/.ptywright/sockets/default.sock \
+  --plugin ~/plugins/echo/manifest.toml \
+  --plugin ~/plugins/foo/manifest.toml
+```
+
+The plugins are visible through `adapter.list` and instantiable via `adapter.start { "plugin": "echo" }` like any built-in.
+
+### At runtime: `plugin.load` / `plugin.unload`
+
+These JSON-RPC methods register or deregister plugins from a connected client. They are **disabled by default** — start the server with `--allow-plugin-load` to enable them. Without that flag, both methods return `-32004 PermissionDenied` with `data.reason = "server_did_not_grant_plugin_load"` so callers can distinguish a server-mode denial from per-adapter permission denials.
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "plugin.load",
+  "params": { "manifest_path": "/abs/path/to/manifest.toml" } }
+```
+
+```json
+{ "jsonrpc": "2.0", "id": 2, "method": "plugin.unload",
+  "params": { "plugin": "echo" } }
+```
+
+Built-in plugins (claude-code) cannot be unloaded. Plugins with live adapters bound to them are rejected by `plugin.unload` — `adapter.close` them first.
+
+### Manifest TOML schema
+
+The same fields as the JSON form, with `[default_target]` as a TOML subtable:
+
+```toml
+name = "echo"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "main.lua"
+permissions = [
+  "session.spawn",
+  "session.kill",
+  "screen.read",
+  "transcript.read",
+  "input.write",
+  "matcher.wait",
+]
+
+[default_target]
+program = "/bin/sh"
+args = ["-lc", "cat"]
+```
+
+Permission names match the wire form documented in [Plugins and extensions](../reference/plugins.md). Declare the minimal subset your plugin actually needs — the JSON-RPC dispatcher's [per-method permission gating](../reference/plugins.md#permission-gating) will reject calls that exceed your declaration with `-32004 PermissionDenied`.

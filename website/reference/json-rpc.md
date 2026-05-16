@@ -220,12 +220,38 @@ See the [Extensions guide](../guide/extensions.md) for plugin authoring and the 
 
 ### Plugin methods
 
-| Method                     | Params                    | Result                    |
-| -------------------------- | ------------------------- | ------------------------- |
-| `plugin.capabilities`      | none                      | Host plugin capabilities. |
-| `plugin.validate_manifest` | `{ "manifest": { ... } }` | `{ "valid": true }`.      |
+| Method                     | Params                                              | Result                       |
+| -------------------------- | --------------------------------------------------- | ---------------------------- |
+| `plugin.capabilities`      | none                                                | Host plugin capabilities.    |
+| `plugin.validate_manifest` | `{ "manifest": { ... } }`                           | `{ "valid": true }`.         |
+| `plugin.load`              | `{ "manifest_path": "path/to/manifest.toml" }`      | `{ "plugin": "<name>" }`.    |
+| `plugin.unload`            | `{ "plugin": "<name>" }`                            | `{ "unloaded": true }`.      |
 
 `plugin.capabilities` reports `embedded_lua: true` and includes built-in plugin manifests in `builtin_plugins`, including the `claude-code` Lua adapter. See [Plugins and extensions](./plugins.md) for manifest fields, runtime names, and permission names.
+
+`plugin.load` registers a trusted-local third-party plugin from a TOML manifest file on disk. The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths and `..` components in the entrypoint are rejected. Built-in plugins (claude-code) cannot be replaced — a name collision returns an error.
+
+`plugin.unload` deregisters a previously loaded third-party plugin. Built-in plugins cannot be unloaded. Plugins with live adapters bound to them are rejected; callers must `adapter.close` first.
+
+Both methods require the server to have been started with `--allow-plugin-load`. Without that flag they return `-32004 PermissionDenied` with `data.reason = "server_did_not_grant_plugin_load"` so callers can distinguish this server-mode denial from per-adapter permission denials. The CLI `--plugin <manifest.toml>` flag on `ptywright serve` works independently — the operator is loading plugins at startup, which is explicitly trusted.
+
+### Permission gating
+
+Every `adapter.*` method consults the bound plugin manifest's declared `permissions` before invoking the handler. Methods that operate on an adapter require the matching `PluginPermission`:
+
+| Method                                   | Required permission |
+| ---------------------------------------- | ------------------- |
+| `adapter.start`                          | `session.spawn`     |
+| `adapter.send`                           | `input.write`       |
+| `adapter.wait`                           | `matcher.wait`      |
+| `adapter.snapshot` / `adapter.state` / `adapter.inspect` | `screen.read`       |
+| `adapter.transcript`                     | `transcript.read`   |
+| `adapter.close`                          | `session.kill`      |
+| `adapter.list` / `adapter.live`          | none (read-only registry queries) |
+
+When a manifest omits the required permission, the call returns `-32004 PermissionDenied` with structured `data` carrying `{ "method": "<name>", "required_permission": "<permission>" }`. Permissions are checked at dispatch time — an adapter's runtime privileges cannot be widened after `adapter.start`.
+
+The built-in claude-code manifest declares all permission variants, so existing callers see no behaviour change. Third-party plugins loaded via `plugin.load` / `--plugin` are subject to their declared subset.
 
 ### `session.snapshot`
 

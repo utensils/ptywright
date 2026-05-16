@@ -30,16 +30,19 @@ ptywright is early-stage. This roadmap captures the intended shape without promi
 
 ## Protocol and CLI ergonomics
 
-- JSON-RPC over stdio and Unix sockets for external automation clients with NDJSON and LSP-style framing.
+- JSON-RPC over stdio and local IPC (Unix domain sockets on macOS/Linux, named pipes on Windows) with NDJSON and LSP-style framing.
 - Opt-in coalesced session notifications.
 - Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
 - Plugin manifests and host capability reporting.
+- Per-method permission gating at the JSON-RPC dispatcher (`-32004 PermissionDenied` with structured `data`).
+- Interactive REPL client (`ptywright repl`, default-on `repl` Cargo feature) with reedline-based DSL.
 
-## Adapters
+## Adapters and plugins
 
-- Shell and REPL helpers.
-- Full-screen TUI helpers.
-- App-specific adapters that live outside the generic core.
+- Built-in Lua plugin: `claude-code`, embedded via `BUILTIN_PLUGINS`.
+- Trusted-local third-party plugins via the `ptywright serve --plugin <manifest.toml>` CLI flag.
+- Runtime plugin registration via `plugin.load` / `plugin.unload` JSON-RPC methods (gated by `--allow-plugin-load`).
+- Planned: shell and REPL helpers, full-screen TUI helpers, additional app-specific adapters — all delivered as plugins.
 
 ## Runtime and operations
 
