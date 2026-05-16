@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
 
 /// Extension/plugin category declared by a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +53,24 @@ pub enum PluginPermission {
     MatcherWait,
 }
 
+impl PluginPermission {
+    /// String form used in serde, JSON-RPC error data, and log messages. Stays
+    /// in sync with the `#[serde(rename = "...")]` attributes above so wire
+    /// names and human-readable names cannot drift.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::SessionSpawn => "session.spawn",
+            Self::SessionKill => "session.kill",
+            Self::SessionResize => "session.resize",
+            Self::ScreenRead => "screen.read",
+            Self::TranscriptRead => "transcript.read",
+            Self::InputWrite => "input.write",
+            Self::MatcherWait => "matcher.wait",
+        }
+    }
+}
+
 /// Default PTY target a plugin expects when callers omit the program.
 ///
 /// Plugins declare this in their manifest so the host can wire
@@ -91,6 +112,99 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
+    /// Load a plugin manifest plus its Lua source from a TOML file on disk.
+    ///
+    /// The manifest's `entrypoint` is resolved relative to the directory
+    /// containing the manifest file, so a manifest at
+    /// `/foo/plugins/echo/manifest.toml` with `entrypoint = "main.lua"` loads
+    /// `/foo/plugins/echo/main.lua`. Absolute `entrypoint` paths and
+    /// path-traversing `..` components are rejected to keep the trust model
+    /// honest — the host only reads source files inside the plugin's own
+    /// directory.
+    ///
+    /// Returns the validated manifest and the Lua source as a `String`.
+    pub fn load_from_toml_path(manifest_path: &Path) -> Result<(Self, String)> {
+        let toml_text = std::fs::read_to_string(manifest_path).map_err(|error| {
+            Error::Config(format!(
+                "failed to read plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        let manifest: Self = toml::from_str(&toml_text).map_err(|error| {
+            Error::Config(format!(
+                "failed to parse plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        manifest.validate().map_err(|error| {
+            Error::Config(format!(
+                "invalid plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        let entrypoint = manifest.entrypoint.as_deref().ok_or_else(|| {
+            Error::Config(format!(
+                "plugin manifest `{}` is missing an entrypoint",
+                manifest_path.display()
+            ))
+        })?;
+        let entrypoint_path = Path::new(entrypoint);
+        if entrypoint_path.is_absolute()
+            || entrypoint_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(Error::Config(format!(
+                "plugin manifest `{}` entrypoint `{entrypoint}` must be a relative path inside the manifest's directory",
+                manifest_path.display()
+            )));
+        }
+        // Canonicalize the manifest file first so a bare-filename path like
+        // `--plugin manifest.toml` (where `Path::parent()` would return
+        // `Some("")` and `"".canonicalize()` would fail with `NotFound`)
+        // resolves through the same code path as `./plugins/echo/manifest.toml`.
+        // The manifest existed when we read it above, so canonicalize cannot
+        // fail for legitimate "no such directory" reasons here.
+        let manifest_real = manifest_path.canonicalize().map_err(|error| {
+            Error::Config(format!(
+                "failed to canonicalize plugin manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        let manifest_dir_real = manifest_real.parent().ok_or_else(|| {
+            Error::Config(format!(
+                "plugin manifest `{}` has no parent directory",
+                manifest_path.display()
+            ))
+        })?;
+        let source_path = manifest_dir_real.join(entrypoint_path);
+        // Canonicalize the resolved entrypoint and assert it stays inside
+        // the manifest's directory. Catches symlink-escape cases the
+        // string-level `..` / absolute check above can't see (a
+        // `Normal("foo")` component that happens to be a symlink pointing
+        // outside the plugin directory).
+        let source_real = source_path.canonicalize().map_err(|error| {
+            Error::Config(format!(
+                "failed to canonicalize plugin entrypoint `{}`: {error}",
+                source_path.display()
+            ))
+        })?;
+        if !source_real.starts_with(manifest_dir_real) {
+            return Err(Error::Config(format!(
+                "plugin manifest `{}` entrypoint `{entrypoint}` escapes the manifest's directory (resolved to `{}`)",
+                manifest_path.display(),
+                source_real.display()
+            )));
+        }
+        let source = std::fs::read_to_string(&source_real).map_err(|error| {
+            Error::Config(format!(
+                "failed to read plugin entrypoint `{}`: {error}",
+                source_real.display()
+            ))
+        })?;
+        Ok((manifest, source))
+    }
+
     /// Validate manifest fields and duplicate permissions.
     pub fn validate(&self) -> std::result::Result<(), PluginManifestError> {
         if self.name.trim().is_empty() {
@@ -407,5 +521,265 @@ mod tests {
             .expect("default_target serialised");
         assert_eq!(target.get("program"), Some(&json!("x")));
         assert!(target.get("args").is_none(), "empty args should be skipped");
+    }
+
+    // ---- load_from_toml_path negative paths ---------------------------
+
+    fn write_temp_manifest(dir: &std::path::Path, manifest_body: &str, lua_body: &str) {
+        std::fs::write(dir.join("manifest.toml"), manifest_body).expect("write manifest");
+        std::fs::write(dir.join("main.lua"), lua_body).expect("write lua");
+    }
+
+    #[test]
+    fn load_from_toml_path_rejects_absolute_entrypoint() {
+        let dir = tempdir_for_test("plugin-abs-entrypoint");
+        // `/etc/passwd` is absolute on Unix but Windows treats `/` paths as
+        // relative-with-root rather than absolute (no drive letter), so
+        // `Path::is_absolute()` would return false there and the test would
+        // miss the early-rejection branch we are trying to exercise. Use a
+        // platform-appropriate absolute path so the rejection fires on both
+        // lanes.
+        #[cfg(windows)]
+        let abs_path = r"C:\Windows\System32\notepad.exe";
+        #[cfg(not(windows))]
+        let abs_path = "/etc/passwd";
+        write_temp_manifest(
+            &dir,
+            &format!(
+                r#"
+name = "abs"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "{}"
+permissions = []
+"#,
+                abs_path.replace('\\', r"\\")
+            ),
+            "-- unused",
+        );
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("absolute entrypoint must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a relative path"),
+            "error should explain the rejection: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_rejects_parent_traversal() {
+        let dir = tempdir_for_test("plugin-parent-traversal");
+        write_temp_manifest(
+            &dir,
+            r#"
+name = "escape"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "../escape.lua"
+permissions = []
+"#,
+            "-- unused",
+        );
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("`..` in entrypoint must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a relative path"),
+            "error should explain the rejection: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_rejects_missing_entrypoint() {
+        // Manifest declares a runtime but no entrypoint — validation should
+        // reject before path resolution even runs.
+        let dir = tempdir_for_test("plugin-missing-entrypoint");
+        std::fs::write(
+            dir.join("manifest.toml"),
+            r#"
+name = "no-entry"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+permissions = []
+"#,
+        )
+        .expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("manifest with runtime but no entrypoint must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("entrypoint") || msg.contains("invalid plugin manifest"),
+            "error should mention the missing entrypoint: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_accepts_bare_filename_relative_to_cwd() {
+        // Regression: `--plugin manifest.toml` (or `plugin.load
+        // {"manifest_path": "manifest.toml"}`) from the plugin's directory
+        // previously broke because `Path::new("manifest.toml").parent()`
+        // returns `Some("")` and `"".canonicalize()` fails with NotFound.
+        // The loader now canonicalizes the manifest itself first so the
+        // bare-filename case resolves through the same code path as an
+        // explicit `./manifest.toml`.
+        let dir = tempdir_for_test("plugin-bare-filename");
+        write_temp_manifest(
+            &dir,
+            r#"
+name = "bare"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "main.lua"
+permissions = []
+"#,
+            "return { classify = function() return { state = 'x', confidence = 1.0, evidence = '' } end }",
+        );
+        // chdir into the manifest's directory so the path passed in is a
+        // bare relative filename with no parent component.
+        let prev_cwd = std::env::current_dir().expect("save cwd");
+        std::env::set_current_dir(&dir).expect("cd into plugin dir");
+        let bare = std::path::PathBuf::from("manifest.toml");
+        let result = PluginManifest::load_from_toml_path(&bare);
+        std::env::set_current_dir(&prev_cwd).expect("restore cwd");
+        let (manifest, source) = result.expect("bare relative manifest path must load from cwd");
+        assert_eq!(manifest.name, "bare");
+        assert!(source.contains("classify"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_from_toml_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        // A normal-looking entrypoint that is actually a symlink pointing
+        // outside the manifest's directory. String-level checks pass; the
+        // canonicalization check should catch it.
+        let parent = tempdir_for_test("plugin-symlink-parent");
+        let plugin_dir = parent.join("inside");
+        let target_dir = parent.join("outside");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        std::fs::create_dir_all(&target_dir).expect("create target dir");
+        std::fs::write(target_dir.join("escape.lua"), "-- outside").expect("write outside lua");
+        // entrypoint points to a symlink whose target is outside the plugin dir.
+        symlink(target_dir.join("escape.lua"), plugin_dir.join("main.lua"))
+            .expect("create escaping symlink");
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "symlink-escape"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "main.lua"
+permissions = []
+"#,
+        )
+        .expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&plugin_dir.join("manifest.toml"))
+            .expect_err("symlink escaping the plugin directory must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes the manifest's directory"),
+            "error should explain the escape: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn permission_as_str_matches_serde_rename() {
+        // Wire-name strings used in error messages and JSON-RPC `data`
+        // payloads must stay in lock-step with the `#[serde(rename = ...)]`
+        // attributes on the enum. Touch each variant so future additions
+        // (e.g. a `Trusted` permission) can't drift silently.
+        assert_eq!(PluginPermission::SessionSpawn.as_str(), "session.spawn");
+        assert_eq!(PluginPermission::SessionKill.as_str(), "session.kill");
+        assert_eq!(PluginPermission::SessionResize.as_str(), "session.resize");
+        assert_eq!(PluginPermission::ScreenRead.as_str(), "screen.read");
+        assert_eq!(PluginPermission::TranscriptRead.as_str(), "transcript.read");
+        assert_eq!(PluginPermission::InputWrite.as_str(), "input.write");
+        assert_eq!(PluginPermission::MatcherWait.as_str(), "matcher.wait");
+    }
+
+    #[test]
+    fn load_from_toml_path_reports_missing_manifest_file() {
+        let dir = tempdir_for_test("plugin-missing-manifest");
+        let missing = dir.join("does-not-exist.toml");
+        let err = PluginManifest::load_from_toml_path(&missing)
+            .expect_err("missing manifest must be reported as Error::Config");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to read plugin manifest"),
+            "error should explain the read failure: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_reports_malformed_toml() {
+        let dir = tempdir_for_test("plugin-malformed-toml");
+        // Missing closing quote and required fields.
+        std::fs::write(dir.join("manifest.toml"), "name = \"unclosed").expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("malformed TOML must be rejected with a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse plugin manifest"),
+            "error should explain the parse failure: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_toml_path_reports_missing_entrypoint_file() {
+        let dir = tempdir_for_test("plugin-missing-entrypoint-file");
+        // Manifest declares a runtime + entrypoint, but the entrypoint file
+        // is not on disk — the canonicalize step on the resolved source
+        // path must fail with a clear "canonicalize plugin entrypoint" error
+        // rather than a generic "no such file" further downstream.
+        std::fs::write(
+            dir.join("manifest.toml"),
+            r#"
+name = "no-entry-file"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "ghost.lua"
+permissions = []
+"#,
+        )
+        .expect("write manifest");
+        let err = PluginManifest::load_from_toml_path(&dir.join("manifest.toml"))
+            .expect_err("missing entrypoint file must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("canonicalize plugin entrypoint")
+                || msg.contains("failed to read plugin entrypoint"),
+            "error should explain the entrypoint-resolution failure: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-test temp directory under `std::env::temp_dir()`. Returned path is
+    /// not auto-cleaned on panic but the negative tests don't write enough
+    /// to matter; each test best-effort removes itself.
+    fn tempdir_for_test(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ptywright-plugin-test-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
 }

@@ -62,16 +62,20 @@ nix run github:utensils/ptywright -- --help
 5. Matchers and waits.
 6. Bounded transcript capture with explicit raw transcript file streaming opt-in.
 7. JSON-RPC over stdio or multi-client local IPC for external automation clients, with NDJSON and LSP-style framing.
-8. Generic `Extension` trait with `ExtensionHandle` host loop; Claude Code ships as the first plugin under that trait, exposed through both `adapter.*` and the original `claude.*` JSON-RPC surfaces.
-9. Plugin manifests, permission declarations, and trusted embedded Lua runtime for adapter orchestration, including explicit local plugin loading from Rust APIs.
-10. Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
-11. Rich screen snapshots with cell/style/mode metadata.
-12. Redaction helpers with built-in and caller-supplied patterns plus default RPC redaction for sensitive-looking output.
+8. Generic `Extension` trait with `ExtensionHandle` host loop; Claude Code ships as the first plugin under that trait, driven through the `adapter.*` JSON-RPC surface.
+9. Plugin manifests, permission declarations, and trusted embedded Lua runtime for adapter orchestration. Trusted-local third-party plugins load via the `ptywright serve --plugin <manifest.toml>` CLI flag or the `plugin.load` JSON-RPC method (gated by `--allow-plugin-load`).
+10. Per-method permission gating at the JSON-RPC dispatcher — every `adapter.*` method consults the bound plugin manifest's declared permissions and rejects calls with `-32004 PermissionDenied` carrying structured `data`.
+11. Per-user runtime directory under `~/.ptywright/` with structured logging (daily rotation, redaction-aware writers).
+12. Interactive REPL client (`ptywright repl`, default-on `repl` Cargo feature) with reedline-based DSL, tmux-style attach, and inline notification rendering.
+13. Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
+14. Rich screen snapshots with cell/style/mode metadata.
+15. Redaction helpers with built-in and caller-supplied patterns plus default RPC redaction for sensitive-looking output.
 
 ## Planned layers
 
 1. More Claude Code real-world fixtures and transition tests as upstream Claude Code UI changes.
-2. Optional WASM only if untrusted marketplace-style plugins become a concrete priority.
+2. A second built-in adapter (Codex / shell) to validate the plugin model against a non-Claude TUI.
+3. Optional WASM only if untrusted marketplace-style plugins become a concrete priority.
 
 ## Development
 

@@ -6,14 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-15
+
 ### Added
 
+- Trusted-local third-party plugin loading. `ptywright serve --plugin <manifest.toml>` (repeatable) pre-loads plugins at server startup from on-disk TOML manifests; `--allow-plugin-load` enables runtime registration via the new `plugin.load` / `plugin.unload` JSON-RPC methods. The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths, `..` traversal, and symlinks that resolve outside the manifest's own directory are all rejected. Built-in plugins (claude-code) cannot be unloaded. The new `PluginManifest::load_from_toml_path()` Rust API powers both paths.
+- End-to-end Windows named-pipe IPC test (`tests/windows_ipc_tests.rs`, `#[cfg(windows)]`) mirroring the existing Unix-socket test. Closes a silent regression risk in the Windows-only `serve --socket \\.\pipe\…` code paths.
 - VitePress docs site redesigned around the "Operator" direction from Claude Design: JetBrains Mono on every chrome surface (nav, sidebar, headings, code, tables, hero, footer) with Inter retained for sustained doc prose, chartreuse (`#c6f24e`) accent, ink-on-bone (light) / bone-on-ink (dark) palette. New homepage components — Operator hero, 4-cell strip, and a `fig.01` runtime schematic SVG diagramming the nine reusable layers (caller → rpc → session → screen/transcript → matcher/action → turn → adapter). Both light and dark modes ship together; the embedded PTY frame stays dark in both modes so it always reads as a real terminal. Existing docs pages inherit the same vocabulary (numbered `01 ›` headings, chartreuse → amber code-block bar, datasheet tables).
 - Initial ptywright skeleton.
 - Minimal Rust CLI that prints help by default and supports `--version`.
 - Minimal library surface for future PTY/TUI automation abstractions.
 - Nix flake, devshell, GitHub CI, release packaging, install script, and VitePress docs.
-- Integration tests for the `claude.approve`, `claude.deny`, and `claude.cancel` JSON-RPC dispatch paths and their `InvalidParams` error responses.
 - End-to-end test that a `tracing` event with a secret-shaped structured field is masked through the full `RedactingMakeWriter` pipeline before reaching the underlying writer.
 - Unix-gated test asserting raw transcript files are created with `0o600` permissions, matching SPEC's "restrictive permissions where supported" guarantee.
 - `Action::BracketedPaste(String)` variant (and matching `action.bracketed_paste(...)` Lua host helper) for receivers that have enabled bracketed paste (Claude Code v2.1+, vim, fish, …). The Claude Code plugin's `send_prompt` uses this so a trailing Enter is interpreted as a submit instead of absorbed into the paste tokeniser.
@@ -46,4 +49,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** the typed Rust adapter shim (`ClaudeCodeAdapter`, `ClaudeCodeConfig`, `ClaudeCodeState`, `ClaudeCodeStateSnapshot`) and the entire `src/adapters/` module. Rust callers should drive plugins through `ExtensionHandle` + `LuaExtension::built_in(<name>)` and read state strings off `ExtensionStateSnapshot` directly.
 - `claude_code_manifest` is no longer part of the public library surface; use `builtin_manifests()` to enumerate registered plugins.
 
+### Security
+
+- Per-method permission gating at the JSON-RPC dispatcher. Every `adapter.*` method (except read-only registry queries `adapter.list` / `adapter.live`) consults the bound plugin manifest's declared `permissions` before invoking the handler. Method → permission mapping: `adapter.start` → `session.spawn`, `adapter.send` → `input.write`, `adapter.wait` → `matcher.wait`, `adapter.snapshot` / `adapter.state` / `adapter.inspect` → `screen.read`, `adapter.transcript` → `transcript.read`, `adapter.close` → `session.kill`. Denied calls return new JSON-RPC error code `-32004 PermissionDenied` with structured `data: { method, required_permission }`. The built-in `claude-code` manifest declares all seven permission variants so existing callers see no behaviour change.
+- New `Error::PermissionDenied { method, required }` variant in the public library surface.
+- `plugin.load` / `plugin.unload` JSON-RPC methods require the server to have been started with `--allow-plugin-load`; without it both return `-32004 PermissionDenied` with `data.reason = "server_did_not_grant_plugin_load"`. The CLI `--plugin <manifest.toml>` flag works regardless because operators load plugins at startup, which is explicitly trusted.
+
 [Unreleased]: https://github.com/utensils/ptywright/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/utensils/ptywright/releases/tag/v0.1.0

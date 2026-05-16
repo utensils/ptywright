@@ -1,0 +1,17 @@
+name = "echo"
+kind = "adapter"
+version = "0.1.0"
+runtime = "lua"
+entrypoint = "main.lua"
+permissions = [
+  "session.spawn",
+  "session.kill",
+  "screen.read",
+  "transcript.read",
+  "input.write",
+  "matcher.wait",
+]
+
+[default_target]
+program = "/bin/sh"
+args = ["-lc", "cat"]

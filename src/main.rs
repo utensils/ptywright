@@ -6,8 +6,8 @@ use std::process::ExitCode;
 mod run_terminal;
 use ptywright::{
     Config, DESCRIPTION, LogGuard, LoggingConfig, NAME, Paths, RpcServerState, TerminalSize,
-    init_for_oneshot, init_for_run, init_for_serve_socket, init_for_serve_stdio, serve_lsp,
-    serve_lsp_with_state, serve_ndjson, serve_ndjson_with_state,
+    init_for_oneshot, init_for_run, init_for_serve_socket, init_for_serve_stdio,
+    serve_lsp_with_state, serve_ndjson_with_state,
 };
 
 #[derive(Debug, Parser)]
@@ -48,6 +48,21 @@ enum Commands {
         /// JSON-RPC message framing to use.
         #[arg(long, value_enum, default_value_t = RpcFraming::Ndjson)]
         framing: RpcFraming,
+        /// Pre-load a trusted-local third-party plugin from a TOML manifest.
+        /// May be repeated to load multiple plugins. The manifest's
+        /// `entrypoint` is resolved relative to the manifest file's parent
+        /// directory. Plugins loaded this way are visible through
+        /// `adapter.list` and instantiable via `adapter.start`. Only load
+        /// plugins from trusted local sources — they execute in the same
+        /// trust domain as the built-in claude-code plugin.
+        #[arg(long = "plugin", value_name = "MANIFEST.TOML", action = clap::ArgAction::Append)]
+        plugin: Vec<PathBuf>,
+        /// Enable the `plugin.load` / `plugin.unload` JSON-RPC methods so
+        /// connected clients can register additional trusted-local plugins
+        /// at runtime. Off by default; combine with `--plugin` for
+        /// boot-time registration without runtime mutation.
+        #[arg(long)]
+        allow_plugin_load: bool,
     },
     /// Interactive REPL client for a running `ptywright serve`.
     ///
@@ -154,7 +169,15 @@ fn run() -> ptywright::Result<ExitCode> {
             stdio,
             socket,
             framing,
-        }) => serve_command(stdio, socket.as_deref(), framing),
+            plugin,
+            allow_plugin_load,
+        }) => serve_command(
+            stdio,
+            socket.as_deref(),
+            framing,
+            &plugin,
+            allow_plugin_load,
+        ),
         #[cfg(feature = "repl")]
         Some(Commands::Repl {
             socket,
@@ -323,13 +346,20 @@ fn serve_command(
     stdio: bool,
     socket: Option<&Path>,
     framing: RpcFraming,
+    plugin_paths: &[PathBuf],
+    allow_plugin_load: bool,
 ) -> ptywright::Result<ExitCode> {
+    let state = build_rpc_state(plugin_paths, allow_plugin_load)?;
     match (stdio, socket) {
         (true, None) => match framing {
-            RpcFraming::Ndjson => serve_ndjson(io::stdin().lock(), io::stdout().lock())?,
-            RpcFraming::Lsp => serve_lsp(io::stdin().lock(), io::stdout().lock())?,
+            RpcFraming::Ndjson => {
+                serve_ndjson_with_state(io::stdin().lock(), io::stdout().lock(), state)?
+            }
+            RpcFraming::Lsp => {
+                serve_lsp_with_state(io::stdin().lock(), io::stdout().lock(), state)?
+            }
         },
-        (false, Some(path)) => serve_socket(path, framing)?,
+        (false, Some(path)) => serve_socket(path, framing, state)?,
         (true, Some(_)) => {
             return Err(ptywright::Error::Rpc(
                 "serve accepts only one transport: use either --stdio or --socket".to_string(),
@@ -348,10 +378,32 @@ fn serve_command(
                 default.display()
             );
             tracing::info!(socket = %default.display(), "ptywright: serving on default socket");
-            serve_socket(&default, framing)?;
+            serve_socket(&default, framing, state)?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Construct a shared `RpcServerState`, pre-load any third-party plugins the
+/// operator passed via `--plugin <manifest.toml>`, and gate `plugin.load` /
+/// `plugin.unload` based on `--allow-plugin-load`. CLI plugin paths are
+/// trusted by virtue of being passed by the operator at server startup.
+fn build_rpc_state(
+    plugin_paths: &[PathBuf],
+    allow_plugin_load: bool,
+) -> ptywright::Result<RpcServerState> {
+    let state = RpcServerState::new();
+    for path in plugin_paths {
+        let (manifest, source) = ptywright::PluginManifest::load_from_toml_path(path)?;
+        let name = manifest.name.clone();
+        state.register_plugin(manifest, source)?;
+        tracing::info!(plugin = %name, manifest = %path.display(), "ptywright: registered plugin");
+    }
+    state.set_allow_plugin_load(allow_plugin_load);
+    if allow_plugin_load {
+        tracing::info!("ptywright: plugin.load enabled via --allow-plugin-load");
+    }
+    Ok(state)
 }
 
 /// Backing storage for the socket-cleanup signal handler. Declared at
@@ -427,7 +479,7 @@ fn install_socket_cleanup(path: &Path) {
 }
 
 #[cfg(unix)]
-fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
+fn serve_socket(path: &Path, framing: RpcFraming, state: RpcServerState) -> ptywright::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
 
@@ -444,7 +496,6 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
 
     let listener = UnixListener::bind(path)?;
     install_socket_cleanup(path);
-    let state = RpcServerState::new();
     tracing::info!(socket = %path.display(), "ptywright: listening on local socket");
     for stream in listener.incoming() {
         let stream = stream?;
@@ -464,12 +515,11 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
 }
 
 #[cfg(windows)]
-fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
+fn serve_socket(path: &Path, framing: RpcFraming, state: RpcServerState) -> ptywright::Result<()> {
     use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
 
     let name = path.as_os_str().to_fs_name::<GenericFilePath>()?;
     let listener = ListenerOptions::new().name(name).create_sync()?;
-    let state = RpcServerState::new();
     tracing::info!(socket = %path.display(), "ptywright: listening on named pipe");
     for stream in listener.incoming() {
         let stream = stream?;
@@ -489,7 +539,11 @@ fn serve_socket(path: &Path, framing: RpcFraming) -> ptywright::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn serve_socket(path: &Path, _framing: RpcFraming) -> ptywright::Result<()> {
+fn serve_socket(
+    path: &Path,
+    _framing: RpcFraming,
+    _state: RpcServerState,
+) -> ptywright::Result<()> {
     Err(ptywright::Error::Rpc(format!(
         "--socket is not supported on this platform yet (requested {})",
         path.display()

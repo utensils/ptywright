@@ -1,5 +1,7 @@
 use std::io;
 
+use crate::plugin::PluginPermission;
+
 /// ptywright result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -33,4 +35,15 @@ pub enum Error {
     /// Failed to parse the on-disk config file.
     #[error("config error: {0}")]
     Config(String),
+    /// JSON-RPC method denied because the bound plugin manifest does not
+    /// declare the required permission. Surfaced over the wire as JSON-RPC
+    /// error code `-32004`, with structured `data` carrying the method name
+    /// and the missing permission.
+    #[error("method `{method}` requires permission `{}`", required.as_str())]
+    PermissionDenied {
+        /// JSON-RPC method that was rejected.
+        method: String,
+        /// Permission the caller's plugin manifest needed to declare.
+        required: PluginPermission,
+    },
 }
