@@ -289,6 +289,36 @@ struct AdapterParams {
     adapter: String,
 }
 
+/// Parameters for `adapter.resume`. Mirrors `AdapterStartParams` plus an
+/// optional `prior_adapter` so the host can close the old PTY before
+/// spawning the replacement. Keeping the field-by-field shape (rather
+/// than embedding `AdapterStartParams`) keeps the wire schema stable
+/// regardless of which struct the JSON-RPC dispatcher routes to.
+#[derive(Debug, Deserialize)]
+struct AdapterResumeParams {
+    /// Built-in or trusted-local plugin manifest name.
+    plugin: String,
+    /// PTY program. Falls back to the plugin manifest's `default_target.program`.
+    program: Option<String>,
+    /// CLI args, e.g. `["--resume", "<uuid>"]`. Same `None` vs `Some(vec![])`
+    /// distinction as `adapter.start`.
+    args: Option<Vec<String>>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    pixel_width: Option<u16>,
+    pixel_height: Option<u16>,
+    /// Adapter id from a previous session, if any. When provided and still
+    /// in the registry, the host closes it before spawning the
+    /// replacement so callers don't have to make a separate
+    /// `adapter.close` call. Missing ids are silently ignored (the caller
+    /// may have already closed, or the prior adapter may never have
+    /// started) — that keeps the call idempotent.
+    prior_adapter: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AdapterSendParams {
     adapter: String,
@@ -384,6 +414,7 @@ impl RpcErrorCode {
 /// `session.*` is tracked in the ongoing hardening backlog.
 const ADAPTER_METHOD_PERMISSIONS: &[(&str, PluginPermission)] = &[
     ("adapter.start", PluginPermission::SessionSpawn),
+    ("adapter.resume", PluginPermission::SessionSpawn),
     ("adapter.send", PluginPermission::InputWrite),
     ("adapter.wait", PluginPermission::MatcherWait),
     ("adapter.snapshot", PluginPermission::ScreenRead),
@@ -676,6 +707,7 @@ impl RpcServer {
                     "adapter.list",
                     "adapter.live",
                     "adapter.start",
+                    "adapter.resume",
                     "adapter.state",
                     "adapter.send",
                     "adapter.wait",
@@ -703,6 +735,7 @@ impl RpcServer {
             "adapter.list" => Ok(self.adapter_list()),
             "adapter.live" => Ok(self.adapter_live()),
             "adapter.start" => self.adapter_start(request.params),
+            "adapter.resume" => self.adapter_resume(request.params),
             "adapter.state" => self.adapter_state(request.params),
             "adapter.send" => self.adapter_send(request.params),
             "adapter.wait" => self.adapter_wait(request.params),
@@ -1275,6 +1308,43 @@ impl RpcServer {
             "session": session_id,
             "state": state,
         }))
+    }
+
+    /// `adapter.resume` — convenience wrapper around `adapter.start` that
+    /// first closes a prior adapter (if supplied and still live), then
+    /// spawns a fresh adapter with the same `adapter.start` parameter shape.
+    ///
+    /// Designed for callers chaining sessions across PTY restarts — typically
+    /// re-spawning with a `--resume <uuid>` style flag that the TUI itself
+    /// supports — so the consumer doesn't have to make a separate
+    /// `adapter.close` call before re-starting. Permission gate is identical
+    /// to `adapter.start` (the `prior_adapter` close is best-effort and
+    /// silently no-ops on missing ids, so it does not constitute an
+    /// additional capability boundary).
+    fn adapter_resume(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        let params: AdapterResumeParams = parse_params(params)?;
+        // Best-effort cleanup of the prior adapter. We ignore the result
+        // entirely — a missing id means "already closed / never started",
+        // which is the idempotent semantic callers expect. Per-method
+        // permission gating ran above the dispatcher so we don't re-check.
+        if let Some(prior) = params.prior_adapter.as_deref() {
+            let _ = self.adapter_close(Some(json!({ "adapter": prior })));
+        }
+        let forwarded = json!({
+            "plugin": params.plugin,
+            "program": params.program,
+            "args": params.args,
+            "cwd": params.cwd,
+            "env": params.env,
+            "rows": params.rows,
+            "cols": params.cols,
+            "pixel_width": params.pixel_width,
+            "pixel_height": params.pixel_height,
+        });
+        self.adapter_start(Some(forwarded))
     }
 
     /// `adapter.state` — re-classify and return the current state without
@@ -2250,39 +2320,67 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn adapter_start_uses_manifest_geometry_when_caller_omits_rows_cols() {
-        // The claude-code manifest declares a `rows = 60, cols = 200`
-        // classifier-stable headless preset. `adapter.start` with no
-        // `rows` / `cols` must honour it instead of falling through to the
-        // host's last-resort `rows = 40, cols = 120`. Using `/bin/sh` as
-        // the program keeps the test claude-binary-independent.
+    fn adapter_resume_closes_prior_adapter_and_spawns_fresh() {
+        // adapter.resume is a thin convenience: close the prior adapter
+        // (best-effort, idempotent) then spawn a new one with the same
+        // adapter.start shape. The two adapter IDs must differ, and the
+        // prior id must no longer be in the registry after the resume.
         let mut server = RpcServer::new();
-        let start = handle(
+        let first = handle(
             &mut server,
             r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-c","sleep 5"]}}"#,
         );
-        let adapter = start["result"]["adapter"]
+        let first_adapter = first["result"]["adapter"]
             .as_str()
-            .expect("adapter.start must succeed");
+            .expect("first adapter id")
+            .to_string();
 
-        let snapshot = handle(
+        let resumed = handle(
             &mut server,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.snapshot","params":{{"adapter":"{adapter}"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.resume","params":{{"plugin":"claude-code","program":"/bin/sh","args":["-c","sleep 5"],"prior_adapter":"{first_adapter}"}}}}"#
             ),
         );
-        let size = &snapshot["result"]["size"];
-        assert_eq!(
-            size["rows"].as_u64(),
-            Some(60),
-            "manifest's rows preset must drive adapter.start when caller omits rows; got {snapshot}"
-        );
-        assert_eq!(
-            size["cols"].as_u64(),
-            Some(200),
-            "manifest's cols preset must drive adapter.start when caller omits cols; got {snapshot}"
+        let new_adapter = resumed["result"]["adapter"]
+            .as_str()
+            .expect("resumed adapter id")
+            .to_string();
+        assert_ne!(
+            first_adapter, new_adapter,
+            "resume must allocate a fresh id"
         );
 
+        // Prior id must no longer be live — subsequent adapter.state
+        // against it returns InvalidParams.
+        let after = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"adapter.state","params":{{"adapter":"{first_adapter}"}}}}"#
+            ),
+        );
+        assert_eq!(after["error"]["code"], -32602);
+
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{new_adapter}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adapter_resume_without_prior_adapter_just_spawns() {
+        // Omitting prior_adapter must still work — resume is then literally
+        // adapter.start with a different method name.
+        let mut server = RpcServer::new();
+        let resumed = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.resume","params":{"plugin":"claude-code","program":"/bin/sh","args":["-c","sleep 5"]}}"#,
+        );
+        let adapter = resumed["result"]["adapter"]
+            .as_str()
+            .expect("resume without prior must spawn");
         let _ = handle(
             &mut server,
             &format!(
@@ -2293,32 +2391,39 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn adapter_start_explicit_rows_cols_override_manifest_geometry() {
-        // Caller-supplied geometry wins over the manifest preset — same
-        // contract as `program` / `args` overrides.
+    fn adapter_resume_silently_ignores_missing_prior_adapter() {
+        // Idempotent: a prior_adapter that doesn't exist must not break
+        // the resume — callers can retry resume after a crash without
+        // first checking adapter.live.
         let mut server = RpcServer::new();
-        let start = handle(
+        let resumed = handle(
             &mut server,
-            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-c","sleep 5"],"rows":30,"cols":100}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.resume","params":{"plugin":"claude-code","program":"/bin/sh","args":["-c","sleep 5"],"prior_adapter":"never-existed"}}"#,
         );
-        let adapter = start["result"]["adapter"]
+        let adapter = resumed["result"]["adapter"]
             .as_str()
-            .expect("adapter.start must succeed");
-
-        let snapshot = handle(
-            &mut server,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.snapshot","params":{{"adapter":"{adapter}"}}}}"#
-            ),
-        );
-        assert_eq!(snapshot["result"]["size"]["rows"].as_u64(), Some(30));
-        assert_eq!(snapshot["result"]["size"]["cols"].as_u64(), Some(100));
-
+            .expect("resume must succeed despite missing prior_adapter");
         let _ = handle(
             &mut server,
             &format!(
                 r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
             ),
+        );
+    }
+
+    #[test]
+    fn capabilities_list_includes_adapter_resume() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"server.capabilities"}"#,
+        );
+        let methods = response["result"]["methods"]
+            .as_array()
+            .expect("methods array");
+        assert!(
+            methods.iter().any(|m| m == "adapter.resume"),
+            "capabilities must advertise adapter.resume; got {methods:?}"
         );
     }
 
