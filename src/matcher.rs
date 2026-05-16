@@ -48,8 +48,12 @@ pub struct MatchResult {
     /// not include `screen_stable`.
     pub stable_for: Duration,
     /// Structured description of the branch that satisfied the matcher.
-    /// `None` when the wait surfaced without a successful match (e.g.
-    /// `ProcessExited` short-circuit, future cancellation hooks).
+    /// [`Session::wait_for`](crate::session::Session::wait_for) only
+    /// constructs `MatchResult` on a successful match today, so this is
+    /// always `Some(_)` in practice — the `Option` wrapper keeps the field
+    /// future-proof for cancellation hooks that might surface a non-match
+    /// `MatchResult` (e.g. on timeout) without requiring a wire schema
+    /// migration.
     pub outcome: Option<MatchOutcome>,
 }
 
@@ -190,18 +194,39 @@ pub enum Matcher {
 impl Matcher {
     /// Evaluate this matcher against a screen snapshot and transcript text.
     pub fn is_match(&self, snapshot: &ScreenSnapshot, transcript: &str) -> bool {
-        self.describe_match(snapshot, transcript).is_some()
+        self.is_match_with_context(snapshot, transcript, MatcherContext::stateless())
     }
 
     /// Evaluate this matcher with temporal/lifecycle context.
+    ///
+    /// Uses an allocation-free fast path so callers that only need a
+    /// boolean check (the common case for [`Session::wait_for`] inner
+    /// polling) don't pay the per-iteration cost of building a
+    /// [`MatchOutcome`] — that work happens once at success time through
+    /// [`Matcher::describe_match_with_context`] instead.
     pub fn is_match_with_context(
         &self,
         snapshot: &ScreenSnapshot,
         transcript: &str,
         context: MatcherContext,
     ) -> bool {
-        self.describe_match_with_context(snapshot, transcript, context)
-            .is_some()
+        match self {
+            Self::ContainsText(text) => snapshot.plain_text.contains(text),
+            Self::ScreenRegex(pattern) => cached_regex_is_match(pattern, &snapshot.plain_text),
+            Self::TranscriptContains(text) => transcript.contains(text),
+            Self::TranscriptRegex(pattern) => cached_regex_is_match(pattern, transcript),
+            Self::CursorAt { row, col } => {
+                snapshot.cursor.row == *row && snapshot.cursor.col == *col
+            }
+            Self::ScreenStable { min_ms } => context.stable_for >= Duration::from_millis(*min_ms),
+            Self::ProcessExited => context.process_exited,
+            Self::Any(matchers) => matchers
+                .iter()
+                .any(|matcher| matcher.is_match_with_context(snapshot, transcript, context)),
+            Self::All(matchers) => matchers
+                .iter()
+                .all(|matcher| matcher.is_match_with_context(snapshot, transcript, context)),
+        }
     }
 
     /// Like [`Matcher::is_match`] but returns a structured
@@ -290,11 +315,16 @@ impl Matcher {
     }
 }
 
+/// Allocation-free boolean check used by [`Matcher::is_match_with_context`]
+/// to keep the polling path cheap when no outcome metadata is needed.
+fn cached_regex_is_match(pattern: &str, text: &str) -> bool {
+    with_cached_regex(pattern, |regex| regex.is_match(text))
+}
+
 /// Return the matching slice (first capture group when one is declared,
 /// otherwise the whole match) when `pattern` matches `text`. Shares the regex
-/// cache with [`Matcher::is_match_with_context`]'s underlying compiled regex
-/// pool so callers paying for a structured outcome don't double-compile the
-/// pattern.
+/// cache with [`cached_regex_is_match`] so callers paying for a structured
+/// outcome don't double-compile the pattern.
 fn cached_regex_capture(pattern: &str, text: &str) -> Option<Option<String>> {
     with_cached_regex(pattern, |regex| {
         regex.captures(text).map(|captures| {
@@ -306,8 +336,9 @@ fn cached_regex_capture(pattern: &str, text: &str) -> Option<Option<String>> {
 
 /// Shared cache front-end: compile-on-first-use, evict on overflow, then run
 /// the caller's reader against the cached regex (or against the absence of one
-/// if compilation failed). Centralises the lock and the cap so the two cached
-/// entry points cannot drift.
+/// if compilation failed). Centralises the lock and the cap so
+/// [`cached_regex_is_match`] (the allocation-free boolean fast path) and
+/// [`cached_regex_capture`] (the structured-outcome path) cannot drift.
 fn with_cached_regex<T: Default, F>(pattern: &str, f: F) -> T
 where
     F: FnOnce(&Regex) -> T,

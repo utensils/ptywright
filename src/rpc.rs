@@ -1319,14 +1319,14 @@ impl RpcServer {
             .handle
             .wait(&intent, params.params, timeout)
             .map_err(rpc_error_from_error)?;
-        let mut response = json!({ "state": state });
-        if let Some(outcome) = outcome {
-            response
-                .as_object_mut()
-                .expect("response object")
-                .insert("matched".to_string(), json!(outcome));
-        }
-        Ok(response)
+        // Always emit `matched` so consumers don't have to branch on key
+        // presence. Today every successful wait carries a `Some(outcome)`;
+        // `null` is reserved for future paths (e.g. cancellation hooks)
+        // that surface a `MatchResult` without a satisfying branch.
+        Ok(json!({
+            "state": state,
+            "matched": outcome,
+        }))
     }
 
     /// `adapter.snapshot` — passthrough to the adapter's underlying session
