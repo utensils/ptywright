@@ -231,6 +231,52 @@ local function parse_usage_screen(text)
   return { usage = usage }
 end
 
+-- Parse the bottom status-bar text into the structured `status` table the
+-- host exposes on `ExtensionStateSnapshot::metadata`. Claude Code renders
+-- the active model inside square brackets (`[Haiku 4.5]`) plus a
+-- permission-mode hint (`⏵⏵ bypass permissions on`, `⏵⏵ auto mode on`,
+-- `⏵⏵ plan mode on`, …). Every field is best-effort; the host omits keys
+-- that didn't match. Returns nil only when no fields parsed at all so
+-- callers don't have to special-case an empty table.
+local function parse_status_bar(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local status = {}
+  local model = text:match("%[([^%]]+)%]")
+  if model then
+    status.model = trim(model)
+  end
+  local lowered = lower(text)
+  if contains(lowered, "bypass permissions on") then
+    status.permission_mode = "bypass"
+  elseif contains(lowered, "auto mode on") then
+    status.permission_mode = "auto"
+  elseif contains(lowered, "plan mode on") then
+    status.permission_mode = "plan"
+  end
+  if next(status) == nil then
+    return nil
+  end
+  return { status = status }
+end
+
+-- Merge two metadata tables (either may be nil). Plain shallow merge —
+-- callers structure their metadata under disjoint top-level keys (`usage`,
+-- `status`, `permission`, …) so a deep merge is unnecessary.
+local function merge_metadata(a, b)
+  if a == nil then
+    return b
+  end
+  if b == nil then
+    return a
+  end
+  for key, value in pairs(b) do
+    a[key] = value
+  end
+  return a
+end
+
 local function has_welcome_screen(text)
   -- Claude Code's first-launch welcome panel renders after the workspace
   -- trust dialog is accepted. It shows "Welcome back <user>!" alongside a
@@ -263,6 +309,23 @@ function M.classify(input)
   local body_text = lower(body)
   local screen_text = lower(screen)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
+
+  -- Parse the bottom status-bar text once and merge it into every branch's
+  -- return. Shadowing the module-level `state_snapshot` keeps each branch
+  -- one-liner without having to thread `status_metadata` through 13 call
+  -- sites. Branches that already attach their own metadata (the
+  -- `completed_turn` usage screen) get a shallow merge with status on top.
+  local outer_state_snapshot = state_snapshot
+  local status_metadata = parse_status_bar(status)
+  local function state_snapshot(state, confidence, evidence, seq, metadata)
+    return outer_state_snapshot(
+      state,
+      confidence,
+      evidence,
+      seq,
+      merge_metadata(status_metadata, metadata)
+    )
+  end
 
   if trim(text) == "" then
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
