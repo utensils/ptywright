@@ -41,8 +41,16 @@ pub const STATUS_BAR_ROWS: usize = 3;
 ///
 /// `#[non_exhaustive]` is set so future plugin-driven additions (richer
 /// candidate metadata, classifier latency, …) can land without
-/// source-breaking downstream Rust callers — construct via the public
-/// builders or struct-update syntax (`..Default::default()`).
+/// source-breaking downstream Rust callers. From outside the crate, build
+/// via [`ExtensionStateSnapshot::new`] (which seeds the required `state` /
+/// `sequence` fields and leaves the rest at sensible defaults) and then
+/// assign whichever public fields you want to override:
+///
+/// ```ignore
+/// let mut snap = ExtensionStateSnapshot::new("ready", 42);
+/// snap.confidence = 0.95;
+/// snap.evidence = "ready prompt visible".into();
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ExtensionStateSnapshot {
@@ -69,6 +77,26 @@ pub struct ExtensionStateSnapshot {
     /// "no metadata" case stays cheap to render.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+}
+
+impl ExtensionStateSnapshot {
+    /// Construct a snapshot with the required `state` label and observed
+    /// `sequence`. All other public fields land at their defaults (zero
+    /// confidence, empty evidence, empty candidates, no metadata) — set
+    /// them by assigning the public fields after construction. The struct
+    /// is `#[non_exhaustive]` so this constructor is the only way to
+    /// build one from outside the crate.
+    #[must_use]
+    pub fn new(state: impl Into<String>, sequence: u64) -> Self {
+        Self {
+            state: state.into(),
+            confidence: 0.0,
+            evidence: String::new(),
+            sequence,
+            candidates: Vec::new(),
+            metadata: None,
+        }
+    }
 }
 
 /// Runner-up classification produced alongside the primary `state`.
@@ -675,6 +703,28 @@ mod tests {
         assert!(
             !wire.contains("0.62000000"),
             "f32 noise leaked through: {wire}",
+        );
+    }
+
+    #[test]
+    fn metadata_field_is_omitted_from_wire_when_none() {
+        // The `metadata` field is opt-in plugin sugar; when a classifier
+        // doesn't attach anything the JSON-RPC wire must NOT carry a
+        // `"metadata": null` key. Catches a future change that flips the
+        // skip_serializing_if attribute or drops the Option wrapper.
+        let snapshot = ExtensionStateSnapshot::new("ready", 7);
+        let wire = serde_json::to_string(&snapshot).expect("serialize");
+        assert!(
+            !wire.contains("metadata"),
+            "`metadata: None` must not appear on the wire; got: {wire}",
+        );
+
+        let mut with_metadata = snapshot.clone();
+        with_metadata.metadata = Some(serde_json::json!({"usage": {"cost_usd": 0.12}}));
+        let wire = serde_json::to_string(&with_metadata).expect("serialize");
+        assert!(
+            wire.contains("\"metadata\":{\"usage\":{\"cost_usd\":0.12}}"),
+            "metadata must serialize verbatim when Some; got: {wire}",
         );
     }
 
