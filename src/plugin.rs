@@ -82,10 +82,15 @@ impl PluginPermission {
 /// They matter for TUI plugins whose classifier behaviour depends on line
 /// wrapping (claude-code, for instance, parses status bars and prompt
 /// glyphs whose visual location shifts with the column count). A
-/// classifier-stable preset is strongly preferred to whatever the host
-/// happens to default to (`80x24`), so plugins that have one should
+/// classifier-stable preset is strongly preferred to the host's last-resort
+/// fallback (`rows = 40, cols = 120`), so plugins that have one should
 /// declare it.
+///
+/// `#[non_exhaustive]` is set so future additions (pixel hints, env hints,
+/// `cwd`) can land without source-breaking downstream callers — construct
+/// via the public constructors or struct-update syntax (`..Default::default()`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DefaultTarget {
     /// PTY program to spawn when the caller does not specify one.
     pub program: String,

@@ -1229,11 +1229,12 @@ impl RpcServer {
                 .unwrap_or_default()
         });
         // Geometry resolution order: explicit caller value, then manifest's
-        // declared headless preset, then the host's last-resort `40x120`.
-        // The manifest preset matters for TUI plugins whose classifier
-        // depends on line wrapping (claude-code in particular renders
-        // status-bar / prompt anchors at column-sensitive positions and
-        // ships a 200x60 preset for that reason).
+        // declared headless preset, then the host's last-resort
+        // `rows = 40, cols = 120`. The manifest preset matters for TUI
+        // plugins whose classifier depends on line wrapping (claude-code in
+        // particular renders status-bar / prompt anchors at column-sensitive
+        // positions and ships a `rows = 60, cols = 200` preset for that
+        // reason).
         let manifest_rows = manifest_default.as_ref().and_then(|t| t.rows);
         let manifest_cols = manifest_default.as_ref().and_then(|t| t.cols);
         let size = TerminalSize {
@@ -2250,11 +2251,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn adapter_start_uses_manifest_geometry_when_caller_omits_rows_cols() {
-        // The claude-code manifest declares a 200x60 classifier-stable
-        // headless preset. `adapter.start` with no `rows` / `cols` must
-        // honour it instead of falling through to the host's last-resort
-        // 40x120. Using `/bin/sh` as the program keeps the test
-        // claude-binary-independent.
+        // The claude-code manifest declares a `rows = 60, cols = 200`
+        // classifier-stable headless preset. `adapter.start` with no
+        // `rows` / `cols` must honour it instead of falling through to the
+        // host's last-resort `rows = 40, cols = 120`. Using `/bin/sh` as
+        // the program keeps the test claude-binary-independent.
         let mut server = RpcServer::new();
         let start = handle(
             &mut server,
