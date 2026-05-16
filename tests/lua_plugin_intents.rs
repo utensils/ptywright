@@ -61,6 +61,36 @@ fn wait_matcher(extension: &LuaExtension, intent: &str, params: serde_json::Valu
 }
 
 #[test]
+fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
+    // Mid-turn steering injects a follow-up prompt while Claude is still
+    // thinking. The action shape is identical to `send_prompt` (bracketed
+    // paste + Enter) but `last_intent` MUST NOT flip to `prompt_submitted`
+    // — that's the marker the classifier uses to decide a `completed_turn`
+    // can fire when the screen settles. Treating steering as the first
+    // half of a fresh turn would cause `adapter.wait` to mistake a
+    // stable-thinking screen for "turn complete" the moment Claude is
+    // just slow on the original turn.
+    let extension = claude_plugin();
+    let plan = plan(
+        &extension,
+        "steer",
+        json!({ "prompt": "actually use /tmp" }),
+    );
+
+    assert_eq!(
+        plan.actions,
+        vec![
+            Action::BracketedPaste("actually use /tmp".to_string()),
+            Action::Key(Key::Enter),
+        ]
+    );
+    assert!(
+        plan.last_intent.is_none(),
+        "steer is mid-turn — last_intent must not flip to prompt_submitted"
+    );
+}
+
+#[test]
 fn send_prompt_plan_uses_bracketed_paste_and_sets_intent() {
     // Claude Code v2.1+ enables bracketed paste; the plan must use the
     // bracketed variant so the trailing Enter is not absorbed into the

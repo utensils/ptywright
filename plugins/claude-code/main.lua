@@ -334,6 +334,23 @@ function M.wait_cancel_settled_matcher(input)
   return matcher.screen_stable(completed_turn_stable_ms)
 end
 
+-- Mid-turn steering: inject an additional prompt while Claude is still
+-- working on the previous turn. Same action shape as `send_prompt`
+-- (bracketed paste + Enter) but deliberately leaves `last_intent` alone
+-- so the classifier's `completed_turn` gate keeps waiting for the
+-- original turn to actually finish. Otherwise a mid-turn stable screen
+-- (Claude paused before another tool call) would look like "turn done"
+-- to `wait_turn_matcher`.
+function M.steer(input)
+  return {
+    actions = {
+      action.bracketed_paste(input.prompt or ""),
+      action.key("enter"),
+    },
+  }
+end
+
+
 function M.wait_turn_matcher(input)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
   -- Boundary anchors: any single one of these is enough to wake the wait.
