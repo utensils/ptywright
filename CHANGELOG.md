@@ -8,17 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.1.1] - 2026-05-15
 
-### Fixed
-
-- Re-publish the full v0.1.0 crate to crates.io. The `ptywright 0.1.0`
-  uploaded on 2026-05-14 was an early-skeleton snapshot (36 files,
-  ~40 KB) predating the JSON-RPC server, REPL client, Extension trait,
-  Lua plugin runtime, and most of the integration tests. It has been
-  yanked. Use `0.1.1` or newer. `cargo install ptywright` without a
-  `--version` pin will pick the unyanked release automatically; pinned
-  installs of `0.1.0` will see a yank warning from cargo.
-
-## [0.1.0] - 2026-05-15
+Initial public release. (`0.1.0` on crates.io was an accidental early-skeleton publish and has been yanked — `cargo install ptywright` resolves to `0.1.1`.)
 
 ### Added
 
@@ -73,4 +63,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 [Unreleased]: https://github.com/utensils/ptywright/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/utensils/ptywright/releases/tag/v0.1.1
-[0.1.0]: https://github.com/utensils/ptywright/releases/tag/v0.1.0
