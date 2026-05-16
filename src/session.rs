@@ -12,7 +12,7 @@ use crate::matcher::{MatchResult, Matcher, MatcherContext};
 use crate::redaction::RedactionPolicy;
 use crate::screen::{ScreenSnapshot, Terminal};
 use crate::target::{Target, TerminalSize};
-use crate::transcript::{Transcript, TranscriptConfig};
+use crate::transcript::{Transcript, TranscriptConfig, TranscriptDelta};
 
 /// Configuration for a PTY-backed session.
 #[derive(Debug, Clone)]
@@ -158,6 +158,46 @@ impl Session {
     #[must_use]
     pub fn redacted_transcript(&self, policy: &RedactionPolicy) -> String {
         policy.redact(&self.transcript())
+    }
+
+    /// Total chars ever appended to this session's transcript. Survives
+    /// ring-buffer evictions so subscribers can seed a stable cursor when
+    /// they first subscribe — pairs with [`Session::transcript_delta_since`].
+    #[must_use]
+    pub fn transcript_chars_written(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .chars_written()
+    }
+
+    /// Newly-appended transcript text since `cursor`. Useful for streaming
+    /// `session.output` notifications — see `RpcServer::poll_notifications`.
+    /// The returned cursor advances even when the bounded buffer evicted part
+    /// of the unseen range; the `dropped` flag reports the loss.
+    #[must_use]
+    pub fn transcript_delta_since(&self, cursor: u64) -> TranscriptDelta {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .delta_since(cursor)
+    }
+
+    /// Redacted variant of [`Session::transcript_delta_since`]. Applies the
+    /// policy to the delta only — the underlying cursor advances normally.
+    #[must_use]
+    pub fn redacted_transcript_delta_since(
+        &self,
+        cursor: u64,
+        policy: &RedactionPolicy,
+    ) -> TranscriptDelta {
+        let mut delta = self.transcript_delta_since(cursor);
+        delta.text = policy.redact(&delta.text);
+        delta
     }
 
     /// Send an action to the session.
