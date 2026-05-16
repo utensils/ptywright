@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Added
 
 - `session.output` JSON-RPC notification carrying newly-appended transcript text (default-redacted) plus the sequence number. Fires from the same poll as `session.changed` whenever new output reaches the bounded transcript. Each connection keeps an independent cursor into the transcript's monotonic `chars_written` counter; if a slow subscriber falls behind the ring buffer's retention window, the next emitted notification carries the surviving tail and an explicit `dropped: true` flag. `server.capabilities` advertises `session.output` alongside `session.changed` / `session.exited`. New `Transcript::delta_since(cursor)` / `Session::transcript_delta_since(cursor)` / `Session::redacted_transcript_delta_since(cursor, policy)` powers the same delta access from Rust.
@@ -14,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `DefaultTarget` gained optional `rows` / `cols` fields so plugins can declare a classifier-stable headless terminal size. `adapter.start` falls back to the manifest preset when callers omit geometry, ahead of the host's last-resort `rows = 40, cols = 120`. The built-in `claude-code` plugin now ships a **`rows = 60, cols = 200`** preset wide enough to keep the status bar, prompt glyphs (`❯` / `>`), the "Total cost: …" usage screen, and the longest tool-use status lines off the wrap line. Caller-supplied `rows` / `cols` still win over the manifest preset.
 - `DefaultTarget` is now marked `#[non_exhaustive]` so future field additions (pixel hints, env hints, `cwd`) no longer source-break downstream Rust callers. A new `DefaultTarget::new(program)` constructor seeds the required field and leaves the rest at their defaults; external callers then assign the public optional fields directly (`target.args = …; target.rows = Some(60);`). Struct literals from outside the crate no longer compile against `DefaultTarget`. JSON/TOML representation is unchanged.
 - New `adapter.resume` JSON-RPC method: convenience wrapper that takes the same parameters as `adapter.start` plus an optional `prior_adapter` id. When `prior_adapter` is supplied and still live, the host closes it before spawning the replacement so callers chaining sessions across PTY restarts (typically re-spawning with a `--resume <uuid>` style flag the TUI itself supports) don't have to make a separate `adapter.close`. Missing prior ids are silently ignored, keeping retries idempotent. Permission gate is `session.spawn` — identical to `adapter.start`.
+- `claude-code` plugin exposes a new `steer` intent for mid-turn prompt injection. Same action shape as `send_prompt` (bracketed paste + Enter) but does NOT flip `last_intent` to `prompt_submitted`, so the classifier's `completed_turn` gate keeps waiting for the original turn to actually finish rather than mistaking a mid-turn stable screen for "turn complete". Verify against a recent Claude Code build before relying on it — the mid-turn input affordance is not version-stable.
 
 ### Changed
 
