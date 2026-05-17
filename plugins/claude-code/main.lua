@@ -913,9 +913,16 @@ function M.dismiss_welcome(_input)
 end
 
 function M.cancel(_input)
+  -- Claude Code 2.1.x captures Escape as the mid-turn interrupt key —
+  -- the active-work indicator literally renders "esc to interrupt".
+  -- Ctrl-C is reserved for a different role at idle (one press warns,
+  -- two presses exit Claude entirely), so sending it mid-turn would
+  -- either be ignored or trigger Claude's exit confirmation flow
+  -- instead of cancelling the current turn cleanly. `action.key`
+  -- with the "escape" alias is what the active-work hint maps to.
   return {
     actions = {
-      action.interrupt(),
+      action.key("escape"),
     },
     last_intent = "cancelling",
   }

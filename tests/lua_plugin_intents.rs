@@ -233,11 +233,16 @@ fn send_prompt_refuses_empty_input_and_leaves_intent_unset() {
 }
 
 #[test]
-fn cancel_plan_emits_interrupt_and_marks_cancelling_intent() {
+fn cancel_plan_emits_escape_and_marks_cancelling_intent() {
+    // Claude Code 2.1.x captures Escape as the mid-turn interrupt key
+    // (the active-work indicator literally renders "esc to interrupt").
+    // Sending Ctrl-C here used to either be ignored mid-turn or trigger
+    // Claude's idle exit-confirmation flow instead of cancelling the
+    // current turn.
     let extension = claude_plugin();
     let plan = plan(&extension, "cancel", json!({}));
 
-    assert_eq!(plan.actions, vec![Action::Interrupt]);
+    assert_eq!(plan.actions, vec![Action::Key(Key::Escape)]);
     assert_eq!(plan.last_intent.as_deref(), Some("cancelling"));
 }
 
