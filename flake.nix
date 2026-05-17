@@ -112,10 +112,7 @@
           };
 
           devshells.default = {
-            motd = ''
-              {202}ptywright{reset} — drive interactive terminal applications through PTYs ({bold}${system}{reset})
-              $(type menu &>/dev/null && menu)
-            '';
+            motd = ''$(if [ -z "''${DIRENV_IN_ENVRC:-}" ]; then printf '{202}ptywright{reset} — drive interactive terminal applications through PTYs ({bold}${system}{reset})\n\n'; type menu &>/dev/null && menu; fi)'';
 
             packages = [
               rustToolchain
@@ -230,15 +227,23 @@
                 help = "drive Claude Code through ptywright and stream the response (e.g. claude-stream 'summarize CHANGELOG.md')";
                 command = ''
                   set -euo pipefail
-                  # Prefer an already-built release binary; fall back to a
-                  # debug build through `cargo run` so the devshell user
-                  # doesn't have to remember to `build-release` first.
-                  if [ -x "$PRJ_ROOT/target/release/ptywright" ]; then
+
+                  ptywright_sources_newer_than() {
+                    local bin="$1"
+                    [ -x "$bin" ] || return 0
+                    find "$PRJ_ROOT/Cargo.toml" \
+                         "$PRJ_ROOT/Cargo.lock" \
+                         "$PRJ_ROOT/src" \
+                         "$PRJ_ROOT/plugins" \
+                         -newer "$bin" -print -quit | grep -q .
+                  }
+
+                  if [ -x "$PRJ_ROOT/target/release/ptywright" ] && ! ptywright_sources_newer_than "$PRJ_ROOT/target/release/ptywright"; then
                     export PTYWRIGHT_BIN="$PRJ_ROOT/target/release/ptywright"
-                  elif [ -x "$PRJ_ROOT/target/debug/ptywright" ]; then
+                  elif [ -x "$PRJ_ROOT/target/debug/ptywright" ] && ! ptywright_sources_newer_than "$PRJ_ROOT/target/debug/ptywright"; then
                     export PTYWRIGHT_BIN="$PRJ_ROOT/target/debug/ptywright"
                   else
-                    echo "claude-stream: no ptywright binary found; building debug..." >&2
+                    echo "claude-stream: ptywright binary is missing or stale; building debug..." >&2
                     cargo build --quiet >&2
                     export PTYWRIGHT_BIN="$PRJ_ROOT/target/debug/ptywright"
                   fi

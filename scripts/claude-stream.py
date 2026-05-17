@@ -41,6 +41,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -502,6 +503,12 @@ def main() -> int:
     client = Client(bin_path, log_level=os.environ.get("PTYWRIGHT_LOG", "warn"))
     stream: Stream | None = None
     aid: str | None = None
+    direnv_config = tempfile.TemporaryDirectory(prefix="claude-stream-direnv-")
+    direnv_config_path = Path(direnv_config.name)
+    (direnv_config_path / "direnv.toml").write_text(
+        'log_filter = "^$"\nhide_env_diff = true\n',
+        encoding="utf-8",
+    )
 
     # SIGINT handler — terminate the server subprocess and let the main
     # thread perform RPC cleanup outside the signal context. Doing RPC
@@ -531,7 +538,11 @@ def main() -> int:
     try:
         client.rpc("server.set_notifications", {"enabled": True})
 
-        start_params: dict = {"plugin": "claude-code", "cwd": args.cwd}
+        start_params: dict = {
+            "plugin": "claude-code",
+            "cwd": args.cwd,
+            "env": {"DIRENV_CONFIG": str(direnv_config_path)},
+        }
         if args.model:
             start_params["args"] = ["--model", args.model]
         start = client.rpc("adapter.start", start_params, t=15.0)
@@ -577,6 +588,7 @@ def main() -> int:
 
     finally:
         client.close()
+        direnv_config.cleanup()
 
 if __name__ == "__main__":
     sys.exit(main())

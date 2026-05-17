@@ -690,6 +690,22 @@ fn classifier_completed_turn_paths() {
         preamble.state, "completed_turn",
         "preamble (bullet + empty prompt but no ✻ marker) must not fire completed_turn"
     );
+
+    // (e) Same regression with Claude's tool-progress row visible. This is
+    // the exact shape observed from claude-stream before it exited early:
+    // a preamble bullet, "Reading 1 file...", and an empty prompt row, but
+    // still no TUI completion marker.
+    let preamble_with_tool_progress = classify_state(
+        &extension,
+        "⏺ I'll read through the key files in this project to give you a comprehensive summary.\n  Reading 1 file... (ctrl+o to expand)\n\n>",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        preamble_with_tool_progress.state, "completed_turn",
+        "preamble with tool progress but no ✻ marker must not fire completed_turn"
+    );
 }
 
 #[test]
