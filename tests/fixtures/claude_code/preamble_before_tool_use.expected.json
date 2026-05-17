@@ -1,6 +1,6 @@
 {
-  "state": "waiting_for_user_input",
-  "evidence": "input prompt glyph detected",
+  "state": "thinking",
+  "evidence": "turn in flight; no completion marker on screen",
   "last_intent": "prompt_submitted",
   "min_confidence": 0.6
 }

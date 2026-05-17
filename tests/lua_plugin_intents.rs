@@ -772,6 +772,71 @@ fn classifier_completed_turn_paths() {
     );
 }
 
+/// When a turn is in flight (`last_intent == "prompt_submitted"`) and no
+/// completion marker is on screen yet, the classifier must return
+/// `thinking` regardless of whether the active-work indicator is visible
+/// on this particular frame. Without this branch, the classifier
+/// oscillates between `thinking` (spinner glyph captured) and
+/// `waiting_for_user_input` (between spinner repaints — the submitted
+/// prompt is still visible so `has_input_prompt` keeps returning true)
+/// on every polling tick, which makes downstream consumers see spurious
+/// state churn. The fix is timing-independent: the completion marker
+/// (`✻ <Verb> for <duration>`) is the TUI's structural end-of-turn
+/// signal, so its absence is the durable mid-turn signal.
+#[test]
+fn classifier_returns_thinking_mid_turn_even_between_spinner_frames() {
+    let extension = claude_plugin();
+
+    // The submitted prompt is still visible on screen, and the spinner
+    // happens to be between repaints this tick. Pre-fix, this classified
+    // as `waiting_for_user_input`. Post-fix, `thinking`.
+    let between_spinner_frames = classify_state(
+        &extension,
+        "❯ Read all files in this project and summarize it.\n\n⏺ I'll explore the project structure.\n\n>",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        between_spinner_frames.state, "thinking",
+        "mid-turn frames without the completion marker must stay on `thinking` instead of flipping to `waiting_for_user_input`"
+    );
+    assert_eq!(
+        between_spinner_frames.evidence,
+        "turn in flight; no completion marker on screen"
+    );
+
+    // The spinner-visible frame must still resolve via the higher-confidence
+    // active-work branch, not the mid-turn fallback.
+    let spinner_visible = classify_state(
+        &extension,
+        "❯ Read all files in this project and summarize it.\n\n✶ Razzle-dazzling…\n\n>",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(spinner_visible.state, "thinking");
+    assert_eq!(spinner_visible.evidence, "active work indicator detected");
+    assert!(
+        spinner_visible.confidence > between_spinner_frames.confidence,
+        "active-work branch should win on confidence when the spinner IS visible"
+    );
+
+    // Once the completion marker lands, the mid-turn branch must release
+    // so completed_turn can fire.
+    let post_completion = classify_state(
+        &extension,
+        "❯ Read all files in this project and summarize it.\n\n⏺ Done.\n\n✻ Brewed for 5s\n\n>",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        post_completion.state, "completed_turn",
+        "mid-turn branch must release once the completion marker is on screen"
+    );
+}
+
 #[test]
 fn classifier_prefers_active_work_over_prompt_glyph() {
     let extension = claude_plugin();

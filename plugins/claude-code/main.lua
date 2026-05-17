@@ -650,6 +650,32 @@ function M.classify(input)
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
   end
 
+  -- Mid-turn determinism — when a turn is in flight (`prompt_submitted`)
+  -- and no completion marker is on screen yet, classify as `thinking`
+  -- regardless of whether the active-work indicator happens to be visible
+  -- on this particular frame. Without this branch the classifier
+  -- oscillates between `thinking` (spinner glyph captured) and
+  -- `waiting_for_user_input` (between spinner repaints — the submitted
+  -- prompt is still visible so `has_input_prompt` keeps returning true)
+  -- on every polling tick, which makes downstream consumers (the
+  -- `claude-stream` body diff loop, anything driving `adapter.state` on a
+  -- heartbeat) see spurious state churn. The completion marker
+  -- (`✻ <Verb> for <duration>`) is the TUI's structural end-of-turn
+  -- signal, so its absence is the durable mid-turn signal: any screen
+  -- where it isn't present yet is by definition still mid-turn.
+  --
+  -- This branch deliberately runs after the active-work-indicator
+  -- branch above so that branch's higher 0.76 confidence wins when the
+  -- spinner IS visible; this fallback fires only between repaints.
+  if last_intent == "prompt_submitted" and not has_turn_completion_marker(screen) then
+    return state_snapshot(
+      "thinking",
+      0.6,
+      "turn in flight; no completion marker on screen",
+      sequence
+    )
+  end
+
   -- Poll-path completed_turn — fires when adapter.state polling sees
   -- the "Claude is back at idle after answering" pattern: input
   -- prompt visible + tea-verb completion marker on screen + no active
