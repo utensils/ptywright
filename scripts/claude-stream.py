@@ -210,6 +210,11 @@ def _normalize_for_dedup(line: str) -> str:
 class Stream:
     """Robust Claude Code streaming driver — TUI-version-agnostic."""
 
+    SUCCESS_STATE = "completed_turn"
+    # Any of these end the stream. Only SUCCESS_STATE is a clean exit;
+    # `error` / `exited` / `plugin_error` are failure terminations and
+    # must return a non-zero exit code so CI / callers don't treat
+    # them as success.
     TERMINAL_STATES = {"completed_turn", "error", "exited", "plugin_error"}
 
     def __init__(self, client: Client, aid: str, args: argparse.Namespace,
@@ -440,8 +445,12 @@ class Stream:
             if state in self.TERMINAL_STATES:
                 self._clear_alive()
                 grew_by = max(0, len(body) - baseline_len)
-                emit(GREEN(f"✓ {state}"), DIM(f"(+{grew_by} chars in body)"))
-                return 0
+                if state == self.SUCCESS_STATE:
+                    emit(GREEN(f"✓ {state}"), DIM(f"(+{grew_by} chars in body)"))
+                    return 0
+                # error / exited / plugin_error → failure exit.
+                emit(RED(f"✗ {state}"), DIM(f"(+{grew_by} chars in body)"))
+                return 1
 
             self._tick_alive(prefix=f"{state}")
             time.sleep(self.heartbeat)
@@ -484,19 +493,27 @@ def main() -> int:
     stream: Stream | None = None
     aid: str | None = None
 
-    # SIGINT handler — close the adapter politely, kill the server, then exit.
+    # SIGINT handler — terminate the server subprocess and let the main
+    # thread perform RPC cleanup outside the signal context. Doing RPC
+    # from the handler itself risks deadlocking on Client.lock: the
+    # handler runs on the main thread, and if SIGINT happens to be
+    # delivered while the main thread is inside `with self.lock:` in
+    # Client.rpc, re-acquiring the (non-reentrant) lock from the handler
+    # would block forever.
+    #
+    # Terminating the server subprocess breaks any blocking rpc() call
+    # in the main thread (the reader thread sets `_dead = True` when
+    # stdout closes; the next rpc() raises RuntimeError, which the
+    # stream loop already handles by returning 1; main()'s try/finally
+    # then runs the actual cleanup with the lock held normally).
     interrupted = {"flag": False}
     def on_sigint(_signum, _frame):
         if interrupted["flag"]:
             os._exit(130)  # second Ctrl+C → hard exit, no cleanup
         interrupted["flag"] = True
-        sys.stderr.write(f"\n{YELLOW('⏸ Ctrl+C — closing adapter cleanly (Ctrl+C again to force)')}\n")
-        if stream:
-            try: stream.close()
-            except Exception: pass
-        try: client.close()
+        sys.stderr.write(f"\n{YELLOW('⏸ Ctrl+C — terminating ptywright (Ctrl+C again to force)')}\n")
+        try: client.proc.terminate()
         except Exception: pass
-        sys.exit(130)
     signal.signal(signal.SIGINT, on_sigint)
 
     hard_deadline = time.monotonic() + args.timeout
