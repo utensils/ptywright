@@ -173,7 +173,7 @@
               {
                 category = "check";
                 name = "run-tests";
-                help = "cargo test + claude-stream pytest suite (matches CI)";
+                help = "cargo test + claude-stream unittest suite (matches CI)";
                 command = ''
                   set -euo pipefail
                   cargo test --features _test-fixtures "$@"
@@ -191,8 +191,8 @@
                   cargo clippy -- -D warnings
                   cargo test --features _test-fixtures
                   cargo build --release
-                  # claude-stream pytest suite (stdlib-only `unittest`, so
-                  # no extra Python deps). Covers chrome filtering,
+                  # claude-stream unittest suite (stdlib-only, so no
+                  # extra Python deps). Covers chrome filtering,
                   # answer-region fallback, terminal-state taxonomy, and
                   # Client JSON-RPC framing — the script-side contracts
                   # that determine whether the streaming output is

@@ -529,10 +529,12 @@ fn key_intent_covers_every_rust_key_variant() {
         Key::PageUp,
         Key::PageDown,
         Key::Insert,
-        // Ctrl combos (ctrl_h / ctrl_i / ctrl_j / ctrl_m are deliberately
-        // absent from KEY_ALIASES — use backspace / tab / enter so
-        // transcripts stay readable. The serde form for those still
-        // exists in the Rust enum but is not exercised here).
+        // Ctrl combos. Note that `ctrl_h` / `ctrl_i` / `ctrl_j` / `ctrl_m`
+        // are NOT defined as variants in `Key` — those control codes
+        // are intentionally represented by the semantic aliases
+        // (`backspace` / `tab` / `enter`) so transcripts stay readable
+        // and the alias table doesn't carry two equivalent names for
+        // the same wire byte.
         Key::CtrlA,
         Key::CtrlB,
         Key::CtrlC,

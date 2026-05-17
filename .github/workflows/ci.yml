@@ -80,8 +80,8 @@ jobs:
       # filtering, the answer-region fallback, terminal-state
       # taxonomy, and Client JSON-RPC framing. Runs on every host
       # so platform-specific path / encoding behaviour is caught.
-      # Windows runners ship `python` (and `py`), not `python3`, so
-      # the launcher differs per host.
+      # `actions/setup-python` installs a `python` executable on every
+      # OS so the launcher is the same across Linux / macOS / Windows.
       - name: Setup Python
         uses: actions/setup-python@v6
         with:

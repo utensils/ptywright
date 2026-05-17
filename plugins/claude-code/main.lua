@@ -310,9 +310,17 @@ local function is_progress_chrome_line(line)
       if tail:match("^%s*%([^)]*%)%s*$") then return true end
     end
   end
+  -- Collapsible tool-progress row: leading `⏺` + trailing
+  -- `(ctrl+o to expand)`. Only the IN-FLIGHT form (with `…`) counts as
+  -- chrome above the marker — a COMPLETED tool summary like
+  -- `⏺ Read(file)` followed by `Read 5 files (ctrl+o to expand)` is
+  -- substantive evidence that work happened and must be honoured by the
+  -- marker-substance check. The check below mirrors `has_active_work_indicator`:
+  -- collapsible-row anchor + ellipsis somewhere on the line.
   if string.sub(t, 1, 3) == "⏺"
       and #t >= #CTRL_O_HINT
       and string.sub(t, -#CTRL_O_HINT) == CTRL_O_HINT
+      and t:find(ELLIPSIS, 1, true)
   then
     return true
   end
@@ -705,18 +713,19 @@ local function has_model_picker_indicator(text)
   })
 end
 
--- Claude Code's signed-out / not-authenticated screen. Two shapes:
+-- Claude Code's signed-out / not-authenticated screen. The TUI renders
+-- it in two flavours:
 --   * an OAuth prompt: "Log in to Claude Code" / "Press Enter to log in"
 --     with a hint about an `anthropic.com` URL,
 --   * an API-key fallback: "Sign in to Claude" / "API key" / "Enter your
 --     API key:".
--- A turn whose prose mentions "log in" can't realistically combine all
--- three anchors at once (URL hint + action verb + prompt phrase), so the
--- two-anchor pairing keeps prose mentions from tripping the detector.
--- Login / sign-in dialog. Three structural anchors required so an
--- assistant answer explaining how to authenticate (which can
--- reasonably mention "log in to Claude", "API key", and an Anthropic
--- URL together) doesn't trip the detector:
+--
+-- Detector uses a two-anchor structural check (title phrase + at least
+-- one dialog-unique cue: an action prompt, an OAuth URL anchored at
+-- line start, or the API-key env-var name). An assistant answer that
+-- happens to quote a login title in prose can't trivially also render
+-- one of the structural cues at the right line position, so the
+-- combination keeps prose mentions from tripping the detector:
 --   1. A title-style login phrase rendered at line start. The TUI
 --      puts "Welcome to Claude Code" / "Log in to Claude Code" /
 --      "Sign in to Claude" / "Continue with Anthropic" on its own
@@ -763,8 +772,12 @@ local function has_login_indicator(text)
   if contains(text, "open the link") then return true end
   for line in string.gmatch(text or "", "[^\n]+") do
     local t = trim(line)
-    if t:find("^https?://[%w%./%-_?=&%%]+claude%.ai") then return true end
-    if t:find("^https?://[%w%./%-_?=&%%]+anthropic%.com") then return true end
+    -- Allow zero or more chars before the domain so root-domain URLs
+    -- like `https://claude.ai/login` or `https://anthropic.com/auth`
+    -- match (the previous `[...]+` required at least one char before
+    -- the literal domain, which is broken for the most common shape).
+    if t:find("^https?://[%w%./%-_?=&%%]*claude%.ai") then return true end
+    if t:find("^https?://[%w%./%-_?=&%%]*anthropic%.com") then return true end
   end
   -- API-key fallback: the TUI renders `ANTHROPIC_API_KEY` in caps.
   -- `text` is the body lowered for classifier consistency, so check
@@ -1018,9 +1031,10 @@ function M.classify(input)
     return state_snapshot("waiting_for_trust", 0.86, "workspace trust dialog detected", sequence)
   end
 
-  -- Model picker (opened by `/model`). Anchored on the header phrase
-  -- plus either a focused numbered option or two consecutive numbered
-  -- list entries, so prose mentioning "select a model" can't trip it.
+  -- Model picker (opened by `/model`). Anchored on THREE structural
+  -- cues together (header phrase ending in `:`, a focused `❯ <digit>.`
+  -- option, AND a navigation-hint line like `enter to select`), so
+  -- prose mentioning "select a model" can't trip it on its own.
   if has_model_picker_indicator(body_text) then
     return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence)
   end
@@ -1108,7 +1122,12 @@ function M.classify(input)
       and (stable_ms == 0 or completed_turn_stable_ms == 0 or stable_ms < completed_turn_stable_ms)
       and not has_active_work_indicator(screen_text)
       and has_turn_completion_marker(screen)
-      and has_input_prompt(body)
+      -- Use the FULL screen for the input-prompt check, not just body.
+      -- Claude Code 2.1.x renders `separator + ❯ + 2 status rows` at the
+      -- bottom; the input prompt can land in the status-bar area which
+      -- `body_text` strips. The stable path below already uses `screen`
+      -- here — mirror that so polling consumers don't hang.
+      and has_input_prompt(screen)
   then
     return state_snapshot(
       "completed_turn",
@@ -1258,16 +1277,32 @@ function M.wait_turn_matcher(input)
       -- Login / sign-in dialog. Mirrors `has_login_indicator` so
       -- callers using `adapter.wait` after `adapter.start` against
       -- an unauthenticated user wake on the sign-in panel instead
-      -- of timing out. "Press Enter to log in" is the action prompt
-      -- the TUI always renders inside the panel.
+      -- of timing out. Cover ALL the shapes the classifier accepts:
+      -- the verbatim action prompts, the title phrases, the OAuth
+      -- URL hosts (line-anchored), and the API-key env-var name.
       matcher.contains_text("Press Enter to log in"),
+      matcher.contains_text("Open the link"),
       matcher.contains_text("Log in to Claude Code"),
+      matcher.contains_text("Sign in to Claude"),
+      matcher.contains_text("Continue with Anthropic"),
+      matcher.contains_text("Continue with Google"),
+      matcher.contains_text("ANTHROPIC_API_KEY"),
+      matcher.screen_regex("(?m)^\\s*https?://[\\w./\\-_?=&%]*claude\\.ai"),
+      matcher.screen_regex("(?m)^\\s*https?://[\\w./\\-_?=&%]*anthropic\\.com"),
       -- Model picker dialog (opened by `/model`). Mirrors
       -- `has_model_picker_indicator` so callers waiting after a
       -- `slash_command("model")` send wake on the picker rather
       -- than timing out.
       matcher.contains_text("Select a model:"),
       matcher.contains_text("Switch to model:"),
+      -- Error banners that `has_error_indicator` recognises — keep
+      -- these in sync so a terminal `error` classification wakes
+      -- the wait promptly rather than letting it run to timeout.
+      matcher.contains_text("You've reached your usage limit"),
+      matcher.contains_text("Rate limit reached"),
+      matcher.contains_text("API request failed"),
+      matcher.contains_text("Connection error"),
+      matcher.contains_text("Failed to connect"),
       -- Prompt glyph alone is NOT a completion anchor — it
       -- appears for one frame during preambles before a tool call
       -- while the next spinner is between repaints, and `adapter.wait`
@@ -1280,7 +1315,17 @@ function M.wait_turn_matcher(input)
       -- `❯ run the tests`), so do not require an empty prompt row here.
       -- Dialog / usage anchors above still wake the matcher on their own.
       matcher.all({
-        matcher.screen_regex("(?m)^\\s*(?:>|❯).*"),
+        -- Prompt-glyph anchor: accept either `❯` followed by anything
+        -- (including a post-turn ghost-text suggestion like
+        -- `❯ run the tests`) OR a bare ASCII `>` with only whitespace
+        -- after it (the older / ASCII-fallback idle-prompt shape).
+        -- Crucially this REJECTS `> <text>` because Claude's answer
+        -- prose can include Markdown blockquotes (`> some quoted text`)
+        -- that would otherwise wake the matcher on screens the
+        -- classifier wouldn't call complete. Keeps the matcher aligned
+        -- with `has_input_prompt`, which only treats bare `>` / ` >` /
+        -- `❯…` shapes as prompts.
+        matcher.screen_regex("(?m)^\\s*(?:❯.*|>\\s*$)"),
         matcher.screen_regex("✻ \\S+ for \\d"),
       }),
     }),

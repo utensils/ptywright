@@ -547,16 +547,22 @@ class Stream:
         lines = body.splitlines()
 
         def _is_prompt_with_text(s: str) -> bool:
-            # Line starting with the prompt glyph + at least one
-            # non-whitespace char, but NOT a Markdown-style `> ` quote
-            # (`> `, `>>>`, `> at start of code block` etc.). Numbered
-            # selections like `❯ 1.` are dialog focus glyphs, not
-            # prompt text — exclude those too.
-            if not (s.startswith("❯") or s.startswith(">")):
+            # Restrict to `❯` (Claude Code 2.1.x's actual input-box
+            # glyph). Earlier this also accepted `> <text>`, but ASCII
+            # `>` is also the Markdown blockquote glyph — Claude's
+            # answer prose containing `> some quoted text` would be
+            # misidentified as a prompt-with-text and the answer-region
+            # scan would terminate prematurely. Bare `>` (no text) is
+            # still treated as an IDLE prompt by `_is_idle_prompt`
+            # below; that's safe because Markdown blockquotes always
+            # have text after the `>`.
+            if not s.startswith("❯"):
                 return False
             tail = s[1:].lstrip("  ")
             if not tail:
                 return False
+            # Numbered selections like `❯ 1.` are dialog focus glyphs,
+            # not prompt text.
             if tail[:1].isdigit() and len(tail) > 1 and tail[1] in ".):":
                 return False
             return True
@@ -599,7 +605,9 @@ class Stream:
             sys.stdout.flush()
 
     # ─── fallback: dump answer region from transcript scrollback ────────
-    def _dump_answer_region_from_transcript(self) -> bool:
+    def _dump_answer_region_from_transcript(
+        self, already_printed: set[str] | None = None
+    ) -> bool:
         """Print the answer region using the full transcript scrollback.
 
         The visible body is a single alt-screen snapshot (60×200 cells
@@ -658,10 +666,10 @@ class Stream:
 
         printed = False
         # Dedup so we don't double-print intermediate frames the
-        # transcript captured. The visible-body streaming loop already
-        # deduped what it saw, but this fallback runs blind to that
-        # set — use its own.
-        seen: set[str] = set()
+        # transcript captured. Seed with what the streaming loop has
+        # already printed (when called as a gap-filler at completion),
+        # so any line the diff path emitted isn't repeated here.
+        seen: set[str] = set(already_printed) if already_printed else set()
         for line in lines[start:end]:
             s = line.strip()
             if not s:
@@ -670,8 +678,11 @@ class Stream:
                 continue
             # Skip the post-turn ghost suggestion line shape — it sits
             # below the marker, but in transcript order it can appear
-            # interleaved with the answer if Claude redraws.
-            if (s.startswith("❯ ") or s.startswith("> ")) and not s.startswith("> >"):
+            # interleaved with the answer if Claude redraws. Restrict
+            # to `❯` (the actual prompt glyph) so legitimate Markdown
+            # blockquotes (`> some quoted text`) in Claude's answer
+            # aren't silently dropped.
+            if s.startswith("❯ "):
                 continue
             if s in seen:
                 continue
@@ -842,6 +853,16 @@ class Stream:
                         continue
                     if _is_chrome_line(s):
                         continue
+                    # Skip prompt-glyph rows: the submitted prompt echo
+                    # was seeded into `printed_lines` at baseline, but
+                    # Claude Code 2.1.x also renders a POST-TURN
+                    # ghost-text suggestion (`❯ run the tests`) after
+                    # completion — that's not answer content and the
+                    # fallback paths already filter it. Mirror that here
+                    # so the live diff doesn't print it as a content
+                    # line before the terminal-state check fires.
+                    if s.startswith("❯"):
+                        continue
                     if s in printed_lines:
                         continue
                     printed_lines.add(s)
@@ -857,24 +878,28 @@ class Stream:
             if state in self.TERMINAL_STATES:
                 self._clear_alive()
                 grew_by = max(0, len(body) - baseline_len)
-                # Fallback: surface the answer region even if streaming
-                # caught nothing. Two layered fallbacks, in order of
-                # data fidelity:
+                # Fallback: surface the answer region. Two layers, in
+                # order of data fidelity:
                 #   1. Transcript-based — scans this turn's full PTY
-                #      scrollback (not just the visible body). Catches
-                #      the case where Claude's tool-call output and
-                #      answer rolled past the alt-screen body before
-                #      the classifier fired `completed_turn`. The
-                #      visible body is bounded; the transcript isn't.
-                #   2. Body-based — falls back to the visible body if
-                #      the transcript was empty / unavailable. Covers
-                #      the Haiku-style ack-and-stop case where the
-                #      whole reply fits in the visible body and the
-                #      transcript baseline was never properly
-                #      established (e.g. the test harness path).
-                if not streamed_anything:
-                    if not self._dump_answer_region_from_transcript() and grew_by > 0:
-                        self._dump_answer_region(body)
+                #      scrollback (not just the visible body). ALWAYS
+                #      runs at completion, even if the streaming diff
+                #      printed something, because long turns can have
+                #      the final answer scroll past between the last
+                #      polled body and the terminal-state check —
+                #      `streamed_anything = True` alone is not proof
+                #      the user saw the actual reply. Already-printed
+                #      lines are deduped via the `printed_lines` set
+                #      so this only fills gaps, never repeats.
+                #   2. Body-based — runs only when the transcript was
+                #      empty / unavailable AND the body has grown.
+                #      Covers the Haiku-style ack-and-stop case where
+                #      transcript baseline wasn't established (test
+                #      harness paths).
+                transcript_dumped = self._dump_answer_region_from_transcript(
+                    already_printed=printed_lines
+                )
+                if not transcript_dumped and not streamed_anything and grew_by > 0:
+                    self._dump_answer_region(body)
                 if state == self.SUCCESS_STATE:
                     emit(GREEN(f"✓ {state}"), DIM(f"(+{grew_by} chars in body)"))
                     return 0
@@ -1003,8 +1028,17 @@ def main() -> int:
             "ready",
             "waiting_for_user_input",
             "starting",  # only with the welcome-screen evidence below
-            "thinking",  # rare; Claude finishing a prior turn from --continue
             "completed_turn",  # last turn already done; safe to send next
+            # Deliberately NOT in this set: `thinking`. Calling
+            # `send_prompt` while a prior turn is in flight flips
+            # `last_intent` back to `prompt_submitted` and confuses the
+            # classifier's mid-turn / completed-turn branches. The
+            # plugin exposes `steer` for mid-turn injection (same paste
+            # bytes, intent intact); the wrapper here is single-turn
+            # and should always wait for `waiting_for_user_input` /
+            # `completed_turn` before submitting. The hard deadline
+            # still bounds the wait if `--continue`-style state ever
+            # gets us stuck in `thinking` indefinitely.
         }
         # Whether the startup loop has seen the classifier report
         # `waiting_for_user_input` (input prompt rendered). If yes,

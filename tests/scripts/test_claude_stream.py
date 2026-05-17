@@ -568,7 +568,11 @@ class ClientJsonRpcFramingTests(unittest.TestCase):
                 "params": {"session": "s1", "sequence": 42},
             })
 
-            # Deterministic poll — no sleep loops.
+            # Bounded poll with a short sleep — `time.sleep(0.01)` keeps
+            # the loop from spinning while the daemon reader thread
+            # delivers the notification. The 2.0s deadline makes this
+            # deterministic on every host (any slower than that is a
+            # real failure, not flake).
             deadline = time.monotonic() + 2.0
             notifs = []
             while time.monotonic() < deadline:

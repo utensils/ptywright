@@ -410,7 +410,16 @@ impl ExtensionHandle {
                 "extension method `{method}` did not return last_intent"
             ))
         })?;
-        self.last_intent = Some(intent);
+        // Mirror `apply_plan`'s empty-string semantics: an explicit
+        // empty string is a CLEAR sentinel (used by no-op `send_prompt`
+        // returns to drop a stale `prompt_submitted` intent). Recording
+        // it literally as `Some("")` would leak truthiness into the
+        // classifier and produce an invalid empty state.
+        if intent.is_empty() {
+            self.last_intent = None;
+        } else {
+            self.last_intent = Some(intent);
+        }
         Ok(())
     }
 
