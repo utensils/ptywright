@@ -166,11 +166,45 @@ local function line_ends_with_ellipsis(line)
   return n >= #ELLIPSIS and string.sub(line, n - #ELLIPSIS + 1, n) == ELLIPSIS
 end
 
+-- Returns true if `line` has the spinner-status shape: leading spinner
+-- glyph, a verb, an ellipsis, and an optional trailing parenthesized
+-- counter section. Two shapes the live TUI renders:
+--   * Bare: `✻ Thinking…`
+--   * Counter: `✻ Thinking… (12s · ↓ 339 tokens · thinking)`
+-- Both must register as active work — the counter form is what Sonnet
+-- 4.6 renders during extended thinking / Explore subagent runs, and
+-- missing it lets the classifier fall through to the no-marker branch
+-- even though Claude is plainly working.
+local function has_spinner_ellipsis_shape(trimmed)
+  if not starts_with_spinner_glyph(trimmed) then return false end
+  if line_ends_with_ellipsis(trimmed) then return true end
+  -- Find the LAST `…` in the line. If everything after it is just
+  -- whitespace + a balanced parenthesized section, treat it as the
+  -- counter variant.
+  local n = #trimmed
+  local last = nil
+  local i = 1
+  while i <= n - #ELLIPSIS + 1 do
+    if string.sub(trimmed, i, i + #ELLIPSIS - 1) == ELLIPSIS then
+      last = i
+    end
+    i = i + 1
+  end
+  if not last then return false end
+  local tail = string.sub(trimmed, last + #ELLIPSIS)
+  -- Allow `[ws]*([anything no nested parens])[ws]*`. Using a simple
+  -- character-class match instead of `%b()` because the counter can
+  -- contain glyphs that confuse Lua's balanced-string matcher when
+  -- bytes happen to share a code unit with parens; a literal `[^)]*`
+  -- is more predictable here.
+  return tail:match("^%s*%([^)]*%)%s*$") ~= nil
+end
+
 local function has_thinking_spinner_line(text)
   for line in string.gmatch(text or "", "[^\n]+") do
     local trimmed = trim(line)
     if #trimmed > 0 and #trimmed <= THINKING_LINE_MAX_BYTES then
-      if starts_with_spinner_glyph(trimmed) and line_ends_with_ellipsis(trimmed) then
+      if has_spinner_ellipsis_shape(trimmed) then
         return true
       end
     end
@@ -255,7 +289,27 @@ end
 local function is_progress_chrome_line(line)
   local t = trim(line)
   if t == "" then return false end
-  if starts_with_spinner_glyph(t) and line_ends_with_ellipsis(t) then return true end
+  -- Spinner-shape (with or without trailing counter) — see
+  -- `has_spinner_ellipsis_shape` below. We can't call it directly
+  -- because it's defined later; instead, replicate the cheap structural
+  -- check inline: leading spinner glyph + (`…` at end OR `…` followed
+  -- by a parenthesized counter at end).
+  if starts_with_spinner_glyph(t) then
+    if line_ends_with_ellipsis(t) then return true end
+    local n = #t
+    local last = nil
+    local i = 1
+    while i <= n - #ELLIPSIS + 1 do
+      if string.sub(t, i, i + #ELLIPSIS - 1) == ELLIPSIS then
+        last = i
+      end
+      i = i + 1
+    end
+    if last then
+      local tail = string.sub(t, last + #ELLIPSIS)
+      if tail:match("^%s*%([^)]*%)%s*$") then return true end
+    end
+  end
   if string.sub(t, 1, 3) == "⏺"
       and #t >= #CTRL_O_HINT
       and string.sub(t, -#CTRL_O_HINT) == CTRL_O_HINT
@@ -985,7 +1039,7 @@ function M.classify(input)
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
   end
 
-  if has_active_work_indicator(body_text) then
+  if has_active_work_indicator(screen_text) then
     return state_snapshot("thinking", 0.76, "active work indicator detected", sequence)
   end
 
@@ -1052,7 +1106,7 @@ function M.classify(input)
   -- polling consumers that don't have screen-stability evidence.
   if last_intent == "prompt_submitted"
       and (stable_ms == 0 or completed_turn_stable_ms == 0 or stable_ms < completed_turn_stable_ms)
-      and not has_active_work_indicator(body_text)
+      and not has_active_work_indicator(screen_text)
       and has_turn_completion_marker(screen)
       and has_input_prompt(body)
   then
@@ -1079,7 +1133,7 @@ function M.classify(input)
     if last_intent == "prompt_submitted"
         and completed_turn_stable_ms > 0
         and stable_ms >= completed_turn_stable_ms
-        and not has_active_work_indicator(body_text)
+        and not has_active_work_indicator(screen_text)
         and has_turn_completion_marker(screen)
     then
       return state_snapshot("completed_turn", 0.78, "stable input prompt after prompt submission", sequence)

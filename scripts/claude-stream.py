@@ -333,6 +333,15 @@ class Stream:
         # Submitted prompt text — used as an anchor in the transcript
         # answer-region scan.
         self._submitted_prompt: str = ""
+        # Transcript bytes/sec tracking — used by the alive ticker to
+        # surface "Claude is alive even though the body is frozen"
+        # during `Explore` subagent runs where the main TUI doesn't
+        # repaint for tens of seconds but the PTY is still receiving
+        # raw bytes (status-bar token counter updates, etc.). Sampled
+        # roughly every second from the ticker.
+        self._bytes_rate_last_t = 0.0
+        self._bytes_rate_last_len = 0
+        self._bytes_rate_kbps = 0.0
 
     # ─── time discipline ─────────────────────────────────────────────────
     def _budget(self) -> float:
@@ -346,6 +355,22 @@ class Stream:
     def inspect(self) -> tuple[str, dict]:
         ins = self.client.rpc("adapter.inspect", {"adapter": self.aid, "redact": False}, t=5.0)
         return ins.get("body_text", ""), ins
+
+    # ─── primitive: full screen (body + status) for activity scans ───────
+    def _screen_for_activity(self, ins: dict) -> str:
+        """Concatenate body + status for the activity ticker.
+
+        Claude Code 2.1.x typically renders the spinner row at the bottom
+        of the body region, but during `Explore` subagent runs the only
+        visible motion is in the status bar (token counter, "Thinking…"
+        line, etc.). The body diff still only prints body lines, but the
+        ticker should reflect *all* activity, so we feed it the union.
+        """
+        body = ins.get("body_text", "") or ""
+        status = ins.get("status_text", "") or ""
+        if not status:
+            return body
+        return body + "\n" + status
 
     # ─── primitive: poll state once, annotate transitions ────────────────
     def poll_state(self) -> dict:
@@ -440,9 +465,51 @@ class Stream:
         activity = _extract_recent_activity(body) if body else None
         if activity and len(activity) > 80:
             activity = activity[:77] + "…"
-        suffix = f"  {activity}" if activity else ""
+        # Transcript bytes/sec — only refresh ~once per second so the
+        # number doesn't jitter at the heartbeat cadence. Surfaces
+        # "Claude is alive" even when the main TUI body is frozen
+        # (subagent runs, extended-thinking phases that only repaint
+        # the status-bar token counter).
+        rate_str = self._sample_bytes_rate()
+        bits: list[str] = []
+        if activity:
+            bits.append(activity)
+        if rate_str:
+            bits.append(rate_str)
+        suffix = ("  " + "  ".join(bits)) if bits else ""
         sys.stdout.write(f"\r{DIM(f'{glyph} {prefix} [{elapsed:.0f}s]{suffix}')}\033[K")
         sys.stdout.flush()
+
+    def _sample_bytes_rate(self) -> str:
+        """Return a `+N.N KB/s` indicator of recent transcript growth,
+        or "" if we don't have enough samples yet. Refreshes only once
+        per second so the number doesn't jitter at heartbeat cadence."""
+        now = time.monotonic()
+        if self._bytes_rate_last_t and now - self._bytes_rate_last_t < 1.0:
+            # Reuse the cached rate without polling — keeps the ticker
+            # snappy and the cached value visible between samples.
+            return self._format_kbps(self._bytes_rate_kbps)
+        try:
+            trans = self.client.rpc("adapter.transcript",
+                {"adapter": self.aid, "redact": False}, t=2.0)["text"]
+        except (RuntimeError, TimeoutError):
+            return ""
+        cur_len = len(trans)
+        if self._bytes_rate_last_t:
+            dt = max(now - self._bytes_rate_last_t, 0.001)
+            dbytes = max(cur_len - self._bytes_rate_last_len, 0)
+            self._bytes_rate_kbps = (dbytes / 1024.0) / dt
+        self._bytes_rate_last_t = now
+        self._bytes_rate_last_len = cur_len
+        return self._format_kbps(self._bytes_rate_kbps)
+
+    @staticmethod
+    def _format_kbps(kbps: float) -> str:
+        if kbps <= 0:
+            return ""
+        if kbps < 1.0:
+            return f"+{int(kbps * 1024)} B/s"
+        return f"+{kbps:.1f} KB/s"
 
     def _clear_alive(self):
         if sys.stdout.isatty():
@@ -735,11 +802,17 @@ class Stream:
         while not self._expired():
             try:
                 state = self.poll_state()["state"]
-                body, _ = self.inspect()
+                body, ins = self.inspect()
             except (RuntimeError, TimeoutError) as e:
                 self._clear_alive()
                 emit(RED("✗ stream interrupted"), str(e))
                 return 1
+            # Activity-scan surface: body for diff/print, full screen
+            # (body + status_text) for the ticker. During Explore-subagent
+            # runs the main body is frozen but the status bar still
+            # repaints with the spinner / token counter, so the ticker
+            # needs the union.
+            activity_text = self._screen_for_activity(ins)
 
             for n in self.client.drain_notifs():
                 if n.get("method") == "session.exited":
@@ -809,7 +882,7 @@ class Stream:
                 emit(RED(f"✗ {state}"), DIM(f"(+{grew_by} chars in body)"))
                 return 1
 
-            self._tick_alive(prefix=f"{state}", body=body)
+            self._tick_alive(prefix=f"{state}", body=activity_text)
             time.sleep(self.heartbeat)
 
         self._clear_alive()
