@@ -770,10 +770,25 @@ function M.send_prompt(input)
   -- send their own Enter and synchronise on stability before pasting,
   -- which is fragile across machine speeds and Claude Code versions.
   -- driving programs that have not opted into bracketed paste.
+  --
+  -- Empty-prompt guard: an empty bracketed paste leaves Claude at
+  -- idle (the two Enters are no-ops on an empty input box), so do
+  -- NOT set `last_intent = "prompt_submitted"` in that case. The
+  -- classifier's mid-turn `thinking` branch keys off that intent;
+  -- claiming a turn started when no actual prompt was submitted
+  -- would lock the state machine in `thinking` forever, since the
+  -- TUI never renders the `✻ <Verb> for <duration>` completion
+  -- marker that's the durable mid-turn release signal. The intent
+  -- field stays unset so the classifier reads the screen for what
+  -- it actually is (`waiting_for_user_input` at an empty prompt).
+  local prompt = input.prompt or ""
+  if prompt == "" then
+    return { actions = {} }
+  end
   return {
     actions = {
       action.key("enter"),
-      action.bracketed_paste(input.prompt or ""),
+      action.bracketed_paste(prompt),
       action.key("enter"),
     },
     last_intent = "prompt_submitted",

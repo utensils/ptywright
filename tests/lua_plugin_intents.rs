@@ -201,6 +201,37 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
     assert_eq!(plan.last_intent.as_deref(), Some("prompt_submitted"));
 }
 
+/// An empty `send_prompt` must NOT mark `last_intent = "prompt_submitted"`.
+/// The two Enters are no-ops on an empty input box, so Claude stays at
+/// idle and never renders the `✻ <Verb> for <duration>` completion
+/// marker that's the mid-turn release signal — claiming an intent here
+/// would lock the classifier in `thinking` indefinitely on the next
+/// `adapter.state` call. Returning an empty action list with no intent
+/// leaves the screen-derived state alone (the classifier will read the
+/// empty prompt as `waiting_for_user_input`, which is what's actually
+/// on screen).
+#[test]
+fn send_prompt_refuses_empty_input_and_leaves_intent_unset() {
+    let extension = claude_plugin();
+
+    let empty_string = plan(&extension, "send_prompt", json!({ "prompt": "" }));
+    assert!(
+        empty_string.actions.is_empty(),
+        "empty prompt must emit zero actions, got {:?}",
+        empty_string.actions
+    );
+    assert!(
+        empty_string.last_intent.is_none(),
+        "empty prompt must leave last_intent unset so the classifier reads the screen, not a phantom turn"
+    );
+
+    // Missing prompt field is the same edge case — the plugin defaults
+    // it to "" and must take the same path.
+    let missing_prompt = plan(&extension, "send_prompt", json!({}));
+    assert!(missing_prompt.actions.is_empty());
+    assert!(missing_prompt.last_intent.is_none());
+}
+
 #[test]
 fn cancel_plan_emits_interrupt_and_marks_cancelling_intent() {
     let extension = claude_plugin();

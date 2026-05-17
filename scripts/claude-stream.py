@@ -507,12 +507,9 @@ def main() -> int:
     client = Client(bin_path, log_level=os.environ.get("PTYWRIGHT_LOG", "warn"))
     stream: Stream | None = None
     aid: str | None = None
-    direnv_config = tempfile.TemporaryDirectory(prefix="claude-stream-direnv-")
-    direnv_config_path = Path(direnv_config.name)
-    (direnv_config_path / "direnv.toml").write_text(
-        'log_filter = "^$"\nhide_env_diff = true\n',
-        encoding="utf-8",
-    )
+    # Created lazily inside the try/finally below so a failure here cannot
+    # leak the ptywright subprocess `client` just started.
+    direnv_config: tempfile.TemporaryDirectory | None = None
 
     # SIGINT handler — terminate the server subprocess and let the main
     # thread perform RPC cleanup outside the signal context. Doing RPC
@@ -541,6 +538,13 @@ def main() -> int:
 
     try:
         client.rpc("server.set_notifications", {"enabled": True})
+
+        direnv_config = tempfile.TemporaryDirectory(prefix="claude-stream-direnv-")
+        direnv_config_path = Path(direnv_config.name)
+        (direnv_config_path / "direnv.toml").write_text(
+            'log_filter = "^$"\nhide_env_diff = true\n',
+            encoding="utf-8",
+        )
 
         start_params: dict = {
             "plugin": "claude-code",
@@ -585,12 +589,22 @@ def main() -> int:
                 emit(RED(f"✗ adapter entered {state} during startup"), DIM(evidence))
                 stream.close()
                 return 1
-            # Only keep waiting while the classifier hasn't seen anything
-            # real yet. The welcome screen reports `starting` with evidence
-            # "welcome screen visible" but is dismissible — send_prompt's
-            # leading Enter handles it, so treat it as a green light rather
-            # than spinning until the global timeout.
-            if state == "starting" and "no screen evidence" in evidence:
+            # Only break out of the wait once the classifier has observed
+            # something that's *actually* Claude — the welcome panel, the
+            # input prompt, a dialog, or active work. Two fallbacks have to
+            # keep polling instead of letting the script paste into a
+            # not-yet-ready terminal:
+            #   * `starting` + "no screen evidence" — the PTY is up but
+            #     nothing has been rendered yet (or only ANSI churn the
+            #     parser collapsed).
+            #   * `ready` / `<intent>` + "no Claude Code-specific evidence
+            #     detected" — the classifier's last-resort fallback when
+            #     nothing matched. Shell / direnv / tool chatter before
+            #     Claude actually starts lands here; treating it as ready
+            #     would race the paste against Claude's real input box.
+            # The welcome panel (`starting` + "welcome screen visible") is
+            # a green light — `send_prompt`'s leading Enter handles it.
+            if "no screen evidence" in evidence or "no Claude Code-specific evidence" in evidence:
                 time.sleep(stream.heartbeat)
                 continue
             break
@@ -607,7 +621,8 @@ def main() -> int:
 
     finally:
         client.close()
-        direnv_config.cleanup()
+        if direnv_config is not None:
+            direnv_config.cleanup()
 
 if __name__ == "__main__":
     sys.exit(main())
