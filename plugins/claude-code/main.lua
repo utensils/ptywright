@@ -1,35 +1,46 @@
+-- File layout (with `helpers.lua` providing shared utilities):
+--
+--   helpers.lua            — generic string utilities + secret scrubbing
+--                            (pre-loaded as a Lua global by the host)
+--   main.lua (this file)
+--     ├─ host bindings       — ptywright.action / ptywright.matcher
+--     ├─ classifier helpers  — state_snapshot
+--     ├─ structural indicators — has_*_indicator, has_*_screen, …
+--     ├─ structural parsers    — parse_status_bar / parse_usage_screen / …
+--     ├─ classify(input)       — the screen-state classifier
+--     ├─ intent plans          — send_prompt, cancel, approve, … (M.*)
+--     ├─ matcher builders      — wait_*_matcher (M.*)
+--     └─ key-alias router      — M.key
+--
+-- When a section in this file grows past roughly 200 lines, extract it
+-- into its own module file alongside `helpers.lua`: add a `(name,
+-- source)` pair to `BUILTIN_PLUGINS.modules` in `src/plugin.rs`, write
+-- `<name>.lua` returning a module table, and reference its functions
+-- here as `local <fn> = <name>.<fn>` (the host loader pre-registers
+-- each module as a Lua global before main.lua runs). Tests under
+-- `tests/lua_plugin_intents.rs` and the fixture matrix at
+-- `tests/lua_classifier_tests.rs` exercise the public surface either
+-- way — module splits are intentionally transparent to callers.
+
 assert(ptywright, "ptywright host API not installed")
 assert(ptywright.action, "ptywright action host API not installed")
 assert(ptywright.matcher, "ptywright matcher host API not installed")
+assert(helpers, "helpers module not pre-loaded (see BUILTIN_PLUGINS in src/plugin.rs)")
 
 local M = {}
 local action = ptywright.action
 local matcher = ptywright.matcher
 
-local function contains(text, needle)
-  return string.find(text, needle, 1, true) ~= nil
-end
-
-local function contains_any(text, needles)
-  for _, needle in ipairs(needles) do
-    if contains(text, needle) then
-      return true
-    end
-  end
-  return false
-end
-
-local function starts_with(text, prefix)
-  return string.sub(text, 1, #prefix) == prefix
-end
-
-local function trim(text)
-  return (text:gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
-local function lower(text)
-  return string.lower(text or "")
-end
+-- Bring the shared helpers in as locals so the rest of this file reads
+-- identically to the pre-split version. Anything new that needs a
+-- helper but isn't aliased here can still call `helpers.<fn>` directly.
+local contains               = helpers.contains
+local contains_any           = helpers.contains_any
+local starts_with            = helpers.starts_with
+local trim                   = helpers.trim
+local lower                  = helpers.lower
+local redact_secret_patterns = helpers.redact_secret_patterns
+local strip_dollar           = helpers.strip_dollar
 
 local function state_snapshot(state, confidence, evidence, sequence, metadata)
   return {
@@ -39,50 +50,6 @@ local function state_snapshot(state, confidence, evidence, sequence, metadata)
     sequence = sequence,
     metadata = metadata,
   }
-end
-
--- Best-effort plugin-side redaction for text that we expose through
--- `ExtensionStateSnapshot.metadata` (permission dialog summaries today).
--- The host applies `RedactionPolicy::default()` to screen/transcript reads
--- but state-shaped responses (adapter.state / send / wait) don't go
--- through that filter. Without this guard, a permission prompt for a
--- Bash command can carry a `token=…` / `sk-…` / `AKIA…` value in the
--- metadata summary even when callers rely on default-redacted reads.
--- Mirror the most common Rust-side patterns; document on the wire that
--- callers handling secrets must apply their own redaction layer for
--- guarantees beyond best-effort.
-local SECRET_PATTERNS = {
-  -- `token=value`, `password=value`, `api_key=value` — keep the prefix.
-  "([Tt]oken%s*=%s*)([^%s\"']+)",
-  "([Pp]assword%s*=%s*)([^%s\"']+)",
-  "([Aa]pi[_-]?[Kk]ey%s*=%s*)([^%s\"']+)",
-  "([Ss]ecret%s*=%s*)([^%s\"']+)",
-  -- Anthropic / OpenAI style API key prefixes.
-  "()(sk%-[%w%-_]+)",
-  "()(sk%-ant%-[%w%-_]+)",
-  -- AWS access key id.
-  "()(AKIA[%w]+)",
-}
-
-local function redact_secret_patterns(text)
-  if text == nil or text == "" then
-    return text
-  end
-  for _, pattern in ipairs(SECRET_PATTERNS) do
-    text = (text:gsub(pattern, function(prefix, _value)
-      if prefix == nil or prefix == "" then
-        return "[REDACTED]"
-      end
-      return prefix .. "[REDACTED]"
-    end))
-  end
-  return text
-end
-
--- Strip a single leading "$" so a number prefixed by a currency glyph still
--- parses as a number. Returns the trailing slice, never nil. Cheap to call.
-local function strip_dollar(text)
-  return (text:gsub("^%$", ""))
 end
 
 local function has_error_indicator(screen)

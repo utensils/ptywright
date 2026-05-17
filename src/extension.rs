@@ -239,7 +239,7 @@ impl LuaExtension {
             .find(|entry| (entry.manifest)().name == name)
             .ok_or_else(|| Error::Lua(format!("no built-in Lua extension named `{name}`")))?;
         let manifest = (entry.manifest)();
-        let plugin = LuaPlugin::trusted(&manifest, entry.source)?;
+        let plugin = LuaPlugin::trusted_with_modules(&manifest, entry.source, entry.modules)?;
         Ok(Self::new(plugin, manifest))
     }
 
