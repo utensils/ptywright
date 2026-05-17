@@ -75,6 +75,19 @@ jobs:
       - name: Test
         if: runner.os != 'macOS'
         run: rustup run stable cargo test --locked --features _test-fixtures
+
+      # claude-stream pytest suite — stdlib `unittest`, Python 3.10+
+      # which every CI runner has preinstalled. Covers chrome
+      # filtering, the answer-region fallback, terminal-state
+      # taxonomy, and Client JSON-RPC framing. Runs on every host so
+      # platform-specific path / encoding behaviour is caught.
+      - name: Test (claude-stream pytest, macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: python3 -m unittest discover -t . -s tests/scripts -v
+      - name: Test (claude-stream pytest)
+        if: runner.os != 'macOS'
+        run: python3 -m unittest discover -t . -s tests/scripts -v
       - name: Build (macOS)
         if: runner.os == 'macOS'
         shell: bash

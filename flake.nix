@@ -173,8 +173,12 @@
               {
                 category = "check";
                 name = "run-tests";
-                help = "cargo test (matches CI)";
-                command = "cargo test --features _test-fixtures \"$@\"";
+                help = "cargo test + claude-stream pytest suite (matches CI)";
+                command = ''
+                  set -euo pipefail
+                  cargo test --features _test-fixtures "$@"
+                  python3 -m unittest discover -t "$PRJ_ROOT" -s "$PRJ_ROOT/tests/scripts" -v
+                '';
               }
               {
                 category = "check";
@@ -187,6 +191,13 @@
                   cargo clippy -- -D warnings
                   cargo test --features _test-fixtures
                   cargo build --release
+                  # claude-stream pytest suite (stdlib-only `unittest`, so
+                  # no extra Python deps). Covers chrome filtering,
+                  # answer-region fallback, terminal-state taxonomy, and
+                  # Client JSON-RPC framing — the script-side contracts
+                  # that determine whether the streaming output is
+                  # legible and how failures terminate.
+                  python3 -m unittest discover -t "$PRJ_ROOT" -s "$PRJ_ROOT/tests/scripts" -v
                   # Lean baseline: keep the `--no-default-features` path
                   # green so callers who opt out of the `repl` stack don't
                   # silently break. Mirrors the extra steps in
