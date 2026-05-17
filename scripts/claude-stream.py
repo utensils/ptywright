@@ -397,32 +397,64 @@ class Stream:
             the gap between two polling ticks).
           * Content was rewritten in place faster than the diff caught.
 
-        The "answer region" is everything from after the last `❯ …`
-        prompt-with-text line (the user's submitted prompt echo) up to
-        (but not including) the trailing empty `❯` idle prompt. That
-        captures Claude's actual reply plus the completion marker
-        without the welcome chrome above or the post-turn input row
-        below. Chrome lines (horizontal rules, spinner status) are
-        skipped using the same structural filter the streaming loop
-        uses.
+        The "answer region" is everything from after the FIRST `❯ …`
+        prompt-with-text line (the user's submitted prompt echo, at the
+        top of the body) up to (but not including) the first trailing
+        anchor we recognise — either an empty `❯` idle prompt or a
+        post-turn ghost-text suggestion (`❯ run the tests` after the
+        completion marker). Anchoring `start` on the FIRST prompt-with-
+        text instead of the LAST is critical: Claude Code 2.1.x renders
+        a post-turn ghost-text suggestion using the SAME `❯ <text>`
+        shape, and if we used the last occurrence we'd skip over the
+        actual answer to the suggestion at the bottom and print
+        nothing. The submitted prompt always lives at the top of the
+        visible body in Claude Code's layout, so the first occurrence
+        is the reliable anchor.
+
+        Chrome lines (horizontal rules, spinner status) inside the
+        answer region are skipped using the same structural filter
+        the streaming loop uses.
         """
         lines = body.splitlines()
-        # Find the user's submitted prompt echo: a line starting with
-        # the prompt glyph followed by user text. The answer starts
-        # AFTER that.
+
+        def _is_prompt_with_text(s: str) -> bool:
+            # Line starting with the prompt glyph + at least one
+            # non-whitespace char, but NOT a Markdown-style `> ` quote
+            # (`> `, `>>>`, `> at start of code block` etc.). Numbered
+            # selections like `❯ 1.` are dialog focus glyphs, not
+            # prompt text — exclude those too.
+            if not (s.startswith("❯") or s.startswith(">")):
+                return False
+            tail = s[1:].lstrip("  ")
+            if not tail:
+                return False
+            if tail[:1].isdigit() and len(tail) > 1 and tail[1] in ".):":
+                return False
+            return True
+
+        def _is_idle_prompt(s: str) -> bool:
+            # Either bare glyph or glyph + only NBSP padding.
+            return s in ("❯", ">") or s.replace(" ", "") in ("❯", ">")
+
+        # Find the FIRST prompt-with-text line — the user's submitted
+        # prompt echo at the top of the body.
         start = 0
         for i, line in enumerate(lines):
             s = line.strip()
-            if (s.startswith("❯") or s.startswith(">")) and len(s) > 2 and not s[1:].lstrip().startswith(("1.", "2.", "3.")):
+            if _is_prompt_with_text(s):
                 start = i + 1
-        # Find the trailing idle prompt (a line that's JUST `❯` or `>`).
-        # Everything between `start` and that boundary is the answer.
+                break
+
+        # Find the FIRST trailing prompt row after `start` — either
+        # the idle prompt (`❯` alone) or a post-turn ghost suggestion
+        # (`❯ run the tests`). Both mark the end of the answer region.
         end = len(lines)
-        for i in range(len(lines) - 1, start, -1):
+        for i in range(start, len(lines)):
             s = lines[i].strip()
-            if s in ("❯", ">"):
+            if _is_idle_prompt(s) or _is_prompt_with_text(s):
                 end = i
                 break
+
         printed = False
         for line in lines[start:end]:
             s = line.strip()
@@ -449,12 +481,22 @@ class Stream:
                          "params": {"prompt": prompt}}, t=10.0)
 
     # ─── compound: submit prompt and verify it landed ────────────────────
-    def submit(self, prompt: str) -> tuple[bool, str]:
+    def submit(self, prompt: str, input_prompt_already_observed: bool = False) -> tuple[bool, str]:
         """Submit the prompt. The plugin's `send_prompt` intent now emits
         Enter → BracketedPaste → Enter, which both dismisses any
         first-keypress interceptor (welcome panel, compact-launch view)
         AND submits the prompt. So the script's responsibility shrinks
         to: wait until the screen is stable, then send_prompt.
+
+        `input_prompt_already_observed=True` skips the initial settle
+        wait: `wait_turn_matcher` only wakes for end-of-turn anchors
+        (completion marker / dialogs / usage), not for the idle input
+        prompt by itself. If the startup loop already saw
+        `waiting_for_user_input` we know the input box is rendered and
+        ready, so blocking for `max_wait_s` here only adds a fixed
+        delay before every submission. The submit-verification loop
+        below has its own paste-acknowledgement check, which is the
+        real correctness guard.
 
         Verification: poll the transcript for growth above noise. A real
         paste acceptance produces 1000+ bytes of PTY output within the
@@ -463,8 +505,11 @@ class Stream:
 
         Returns (success, failure_reason).
         """
-        emit(DIM("· waiting for Claude's input box to settle"))
-        self.wait_for_settled(max_wait_s=3.0)
+        if input_prompt_already_observed:
+            emit(DIM("· input box already observed; skipping settle wait"))
+        else:
+            emit(DIM("· waiting for Claude's input box to settle"))
+            self.wait_for_settled(max_wait_s=3.0)
         if self._expired(): return False, "deadline expired before initial settle"
 
         baseline = len(self.client.rpc("adapter.transcript",
@@ -724,6 +769,11 @@ def main() -> int:
             "thinking",  # rare; Claude finishing a prior turn from --continue
             "completed_turn",  # last turn already done; safe to send next
         }
+        # Whether the startup loop has seen the classifier report
+        # `waiting_for_user_input` (input prompt rendered). If yes,
+        # `submit()` can skip its initial settle wait — see the
+        # docstring there.
+        input_prompt_seen = False
         while not stream._expired():
             st = stream.poll_state()
             state = st["state"]
@@ -752,13 +802,16 @@ def main() -> int:
             # Enter dismisses it.
             if state == "starting" and "welcome screen visible" in evidence:
                 break
+            if state == "waiting_for_user_input":
+                input_prompt_seen = True
+                break
             if state in SUBMIT_READY_STATES:
                 break
             # Unknown state — keep polling rather than guessing. The
             # hard deadline bounds this.
             time.sleep(stream.heartbeat)
 
-        ok, reason = stream.submit(prompt)
+        ok, reason = stream.submit(prompt, input_prompt_already_observed=input_prompt_seen)
         if not ok:
             emit(RED("✗ could not get Claude to accept the prompt"), DIM(reason))
             stream.close()

@@ -52,44 +52,78 @@ local function state_snapshot(state, confidence, evidence, sequence, metadata)
   }
 end
 
+-- Banner phrases that the TUI renders as their OWN line at the start
+-- of the row (no leading prose context). Anchoring with `starts_with`
+-- ensures assistant prose that quotes these phrases inside a sentence
+-- doesn't trip the detector — e.g. an answer that says `Note that
+-- "you've reached your usage limit" can be reset by …` should NOT
+-- classify as `error`.
+local ERROR_BANNER_PREFIXES = {
+  "error:",
+  "request failed",
+  "api error",
+  -- Rate-limit / plan-limit banners. Claude Code 2.1.x renders one of
+  -- these as a standalone body row when you exhaust your plan budget.
+  "5-hour limit",
+  "rate limit reached",
+  "you've used your pro plan",
+  "you've used your max plan",
+  "you've reached your usage limit",
+  "credit balance is too low",
+  -- Connection / network failure banner.
+  "connection error",
+  "connection issue",
+  "could not connect",
+  "network error",
+}
+
 local function has_error_indicator(screen)
-  -- Lines anchored at the start of a line so prose mentions of the
-  -- words "error" or "limit reached" inside an assistant reply do not
-  -- trip the detector. The TUI renders its error / rate-limit banners
-  -- as their own row, not as fragments inside flowing prose.
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = lower(trim(line))
-    if starts_with(text, "error:")
-      or starts_with(text, "request failed")
-      or starts_with(text, "api error")
-      or contains(text, "please retry")
-      or contains(text, "press r to retry")
-      -- Rate-limit / plan-limit banners. Claude Code 2.1.x renders
-      -- one of these as the body when you exhaust your plan budget.
-      or contains(text, "5-hour limit reached")
-      or contains(text, "5-hour limit")
-      or contains(text, "rate limit reached")
-      or contains(text, "you've used your pro plan")
-      or contains(text, "you've used your max plan")
-      or contains(text, "you've reached your usage limit")
-      or contains(text, "credit balance is too low")
-      -- Connection / network failure banner.
-      or contains(text, "connection error")
-      or contains(text, "connection issue")
-      or contains(text, "could not connect")
-      or contains(text, "network error") then
+    for _, prefix in ipairs(ERROR_BANNER_PREFIXES) do
+      if starts_with(text, prefix) then
+        return true
+      end
+    end
+    -- Retry hints — these appear on their own line after a banner,
+    -- typically as just the action verb. Still anchored at line
+    -- start because Claude doesn't write "Press r to retry" inside
+    -- flowing answer prose.
+    if starts_with(text, "please retry") or starts_with(text, "press r to retry") then
       return true
     end
   end
   return false
 end
 
+-- Returns true if any line in `screen` is an input-prompt row.
+-- Recognised shapes (left-anchored unless noted):
+--   * Bare prompt glyph (`>` or `❯`), optionally followed by ASCII
+--     whitespace OR NBSP (U+00A0) padding OR user/ghost text.
+--   * Line ENDING in ` >` — legacy shell-style prompt position where
+--     `text >` is the input cursor (e.g. some older Claude builds).
+-- The `❯` glyph case stays anchored at line start because the modern
+-- Claude Code 2.1.x TUI always renders it as the first non-space
+-- char on the input row. The legacy ASCII `>` had to be supported
+-- at line end too; we keep that side intact so old fixtures still
+-- match while symmetrically also accepting `>` at line start.
+-- `trim` strips ASCII whitespace only, so NBSP padding is handled
+-- explicitly with byte-level checks on the multi-byte sequence.
+local NBSP_BYTES = "\194\160"  -- U+00A0 as UTF-8
+
 local function has_input_prompt(screen)
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = trim(line)
-    if text == ">" or string.sub(text, -2) == " >" or starts_with(text, "❯") then
-      return true
-    end
+    if text == ">" or text == "❯" then return true end
+    if string.sub(text, -2) == " >" then return true end
+    if starts_with(text, "❯") then return true end
+    -- Legacy ASCII `>` at line start, with either ASCII space or
+    -- NBSP between the glyph and any following text. Restores the
+    -- behaviour `has_empty_input_prompt_line` had explicitly for
+    -- NBSP-padded `>` rows on terminals that render the ASCII
+    -- prompt fallback.
+    if starts_with(text, "> ") then return true end
+    if starts_with(text, ">" .. NBSP_BYTES) then return true end
   end
   return false
 end
@@ -173,9 +207,22 @@ local function is_post_marker_trailing_line(line)
   if starts_with(t, "❯\194\160") or starts_with(t, ">\194\160") then return true end
   -- Horizontal rule — single repeated box-drawing character.
   if t:match("^[─━═]+$") then return true end
-  -- Status bar shapes Claude Code 2.1.x renders below the prompt.
-  if starts_with(t, "user ") then return true end
+  -- Status-bar rows Claude Code 2.1.x renders below the prompt. The
+  -- real TUI fills these with the actual `<username> @ <host>` and a
+  -- `[<Model> <Version>]` suffix, e.g.
+  --   `james @ laptop /Users/james/Projects                  [Sonnet 4.6]`
+  --   `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents`
+  -- Recognise both structural shapes generically — never anchor on
+  -- the fixture's sanitized literal `user ` prefix, which would leave
+  -- real users with a marker followed by their own status bar stuck
+  -- in `thinking`:
+  --   * `⏵⏵ … on …` — permission-mode hint glyph.
+  --   * `[<word(s)> <digit>.<digit>]` — model bracket with version.
+  --   * `<token> @ <token>` followed by a `[<word> <digit>]` later
+  --     on the same line (the user@host + model layout).
   if t:find("⏵⏵") then return true end
+  if t:find("%[%u%a-%s%d+%.%d+%]") then return true end
+  if t:find("%S+%s*@%s*%S+") and t:find("%[") and t:find("%]") then return true end
   return false
 end
 
@@ -224,34 +271,63 @@ local function has_turn_completion_marker(text)
   return false
 end
 
+-- Returns true if any line in `text` is a Claude Code 2.1.x
+-- collapsible tool-progress row: starts with `⏺`, contains
+-- `(ctrl+o to expand)` (the collapse hint the TUI puts at the end
+-- of every collapsible row), and ends with that hint. Anchoring
+-- both the leading glyph AND the trailing hint position keeps
+-- assistant prose that merely quotes the hint phrase from tripping
+-- the detector — Claude can reasonably write "(ctrl+o to expand)"
+-- inside an answer, but it can't render it as part of a
+-- `⏺ <verb> N <thing>… (ctrl+o to expand)` row in the body during
+-- a completed turn.
+local CTRL_O_HINT = "(ctrl+o to expand)"
+
+local function has_collapsible_tool_progress_row(text)
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local trimmed = trim(line)
+    -- Must start with `⏺` (Claude's tool-progress glyph; 3 bytes
+    -- in UTF-8) and end with the collapse hint.
+    if starts_with(trimmed, "⏺")
+        and #trimmed >= #CTRL_O_HINT
+        and string.sub(trimmed, -#CTRL_O_HINT) == CTRL_O_HINT
+    then
+      return true
+    end
+  end
+  return false
+end
+
 local function has_active_work_indicator(text)
-  -- Phrases the TUI renders ONLY during active work. Each is paired
-  -- with a structural hint so it doesn't match the same words in
-  -- assistant prose:
+  -- Phrases / row shapes the TUI renders ONLY during active work:
   --   * "esc to interrupt"   — control hint shown only while a turn is
   --                            in flight (Claude never writes this in
-  --                            answer text)
-  --   * "(ctrl+o to expand)" — Claude Code 2.1.x's tool-progress hint
-  --                            rendered on every collapsible interim
-  --                            row ("Reading 1 file…", "Searching for
-  --                            1 pattern…", "Bash(cmd)", etc.). These
-  --                            rows START with `⏺` rather than a
-  --                            spinner glyph, so `has_thinking_spinner_line`
-  --                            misses them; without this anchor the
+  --                            answer text).
+  --   * A `⏺ <verb>… (ctrl+o to expand)` row — Claude Code 2.1.x's
+  --                            collapsible tool-progress row for
+  --                            Read/Glob/Grep/Bash interim output.
+  --                            These rows START with `⏺` rather than
+  --                            a spinner glyph, so
+  --                            `has_thinking_spinner_line` misses
+  --                            them; without this anchor the
   --                            classifier reads the gap between two
   --                            tool calls as "no active work" and can
-  --                            mis-fire `completed_turn` while Claude
-  --                            is still mid-turn. The hint phrase
-  --                            never appears in assistant prose.
-  -- The bare word "thinking" alone (and "running tool", "reading file",
-  -- "searching" etc.) was removed in favor of the structural anchors
-  -- below — those bare words frequently appear in assistant prose when
-  -- Claude explains its own behavior, blocking the classifier from
-  -- ever reaching `completed_turn` on those turns.
-  if contains_any(text, {
-    "esc to interrupt",
-    "(ctrl+o to expand)",
-  }) then
+  --                            mis-fire `completed_turn` while
+  --                            Claude is still mid-turn. The row
+  --                            shape (leading `⏺` + trailing hint)
+  --                            is dialog-unique — prose can't
+  --                            reproduce both anchors at the same
+  --                            line positions.
+  -- The bare word "thinking" alone (and "running tool", "reading
+  -- file", "searching" etc.) was removed in favor of these
+  -- structural anchors — those bare words frequently appear in
+  -- assistant prose when Claude explains its own behavior,
+  -- blocking the classifier from ever reaching `completed_turn`
+  -- on those turns.
+  if contains(text, "esc to interrupt") then
+    return true
+  end
+  if has_collapsible_tool_progress_row(text) then
     return true
   end
   -- Claude Code 2.1.x spinner-and-ellipsis status line. This is the
@@ -454,31 +530,46 @@ end
 
 -- `/model` opens an interactive selection panel: a "Select a model:"
 -- (or "Switch to model:") header followed by a numbered list of
--- available models, with the focus glyph `❯` on one row. The TUI
--- treats Enter as "pick the focused option" and arrow keys as
--- navigation. Detect it so script drivers know they're at the model
--- picker after running `slash_command("model")` rather than at the
--- regular input prompt; pasting a prompt into the picker would type
--- into the search filter and select the wrong model.
+-- available models, with the focus glyph `❯` on one row. Three
+-- structural anchors are required so assistant prose that explains
+-- model selection — and might reasonably list `1. Sonnet 2. Opus
+-- 3. Haiku` in the middle of a paragraph — can't trip the detector:
+--   1. A header phrase (`select a model:` / `choose a model:` /
+--      `switch to model:` / `available models:`) — note the COLON,
+--      which Claude's TUI renders and prose typically doesn't.
+--   2. A focused numbered option line (`❯ 1.` / `❯ 1)`).
+--   3. A keyboard hint line (`enter to select`, `esc to cancel`,
+--      `↑/↓` arrows). Real pickers always render this; prose lists
+--      don't.
+-- All three together are dialog-unique. A completed answer can
+-- contain any one of them, but very rarely all three with the
+-- right structure.
+local MODEL_PICKER_HEADERS = {
+  "select a model:",
+  "switch to model:",
+  "choose a model:",
+  "available models:",
+}
+
 local function has_model_picker_indicator(text)
-  local has_header = contains_any(text, {
-    "select a model",
-    "switch to model",
-    "choose a model",
-    "available models",
-  })
+  local has_header = contains_any(text, MODEL_PICKER_HEADERS)
   if not has_header then
     return false
   end
-  -- Require either a focused option (`❯ <digit>.` or `❯ <digit>)`) OR
-  -- at least two consecutive numbered entries — the dialog always
-  -- renders a multi-option list, never a single line.
-  if text:find("❯%s*%d+[%.%)]") then
-    return true
+  -- Require the focused-option glyph (`❯ <digit>.`/`)`); the dialog
+  -- never renders without a cursor on one option.
+  if not text:find("❯%s*%d+[%.%)]") then
+    return false
   end
-  local first = text:find("\n%s*1[%.%)]")
-  if not first then return false end
-  return text:find("\n%s*2[%.%)]") ~= nil
+  -- Require a navigation-hint line. Either keyboard verbs Claude's
+  -- prose wouldn't naturally use in a model-list explanation
+  -- (`↑/↓`, `esc to cancel`, `enter to select`).
+  return contains_any(text, {
+    "enter to select",
+    "esc to cancel",
+    "↑/↓",
+    "↑ / ↓",
+  })
 end
 
 -- Claude Code's signed-out / not-authenticated screen. Two shapes:
@@ -489,24 +580,64 @@ end
 -- A turn whose prose mentions "log in" can't realistically combine all
 -- three anchors at once (URL hint + action verb + prompt phrase), so the
 -- two-anchor pairing keeps prose mentions from tripping the detector.
+-- Login / sign-in dialog. Three structural anchors required so an
+-- assistant answer explaining how to authenticate (which can
+-- reasonably mention "log in to Claude", "API key", and an Anthropic
+-- URL together) doesn't trip the detector:
+--   1. A title-style login phrase rendered at line start. The TUI
+--      puts "Welcome to Claude Code" / "Log in to Claude Code" /
+--      "Sign in to Claude" / "Continue with Anthropic" on its own
+--      panel row. Prose typically embeds those phrases inside
+--      sentences.
+--   2. An action prompt — "Press Enter to log in" / "Open the link
+--      in your browser" / `https://claude.ai/login`. Prose
+--      explaining authentication is unlikely to render an action
+--      verb of this exact shape.
+--   3. The fallback "API key" affordance is accepted as the second
+--      anchor only when paired with a setenv hint ("ANTHROPIC_API_KEY"
+--      in caps), so a generic prose mention of "api key" doesn't
+--      single-handedly satisfy the second anchor.
+local LOGIN_TITLE_PREFIXES = {
+  "welcome to claude code",
+  "log in to claude",
+  "login to claude",
+  "sign in to claude",
+  "continue with anthropic",
+  "continue with google",
+}
+
 local function has_login_indicator(text)
-  local has_login_phrase = contains_any(text, {
-    "log in to claude",
-    "sign in to claude",
-    "login to claude",
-    "press enter to log in",
-    "continue with anthropic",
-    "continue with google",
-  })
-  if not has_login_phrase then
+  -- Anchor #1: a title-style login phrase appears somewhere in the
+  -- body. Use `contains` rather than `starts_with` because the TUI
+  -- wraps the title inside a box-drawing panel (`│   Welcome to
+  -- Claude Code`); trimming the box border isn't enough because
+  -- multiple panel rows have border chars before content. Prose
+  -- often quotes login titles too, so this anchor alone isn't
+  -- sufficient — pair it with anchor #2.
+  local has_title = contains_any(text, LOGIN_TITLE_PREFIXES)
+  if not has_title then
     return false
   end
-  return contains_any(text, {
-    "anthropic.com",
-    "api key",
-    "press enter to log in",
-    "open the link",
-  })
+  -- Anchor #2: at least one dialog-unique structural cue. Each of
+  -- these is something the TUI renders but assistant prose would
+  -- rarely combine with a login title:
+  --   * a verbatim action prompt rendered on its own row,
+  --   * a real OAuth URL anchored at the start of a line (typically
+  --     `https://claude.ai/login...` or `https://anthropic.com/...`),
+  --   * the API-key env var name (only the TUI panel renders that
+  --     verbatim).
+  if contains(text, "press enter to log in") then return true end
+  if contains(text, "open the link") then return true end
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local t = trim(line)
+    if t:find("^https?://[%w%./%-_?=&%%]+claude%.ai") then return true end
+    if t:find("^https?://[%w%./%-_?=&%%]+anthropic%.com") then return true end
+  end
+  -- API-key fallback: the TUI renders `ANTHROPIC_API_KEY` in caps.
+  -- `text` is the body lowered for classifier consistency, so check
+  -- the lowered form here.
+  if contains(text, "anthropic_api_key") then return true end
+  return false
 end
 
 local function has_usage_screen(text)
@@ -916,17 +1047,24 @@ function M.send_prompt(input)
   --
   -- Empty-prompt guard: an empty bracketed paste leaves Claude at
   -- idle (the two Enters are no-ops on an empty input box), so do
-  -- NOT set `last_intent = "prompt_submitted"` in that case. The
-  -- classifier's mid-turn `thinking` branch keys off that intent;
-  -- claiming a turn started when no actual prompt was submitted
-  -- would lock the state machine in `thinking` forever, since the
-  -- TUI never renders the `✻ <Verb> for <duration>` completion
-  -- marker that's the durable mid-turn release signal. The intent
-  -- field stays unset so the classifier reads the screen for what
-  -- it actually is (`waiting_for_user_input` at an empty prompt).
+  -- NOT advance to the `prompt_submitted` intent. The classifier's
+  -- mid-turn `thinking` branch keys off that intent; claiming a
+  -- turn started when no actual prompt was submitted would lock the
+  -- state machine in `thinking` forever, since the TUI never
+  -- renders the `✻ <Verb> for <duration>` completion marker that's
+  -- the durable mid-turn release signal.
+  --
+  -- Equally important: actively CLEAR any previously-recorded
+  -- intent. If a caller submitted a real prompt, the turn completed,
+  -- and then called `send_prompt("")` again, leaving the recorded
+  -- intent at `prompt_submitted` would keep the mid-turn /
+  -- completed-turn branches active against an idle screen. We
+  -- communicate "clear the intent" by returning `last_intent = ""`;
+  -- the host's `apply_plan` interprets the empty string as an
+  -- explicit reset (see `src/extension.rs::apply_plan`).
   local prompt = input.prompt or ""
   if prompt == "" then
-    return { actions = {} }
+    return { actions = {}, last_intent = "" }
   end
   return {
     actions = {
@@ -984,6 +1122,19 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
+      -- Login / sign-in dialog. Mirrors `has_login_indicator` so
+      -- callers using `adapter.wait` after `adapter.start` against
+      -- an unauthenticated user wake on the sign-in panel instead
+      -- of timing out. "Press Enter to log in" is the action prompt
+      -- the TUI always renders inside the panel.
+      matcher.contains_text("Press Enter to log in"),
+      matcher.contains_text("Log in to Claude Code"),
+      -- Model picker dialog (opened by `/model`). Mirrors
+      -- `has_model_picker_indicator` so callers waiting after a
+      -- `slash_command("model")` send wake on the picker rather
+      -- than timing out.
+      matcher.contains_text("Select a model:"),
+      matcher.contains_text("Switch to model:"),
       -- Prompt glyph alone is NOT a completion anchor — it
       -- appears for one frame during preambles before a tool call
       -- while the next spinner is between repaints, and `adapter.wait`

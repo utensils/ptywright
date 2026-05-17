@@ -1,0 +1,10 @@
+❯ What is 2+2?
+
+⏺ 4
+
+✻ Brewed for 0.3s
+
+────────────────────────────────────────────────────────────────────────
+❯
+  james @ laptop /Users/james/Projects/sample                       [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

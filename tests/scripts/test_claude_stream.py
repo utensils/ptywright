@@ -177,6 +177,38 @@ class DumpAnswerRegionTests(unittest.TestCase):
         out = captured.getvalue()
         self.assertIn("⏺ Brief answer.", out)
 
+    def test_post_turn_ghost_suggestion_does_not_swallow_answer(self):
+        # Claude Code 2.1.x renders a post-turn suggested follow-up
+        # prompt (`❯ run the tests`) BELOW the answer/marker. The
+        # previous _dump_answer_region used the LAST prompt-with-text
+        # line as the start boundary, so it skipped past the answer
+        # and printed nothing. Anchoring on the FIRST prompt-with-text
+        # (the user's submitted prompt echo at the top) fixes it.
+        captured = io.StringIO()
+        stream = self._make_stream(captured)
+        body = "\n".join([
+            "❯ List exactly three .rs files.",  # submitted prompt
+            "",
+            "⏺ Here are three .rs files:",
+            "  src/lib.rs",
+            "  src/main.rs",
+            "  src/action.rs",
+            "",
+            "✻ Brewed for 2s",
+            "",
+            "❯ run the tests",  # post-turn ghost suggestion (NBSP-padded)
+        ])
+        with mock.patch.object(sys, "stdout", captured):
+            stream._dump_answer_region(body)
+        out = captured.getvalue()
+        self.assertIn("⏺ Here are three .rs files:", out)
+        self.assertIn("src/lib.rs", out)
+        self.assertIn("src/main.rs", out)
+        self.assertIn("src/action.rs", out)
+        self.assertIn("✻ Brewed for 2s", out)
+        # The ghost suggestion must NOT leak as content.
+        self.assertNotIn("run the tests", out)
+
     def test_skips_chrome_lines_in_answer_region(self):
         captured = io.StringIO()
         stream = self._make_stream(captured)
@@ -241,18 +273,41 @@ class ChromeSpinnerGlyphSetTests(unittest.TestCase):
 class ClientJsonRpcFramingTests(unittest.TestCase):
     """The Client class spawns ptywright as a subprocess and talks
     NDJSON JSON-RPC. We test its framing/correlation in isolation by
-    swapping in a fake `subprocess.Popen` that exposes byte streams
-    we can write framed messages into.
+    swapping in a fake `subprocess.Popen` that exposes OS-pipe-backed
+    byte streams.
 
-    These are the contracts that determine whether the script can
-    safely round-trip a request: ID-keyed response correlation, error
-    propagation as `RuntimeError`, queue draining for notifications,
-    and the post-shutdown "_dead" semantics that should make `rpc()`
-    bail rather than block forever.
+    The reader thread (Client._reader) drops id-bearing messages
+    whose ids aren't yet registered in `client.responses`. Pre-staging
+    a response onto the stdout pipe BEFORE rpc() runs therefore races
+    against the reader — by the time rpc() registers its queue, the
+    message may already be gone. To pin the framing contract
+    deterministically, each test:
+      1. Runs rpc() in a background thread (so it doesn't block the
+         test).
+      2. Reads the request line from the in_r side of the pipe
+         (blocking; guaranteed to see the request the client just
+         wrote because writes are line-buffered).
+      3. Writes the matching response on out_w.
+      4. Joins the rpc() thread.
+    The request-read step is the synchronization barrier — by the
+    time the response is written, the client has already registered
+    its response queue under the right id.
+
+    Contracts pinned here: ID-keyed response correlation, error
+    propagation as `RuntimeError` (with the error text retained),
+    notification fan-out to `drain_notifs`.
     """
 
-    def _make_client_with_fake_proc(self, fake_proc):
+    def _make_pipes_and_client(self):
         import threading
+
+        in_r, in_w = os.pipe()
+        out_r, out_w = os.pipe()
+        fake_proc = mock.Mock()
+        fake_proc.stdin = os.fdopen(in_w, "w", encoding="utf-8", buffering=1)
+        fake_proc.stdout = os.fdopen(out_r, "r", encoding="utf-8")
+        fake_proc.stderr = io.StringIO()
+        fake_proc.poll.return_value = None
 
         client = CS.Client.__new__(CS.Client)
         client.proc = fake_proc
@@ -261,103 +316,117 @@ class ClientJsonRpcFramingTests(unittest.TestCase):
         client.responses = {}
         client.notifs = queue.Queue()
         client._dead = False
-        # Spin up the reader thread the real __init__ would have
-        # started. The Client's reader is a bound method, not a
-        # standalone function, so passing it directly works.
         threading.Thread(target=client._reader, daemon=True).start()
-        return client
+
+        in_r_file = os.fdopen(in_r, "r", encoding="utf-8")
+
+        def write_response(payload):
+            os.write(out_w, (json.dumps(payload) + "\n").encode("utf-8"))
+
+        def cleanup():
+            client._dead = True
+            try: in_r_file.close()
+            except Exception: pass
+            try: os.close(out_w)
+            except Exception: pass
+
+        return client, in_r_file, write_response, cleanup
 
     def test_response_routes_back_to_caller_by_id(self):
-        # The reader thread should match `id` in the response to the
-        # `rid` allocated by `rpc()`, putting the message on the right
-        # queue. Driving this by hand: write a response after the
-        # request would have allocated id=1.
-        from io import BytesIO
-        # We need a fake Popen with stdin/stdout/stderr where stdout
-        # we can write to from the test and stdin we can read from.
-        in_r, in_w = os.pipe()
-        out_r, out_w = os.pipe()
-        fake_proc = mock.Mock()
-        fake_proc.stdin = os.fdopen(in_w, "w", encoding="utf-8", buffering=1)
-        fake_proc.stdout = os.fdopen(out_r, "r", encoding="utf-8")
-        fake_proc.stderr = io.StringIO()
-        fake_proc.poll.return_value = None
-        client = self._make_client_with_fake_proc(fake_proc)
+        import threading
 
-        # Pre-stage the response on the server-side pipe so when
-        # client.rpc() drains its queue it finds the answer.
-        os.write(out_w, (json.dumps({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {"ok": True},
-        }) + "\n").encode("utf-8"))
-        result = client.rpc("ping", {"x": 1}, t=2.0)
-        self.assertEqual(result, {"ok": True})
+        client, in_r_file, write_response, cleanup = self._make_pipes_and_client()
+        try:
+            slot = {}
+            def driver():
+                try:
+                    slot["result"] = client.rpc("ping", {"x": 1}, t=2.0)
+                except Exception as e:
+                    slot["error"] = e
+            t = threading.Thread(target=driver, daemon=True)
+            t.start()
 
-        # Cleanup.
-        client._dead = True
-        os.close(in_r)
-        os.close(out_w)
+            # Block until the client has actually written the request.
+            # By the time readline() returns, rpc() is past the write
+            # and has registered its response queue.
+            line = in_r_file.readline()
+            self.assertTrue(line, "client never wrote a request")
+            msg = json.loads(line)
+            self.assertEqual(msg["method"], "ping")
+            self.assertEqual(msg["params"], {"x": 1})
+
+            write_response({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "result": {"ok": True, "echo": msg["params"]},
+            })
+
+            t.join(timeout=2.0)
+            self.assertFalse(t.is_alive(), "rpc() never returned")
+            self.assertNotIn("error", slot, f"unexpected error: {slot.get('error')}")
+            self.assertEqual(slot["result"], {"ok": True, "echo": {"x": 1}})
+        finally:
+            cleanup()
 
     def test_error_response_raises_runtime_error(self):
-        in_r, in_w = os.pipe()
-        out_r, out_w = os.pipe()
-        fake_proc = mock.Mock()
-        fake_proc.stdin = os.fdopen(in_w, "w", encoding="utf-8", buffering=1)
-        fake_proc.stdout = os.fdopen(out_r, "r", encoding="utf-8")
-        fake_proc.stderr = io.StringIO()
-        fake_proc.poll.return_value = None
-        client = self._make_client_with_fake_proc(fake_proc)
+        import threading
 
-        os.write(out_w, (json.dumps({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {"code": -32600, "message": "bad request"},
-        }) + "\n").encode("utf-8"))
-        with self.assertRaises(RuntimeError) as cm:
-            client.rpc("bad", {}, t=2.0)
-        self.assertIn("bad", str(cm.exception))
+        client, in_r_file, write_response, cleanup = self._make_pipes_and_client()
+        try:
+            slot = {}
+            def driver():
+                try:
+                    client.rpc("bad", {}, t=2.0)
+                except Exception as e:
+                    slot["error"] = e
+            t = threading.Thread(target=driver, daemon=True)
+            t.start()
 
-        client._dead = True
-        os.close(in_r)
-        os.close(out_w)
+            line = in_r_file.readline()
+            msg = json.loads(line)
+            write_response({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "error": {"code": -32600, "message": "bad request"},
+            })
+
+            t.join(timeout=2.0)
+            self.assertFalse(t.is_alive(), "rpc() never returned")
+            self.assertIsInstance(slot.get("error"), RuntimeError)
+            err_text = str(slot["error"])
+            self.assertIn("bad", err_text)
+            self.assertIn("bad request", err_text)
+        finally:
+            cleanup()
 
     def test_notification_lands_on_drain_queue(self):
-        in_r, in_w = os.pipe()
-        out_r, out_w = os.pipe()
-        fake_proc = mock.Mock()
-        fake_proc.stdin = os.fdopen(in_w, "w", encoding="utf-8", buffering=1)
-        fake_proc.stdout = os.fdopen(out_r, "r", encoding="utf-8")
-        fake_proc.stderr = io.StringIO()
-        fake_proc.poll.return_value = None
-        client = self._make_client_with_fake_proc(fake_proc)
-
-        # Notifications (no `id`) go to client.notifs, drained via
-        # drain_notifs(). Send one, give the reader a tick to pick it
-        # up, then drain.
-        os.write(out_w, (json.dumps({
-            "jsonrpc": "2.0",
-            "method": "session.exited",
-            "params": {"session": "s1", "sequence": 42},
-        }) + "\n").encode("utf-8"))
-        # Wait briefly for the reader thread to process. Polling the
-        # queue itself is the deterministic signal.
+        # Notifications (no `id`) bypass the response queue entirely —
+        # the reader puts them directly on `client.notifs` whether or
+        # not anyone is waiting. No correlation race here, so we can
+        # safely pre-stage the message onto the client's stdout pipe.
         import time
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            notifs = client.drain_notifs()
-            if notifs:
-                break
-            time.sleep(0.01)
-        else:
-            self.fail("notification never arrived on drain_notifs queue")
-        self.assertEqual(len(notifs), 1)
-        self.assertEqual(notifs[0]["method"], "session.exited")
-        self.assertEqual(notifs[0]["params"]["session"], "s1")
 
-        client._dead = True
-        os.close(in_r)
-        os.close(out_w)
+        client, _in_r_file, write_response, cleanup = self._make_pipes_and_client()
+        try:
+            write_response({
+                "jsonrpc": "2.0",
+                "method": "session.exited",
+                "params": {"session": "s1", "sequence": 42},
+            })
+
+            # Deterministic poll — no sleep loops.
+            deadline = time.monotonic() + 2.0
+            notifs = []
+            while time.monotonic() < deadline:
+                notifs = client.drain_notifs()
+                if notifs:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(notifs), 1, "notification never arrived on drain_notifs queue")
+            self.assertEqual(notifs[0]["method"], "session.exited")
+            self.assertEqual(notifs[0]["params"]["session"], "s1")
+        finally:
+            cleanup()
 
 
 if __name__ == "__main__":

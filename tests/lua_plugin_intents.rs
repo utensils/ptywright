@@ -277,13 +277,17 @@ fn slash_command_pastes_token_and_presses_enter_without_intent() {
 /// The two Enters are no-ops on an empty input box, so Claude stays at
 /// idle and never renders the `✻ <Verb> for <duration>` completion
 /// marker that's the mid-turn release signal — claiming an intent here
-/// would lock the classifier in `thinking` indefinitely on the next
-/// `adapter.state` call. Returning an empty action list with no intent
-/// leaves the screen-derived state alone (the classifier will read the
-/// empty prompt as `waiting_for_user_input`, which is what's actually
-/// on screen).
+/// would lock the classifier in `thinking` indefinitely.
+///
+/// Equally important: an empty `send_prompt` must explicitly CLEAR any
+/// previously-recorded intent. If a real turn completed and then the
+/// caller submitted an empty prompt, leaving the stale
+/// `prompt_submitted` intent would keep mid-turn / completed-turn
+/// branches active against an idle screen. The plan signals "clear
+/// the intent" by returning `last_intent = Some("")`; the host's
+/// `apply_plan` treats the empty string as an explicit reset.
 #[test]
-fn send_prompt_refuses_empty_input_and_leaves_intent_unset() {
+fn send_prompt_refuses_empty_input_and_clears_any_stale_intent() {
     let extension = claude_plugin();
 
     let empty_string = plan(&extension, "send_prompt", json!({ "prompt": "" }));
@@ -292,16 +296,17 @@ fn send_prompt_refuses_empty_input_and_leaves_intent_unset() {
         "empty prompt must emit zero actions, got {:?}",
         empty_string.actions
     );
-    assert!(
-        empty_string.last_intent.is_none(),
-        "empty prompt must leave last_intent unset so the classifier reads the screen, not a phantom turn"
+    assert_eq!(
+        empty_string.last_intent.as_deref(),
+        Some(""),
+        "empty prompt must return Some(\"\") to explicitly clear any stale intent recorded by a prior submission"
     );
 
     // Missing prompt field is the same edge case — the plugin defaults
     // it to "" and must take the same path.
     let missing_prompt = plan(&extension, "send_prompt", json!({}));
     assert!(missing_prompt.actions.is_empty());
-    assert!(missing_prompt.last_intent.is_none());
+    assert_eq!(missing_prompt.last_intent.as_deref(), Some(""));
 }
 
 /// `force_cancel` sends Escape twice in one plan. Real Claude Code
@@ -324,6 +329,45 @@ fn force_cancel_plan_emits_two_escapes_and_marks_cancelling_intent() {
         Some("cancelling"),
         "force_cancel must mark the cancelling hold-state just like cancel does"
     );
+}
+
+/// End-to-end check that empty `send_prompt` clears a previously-set
+/// `last_intent` through `ExtensionHandle::apply_plan`. The plan
+/// returns `Some("")` which the host treats as an explicit reset.
+/// Without this, a no-op submission after a real turn would leave
+/// the classifier reading screens against a stale `prompt_submitted`
+/// intent — locking the mid-turn `thinking` branch on an idle screen.
+#[test]
+#[cfg(unix)]
+fn empty_send_prompt_clears_stale_last_intent_via_handle() {
+    use ptywright::session::Session;
+    use ptywright::target::Target;
+
+    let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "cat"]))
+        .expect("spawn /bin/sh -lc cat for PTY round-trip");
+    let extension = claude_plugin();
+    let mut handle = ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+
+    // Simulate a prior real submission having recorded the intent.
+    handle.set_last_intent(Some("prompt_submitted".to_string()));
+    assert_eq!(handle.last_intent(), Some("prompt_submitted"));
+
+    // Empty `send_prompt` must clear the stale intent, not preserve it.
+    handle
+        .send("send_prompt", json!({ "prompt": "" }))
+        .expect("send_prompt empty via ExtensionHandle");
+    assert_eq!(
+        handle.last_intent(),
+        None,
+        "empty send_prompt should explicitly reset last_intent so a stale `prompt_submitted` from a prior turn doesn't keep mid-turn branches active"
+    );
+
+    // Same for missing `prompt` field.
+    handle.set_last_intent(Some("prompt_submitted".to_string()));
+    handle
+        .send("send_prompt", json!({}))
+        .expect("send_prompt with no prompt field via ExtensionHandle");
+    assert_eq!(handle.last_intent(), None);
 }
 
 #[test]

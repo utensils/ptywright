@@ -150,7 +150,7 @@ echo "what changed since last week?" | claude-stream -
 Defaults that matter:
 
 - `--model sonnet` — Sonnet engages with tool-using prompts reliably; switch to `--model haiku` for fast smoke tests, accepting that Haiku sometimes acknowledges-and-stops on broad prompts.
-- `--timeout 600` — the only time-based guard in the control flow. All internal waits derive from screen-content evidence, not wall-clock heuristics.
+- `--timeout 600` — the outer hard deadline. Almost every internal wait is driven by screen-content evidence (`adapter.wait` matchers, `session.exited` notifications, classifier state transitions). The one exception is the bounded initial settle wait in `submit()` — capped at 3 s before the prompt-acknowledgement loop takes over — which is skipped entirely when the startup loop already observed `waiting_for_user_input`.
 - `--heartbeat-ms 50` — poll cadence. Pulses `session.output` redraws but the script does not itself depend on this being any particular value.
 
 What the script demonstrates (and what an integrator should copy):
@@ -161,7 +161,7 @@ What the script demonstrates (and what an integrator should copy):
 4. Fallback dump of the body's answer region if the streaming diff caught nothing (covers the edge case where the model produces its entire reply between two polling ticks).
 5. SIGINT handler that terminates the ptywright subprocess and lets the main thread clean up RPC state outside the signal context.
 
-The script is intentionally short (≈600 lines including comments) so it doubles as a worked example of every primitive a real consumer would touch: `adapter.start`, `adapter.send`, `adapter.state`, `adapter.inspect`, `adapter.transcript`, `adapter.wait`, `adapter.close`, plus the `session.output` / `session.exited` notification subscription.
+The script doubles as a worked example of every primitive a real consumer would touch: `adapter.start`, `adapter.send`, `adapter.state`, `adapter.inspect`, `adapter.transcript`, `adapter.wait`, `adapter.close`, plus the `session.output` / `session.exited` notification subscription. Most of the file is comments documenting why each guard exists; the actual control flow is short. The test surface lives in `tests/scripts/test_claude_stream.py` (stdlib `unittest`) and locks down the chrome filter, the answer-region fallback, the terminal-state taxonomy, and the JSON-RPC framing contracts that determine whether the streaming output is legible and how failures terminate.
 
 ## Safety and limitations
 

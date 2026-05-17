@@ -424,8 +424,26 @@ impl ExtensionHandle {
 
     fn apply_plan(&mut self, plan: &ActionPlan, _intent: &str) -> Result<()> {
         self.apply_actions(&plan.actions)?;
+        // Three states the plan's `last_intent` can express:
+        //   * Some(non-empty)  → record this as the new intent.
+        //   * Some("")         → explicit clear: drop whatever intent
+        //                        is currently recorded. Used by no-op
+        //                        plans (e.g. empty `send_prompt`) so
+        //                        a stale `prompt_submitted` from a
+        //                        prior submission doesn't keep the
+        //                        classifier on the mid-turn branch.
+        //   * None             → leave the recorded intent alone. The
+        //                        conventional pattern for read-only
+        //                        or idempotent actions (approve /
+        //                        deny / dismiss_welcome / expand /
+        //                        slash_command) that don't start a
+        //                        new turn but also don't end one.
         if let Some(intent) = plan.last_intent.clone() {
-            self.last_intent = Some(intent);
+            if intent.is_empty() {
+                self.last_intent = None;
+            } else {
+                self.last_intent = Some(intent);
+            }
         }
         Ok(())
     }
