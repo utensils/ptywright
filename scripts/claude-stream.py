@@ -77,8 +77,8 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("prompt", help='prompt string, @path/to/file, or - for stdin')
     ap.add_argument("--cwd", default=os.getcwd(), help="cwd for the claude session (default: $PWD)")
-    ap.add_argument("--model", default="haiku",
-                    help="model passed to `claude --model` (default: haiku; pass --model '' to let claude choose)")
+    ap.add_argument("--model", default="sonnet",
+                    help="model passed to `claude --model` (default: sonnet; pass --model '' to let claude choose). Haiku tends to acknowledge-and-stop without using tools on broad prompts, which makes the demo look like the stream exited early; sonnet engages with tool-using prompts more reliably.")
     ap.add_argument("--timeout", type=float, default=600.0,
                     help="overall hard safety bound in seconds (default: 600). The script never "
                          "spins past this regardless of internal state — it is the only time-based "
@@ -202,21 +202,37 @@ class Client:
 # *output bytes*, not wall-clock.
 PASTE_REACTION_BYTES = 256
 
-# Pre-compiled patterns for streaming-output dedup. The streaming loop
-# de-duplicates lines so each distinct content shows once; these patterns
-# normalize away the parts that vary tick-to-tick (spinner glyph at the
-# start, timing/token counters in trailing parens) so the same conceptual
-# line — e.g. "Channelling…" — collapses to one print regardless of which
-# glyph or counter Claude happens to render this tick. Structural, not
-# TUI-version-specific: any TUI that wraps live counters in parens or
-# leads spinner lines with a glyph collapses correctly.
-_DEDUP_TRAILING_PARENS_RE = re.compile(r"\s*\([^)]+\)\s*$")
-_DEDUP_LEADING_GLYPH_RE   = re.compile(r"^[^\w]+")
+# Structural filters for body chrome — lines that exist purely as TUI
+# decoration and should not be streamed as content. Matching is by
+# shape, not by glyph identity, so any TUI that uses similar chrome
+# patterns gets filtered without listing every Unicode variant.
+#
+#   * `_CHROME_RULE_RE` — horizontal rules made of one repeated
+#     box-drawing or em-dash character (Claude Code uses `─`).
+#   * `_CHROME_SPINNER_RE` — spinner status lines: leading glyph,
+#     then a verb ending with the horizontal ellipsis `…`, optionally
+#     followed by a parenthesized counter section like
+#     `(9s · ↑ 217 tokens · thinking)` or `(ctrl+o to expand)` that
+#     mutates every frame. The completion line (`✻ <Verb> for <N>`)
+#     does NOT end with an ellipsis and contains ` for <digit>`, so
+#     it intentionally doesn't match this pattern — it's the real
+#     end-of-turn signal we want to surface.
+#   * `_CHROME_SEARCHED_RE` — Claude Code progress lines like
+#     `Searching for 1 pattern…` / `Searched for 1 pattern (ctrl+o
+#     to expand)`. These mutate (count, "ing" → "ed") every tick and
+#     would otherwise be deduped per state.
+_CHROME_RULE_RE = re.compile(r"^[─━═]+$")
+_CHROME_SPINNER_RE = re.compile(r"^\S+\s+\S+…(?:\s*\([^)]*\))?$")
+_CHROME_SEARCHED_RE = re.compile(r"^(?:Searching|Searched|Reading|Read|Listing|Listed|Glob|Grep)\b.*\(ctrl\+o to expand\)$")
 
-def _normalize_for_dedup(line: str) -> str:
-    s = _DEDUP_TRAILING_PARENS_RE.sub("", line)
-    s = _DEDUP_LEADING_GLYPH_RE.sub("", s)
-    return s.strip().lower()
+def _is_chrome_line(s: str) -> bool:
+    if _CHROME_RULE_RE.match(s):
+        return True
+    if _CHROME_SPINNER_RE.match(s) and len(s) <= 120:
+        return True
+    if _CHROME_SEARCHED_RE.match(s):
+        return True
+    return False
 
 class Stream:
     """Robust Claude Code streaming driver — TUI-version-agnostic."""
@@ -264,7 +280,15 @@ class Stream:
         ev = st["state"].get("evidence", "")
         md = st["state"].get("metadata")
         if not self.args.quiet:
-            if s != self._last_state or ev != self._last_evidence:
+            # Only log on actual state transitions. Evidence can flap
+            # within a single state (e.g. the mid-turn `thinking` branch
+            # alternates between "active work indicator detected" and
+            # "turn in flight; no completion marker on screen" as the
+            # spinner repaints), and logging each evidence change made
+            # the output look like the classifier was flapping when it
+            # was steady. The post-transition evidence is preserved on
+            # the line so the reader still sees the most recent reason.
+            if s != self._last_state:
                 emit(MAGENTA("⇢ state"),
                      f"{self._last_state} → {BOLD(s)}  {DIM(ev)}" if self._last_state
                      else f"{BOLD(s)}  {DIM(ev)}")
@@ -343,6 +367,56 @@ class Stream:
             sys.stdout.write("\r\033[K")
             sys.stdout.flush()
 
+    # ─── fallback: dump answer region from final body ────────────────────
+    def _dump_answer_region(self, body: str) -> None:
+        """Print the answer region from the final body snapshot.
+
+        Called at completion when the streaming loop didn't surface any
+        content of its own. Common scenarios:
+          * Model gave a very brief reply (the entire response fits in
+            the gap between two polling ticks).
+          * Content was rewritten in place faster than the diff caught.
+
+        The "answer region" is everything from after the last `❯ …`
+        prompt-with-text line (the user's submitted prompt echo) up to
+        (but not including) the trailing empty `❯` idle prompt. That
+        captures Claude's actual reply plus the completion marker
+        without the welcome chrome above or the post-turn input row
+        below. Chrome lines (horizontal rules, spinner status) are
+        skipped using the same structural filter the streaming loop
+        uses.
+        """
+        lines = body.splitlines()
+        # Find the user's submitted prompt echo: a line starting with
+        # the prompt glyph followed by user text. The answer starts
+        # AFTER that.
+        start = 0
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if (s.startswith("❯") or s.startswith(">")) and len(s) > 2 and not s[1:].lstrip().startswith(("1.", "2.", "3.")):
+                start = i + 1
+        # Find the trailing idle prompt (a line that's JUST `❯` or `>`).
+        # Everything between `start` and that boundary is the answer.
+        end = len(lines)
+        for i in range(len(lines) - 1, start, -1):
+            s = lines[i].strip()
+            if s in ("❯", ">"):
+                end = i
+                break
+        printed = False
+        for line in lines[start:end]:
+            s = line.strip()
+            if not s:
+                continue
+            if _is_chrome_line(s):
+                continue
+            if not printed:
+                self._clear_alive()
+                printed = True
+            sys.stdout.write(line + "\n")
+        if printed:
+            sys.stdout.flush()
+
     # ─── action: send a single named key ─────────────────────────────────
     def send_key(self, key: str):
         self.client.rpc("adapter.send",
@@ -392,34 +466,41 @@ class Stream:
 
     # ─── compound: stream body deltas until classifier signals completion ─
     def stream_until_done(self) -> int:
-        """Stream body deltas + state transitions until completed_turn.
+        """Stream body deltas + state transitions until a terminal state.
 
-        Termination is purely classifier-driven:
-          * `state == completed_turn` from the plugin's poll path fires
-            only when BOTH the answer-bullet `⏺` AND an empty `❯`/`>`
-            prompt line are on screen with no active-work spinner —
-            i.e. Claude is back at idle. The empty-prompt guard is what
-            keeps this from firing mid-stream.
-          * Other TERMINAL_STATES (error, exited, plugin_error) end the
-            run as well.
+        Termination is classifier-driven:
+          * `completed_turn` (success): the TUI rendered its end-of-turn
+            marker (`✻ <Verb> for <duration>`) and the input prompt is
+            visible without an active-work spinner — i.e. Claude is back
+            at idle.
+          * `error` / `exited` / `plugin_error` (failure): the host or
+            the classifier reported a fatal condition.
 
-        Output strategy (TUI-version-agnostic):
-          * Each heartbeat we read body_text and diff against the
-            previous body using longest-common-prefix.
-          * We print only lines we have NEVER printed before
-            (de-duplicated via `_normalize_for_dedup` so the same
-            `✶ Generating…` text shows once even though the glyph
-            rotates each tick).
+        Output strategy:
+          * Each heartbeat we read `body_text` and diff against the
+            previous body. Lines we have NEVER printed before
+            (full-content match — no normalization, no position tricks)
+            get streamed to stdout.
+          * Spinner / status-bar / pure-chrome lines are filtered by
+            structural patterns, not by glyph-stripping, so the dedup
+            key is just the line's stripped content.
+          * If the turn finishes without surfacing any content (a
+            common Haiku failure mode where the model acknowledges and
+            stops without using tools), the final body is dumped so the
+            user always sees Claude's actual reply.
         """
         body, _ = self.inspect()
         baseline_len = len(body)
         last_body = body
+        # Dedup by full stripped line content. Seeded with the
+        # pre-stream body so we don't re-emit the welcome chrome or
+        # the prompt echo.
         printed_lines: set[str] = set()
-        # Seed dedup with the pre-stream body so we don't re-emit the
-        # welcome chrome or the prompt echo.
         for line in last_body.splitlines():
             s = line.strip()
-            if s: printed_lines.add(_normalize_for_dedup(s))
+            if s:
+                printed_lines.add(s)
+        streamed_anything = False
 
         while not self._expired():
             try:
@@ -436,30 +517,39 @@ class Stream:
                     emit(YELLOW("◌ session.exited"))
 
             if body != last_body:
-                old_lines = last_body.splitlines()
-                new_lines = body.splitlines()
-                common = 0
-                for o, n in zip(old_lines, new_lines):
-                    if o == n: common += 1
-                    else: break
+                # Walk EVERY line in the new body (not just past common
+                # prefix). Position-based diffing missed content when
+                # Claude rewrote screen regions in place; full content
+                # match is robust to that.
                 printed = False
-                for line in new_lines[common:]:
+                for line in body.splitlines():
                     s = line.strip()
-                    if not s: continue
-                    if s.startswith("─") and s.rstrip("─") == "": continue
-                    key = _normalize_for_dedup(s)
-                    if not key or key in printed_lines: continue
-                    printed_lines.add(key)
+                    if not s:
+                        continue
+                    if _is_chrome_line(s):
+                        continue
+                    if s in printed_lines:
+                        continue
+                    printed_lines.add(s)
                     if not printed:
                         self._clear_alive()
                         printed = True
                     sys.stdout.write(line + "\n")
-                if printed: sys.stdout.flush()
+                    streamed_anything = True
+                if printed:
+                    sys.stdout.flush()
                 last_body = body
 
             if state in self.TERMINAL_STATES:
                 self._clear_alive()
                 grew_by = max(0, len(body) - baseline_len)
+                # Fallback: surface the answer region even if streaming
+                # caught nothing. Happens when Claude only added the
+                # completion marker (Haiku ack-and-stop) or when content
+                # arrived between the last diff and the terminal-state
+                # check. The user always sees what's on screen.
+                if not streamed_anything and grew_by > 0:
+                    self._dump_answer_region(body)
                 if state == self.SUCCESS_STATE:
                     emit(GREEN(f"✓ {state}"), DIM(f"(+{grew_by} chars in body)"))
                     return 0
