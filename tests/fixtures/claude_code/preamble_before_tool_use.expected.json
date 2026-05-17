@@ -1,6 +1,6 @@
 {
   "state": "waiting_for_user_input",
   "evidence": "input prompt glyph detected",
-  "last_intent": null,
+  "last_intent": "prompt_submitted",
   "min_confidence": 0.6
 }

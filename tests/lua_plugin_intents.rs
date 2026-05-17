@@ -61,6 +61,81 @@ fn wait_matcher(extension: &LuaExtension, intent: &str, params: serde_json::Valu
 }
 
 #[test]
+fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
+    // Reproduces the Claude Code 2.1.143 behaviour where the post-trust
+    // welcome panel stays rendered as visual residue even after the user
+    // has submitted a prompt. Without the `last_intent == prompt_submitted`
+    // gate in the welcome branch, this screen oscillates between `thinking`
+    // (on ticks where the spinner glyph is captured) and `starting` (on
+    // ticks between spinner frames) — making turn-boundary polling
+    // unreliable. The fix: once a prompt has been submitted, the welcome
+    // chrome is stale and the classifier falls through to the regular
+    // input-prompt / completed-turn branches.
+    let extension = claude_plugin();
+    let screen = "\
+╭─── Claude Code v2.1.143 ────────────────────────────────────────────╮
+│ Welcome back James!     │ Tips for getting started                  │
+│  ▐▛███▜▌                │ Ask Claude to create a new app            │
+│  ▝▜█████▛▘              │ What's new                                │
+│  ▘▘ ▝▝                  │ /release-notes for more                   │
+╰─────────────────────────────────────────────────────────────────────╯
+
+❯ What is 2+2? Reply with just the digit.
+
+⏺ 4
+
+✻ Brewed for 0.4s
+
+❯
+────────────────────────────────────────────────────────────────────────
+  user @ host /workspace                                  [Haiku 4.5]
+  ⏵⏵ auto mode on (shift+tab to cycle)
+";
+
+    // With stable_ms >= the stability window — adapter.wait path.
+    let st = classify_state(
+        &extension,
+        screen,
+        7,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+    assert_eq!(
+        st.state, "completed_turn",
+        "welcome chrome must not downgrade to `starting` post-submit (stable path); got state={} evidence={}",
+        st.state, st.evidence
+    );
+
+    // Without stable_ms — adapter.state poll path. The screen has the
+    // answer bullet (`⏺ 4`), the tea-verb completion marker
+    // (`✻ Brewed for 0.4s`), and the empty input prompt (`❯` alone on
+    // its row), so the poll-path `completed_turn` branch fires with
+    // confidence 0.7. The important property the welcome-residue test
+    // locks here is that the welcome chrome does NOT downgrade this to
+    // `starting`; with `last_intent == "prompt_submitted"` the welcome
+    // detection is suppressed.
+    let st_poll = classify_state(&extension, screen, 7, Some("prompt_submitted"), None);
+    assert_eq!(
+        st_poll.state, "completed_turn",
+        "welcome chrome must not downgrade post-submit on state-poll path; got state={} evidence={}",
+        st_poll.state, st_poll.evidence
+    );
+    assert_eq!(
+        st_poll.evidence, "answer bullet plus empty input prompt visible without active work",
+        "poll-path completed_turn must own this screen"
+    );
+
+    // Sanity: when last_intent is empty (still in the welcome-dismissal
+    // window) the welcome detection still wins.
+    let st_pre = classify_state(&extension, screen, 7, None, Some(COMPLETED_TURN_STABLE_MS));
+    assert_eq!(
+        st_pre.state, "starting",
+        "before prompt submission, welcome panel still classifies as `starting`; got state={}",
+        st_pre.state
+    );
+}
+
+#[test]
 fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
     // Mid-turn steering injects a follow-up prompt while Claude is still
     // thinking. The action shape is identical to `send_prompt` (bracketed
@@ -91,12 +166,23 @@ fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
 }
 
 #[test]
-fn send_prompt_plan_uses_bracketed_paste_and_sets_intent() {
-    // Claude Code v2.1+ enables bracketed paste; the plan must use the
-    // bracketed variant so the trailing Enter is not absorbed into the
-    // paste tokeniser on longer prompts. Lock the action shape and the
-    // `last_intent` contract in here — both are part of the plugin's
-    // documented surface for plugin authors.
+fn send_prompt_plan_dismisses_then_pastes_then_submits() {
+    // The plan emits THREE actions in this exact order:
+    //   1. Enter  — dismiss any first-keypress interceptor (welcome
+    //      panel, compact-launch view). On a clean empty input box
+    //      Claude treats this as a no-op submit.
+    //   2. BracketedPaste(prompt) — Claude Code v2.1+ requires the
+    //      bracketed wrapper so the trailing Enter is not absorbed into
+    //      the paste tokeniser on longer prompts.
+    //   3. Enter — submit the now-populated input box.
+    //
+    // Without action #1, the bracketed paste's CSI-200~ open marker
+    // gets consumed by Claude's first-keypress interceptor on a fresh
+    // launch, the rest of the paste lands as input that's then
+    // truncated, and the trailing Enter submits a partial prompt or
+    // nothing at all. Locking the three-action sequence here so a
+    // future plugin edit can't silently regress to the old two-action
+    // form.
     let extension = claude_plugin();
     let plan = plan(
         &extension,
@@ -107,6 +193,7 @@ fn send_prompt_plan_uses_bracketed_paste_and_sets_intent() {
     assert_eq!(
         plan.actions,
         vec![
+            Action::Key(Key::Enter),
             Action::BracketedPaste("hello Claude".to_string()),
             Action::Key(Key::Enter),
         ]
@@ -366,6 +453,11 @@ fn wait_cancel_settled_matcher_returns_screen_stable_threshold() {
 
 #[test]
 fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
+    // The empty-prompt anchor in wait_turn_matcher is now paired with
+    // the tea-verb completion marker — both must appear on the screen
+    // for the empty-prompt branch to fire. This mirrors the
+    // classifier's `completed_turn` gate exactly so `adapter.wait`
+    // can't return before the classifier would.
     let extension = claude_plugin();
     let matcher = wait_matcher(
         &extension,
@@ -373,14 +465,14 @@ fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
         json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
     );
     let snapshot = ScreenSnapshot {
-        size: TerminalSize::new(3, 20),
+        size: TerminalSize::new(4, 30),
         cursor: CursorState {
-            row: 1,
+            row: 2,
             col: 2,
             visible: true,
         },
         sequence: 1,
-        plain_text: "work complete\n > \r\n".to_string(),
+        plain_text: "work complete\n✻ Brewed for 0.4s\n > \r\n".to_string(),
         cells: Vec::new(),
         alternate_screen: false,
         application_cursor: false,
@@ -396,6 +488,51 @@ fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
             process_exited: false,
         },
     ));
+}
+
+#[test]
+fn wait_turn_matcher_does_not_fire_on_preamble_without_completion_marker() {
+    // Regression for the bug Copilot called out: the empty-prompt
+    // anchor used to wake `adapter.wait` on its own, which fired on
+    // preamble-before-tool-use screens (answer-bullet line plus an
+    // empty `❯` for a single frame while the next spinner was between
+    // repaints). Without the tea-verb marker, the wait must hold and
+    // let the next spinner frame re-trigger the active-work state
+    // instead of returning prematurely with `waiting_for_user_input`.
+    let extension = claude_plugin();
+    let matcher = wait_matcher(
+        &extension,
+        "wait_turn_matcher",
+        json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+    );
+    let snapshot = ScreenSnapshot {
+        size: TerminalSize::new(4, 60),
+        cursor: CursorState {
+            row: 2,
+            col: 2,
+            visible: true,
+        },
+        sequence: 1,
+        plain_text: "⏺ I'll explore the project structure and read the\nkey files.\n > \r\n"
+            .to_string(),
+        cells: Vec::new(),
+        alternate_screen: false,
+        application_cursor: false,
+        application_keypad: false,
+        title: None,
+    };
+
+    assert!(
+        !matcher.is_match_with_context(
+            &snapshot,
+            "",
+            MatcherContext {
+                stable_for: Duration::from_millis(COMPLETED_TURN_STABLE_MS),
+                process_exited: false,
+            },
+        ),
+        "wait_turn_matcher must not fire on a preamble screen lacking the ✻ completion marker"
+    );
 }
 
 #[test]
@@ -455,7 +592,7 @@ fn classifier_detects_completed_turn_after_prompt_submission() {
     let extension = claude_plugin();
     let state = classify_state(
         &extension,
-        "work completed\n>",
+        "work completed\n\n✻ Brewed for 0.3s\n\n>",
         6,
         Some("prompt_submitted"),
         Some(COMPLETED_TURN_STABLE_MS),
@@ -469,22 +606,90 @@ fn classifier_detects_completed_turn_after_prompt_submission() {
 }
 
 #[test]
-fn classifier_requires_stable_prompt_for_completed_turn() {
-    // Without the stable_ms threshold being met, an idle prompt right
-    // after prompt_submitted is just waiting_for_user_input — not
-    // completed_turn. Locks the boundary between "rendered idle" and
-    // "settled idle" so a future plugin edit can't relax it.
+fn classifier_completed_turn_paths() {
+    // The classifier has two completion paths:
+    //   (a) Stable path (confidence ~0.78): fires when adapter.wait
+    //       supplies stable_ms >= completed_turn_stable_ms. The matcher
+    //       has already proven the screen settled, so we trust it.
+    //   (b) Poll path (confidence ~0.7): fires from adapter.state when
+    //       the answer bullet `⏺` + the tea-verb completion marker
+    //       `✻ <Verb> for <duration>` + an empty input prompt line are
+    //       all visible. The marker is the TUI's own end-of-turn signal —
+    //       it never appears between tool calls or during preambles, so
+    //       requiring it eliminates the "preamble-before-tool" false
+    //       positive (bullet + empty prompt visible for a frame while
+    //       the spinner hasn't repainted yet).
+    //
+    // Two mid-stream cases must NOT fire completed_turn — either would
+    // terminate the stream before the rest of the answer arrives.
     let extension = claude_plugin();
-    let state = classify_state(
+
+    let completed_screen = "⏺ work completed\n\n✻ Brewed for 0.3s\n\n>";
+
+    // (a) Stable path — completion screen + stable_ms supplied.
+    let stable = classify_state(
         &extension,
-        "work completed\n>",
+        completed_screen,
+        6,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+    assert_eq!(stable.state, "completed_turn");
+    assert_eq!(
+        stable.evidence,
+        "stable input prompt after prompt submission"
+    );
+
+    // (b) Poll path — completion screen, no stable_ms.
+    let poll = classify_state(
+        &extension,
+        completed_screen,
         6,
         Some("prompt_submitted"),
         None,
     );
+    assert_eq!(poll.state, "completed_turn");
+    assert_eq!(
+        poll.evidence,
+        "answer bullet plus empty input prompt visible without active work"
+    );
+    assert!(
+        poll.confidence < stable.confidence,
+        "poll-path confidence ({}) should be below stable-path ({})",
+        poll.confidence,
+        stable.confidence
+    );
 
-    assert_eq!(state.state, "waiting_for_user_input");
-    assert_eq!(state.evidence, "input prompt glyph detected");
+    // (c) Answer bullet visible but no empty prompt yet — mid-stream.
+    // Must NOT fire completed_turn, or the script terminates early.
+    let mid_stream = classify_state(
+        &extension,
+        "⏺ partial answer being written",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        mid_stream.state, "completed_turn",
+        "mid-stream (answer bullet but no empty prompt) must not fire completed_turn"
+    );
+
+    // (d) Preamble-before-tool-use — answer bullet + empty prompt visible
+    // but NO completion marker yet (Claude rendered a preamble line and
+    // is about to start a tool call; the spinner happens to be between
+    // repaints this frame). Must NOT fire completed_turn — that was the
+    // live regression from the claude-stream demo.
+    let preamble = classify_state(
+        &extension,
+        "⏺ I'll explore the project structure and read the key files.\n\n>",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        preamble.state, "completed_turn",
+        "preamble (bullet + empty prompt but no ✻ marker) must not fire completed_turn"
+    );
 }
 
 #[test]

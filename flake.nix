@@ -125,6 +125,8 @@
               pkgs.gh
               pkgs.jq
               pkgs.bun
+              # claude-stream demo driver is a stdlib-only Python script.
+              pkgs.python3
             ];
 
             env = [
@@ -221,6 +223,27 @@
                 name = "ptywright";
                 help = "run ptywright (with the default `repl` feature, including the interactive REPL client)";
                 command = "cargo run --features repl -- \"$@\"";
+              }
+              {
+                category = "run";
+                name = "claude-stream";
+                help = "drive Claude Code through ptywright and stream the response (e.g. claude-stream 'summarize CHANGELOG.md')";
+                command = ''
+                  set -euo pipefail
+                  # Prefer an already-built release binary; fall back to a
+                  # debug build through `cargo run` so the devshell user
+                  # doesn't have to remember to `build-release` first.
+                  if [ -x "$PRJ_ROOT/target/release/ptywright" ]; then
+                    export PTYWRIGHT_BIN="$PRJ_ROOT/target/release/ptywright"
+                  elif [ -x "$PRJ_ROOT/target/debug/ptywright" ]; then
+                    export PTYWRIGHT_BIN="$PRJ_ROOT/target/debug/ptywright"
+                  else
+                    echo "claude-stream: no ptywright binary found; building debug..." >&2
+                    cargo build --quiet >&2
+                    export PTYWRIGHT_BIN="$PRJ_ROOT/target/debug/ptywright"
+                  fi
+                  exec python3 "$PRJ_ROOT/scripts/claude-stream.py" "$@"
+                '';
               }
               {
                 category = "docs";

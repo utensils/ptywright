@@ -1,0 +1,12 @@
+{
+  "state": "completed_turn",
+  "evidence": "stable input prompt after prompt submission",
+  "last_intent": "prompt_submitted",
+  "min_confidence": 0.6,
+  "metadata": {
+    "status": {
+      "model": "Haiku 4.5",
+      "permission_mode": "auto"
+    }
+  }
+}

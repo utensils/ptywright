@@ -1,0 +1,13 @@
+ ▐▛███▜▌   Claude Code v2.1.142
+▝▜█████▛▘  Haiku 4.5 · Claude Max
+  ▘▘ ▝▝    ~/Projects/sample
+
+❯ Read all files in this project and summarize it.
+
+⏺ I'll explore the project structure and read the key files to give you a
+  comprehensive summary.
+
+────────────────────────────────────────────────────────────────────────
+❯
+  user @ host /Users/me/Projects/sample                       [Haiku 4.5]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

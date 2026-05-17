@@ -1,0 +1,89 @@
+# Manifest for the built-in claude-code adapter plugin.
+#
+# All claude-code-specific configuration lives in this directory next to
+# main.lua. The Rust core embeds both at compile time via include_str!
+# and parses this manifest at startup — there is no hand-written Rust
+# constant for the manifest fields. Third-party plugins follow the same
+# shape (manifest.toml + main.lua under their own plugin root).
+#
+# To change any of the values below, edit this file. Do NOT add a
+# parallel Rust struct that re-declares the same values.
+
+name = "claude-code"
+kind = "adapter"
+runtime = "lua"
+entrypoint = "plugins/claude-code/main.lua"
+
+# Version is a placeholder — the Rust loader stamps this with the host's
+# CARGO_PKG_VERSION at runtime so the manifest doesn't have to track
+# Cargo.toml. The field is still here so third-party plugins (which load
+# their own manifest.toml verbatim, no version-stamping) have a worked
+# example of the required shape.
+version = "0.0.0"
+
+# Host capabilities the plugin needs. Per-method permission gating in
+# src/rpc.rs consults this list before dispatching adapter.* calls.
+permissions = [
+  "session.spawn",
+  "session.kill",
+  "session.resize",
+  "screen.read",
+  "transcript.read",
+  "input.write",
+  "matcher.wait",
+]
+
+[default_target]
+# PTY program. `adapter.start` falls back to this when the caller omits
+# `program`.
+program = "claude"
+
+# Headless geometry preset. Claude Code 2.1.x renders its status bar,
+# prompt glyphs (`>`, `❯`), and turn-boundary anchors at column-sensitive
+# positions; the host's last-resort fallback (`rows = 40, cols = 120`)
+# wraps many of those lines and destabilises the classifier. 60×200
+# comfortably fits the status bar, the "Total cost: …" usage screen, and
+# the longest tool-use status lines without wrapping.
+rows = 60
+cols = 200
+
+# TUI-simplification env preset. Each var here disables a Claude Code 2.1.x
+# feature that produces output the classifier either can't see through,
+# can't distinguish from prose, or that simply makes the rendered body
+# noisier. Caller-supplied env on adapter.start overrides any key here;
+# keys the caller omits are inherited.
+#
+# Why these specifically:
+#   * CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 — don't re-display the submitted
+#     prompt in the input box after a turn. Without this the "empty
+#     input prompt visible" completion signal is unreliable (the prompt
+#     re-appears mid-frame after a turn).
+#   * CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 — no OSC title escapes
+#     polluting the transcript.
+#   * CLAUDE_CODE_DISABLE_MOUSE=1 — no mouse-capture escape sequences.
+#   * CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 — keep content in cell
+#     positions the vt100 parser tracks; virtual scrolling pushes
+#     earlier rendered content off the visible grid.
+#   * CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 — fewer status-bar refreshes.
+#   * CLAUDE_CODE_DISABLE_MESSAGE_ACTIONS=1 / CLAUDE_CODE_DISABLE_ATTACHMENTS=1
+#     — drop UI affordances the plugin doesn't drive.
+#   * CLAUDE_CODE_SYNTAX_HIGHLIGHT=0 / NO_COLOR=1 / FORCE_COLOR=0 — minimise
+#     SGR escape churn so body_text diffs are content-driven, not
+#     style-driven.
+#   * CLAUDE_CODE_ACCESSIBILITY=1 — keeps the native cursor visible and
+#     avoids some cursor-hiding behaviour.
+#   * CLAUDE_CODE_NO_FLICKER=0 — opt out of alt-screen / fullscreen
+#     repaint semantics that confuse single-screen vt100 capture.
+[default_target.env]
+CLAUDE_CODE_SKIP_PROMPT_HISTORY = "1"
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"
+CLAUDE_CODE_DISABLE_MOUSE = "1"
+CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL = "1"
+CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1"
+CLAUDE_CODE_DISABLE_MESSAGE_ACTIONS = "1"
+CLAUDE_CODE_DISABLE_ATTACHMENTS = "1"
+CLAUDE_CODE_SYNTAX_HIGHLIGHT = "0"
+CLAUDE_CODE_ACCESSIBILITY = "1"
+CLAUDE_CODE_NO_FLICKER = "0"
+NO_COLOR = "1"
+FORCE_COLOR = "0"

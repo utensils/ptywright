@@ -1,0 +1,22 @@
+╭─── Claude Code v2.1.143 ────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                       │
+│              Welcome back James Brink!             │ Ask Claude to create a new app or clone a repo │
+│                                                    │ ────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                     │
+│                      ▝▜█████▛▘                     │ Added new `claude agents` flags                │
+│                        ▘▘ ▝▝                       │                                                │
+│                                                    │ /release-notes for more                        │
+│            /private/tmp/sample-workspace           │                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+❯ What is 2+2? Reply with just the digit.
+
+⏺ 4
+
+✻ Brewed for 0.4s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+  user @ host /private/tmp/sample-workspace                                          [Haiku 4.5]
+  ⏵⏵ auto mode on (shift+tab to cycle)

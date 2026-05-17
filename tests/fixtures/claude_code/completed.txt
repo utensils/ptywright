@@ -1,4 +1,7 @@
 Claude Code
 
 Done. The tests pass.
-> 
+
+✻ Brewed for 0.3s
+
+>
