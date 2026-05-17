@@ -835,7 +835,19 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
-      matcher.screen_regex("(?m)^\\s*(?:>|❯)\\s*$"),
+      -- Empty prompt glyph alone is NOT a completion anchor — it
+      -- appears for one frame during preambles before a tool call
+      -- while the next spinner is between repaints, and `adapter.wait`
+      -- would otherwise return with `waiting_for_user_input` on that
+      -- frame instead of holding until the turn actually ends. Pair
+      -- it with the tea-verb completion marker (`✻ <Verb> for <N>`)
+      -- the TUI renders only at end-of-turn, matching the classifier's
+      -- `completed_turn` gate. Dialog / usage anchors above still
+      -- wake the matcher on their own.
+      matcher.all({
+        matcher.screen_regex("(?m)^\\s*(?:>|❯)\\s*$"),
+        matcher.screen_regex("✻ \\S+ for \\d"),
+      }),
     }),
     matcher.screen_stable(completed_turn_stable_ms),
   })

@@ -106,17 +106,23 @@ fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
         st.state, st.evidence
     );
 
-    // Without stable_ms — adapter.state poll path falls through to
-    // waiting_for_user_input (the poll-path completed_turn branch was
-    // removed because it fired too early on streaming answers; polling
-    // consumers drive adapter.wait or their own stability heuristic).
-    // The important property here is that it does NOT misclassify as
-    // `starting` despite the welcome chrome still being on screen.
+    // Without stable_ms — adapter.state poll path. The screen has the
+    // answer bullet (`⏺ 4`), the tea-verb completion marker
+    // (`✻ Brewed for 0.4s`), and the empty input prompt (`❯` alone on
+    // its row), so the poll-path `completed_turn` branch fires with
+    // confidence 0.7. The important property the welcome-residue test
+    // locks here is that the welcome chrome does NOT downgrade this to
+    // `starting`; with `last_intent == "prompt_submitted"` the welcome
+    // detection is suppressed.
     let st_poll = classify_state(&extension, screen, 7, Some("prompt_submitted"), None);
-    assert_ne!(
-        st_poll.state, "starting",
-        "welcome chrome must not downgrade to `starting` on state-poll path; got state={}",
-        st_poll.state
+    assert_eq!(
+        st_poll.state, "completed_turn",
+        "welcome chrome must not downgrade post-submit on state-poll path; got state={} evidence={}",
+        st_poll.state, st_poll.evidence
+    );
+    assert_eq!(
+        st_poll.evidence, "answer bullet plus empty input prompt visible without active work",
+        "poll-path completed_turn must own this screen"
     );
 
     // Sanity: when last_intent is empty (still in the welcome-dismissal
@@ -447,6 +453,11 @@ fn wait_cancel_settled_matcher_returns_screen_stable_threshold() {
 
 #[test]
 fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
+    // The empty-prompt anchor in wait_turn_matcher is now paired with
+    // the tea-verb completion marker — both must appear on the screen
+    // for the empty-prompt branch to fire. This mirrors the
+    // classifier's `completed_turn` gate exactly so `adapter.wait`
+    // can't return before the classifier would.
     let extension = claude_plugin();
     let matcher = wait_matcher(
         &extension,
@@ -454,14 +465,14 @@ fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
         json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
     );
     let snapshot = ScreenSnapshot {
-        size: TerminalSize::new(3, 20),
+        size: TerminalSize::new(4, 30),
         cursor: CursorState {
-            row: 1,
+            row: 2,
             col: 2,
             visible: true,
         },
         sequence: 1,
-        plain_text: "work complete\n > \r\n".to_string(),
+        plain_text: "work complete\n✻ Brewed for 0.4s\n > \r\n".to_string(),
         cells: Vec::new(),
         alternate_screen: false,
         application_cursor: false,
@@ -477,6 +488,51 @@ fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
             process_exited: false,
         },
     ));
+}
+
+#[test]
+fn wait_turn_matcher_does_not_fire_on_preamble_without_completion_marker() {
+    // Regression for the bug Copilot called out: the empty-prompt
+    // anchor used to wake `adapter.wait` on its own, which fired on
+    // preamble-before-tool-use screens (answer-bullet line plus an
+    // empty `❯` for a single frame while the next spinner was between
+    // repaints). Without the tea-verb marker, the wait must hold and
+    // let the next spinner frame re-trigger the active-work state
+    // instead of returning prematurely with `waiting_for_user_input`.
+    let extension = claude_plugin();
+    let matcher = wait_matcher(
+        &extension,
+        "wait_turn_matcher",
+        json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+    );
+    let snapshot = ScreenSnapshot {
+        size: TerminalSize::new(4, 60),
+        cursor: CursorState {
+            row: 2,
+            col: 2,
+            visible: true,
+        },
+        sequence: 1,
+        plain_text: "⏺ I'll explore the project structure and read the\nkey files.\n > \r\n"
+            .to_string(),
+        cells: Vec::new(),
+        alternate_screen: false,
+        application_cursor: false,
+        application_keypad: false,
+        title: None,
+    };
+
+    assert!(
+        !matcher.is_match_with_context(
+            &snapshot,
+            "",
+            MatcherContext {
+                stable_for: Duration::from_millis(COMPLETED_TURN_STABLE_MS),
+                process_exited: false,
+            },
+        ),
+        "wait_turn_matcher must not fire on a preamble screen lacking the ✻ completion marker"
+    );
 }
 
 #[test]
