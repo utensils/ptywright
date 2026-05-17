@@ -100,12 +100,22 @@ class IsChromeLineTests(unittest.TestCase):
         self.assertFalse(CS._is_chrome_line("✻ Worked for 5s"))
         self.assertFalse(CS._is_chrome_line("✻ Sautéed for 11s"))
 
-    def test_searched_progress_line_is_chrome(self):
-        # Search / read progress lines mutate (count, ing→ed) every
-        # tick and would flood the output if not filtered.
+    def test_in_flight_searched_progress_line_is_chrome(self):
+        # IN-FLIGHT progress lines (ellipsis + ctrl+o suffix) mutate
+        # every tick and would flood the output if not filtered.
         self.assertTrue(CS._is_chrome_line("Searching for 1 pattern… (ctrl+o to expand)"))
-        self.assertTrue(CS._is_chrome_line("Searched for 1 pattern (ctrl+o to expand)"))
-        self.assertTrue(CS._is_chrome_line("Reading 3 files (ctrl+o to expand)"))
+        self.assertTrue(CS._is_chrome_line("Reading 3 files… (ctrl+o to expand)"))
+        self.assertTrue(CS._is_chrome_line("Listing entries… (ctrl+o to expand)"))
+
+    def test_completed_tool_call_summary_is_not_chrome(self):
+        # COMPLETED tool-call summaries (no ellipsis, past tense or
+        # stable count) are the informative lines a user wants to see
+        # during a long thinking phase. Regression for the
+        # `(ctrl+o to expand)` blanket filter that was suppressing all
+        # tool-call activity.
+        self.assertFalse(CS._is_chrome_line("Searched for 1 pattern (ctrl+o to expand)"))
+        self.assertFalse(CS._is_chrome_line("Read 5,103 lines (ctrl+o to expand)"))
+        self.assertFalse(CS._is_chrome_line("Found 23 files (ctrl+o to expand)"))
 
     def test_answer_bullet_line_is_not_chrome(self):
         # `⏺ <answer text>` is real content — must surface.
@@ -118,6 +128,53 @@ class IsChromeLineTests(unittest.TestCase):
         # by `_is_chrome_line` — the streaming loop dedupes it via the
         # printed_lines baseline seed instead.
         self.assertFalse(CS._is_chrome_line("❯ List the .rs files."))
+
+
+class ExtractRecentActivityTests(unittest.TestCase):
+    """The alive ticker shows the most recent tool-call activity so a
+    long `thinking` phase looks alive instead of hung. Without this,
+    the user couldn't tell whether Claude was working or stuck."""
+
+    def test_returns_in_flight_searched_line(self):
+        body = "\n".join([
+            "❯ Explore the project.",
+            "",
+            "⏺ I'll explore the project structure.",
+            "Reading 2 files… (ctrl+o to expand)",
+            "",
+            "✻ Brewing… (12s · ↑ 217 tokens · esc to interrupt)",
+        ])
+        # Bottom-up scan returns the spinner first.
+        activity = CS._extract_recent_activity(body)
+        self.assertIsNotNone(activity)
+        self.assertIn("Brewing", activity)
+
+    def test_returns_tool_call_bullet_when_no_spinner(self):
+        body = "\n".join([
+            "❯ Read the lib file.",
+            "",
+            "⏺ Read(plugins/claude-code/main.lua)",
+            "",
+        ])
+        activity = CS._extract_recent_activity(body)
+        self.assertEqual(activity, "⏺ Read(plugins/claude-code/main.lua)")
+
+    def test_returns_none_when_nothing_recognisable(self):
+        body = "\n".join([
+            "❯ Hello.",
+            "",
+            "Plain prose without any tool activity.",
+        ])
+        self.assertIsNone(CS._extract_recent_activity(body))
+
+    def test_skips_horizontal_rules(self):
+        body = "\n".join([
+            "⏺ Bash(cargo test)",
+            "─" * 60,
+            "",
+        ])
+        activity = CS._extract_recent_activity(body)
+        self.assertEqual(activity, "⏺ Bash(cargo test)")
 
 
 class DumpAnswerRegionTests(unittest.TestCase):

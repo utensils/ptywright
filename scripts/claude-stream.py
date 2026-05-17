@@ -220,10 +220,14 @@ PASTE_REACTION_BYTES = 256
 #     the glyph to be in the spinner set (not `\S+`) prevents
 #     legitimate one-sentence prose like `"Done… (for now)"` from
 #     matching: ordinary words aren't in the spinner glyph set.
-#   * `_CHROME_SEARCHED_RE` — Claude Code progress lines like
-#     `Searching for 1 pattern…` / `Searched for 1 pattern (ctrl+o
-#     to expand)`. These mutate (count, "ing" → "ed") every tick and
-#     would otherwise be deduped per state.
+#   * `_CHROME_SEARCHED_RE` — IN-FLIGHT progress lines only:
+#     `Searching for 1 pattern… (ctrl+o to expand)` style. The
+#     ellipsis is required, which keeps the COMPLETED forms
+#     (`Searched for 1 pattern (ctrl+o to expand)`, `Read 3 files
+#     (ctrl+o to expand)`) flowing through as content — those are the
+#     informative tool-call summaries the user wants to see. The
+#     in-flight form mutates every tick (count, verb) and is what
+#     would flood the output without filtering.
 #
 # `_CHROME_SPINNER_GLYPHS` MUST stay in sync with `SPINNER_GLYPHS` in
 # `plugins/claude-code/indicators` (currently `main.lua`). If a new
@@ -234,7 +238,16 @@ _CHROME_SPINNER_RE = re.compile(
     r"^[" + _CHROME_SPINNER_GLYPHS + r"]\s+\S.*…(?:\s*\([^)]*\))?$"
 )
 _CHROME_SEARCHED_RE = re.compile(
-    r"^(?:Searching|Searched|Reading|Read|Listing|Listed|Glob|Grep)\b.*\(ctrl\+o to expand\)$"
+    r"^(?:Searching|Reading|Listing)\b.*…\s*\(ctrl\+o to expand\)$"
+)
+# Activity-extraction pattern for the alive ticker — same shape as
+# `_CHROME_SPINNER_RE` plus the bullet-form tool announcements
+# (`⏺ Read(file)`, `⏺ Bash(...)`). The ticker shows the most recent
+# such line so the user can tell what Claude is doing between tool
+# completions, even while the in-flight form itself is filtered out
+# of the streaming output.
+_ACTIVITY_TOOL_BULLET_RE = re.compile(
+    r"^⏺\s+\S+\(.+\)\s*$"
 )
 
 def _is_chrome_line(s: str) -> bool:
@@ -245,6 +258,34 @@ def _is_chrome_line(s: str) -> bool:
     if _CHROME_SEARCHED_RE.match(s):
         return True
     return False
+
+
+def _extract_recent_activity(body: str) -> str | None:
+    """Return the most recent line in `body` that looks like a tool
+    call in progress or just completed. Used by the alive ticker so
+    the user can tell what Claude is doing between tool completions —
+    the in-flight spinner / progress lines are filtered out of the
+    streaming output, but their content is still useful as a status
+    indicator.
+
+    Walks bottom-up because the spinner sits at the bottom of the
+    body, just above the status bar. Skips horizontal rules and
+    long-tail wrapped lines. Returns `None` if nothing recognisable
+    is on screen.
+    """
+    for line in reversed(body.splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        if _CHROME_RULE_RE.match(s):
+            continue
+        if _CHROME_SPINNER_RE.match(s) and len(s) <= 120:
+            return s
+        if _CHROME_SEARCHED_RE.match(s):
+            return s
+        if _ACTIVITY_TOOL_BULLET_RE.match(s):
+            return s
+    return None
 
 class Stream:
     """Robust Claude Code streaming driver — TUI-version-agnostic."""
@@ -369,7 +410,7 @@ class Stream:
             pass
 
     # ─── primitive: liveness indicator that doesn't spam ─────────────────
-    def _tick_alive(self, prefix: str = ""):
+    def _tick_alive(self, prefix: str = "", body: str = ""):
         if not sys.stdout.isatty(): return
         now = time.monotonic()
         # Throttle to at most one tick per 4 heartbeats so the spinner
@@ -379,7 +420,15 @@ class Stream:
         self._alive_phase = (self._alive_phase + 1) % 8
         glyph = "⠋⠙⠹⠸⠼⠴⠦⠧"[self._alive_phase]
         elapsed = self.args.timeout - self._budget()
-        sys.stdout.write(f"\r{DIM(f'{glyph} {prefix} [{elapsed:.0f}s]')}\033[K")
+        # Surface what Claude is currently doing — extracted from the
+        # body (typically the spinner / tool-call announcement at the
+        # bottom). Truncated to keep the alive line on one row even on
+        # narrow terminals.
+        activity = _extract_recent_activity(body) if body else None
+        if activity and len(activity) > 80:
+            activity = activity[:77] + "…"
+        suffix = f"  {activity}" if activity else ""
+        sys.stdout.write(f"\r{DIM(f'{glyph} {prefix} [{elapsed:.0f}s]{suffix}')}\033[K")
         sys.stdout.flush()
 
     def _clear_alive(self):
@@ -645,7 +694,7 @@ class Stream:
                 emit(RED(f"✗ {state}"), DIM(f"(+{grew_by} chars in body)"))
                 return 1
 
-            self._tick_alive(prefix=f"{state}")
+            self._tick_alive(prefix=f"{state}", body=body)
             time.sleep(self.heartbeat)
 
         self._clear_alive()
