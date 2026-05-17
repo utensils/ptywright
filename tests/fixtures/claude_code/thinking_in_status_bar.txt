@@ -1,0 +1,13 @@
+╭─── Claude Code v2.1.143 ─────────────────────────────────╮
+│                                                          │
+│              Welcome back User!                   │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯
+
+❯ Explore project and summarize it.
+
+
+
+✻ Thinking… (12s · ↓ 339 tokens · thinking)
+  user @ host /Users/me/Projects                            [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

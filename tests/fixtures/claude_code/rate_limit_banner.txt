@@ -1,0 +1,13 @@
+❯ Write a Python script that sorts a list.
+
+You've reached your usage limit for the Claude Pro plan.
+
+5-hour limit reached.
+
+Wait for the limit to reset, upgrade your plan at https://claude.ai/upgrade,
+or set ANTHROPIC_API_KEY in your environment to use API credits.
+
+────────────────────────────────────────────────────────────────────────
+❯
+  user @ host /Users/me/Projects/sample                       [Opus 4.7]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

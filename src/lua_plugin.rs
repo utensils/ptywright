@@ -58,11 +58,30 @@ impl LuaPlugin {
     /// This is intended for explicit local trusted plugin loading. It is not a
     /// sandbox for untrusted code.
     pub fn trusted(manifest: &PluginManifest, source: &str) -> Result<Self> {
+        Self::trusted_with_modules(manifest, source, &[])
+    }
+
+    /// Create a trusted Lua plugin with optional auxiliary modules pre-loaded
+    /// into the Lua state's globals before the entrypoint runs.
+    ///
+    /// Each `(name, source)` pair is evaluated in order and the resulting
+    /// value is bound to a global named `name`, so the entrypoint can write
+    /// `local helpers = helpers` (or use the global directly) without
+    /// invoking `require` or touching the filesystem. This lets the
+    /// `claude-code` plugin split into focused files (`helpers.lua`,
+    /// `indicators.lua`, `parsers.lua`, …) while still shipping as a
+    /// single compile-time-embedded built-in.
+    pub fn trusted_with_modules(
+        manifest: &PluginManifest,
+        source: &str,
+        modules: &[(&str, &str)],
+    ) -> Result<Self> {
         validate_lua_manifest(manifest)?;
-        Self::from_source(
+        Self::from_source_with_modules(
             manifest.name.clone(),
             source,
             manifest.permissions.iter().cloned().collect(),
+            modules,
         )
     }
 
@@ -134,6 +153,23 @@ impl LuaPlugin {
             name,
             source,
             permissions,
+            &[],
+            LUA_INSTRUCTION_LIMIT,
+            LUA_WALL_CLOCK_LIMIT,
+        )
+    }
+
+    fn from_source_with_modules(
+        name: String,
+        source: &str,
+        permissions: BTreeSet<PluginPermission>,
+        modules: &[(&str, &str)],
+    ) -> Result<Self> {
+        Self::from_source_with_limits(
+            name,
+            source,
+            permissions,
+            modules,
             LUA_INSTRUCTION_LIMIT,
             LUA_WALL_CLOCK_LIMIT,
         )
@@ -143,6 +179,7 @@ impl LuaPlugin {
         name: String,
         source: &str,
         permissions: BTreeSet<PluginPermission>,
+        modules: &[(&str, &str)],
         instruction_limit: u64,
         wall_clock_limit: Duration,
     ) -> Result<Self> {
@@ -160,6 +197,29 @@ impl LuaPlugin {
             .lock()
             .expect("instruction count poisoned") = 0;
         *call_started_at.lock().expect("call clock poisoned") = Some(Instant::now());
+        // Pre-load auxiliary modules as globals. The module's source is
+        // evaluated as a chunk and its return value (typically a table of
+        // exported functions) becomes a global named `<module>`. The
+        // entrypoint references modules via globals directly:
+        //   `local helpers = helpers` (or just `helpers.trim(s)`).
+        // No `require` is exposed, so a module can't escape into the
+        // filesystem. Errors during module load surface with the
+        // module name in their `set_name` context for clear diagnostics.
+        for (module_name, module_source) in modules {
+            let value_result: mlua::Result<mlua::Value> =
+                lua.load(*module_source).set_name(*module_name).eval();
+            let value = match value_result {
+                Ok(value) => value,
+                Err(error) => {
+                    *call_started_at.lock().expect("call clock poisoned") = None;
+                    return Err(lua_error(&name, error));
+                }
+            };
+            if let Err(error) = lua.globals().set(*module_name, value) {
+                *call_started_at.lock().expect("call clock poisoned") = None;
+                return Err(lua_error(&name, error));
+            }
+        }
         let exports_result: mlua::Result<mlua::Table> = lua.load(source).set_name(&name).eval();
         *call_started_at.lock().expect("call clock poisoned") = None;
         let exports = exports_result.map_err(|error| lua_error(&name, error))?;
@@ -631,6 +691,7 @@ mod tests {
             }
             "#,
             all_host_permissions().into_iter().collect(),
+            &[],
             u64::MAX,
             Duration::from_millis(1),
         )

@@ -75,6 +75,20 @@ jobs:
       - name: Test
         if: runner.os != 'macOS'
         run: rustup run stable cargo test --locked --features _test-fixtures
+
+      # claude-stream unittest suite — stdlib only, covers chrome
+      # filtering, the answer-region fallback, terminal-state
+      # taxonomy, and Client JSON-RPC framing. Runs on every host
+      # so platform-specific path / encoding behaviour is caught.
+      # `actions/setup-python` installs a `python` executable on every
+      # OS so the launcher is the same across Linux / macOS / Windows.
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - name: Test (claude-stream unittest)
+        shell: bash
+        run: python -m unittest discover -t . -s tests/scripts -v
       - name: Build (macOS)
         if: runner.os == 'macOS'
         shell: bash

@@ -1,0 +1,11 @@
+Select a model:
+
+  ❯ 1. Sonnet 4.6 (default)
+    2. Opus 4.7
+    3. Haiku 4.5
+    4. Sonnet 4.5 (legacy)
+
+  ↑/↓ to navigate · Enter to select · Esc to cancel
+────────────────────────────────────────────────────────────
+  user @ host /private/tmp/sample                  [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -239,7 +239,7 @@ impl LuaExtension {
             .find(|entry| (entry.manifest)().name == name)
             .ok_or_else(|| Error::Lua(format!("no built-in Lua extension named `{name}`")))?;
         let manifest = (entry.manifest)();
-        let plugin = LuaPlugin::trusted(&manifest, entry.source)?;
+        let plugin = LuaPlugin::trusted_with_modules(&manifest, entry.source, entry.modules)?;
         Ok(Self::new(plugin, manifest))
     }
 
@@ -410,7 +410,16 @@ impl ExtensionHandle {
                 "extension method `{method}` did not return last_intent"
             ))
         })?;
-        self.last_intent = Some(intent);
+        // Mirror `apply_plan`'s empty-string semantics: an explicit
+        // empty string is a CLEAR sentinel (used by no-op `send_prompt`
+        // returns to drop a stale `prompt_submitted` intent). Recording
+        // it literally as `Some("")` would leak truthiness into the
+        // classifier and produce an invalid empty state.
+        if intent.is_empty() {
+            self.last_intent = None;
+        } else {
+            self.last_intent = Some(intent);
+        }
         Ok(())
     }
 
@@ -424,8 +433,26 @@ impl ExtensionHandle {
 
     fn apply_plan(&mut self, plan: &ActionPlan, _intent: &str) -> Result<()> {
         self.apply_actions(&plan.actions)?;
+        // Three states the plan's `last_intent` can express:
+        //   * Some(non-empty)  → record this as the new intent.
+        //   * Some("")         → explicit clear: drop whatever intent
+        //                        is currently recorded. Used by no-op
+        //                        plans (e.g. empty `send_prompt`) so
+        //                        a stale `prompt_submitted` from a
+        //                        prior submission doesn't keep the
+        //                        classifier on the mid-turn branch.
+        //   * None             → leave the recorded intent alone. The
+        //                        conventional pattern for read-only
+        //                        or idempotent actions (approve /
+        //                        deny / dismiss_welcome / expand /
+        //                        slash_command) that don't start a
+        //                        new turn but also don't end one.
         if let Some(intent) = plan.last_intent.clone() {
-            self.last_intent = Some(intent);
+            if intent.is_empty() {
+                self.last_intent = None;
+            } else {
+                self.last_intent = Some(intent);
+            }
         }
         Ok(())
     }

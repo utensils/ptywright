@@ -1,0 +1,16 @@
+❯ How do I sign in to Claude?
+
+⏺ You can sign in to Claude in a few ways:
+  1. Log in to Claude via the OAuth flow.
+  2. Set the API key as an environment variable.
+  3. Use SSO via your organization.
+
+  When the TUI loads it shows "Log in to Claude Code" and offers
+  "Continue with Anthropic" — pressing Enter then opens the browser
+  to https://example.com/auth (paraphrased).
+
+✻ Brewed for 2s
+
+❯
+  user @ host /workspace                              [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

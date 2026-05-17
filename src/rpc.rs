@@ -81,6 +81,14 @@ struct RpcSharedState {
 struct RegisteredPlugin {
     manifest: PluginManifest,
     source: String,
+    /// Auxiliary module sources to pre-load as Lua globals before the
+    /// main `source` chunk runs. Empty for trusted-local third-party
+    /// plugins loaded via `plugin.load` (they have to inline everything
+    /// into their `main.lua` until the manifest format grows a
+    /// `[[modules]]` array). Built-in plugins forward
+    /// `BuiltinPlugin::modules` here so the same `LuaPlugin::trusted_with_modules`
+    /// loader is used uniformly.
+    modules: Vec<(String, String)>,
     builtin: bool,
 }
 
@@ -94,6 +102,11 @@ impl Default for RpcSharedState {
                 RegisteredPlugin {
                     manifest,
                     source: entry.source.to_string(),
+                    modules: entry
+                        .modules
+                        .iter()
+                        .map(|(name, source)| ((*name).to_string(), (*source).to_string()))
+                        .collect(),
                     builtin: true,
                 },
             );
@@ -464,6 +477,7 @@ impl RpcServerState {
             RegisteredPlugin {
                 manifest,
                 source,
+                modules: Vec::new(),
                 builtin: false,
             },
         );
@@ -1229,8 +1243,17 @@ impl RpcServer {
                 })?
         };
         Self::check_manifest_permission("adapter.start", &registered.manifest)?;
-        let plugin = LuaPlugin::trusted(&registered.manifest, &registered.source)
-            .map_err(rpc_error_from_error)?;
+        // Borrow the (owned `String`) module sources as `&str` so they
+        // match `LuaPlugin::trusted_with_modules`'s slice-of-pairs API
+        // without forcing it to take owned strings.
+        let module_refs: Vec<(&str, &str)> = registered
+            .modules
+            .iter()
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .collect();
+        let plugin =
+            LuaPlugin::trusted_with_modules(&registered.manifest, &registered.source, &module_refs)
+                .map_err(rpc_error_from_error)?;
         let extension = LuaExtension::new(plugin, registered.manifest.clone());
         // Fall back to the manifest's declared default target when the caller
         // omits `program`. Args follow the same rule independently: an

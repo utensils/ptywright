@@ -1,35 +1,46 @@
+-- File layout (with `helpers.lua` providing shared utilities):
+--
+--   helpers.lua            — generic string utilities + secret scrubbing
+--                            (pre-loaded as a Lua global by the host)
+--   main.lua (this file)
+--     ├─ host bindings       — ptywright.action / ptywright.matcher
+--     ├─ classifier helpers  — state_snapshot
+--     ├─ structural indicators — has_*_indicator, has_*_screen, …
+--     ├─ structural parsers    — parse_status_bar / parse_usage_screen / …
+--     ├─ classify(input)       — the screen-state classifier
+--     ├─ intent plans          — send_prompt, cancel, approve, … (M.*)
+--     ├─ matcher builders      — wait_*_matcher (M.*)
+--     └─ key-alias router      — M.key
+--
+-- When a section in this file grows past roughly 200 lines, extract it
+-- into its own module file alongside `helpers.lua`: add a `(name,
+-- source)` pair to `BUILTIN_PLUGINS.modules` in `src/plugin.rs`, write
+-- `<name>.lua` returning a module table, and reference its functions
+-- here as `local <fn> = <name>.<fn>` (the host loader pre-registers
+-- each module as a Lua global before main.lua runs). Tests under
+-- `tests/lua_plugin_intents.rs` and the fixture matrix at
+-- `tests/lua_classifier_tests.rs` exercise the public surface either
+-- way — module splits are intentionally transparent to callers.
+
 assert(ptywright, "ptywright host API not installed")
 assert(ptywright.action, "ptywright action host API not installed")
 assert(ptywright.matcher, "ptywright matcher host API not installed")
+assert(helpers, "helpers module not pre-loaded (see BUILTIN_PLUGINS in src/plugin.rs)")
 
 local M = {}
 local action = ptywright.action
 local matcher = ptywright.matcher
 
-local function contains(text, needle)
-  return string.find(text, needle, 1, true) ~= nil
-end
-
-local function contains_any(text, needles)
-  for _, needle in ipairs(needles) do
-    if contains(text, needle) then
-      return true
-    end
-  end
-  return false
-end
-
-local function starts_with(text, prefix)
-  return string.sub(text, 1, #prefix) == prefix
-end
-
-local function trim(text)
-  return (text:gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
-local function lower(text)
-  return string.lower(text or "")
-end
+-- Bring the shared helpers in as locals so the rest of this file reads
+-- identically to the pre-split version. Anything new that needs a
+-- helper but isn't aliased here can still call `helpers.<fn>` directly.
+local contains               = helpers.contains
+local contains_any           = helpers.contains_any
+local starts_with            = helpers.starts_with
+local trim                   = helpers.trim
+local lower                  = helpers.lower
+local redact_secret_patterns = helpers.redact_secret_patterns
+local strip_dollar           = helpers.strip_dollar
 
 local function state_snapshot(state, confidence, evidence, sequence, metadata)
   return {
@@ -41,104 +52,78 @@ local function state_snapshot(state, confidence, evidence, sequence, metadata)
   }
 end
 
--- Best-effort plugin-side redaction for text that we expose through
--- `ExtensionStateSnapshot.metadata` (permission dialog summaries today).
--- The host applies `RedactionPolicy::default()` to screen/transcript reads
--- but state-shaped responses (adapter.state / send / wait) don't go
--- through that filter. Without this guard, a permission prompt for a
--- Bash command can carry a `token=…` / `sk-…` / `AKIA…` value in the
--- metadata summary even when callers rely on default-redacted reads.
--- Mirror the most common Rust-side patterns; document on the wire that
--- callers handling secrets must apply their own redaction layer for
--- guarantees beyond best-effort.
-local SECRET_PATTERNS = {
-  -- `token=value`, `password=value`, `api_key=value` — keep the prefix.
-  "([Tt]oken%s*=%s*)([^%s\"']+)",
-  "([Pp]assword%s*=%s*)([^%s\"']+)",
-  "([Aa]pi[_-]?[Kk]ey%s*=%s*)([^%s\"']+)",
-  "([Ss]ecret%s*=%s*)([^%s\"']+)",
-  -- Anthropic / OpenAI style API key prefixes.
-  "()(sk%-[%w%-_]+)",
-  "()(sk%-ant%-[%w%-_]+)",
-  -- AWS access key id.
-  "()(AKIA[%w]+)",
+-- Banner phrases that the TUI renders as their OWN line at the start
+-- of the row (no leading prose context). Anchoring with `starts_with`
+-- ensures assistant prose that quotes these phrases inside a sentence
+-- doesn't trip the detector — e.g. an answer that says `Note that
+-- "you've reached your usage limit" can be reset by …` should NOT
+-- classify as `error`.
+local ERROR_BANNER_PREFIXES = {
+  "error:",
+  "request failed",
+  "api error",
+  -- Rate-limit / plan-limit banners. Claude Code 2.1.x renders one of
+  -- these as a standalone body row when you exhaust your plan budget.
+  "5-hour limit",
+  "rate limit reached",
+  "you've used your pro plan",
+  "you've used your max plan",
+  "you've reached your usage limit",
+  "credit balance is too low",
+  -- Connection / network failure banner.
+  "connection error",
+  "connection issue",
+  "could not connect",
+  "network error",
 }
-
-local function redact_secret_patterns(text)
-  if text == nil or text == "" then
-    return text
-  end
-  for _, pattern in ipairs(SECRET_PATTERNS) do
-    text = (text:gsub(pattern, function(prefix, _value)
-      if prefix == nil or prefix == "" then
-        return "[REDACTED]"
-      end
-      return prefix .. "[REDACTED]"
-    end))
-  end
-  return text
-end
-
--- Strip a single leading "$" so a number prefixed by a currency glyph still
--- parses as a number. Returns the trailing slice, never nil. Cheap to call.
-local function strip_dollar(text)
-  return (text:gsub("^%$", ""))
-end
 
 local function has_error_indicator(screen)
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = lower(trim(line))
-    if starts_with(text, "error:")
-      or starts_with(text, "request failed")
-      or contains(text, "please retry")
-      or contains(text, "press r to retry") then
+    for _, prefix in ipairs(ERROR_BANNER_PREFIXES) do
+      if starts_with(text, prefix) then
+        return true
+      end
+    end
+    -- Retry hints — these appear on their own line after a banner,
+    -- typically as just the action verb. Still anchored at line
+    -- start because Claude doesn't write "Press r to retry" inside
+    -- flowing answer prose.
+    if starts_with(text, "please retry") or starts_with(text, "press r to retry") then
       return true
     end
   end
   return false
 end
 
--- Returns true if the body contains a line that is *just* an input
--- prompt glyph (`>` or `❯`) with optional whitespace — the universal
--- "Claude is back at idle, ready for the next turn" signal. Used by the
--- poll-path `completed_turn` branch in classify().
---
--- Two byte-level gotchas this implementation works around:
---
---   1. `❯` is U+276F encoded as 3 bytes (`\xe2\x9d\xaf`). Lua patterns
---      operate on bytes; a character class like `[>❯]` does NOT match
---      the multi-byte sequence as a unit — it would only match `>` or
---      the individual bytes `\xe2` / `\x9d` / `\xaf`. So we iterate the
---      glyphs and embed each one literally in its own pattern, which
---      DOES match the full byte sequence.
---   2. Claude Code 2.1.x pads the empty prompt with U+00A0 NBSP for
---      visual alignment. Lua's `%s` only matches ASCII whitespace; we
---      add NBSP explicitly so the trailing `❯\xa0 ` pattern matches.
-local WS = "[%s\194\160]"
-local PROMPT_GLYPHS = { ">", "❯" }
-
-local function has_empty_input_prompt_line(text)
-  if not text or text == "" then return false end
-  for _, glyph in ipairs(PROMPT_GLYPHS) do
-    -- Pattern: (start | newline) + WS* + literal-glyph + WS* + (newline | end)
-    local p1 = "^" .. WS .. "*" .. glyph .. WS .. "*\n"
-    local p2 = "\n" .. WS .. "*" .. glyph .. WS .. "*\n"
-    local p3 = "\n" .. WS .. "*" .. glyph .. WS .. "*$"
-    local p4 = "^" .. WS .. "*" .. glyph .. WS .. "*$"
-    if text:match(p1) then return true end
-    if text:match(p2) then return true end
-    if text:match(p3) then return true end
-    if text:match(p4) then return true end
-  end
-  return false
-end
+-- Returns true if any line in `screen` is an input-prompt row.
+-- Recognised shapes (left-anchored unless noted):
+--   * Bare prompt glyph (`>` or `❯`), optionally followed by ASCII
+--     whitespace OR NBSP (U+00A0) padding OR user/ghost text.
+--   * Line ENDING in ` >` — legacy shell-style prompt position where
+--     `text >` is the input cursor (e.g. some older Claude builds).
+-- The `❯` glyph case stays anchored at line start because the modern
+-- Claude Code 2.1.x TUI always renders it as the first non-space
+-- char on the input row. The legacy ASCII `>` had to be supported
+-- at line end too; we keep that side intact so old fixtures still
+-- match while symmetrically also accepting `>` at line start.
+-- `trim` strips ASCII whitespace only, so NBSP padding is handled
+-- explicitly with byte-level checks on the multi-byte sequence.
+local NBSP_BYTES = "\194\160"  -- U+00A0 as UTF-8
 
 local function has_input_prompt(screen)
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = trim(line)
-    if text == ">" or string.sub(text, -2) == " >" or starts_with(text, "❯") then
-      return true
-    end
+    if text == ">" or text == "❯" then return true end
+    if string.sub(text, -2) == " >" then return true end
+    if starts_with(text, "❯") then return true end
+    -- Legacy ASCII `>` at line start, with either ASCII space or
+    -- NBSP between the glyph and any following text. Restores the
+    -- behaviour `has_empty_input_prompt_line` had explicitly for
+    -- NBSP-padded `>` rows on terminals that render the ASCII
+    -- prompt fallback.
+    if starts_with(text, "> ") then return true end
+    if starts_with(text, ">" .. NBSP_BYTES) then return true end
   end
   return false
 end
@@ -181,11 +166,45 @@ local function line_ends_with_ellipsis(line)
   return n >= #ELLIPSIS and string.sub(line, n - #ELLIPSIS + 1, n) == ELLIPSIS
 end
 
+-- Returns true if `line` has the spinner-status shape: leading spinner
+-- glyph, a verb, an ellipsis, and an optional trailing parenthesized
+-- counter section. Two shapes the live TUI renders:
+--   * Bare: `✻ Thinking…`
+--   * Counter: `✻ Thinking… (12s · ↓ 339 tokens · thinking)`
+-- Both must register as active work — the counter form is what Sonnet
+-- 4.6 renders during extended thinking / Explore subagent runs, and
+-- missing it lets the classifier fall through to the no-marker branch
+-- even though Claude is plainly working.
+local function has_spinner_ellipsis_shape(trimmed)
+  if not starts_with_spinner_glyph(trimmed) then return false end
+  if line_ends_with_ellipsis(trimmed) then return true end
+  -- Find the LAST `…` in the line. If everything after it is just
+  -- whitespace + a balanced parenthesized section, treat it as the
+  -- counter variant.
+  local n = #trimmed
+  local last = nil
+  local i = 1
+  while i <= n - #ELLIPSIS + 1 do
+    if string.sub(trimmed, i, i + #ELLIPSIS - 1) == ELLIPSIS then
+      last = i
+    end
+    i = i + 1
+  end
+  if not last then return false end
+  local tail = string.sub(trimmed, last + #ELLIPSIS)
+  -- Allow `[ws]*([anything no nested parens])[ws]*`. Using a simple
+  -- character-class match instead of `%b()` because the counter can
+  -- contain glyphs that confuse Lua's balanced-string matcher when
+  -- bytes happen to share a code unit with parens; a literal `[^)]*`
+  -- is more predictable here.
+  return tail:match("^%s*%([^)]*%)%s*$") ~= nil
+end
+
 local function has_thinking_spinner_line(text)
   for line in string.gmatch(text or "", "[^\n]+") do
     local trimmed = trim(line)
     if #trimmed > 0 and #trimmed <= THINKING_LINE_MAX_BYTES then
-      if starts_with_spinner_glyph(trimmed) and line_ends_with_ellipsis(trimmed) then
+      if has_spinner_ellipsis_shape(trimmed) then
         return true
       end
     end
@@ -195,52 +214,266 @@ end
 
 local TURN_COMPLETION_GLYPH = "✻"
 
+-- Trailing collapse-hint phrase Claude Code 2.1.x appends to every
+-- collapsible tool-progress row (`⏺ Reading 1 file… (ctrl+o to expand)`).
+-- Declared near the top so the helpers below can reference it without
+-- relying on Lua's hoisting (which only works for the function names,
+-- not the values they close over).
+local CTRL_O_HINT = "(ctrl+o to expand)"
+
+-- Lines we expect to find AFTER a real end-of-turn `✻ <Verb> for <N>`
+-- marker on a settled screen:
+--   * blank lines,
+--   * the empty input prompt (`❯` / `>` alone),
+--   * the prompt with a post-turn suggested follow-up (`❯ run the
+--     tests`), which Claude Code 2.1.x renders as ghost text after a
+--     completed turn,
+--   * horizontal rules,
+--   * the status-bar rows (`user @ host …`, `⏵⏵ … on …`).
+-- Anything else (tool-progress rows like `⏺ Reading 1 file…`, answer
+-- bullets, search results, `⎿` tool output) means we're looking at an
+-- intermediate render or a still-in-flight turn, not the actual end
+-- boundary. The submitted prompt echo (`❯ Read all files…`) renders
+-- ABOVE the answer/marker in Claude Code's layout, never below, so
+-- accepting `❯ <text>` here cannot let a mid-turn marker match by
+-- mistaking the submitted prompt for trailing chrome.
+local function is_post_marker_trailing_line(line)
+  local t = trim(line)
+  if t == "" then return true end
+  if t == ">" or t == "❯" then return true end
+  -- Prompt with text — post-turn ghost-text suggestion. Restricted to
+  -- `❯ <text>` only; ASCII `> <text>` is the Markdown blockquote shape
+  -- and Claude can legitimately include blockquotes below a marker as
+  -- answer prose. The bare `>` idle form above still matches.
+  if starts_with(t, "❯ ") then return true end
+  -- Same with NBSP (U+00A0, bytes 0xC2 0xA0) — Claude Code pads ghost
+  -- text with a non-breaking space rather than a regular space.
+  if starts_with(t, "❯\194\160") then return true end
+  -- Horizontal rule — single repeated box-drawing character.
+  if t:match("^[─━═]+$") then return true end
+  -- Status-bar rows Claude Code 2.1.x renders below the prompt. The
+  -- real TUI fills these with the actual `<username> @ <host>` and a
+  -- `[<Model> <Version>]` suffix, e.g.
+  --   `james @ laptop /Users/james/Projects                  [Sonnet 4.6]`
+  --   `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents`
+  -- Recognise both structural shapes generically — never anchor on
+  -- the fixture's sanitized literal `user ` prefix, which would leave
+  -- real users with a marker followed by their own status bar stuck
+  -- in `thinking`:
+  --   * `⏵⏵ … on …` — permission-mode hint glyph.
+  --   * `[<word(s)> <digit>.<digit>]` — model bracket with version.
+  --   * `<token> @ <token>` followed by a `[<word> <digit>]` later
+  --     on the same line (the user@host + model layout).
+  if t:find("⏵⏵") then return true end
+  if t:find("%[%u%a-%s%d+%.%d+%]") then return true end
+  if t:find("%S+%s*@%s*%S+") and t:find("%[") and t:find("%]") then return true end
+  return false
+end
+
+-- Returns true if `line` looks like the user's submitted-prompt echo
+-- or a post-turn ghost suggestion — both render as `❯ <text>` (with
+-- regular space or NBSP padding). Restricted to `❯` only; ASCII
+-- `> <text>` is the Markdown blockquote shape, which can legitimately
+-- appear as substantive answer content above the marker. Anchoring on
+-- a blockquote here would let the reverse scan pick it as the prompt
+-- echo and reject the real marker for "no content above".
+local function is_prompt_echo_line(line)
+  local t = trim(line)
+  if starts_with(t, "❯ ") then return true end
+  if starts_with(t, "❯\194\160") then return true end
+  return false
+end
+
+-- Returns true if `line` looks like spinner / progress chrome that
+-- doesn't prove real work happened. Spinner lines (leading spinner
+-- glyph + ellipsis tail) AND collapsible tool-progress rows
+-- (`⏺ Reading… (ctrl+o to expand)`) both fall through to the marker
+-- mid-turn but neither represents *completed* work above the marker.
+-- A real completion has either a stable `⏺ Read(file)` row (no
+-- ellipsis) OR prose answer text above the marker.
+local function is_progress_chrome_line(line)
+  local t = trim(line)
+  if t == "" then return false end
+  -- Spinner-shape (with or without trailing counter) — see
+  -- `has_spinner_ellipsis_shape` below. We can't call it directly
+  -- because it's defined later; instead, replicate the cheap structural
+  -- check inline: leading spinner glyph + (`…` at end OR `…` followed
+  -- by a parenthesized counter at end).
+  if starts_with_spinner_glyph(t) then
+    if line_ends_with_ellipsis(t) then return true end
+    local n = #t
+    local last = nil
+    local i = 1
+    while i <= n - #ELLIPSIS + 1 do
+      if string.sub(t, i, i + #ELLIPSIS - 1) == ELLIPSIS then
+        last = i
+      end
+      i = i + 1
+    end
+    if last then
+      local tail = string.sub(t, last + #ELLIPSIS)
+      if tail:match("^%s*%([^)]*%)%s*$") then return true end
+    end
+  end
+  -- Collapsible tool-progress row: leading `⏺` + trailing
+  -- `(ctrl+o to expand)`. Only the IN-FLIGHT form (with `…`) counts as
+  -- chrome above the marker — a COMPLETED tool summary like
+  -- `⏺ Read(file)` followed by `Read 5 files (ctrl+o to expand)` is
+  -- substantive evidence that work happened and must be honoured by the
+  -- marker-substance check. The check below mirrors `has_active_work_indicator`:
+  -- collapsible-row anchor + ellipsis somewhere on the line.
+  if string.sub(t, 1, 3) == "⏺"
+      and #t >= #CTRL_O_HINT
+      and string.sub(t, -#CTRL_O_HINT) == CTRL_O_HINT
+      and t:find(ELLIPSIS, 1, true)
+  then
+    return true
+  end
+  return false
+end
+
 local function has_turn_completion_marker(text)
   -- Claude Code 2.1.x renders a "tea verb" completion line at the very
   -- end of every turn — e.g. "✻ Brewed for 1s", "✻ Worked for 5s",
   -- "✻ Heated for 12s". The verb rotates from a fixed set; what's stable
   -- across versions is the leading `✻` glyph plus a "for <duration>"
-  -- tail. This line never appears mid-turn (between tool calls, during
-  -- preambles, etc.); the TUI renders it only when the assistant has
-  -- produced its final reply and the turn has settled.
+  -- tail.
   --
-  -- The spinner cycle uses `✻` too via "✻ Working…" etc., so the glyph
-  -- alone isn't enough. Spinner lines END with the ellipsis glyph; the
-  -- completion line ends with a numeric duration (matched by
-  -- ` for %d`). Distinguishing on the ellipsis vs duration tail is what
-  -- separates "mid-turn spinner frame" from "turn is actually over".
+  -- The spinner cycle ALSO uses `✻` via "✻ Working…" etc., so the
+  -- glyph alone isn't enough. Spinner lines end with the ellipsis;
+  -- completion lines end with a numeric duration (` for %d`). That tail
+  -- difference is necessary but not sufficient — three additional
+  -- structural requirements rule out the false-positive shapes:
   --
-  -- This is the structural anchor the completed_turn branches need —
-  -- without it, a preamble line like "⏺ I'll explore the project..."
-  -- plus an empty `❯` plus an instant where the spinner happens not to
-  -- have repainted yet looks identical to a real turn boundary.
+  --   * STRUCTURALLY TERMINAL: everything AFTER the marker must be
+  --     trailing chrome (blank, prompt, rule, status bar). End-of-turn
+  --     screens satisfy this; mid-turn screens have tool-progress
+  --     rows below whatever flickered into view.
+  --
+  --   * SUBSTANTIVE CONTENT ABOVE: the body between the user's
+  --     submitted-prompt echo and the marker must contain at least
+  --     ONE non-chrome, non-prompt-echo content line. This rules out
+  --     the case where Claude's TUI renders a stale-looking
+  --     `✻ <Verb> for 0s` frame next to the prompt echo with no
+  --     answer prose between them — that's a flake, not a real
+  --     completion. If the prompt echo has scrolled off the visible
+  --     body (long answer pushed it past the top), we trust the
+  --     marker — Claude clearly did enough work to scroll a screen.
+  local lines = {}
   for line in string.gmatch(text or "", "[^\n]+") do
-    local trimmed = trim(line)
+    table.insert(lines, line)
+  end
+  -- Walk lines in reverse so we find the LAST marker on screen; that's
+  -- the candidate end-of-turn boundary.
+  for i = #lines, 1, -1 do
+    local trimmed = trim(lines[i])
     if string.sub(trimmed, 1, #TURN_COMPLETION_GLYPH) == TURN_COMPLETION_GLYPH then
       if not line_ends_with_ellipsis(trimmed) and trimmed:find(" for %d") then
-        return true
+        -- Structural-terminal check: everything after this row must be
+        -- trailing chrome (blank, prompt, rule, status bar).
+        local terminal = true
+        for j = i + 1, #lines do
+          if not is_post_marker_trailing_line(lines[j]) then
+            terminal = false
+            break
+          end
+        end
+        if not terminal then
+          -- Not the real end-of-turn boundary; keep walking.
+        else
+          -- Substantive-content check: find the LAST prompt echo above
+          -- the marker (the user's submission). If found, require ≥1
+          -- non-chrome, non-prompt-echo content line between them.
+          -- If the prompt echo isn't visible (scrolled off the top of
+          -- the body), trust the marker.
+          local echo_idx = 0
+          for j = i - 1, 1, -1 do
+            if is_prompt_echo_line(lines[j]) then
+              echo_idx = j
+              break
+            end
+          end
+          if echo_idx == 0 then
+            -- Prompt scrolled off — trust the marker.
+            return true
+          end
+          local has_content = false
+          for j = echo_idx + 1, i - 1 do
+            local s = trim(lines[j])
+            if s ~= "" and not is_progress_chrome_line(lines[j])
+                and not is_prompt_echo_line(lines[j])
+                and not s:match("^[─━═]+$")
+            then
+              has_content = true
+              break
+            end
+          end
+          if has_content then return true end
+        end
       end
     end
   end
   return false
 end
 
+-- Returns true if any line in `text` is a Claude Code 2.1.x
+-- collapsible tool-progress row: starts with `⏺`, contains
+-- `(ctrl+o to expand)` (the collapse hint the TUI puts at the end
+-- of every collapsible row), and ends with that hint. Anchoring
+-- both the leading glyph AND the trailing hint position keeps
+-- assistant prose that merely quotes the hint phrase from tripping
+-- the detector — Claude can reasonably write "(ctrl+o to expand)"
+-- inside an answer, but it can't render it as part of a
+-- `⏺ <verb> N <thing>… (ctrl+o to expand)` row in the body during
+-- a completed turn.
+-- (`CTRL_O_HINT` is declared near the top of this file so the
+--  marker-substance check can use it; see above.)
+
+local function has_collapsible_tool_progress_row(text)
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local trimmed = trim(line)
+    -- Must start with `⏺` (Claude's tool-progress glyph; 3 bytes
+    -- in UTF-8) and end with the collapse hint.
+    if starts_with(trimmed, "⏺")
+        and #trimmed >= #CTRL_O_HINT
+        and string.sub(trimmed, -#CTRL_O_HINT) == CTRL_O_HINT
+    then
+      return true
+    end
+  end
+  return false
+end
+
 local function has_active_work_indicator(text)
-  -- Phrases the TUI renders ONLY during active work. Each is paired
-  -- with a structural hint so it doesn't match the same words in
-  -- assistant prose:
+  -- Phrases / row shapes the TUI renders ONLY during active work:
   --   * "esc to interrupt"   — control hint shown only while a turn is
   --                            in flight (Claude never writes this in
-  --                            answer text)
-  --   * "(esc to interrupt)" — bracketed variant
-  -- The bare word "thinking" alone (and "running tool", "reading file",
-  -- "searching" etc.) was removed in favor of the structural anchors
-  -- below — those bare words frequently appear in assistant prose when
-  -- Claude explains its own behavior, blocking the classifier from
-  -- ever reaching `completed_turn` on those turns.
-  if contains_any(text, {
-    "esc to interrupt",
-  }) then
+  --                            answer text).
+  --   * A `⏺ <verb>… (ctrl+o to expand)` row — Claude Code 2.1.x's
+  --                            collapsible tool-progress row for
+  --                            Read/Glob/Grep/Bash interim output.
+  --                            These rows START with `⏺` rather than
+  --                            a spinner glyph, so
+  --                            `has_thinking_spinner_line` misses
+  --                            them; without this anchor the
+  --                            classifier reads the gap between two
+  --                            tool calls as "no active work" and can
+  --                            mis-fire `completed_turn` while
+  --                            Claude is still mid-turn. The row
+  --                            shape (leading `⏺` + trailing hint)
+  --                            is dialog-unique — prose can't
+  --                            reproduce both anchors at the same
+  --                            line positions.
+  -- The bare word "thinking" alone (and "running tool", "reading
+  -- file", "searching" etc.) was removed in favor of these
+  -- structural anchors — those bare words frequently appear in
+  -- assistant prose when Claude explains its own behavior,
+  -- blocking the classifier from ever reaching `completed_turn`
+  -- on those turns.
+  if contains(text, "esc to interrupt") then
+    return true
+  end
+  if has_collapsible_tool_progress_row(text) then
     return true
   end
   -- Claude Code 2.1.x spinner-and-ellipsis status line. This is the
@@ -441,6 +674,123 @@ local function has_trust_indicator(text)
     })
 end
 
+-- `/model` opens an interactive selection panel: a "Select a model:"
+-- (or "Switch to model:") header followed by a numbered list of
+-- available models, with the focus glyph `❯` on one row. Three
+-- structural anchors are required so assistant prose that explains
+-- model selection — and might reasonably list `1. Sonnet 2. Opus
+-- 3. Haiku` in the middle of a paragraph — can't trip the detector:
+--   1. A header phrase (`select a model:` / `choose a model:` /
+--      `switch to model:` / `available models:`) — note the COLON,
+--      which Claude's TUI renders and prose typically doesn't.
+--   2. A focused numbered option line (`❯ 1.` / `❯ 1)`).
+--   3. A keyboard hint line (`enter to select`, `esc to cancel`,
+--      `↑/↓` arrows). Real pickers always render this; prose lists
+--      don't.
+-- All three together are dialog-unique. A completed answer can
+-- contain any one of them, but very rarely all three with the
+-- right structure.
+local MODEL_PICKER_HEADERS = {
+  "select a model:",
+  "switch to model:",
+  "choose a model:",
+  "available models:",
+}
+
+local function has_model_picker_indicator(text)
+  local has_header = contains_any(text, MODEL_PICKER_HEADERS)
+  if not has_header then
+    return false
+  end
+  -- Require the focused-option glyph (`❯ <digit>.`/`)`); the dialog
+  -- never renders without a cursor on one option.
+  if not text:find("❯%s*%d+[%.%)]") then
+    return false
+  end
+  -- Require a navigation-hint line. Either keyboard verbs Claude's
+  -- prose wouldn't naturally use in a model-list explanation
+  -- (`↑/↓`, `esc to cancel`, `enter to select`).
+  return contains_any(text, {
+    "enter to select",
+    "esc to cancel",
+    "↑/↓",
+    "↑ / ↓",
+  })
+end
+
+-- Claude Code's signed-out / not-authenticated screen. The TUI renders
+-- it in two flavours:
+--   * an OAuth prompt: "Log in to Claude Code" / "Press Enter to log in"
+--     with a hint about an `anthropic.com` URL,
+--   * an API-key fallback: "Sign in to Claude" / "API key" / "Enter your
+--     API key:".
+--
+-- Detector uses a two-anchor structural check (title phrase + at least
+-- one dialog-unique cue: an action prompt, an OAuth URL anchored at
+-- line start, or the API-key env-var name). An assistant answer that
+-- happens to quote a login title in prose can't trivially also render
+-- one of the structural cues at the right line position, so the
+-- combination keeps prose mentions from tripping the detector:
+--   1. A title-style login phrase rendered at line start. The TUI
+--      puts "Welcome to Claude Code" / "Log in to Claude Code" /
+--      "Sign in to Claude" / "Continue with Anthropic" on its own
+--      panel row. Prose typically embeds those phrases inside
+--      sentences.
+--   2. An action prompt — "Press Enter to log in" / "Open the link
+--      in your browser" / `https://claude.ai/login`. Prose
+--      explaining authentication is unlikely to render an action
+--      verb of this exact shape.
+--   3. The fallback "API key" affordance is accepted as the second
+--      anchor only when paired with a setenv hint ("ANTHROPIC_API_KEY"
+--      in caps), so a generic prose mention of "api key" doesn't
+--      single-handedly satisfy the second anchor.
+local LOGIN_TITLE_PREFIXES = {
+  "welcome to claude code",
+  "log in to claude",
+  "login to claude",
+  "sign in to claude",
+  "continue with anthropic",
+  "continue with google",
+}
+
+local function has_login_indicator(text)
+  -- Anchor #1: a title-style login phrase appears somewhere in the
+  -- body. Use `contains` rather than `starts_with` because the TUI
+  -- wraps the title inside a box-drawing panel (`│   Welcome to
+  -- Claude Code`); trimming the box border isn't enough because
+  -- multiple panel rows have border chars before content. Prose
+  -- often quotes login titles too, so this anchor alone isn't
+  -- sufficient — pair it with anchor #2.
+  local has_title = contains_any(text, LOGIN_TITLE_PREFIXES)
+  if not has_title then
+    return false
+  end
+  -- Anchor #2: at least one dialog-unique structural cue. Each of
+  -- these is something the TUI renders but assistant prose would
+  -- rarely combine with a login title:
+  --   * a verbatim action prompt rendered on its own row,
+  --   * a real OAuth URL anchored at the start of a line (typically
+  --     `https://claude.ai/login...` or `https://anthropic.com/...`),
+  --   * the API-key env var name (only the TUI panel renders that
+  --     verbatim).
+  if contains(text, "press enter to log in") then return true end
+  if contains(text, "open the link") then return true end
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local t = trim(line)
+    -- Allow zero or more chars before the domain so root-domain URLs
+    -- like `https://claude.ai/login` or `https://anthropic.com/auth`
+    -- match (the previous `[...]+` required at least one char before
+    -- the literal domain, which is broken for the most common shape).
+    if t:find("^https?://[%w%./%-_?=&%%]*claude%.ai") then return true end
+    if t:find("^https?://[%w%./%-_?=&%%]*anthropic%.com") then return true end
+  end
+  -- API-key fallback: the TUI renders `ANTHROPIC_API_KEY` in caps.
+  -- `text` is the body lowered for classifier consistency, so check
+  -- the lowered form here.
+  if contains(text, "anthropic_api_key") then return true end
+  return false
+end
+
 local function has_usage_screen(text)
   return contains(text, "total cost:")
     and contains(text, "usage:")
@@ -562,9 +912,31 @@ local function has_welcome_screen(text)
   -- caller's prompt). Detect it so the classifier reports `starting`
   -- instead of `waiting_for_user_input` — Claude is not actually ready to
   -- accept a prompt yet, even though the input cursor `❯` is on screen.
-  return contains(text, "tips for getting started")
-    and contains(text, "what's new")
-    and contains_any(text, { "welcome back", "claude code v" })
+  --
+  -- Two-anchor pairing: `welcome back` / `claude code v` (a TUI-only
+  -- header phrase) PLUS one of the "what's new" / "tips for getting
+  -- started" / "ask claude to" panels. The compact-launch view that
+  -- ships under tight terminals omits one of the side panels but
+  -- always renders the welcome header AND at least one suggestion
+  -- block, so accepting either side panel keeps small terminals
+  -- working. Requiring the welcome-header anchor keeps assistant
+  -- prose that says "tips for getting started" by itself from
+  -- tripping the detector.
+  local has_welcome_header = contains_any(text, {
+    "welcome back",
+    "claude code v",
+    "welcome to claude code",
+  })
+  if not has_welcome_header then
+    return false
+  end
+  return contains_any(text, {
+    "tips for getting started",
+    "what's new",
+    "ask claude to",
+    "/release-notes for more",
+    "/help for help",
+  })
 end
 
 function M.classify(input)
@@ -645,12 +1017,31 @@ function M.classify(input)
   -- bracket labels on one line) rather than loose substring matches.
   local body_and_status = body_text .. "\n" .. lower(status)
 
+  -- Login / sign-in dialog runs before any other dialog branch because
+  -- nothing else is actionable when the user isn't authenticated:
+  -- send_prompt's leading Enter would either trigger the OAuth flow
+  -- (opening a browser, which a script driver can't complete) or land
+  -- in the API-key entry box. Callers must `claude login` interactively
+  -- once before driving the adapter; the script-side handler surfaces
+  -- this as a non-zero exit with a clear message.
+  if has_login_indicator(body_text) then
+    return state_snapshot("waiting_for_login", 0.86, "login / sign-in dialog detected", sequence)
+  end
+
   -- Workspace-trust dialog is checked before permission/plan because its
   -- approve action differs (numbered selection, not a single Enter press).
   -- Trust questions and answers live entirely in the dialog body; the
   -- status bar carries only navigation hints.
   if has_trust_indicator(body_text) then
     return state_snapshot("waiting_for_trust", 0.86, "workspace trust dialog detected", sequence)
+  end
+
+  -- Model picker (opened by `/model`). Anchored on THREE structural
+  -- cues together (header phrase ending in `:`, a focused `❯ <digit>.`
+  -- option, AND a navigation-hint line like `enter to select`), so
+  -- prose mentioning "select a model" can't trip it on its own.
+  if has_model_picker_indicator(body_text) then
+    return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence)
   end
 
   if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
@@ -667,7 +1058,7 @@ function M.classify(input)
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
   end
 
-  if has_active_work_indicator(body_text) then
+  if has_active_work_indicator(screen_text) then
     return state_snapshot("thinking", 0.76, "active work indicator detected", sequence)
   end
 
@@ -685,20 +1076,47 @@ function M.classify(input)
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
   end
 
+  -- Mid-turn determinism — when a turn is in flight (`prompt_submitted`)
+  -- and no completion marker is on screen yet, classify as `thinking`
+  -- regardless of whether the active-work indicator happens to be visible
+  -- on this particular frame. Without this branch the classifier
+  -- oscillates between `thinking` (spinner glyph captured) and
+  -- `waiting_for_user_input` (between spinner repaints — the submitted
+  -- prompt is still visible so `has_input_prompt` keeps returning true)
+  -- on every polling tick, which makes downstream consumers (the
+  -- `claude-stream` body diff loop, anything driving `adapter.state` on a
+  -- heartbeat) see spurious state churn. The completion marker
+  -- (`✻ <Verb> for <duration>`) is the TUI's structural end-of-turn
+  -- signal, so its absence is the durable mid-turn signal: any screen
+  -- where it isn't present yet is by definition still mid-turn.
+  --
+  -- This branch deliberately runs after the active-work-indicator
+  -- branch above so that branch's higher 0.76 confidence wins when the
+  -- spinner IS visible; this fallback fires only between repaints.
+  if last_intent == "prompt_submitted" and not has_turn_completion_marker(screen) then
+    return state_snapshot(
+      "thinking",
+      0.6,
+      "turn in flight; no accepted completion marker on screen",
+      sequence
+    )
+  end
+
   -- Poll-path completed_turn — fires when adapter.state polling sees
-  -- the "Claude is back at idle after answering" pattern: answer bullet
-  -- present + empty input prompt visible + tea-verb completion marker
-  -- on screen + no active work spinner.
+  -- the "Claude is back at idle after answering" pattern: input
+  -- prompt visible + tea-verb completion marker on screen + no active
+  -- work spinner.
   --
   -- The completion-marker (`✻ <Verb> for <duration>`) gate is what
   -- prevents the classic preamble false positive: a turn that starts
-  -- with "⏺ I'll explore the project..." renders the answer bullet and
-  -- shows an empty `❯` prompt for a moment before the next tool spinner
-  -- repaints; without the marker requirement, that frame looks
-  -- identical to a real turn boundary and the classifier flips to
-  -- `completed_turn` mid-stream. The `✻ <Verb> for <duration>` line is
-  -- the TUI's own end-of-turn signal — it's never rendered between tool
-  -- calls.
+  -- with "⏺ I'll explore the project..." renders a prompt for a moment
+  -- before the next tool spinner repaints; without the marker
+  -- requirement, that frame looks identical to a real turn boundary and
+  -- the classifier flips to `completed_turn` mid-stream. The
+  -- `✻ <Verb> for <duration>` line is the TUI's own end-of-turn signal
+  -- — it's never rendered between tool calls. Long answers can scroll
+  -- the original answer bullet out of the visible body by the time the
+  -- completion marker appears, so do not require `⏺` here.
   --
   -- Gated on `stable_ms < completed_turn_stable_ms` so callers driving
   -- `adapter.wait` (which always supplies a stable_ms >= the threshold)
@@ -707,15 +1125,19 @@ function M.classify(input)
   -- polling consumers that don't have screen-stability evidence.
   if last_intent == "prompt_submitted"
       and (stable_ms == 0 or completed_turn_stable_ms == 0 or stable_ms < completed_turn_stable_ms)
-      and not has_active_work_indicator(body_text)
-      and contains(body, "⏺")
+      and not has_active_work_indicator(screen_text)
       and has_turn_completion_marker(screen)
-      and has_empty_input_prompt_line(body)
+      -- Use the FULL screen for the input-prompt check, not just body.
+      -- Claude Code 2.1.x renders `separator + ❯ + 2 status rows` at the
+      -- bottom; the input prompt can land in the status-bar area which
+      -- `body_text` strips. The stable path below already uses `screen`
+      -- here — mirror that so polling consumers don't hang.
+      and has_input_prompt(screen)
   then
     return state_snapshot(
       "completed_turn",
       0.7,
-      "answer bullet plus empty input prompt visible without active work",
+      "completion marker plus input prompt visible without active work",
       sequence
     )
   end
@@ -735,7 +1157,7 @@ function M.classify(input)
     if last_intent == "prompt_submitted"
         and completed_turn_stable_ms > 0
         and stable_ms >= completed_turn_stable_ms
-        and not has_active_work_indicator(body_text)
+        and not has_active_work_indicator(screen_text)
         and has_turn_completion_marker(screen)
     then
       return state_snapshot("completed_turn", 0.78, "stable input prompt after prompt submission", sequence)
@@ -779,10 +1201,32 @@ function M.send_prompt(input)
   -- send their own Enter and synchronise on stability before pasting,
   -- which is fragile across machine speeds and Claude Code versions.
   -- driving programs that have not opted into bracketed paste.
+  --
+  -- Empty-prompt guard: an empty bracketed paste leaves Claude at
+  -- idle (the two Enters are no-ops on an empty input box), so do
+  -- NOT advance to the `prompt_submitted` intent. The classifier's
+  -- mid-turn `thinking` branch keys off that intent; claiming a
+  -- turn started when no actual prompt was submitted would lock the
+  -- state machine in `thinking` forever, since the TUI never
+  -- renders the `✻ <Verb> for <duration>` completion marker that's
+  -- the durable mid-turn release signal.
+  --
+  -- Equally important: actively CLEAR any previously-recorded
+  -- intent. If a caller submitted a real prompt, the turn completed,
+  -- and then called `send_prompt("")` again, leaving the recorded
+  -- intent at `prompt_submitted` would keep the mid-turn /
+  -- completed-turn branches active against an idle screen. We
+  -- communicate "clear the intent" by returning `last_intent = ""`;
+  -- the host's `apply_plan` interprets the empty string as an
+  -- explicit reset (see `src/extension.rs::apply_plan`).
+  local prompt = input.prompt or ""
+  if prompt == "" then
+    return { actions = {}, last_intent = "" }
+  end
   return {
     actions = {
       action.key("enter"),
-      action.bracketed_paste(input.prompt or ""),
+      action.bracketed_paste(prompt),
       action.key("enter"),
     },
     last_intent = "prompt_submitted",
@@ -835,17 +1279,68 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
-      -- Empty prompt glyph alone is NOT a completion anchor — it
+      -- Login / sign-in dialog. Mirrors `has_login_indicator` so
+      -- callers using `adapter.wait` after `adapter.start` against
+      -- an unauthenticated user wake on the sign-in panel instead
+      -- of timing out. Cover ALL the shapes the classifier accepts:
+      -- the verbatim action prompts, the title phrases, the OAuth
+      -- URL hosts (line-anchored), and the API-key env-var name.
+      matcher.contains_text("Press Enter to log in"),
+      matcher.contains_text("Open the link"),
+      matcher.contains_text("Log in to Claude Code"),
+      matcher.contains_text("Sign in to Claude"),
+      matcher.contains_text("Continue with Anthropic"),
+      matcher.contains_text("Continue with Google"),
+      matcher.contains_text("ANTHROPIC_API_KEY"),
+      matcher.screen_regex("(?m)^\\s*https?://[\\w./\\-_?=&%]*claude\\.ai"),
+      matcher.screen_regex("(?m)^\\s*https?://[\\w./\\-_?=&%]*anthropic\\.com"),
+      -- Model picker dialog (opened by `/model`). Mirrors the full
+      -- `MODEL_PICKER_HEADERS` list in `has_model_picker_indicator`
+      -- so any of the four header shapes wakes the wait.
+      matcher.contains_text("Select a model:"),
+      matcher.contains_text("Switch to model:"),
+      matcher.contains_text("Choose a model:"),
+      matcher.contains_text("Available models:"),
+      -- Error banners that `has_error_indicator` recognises — mirror
+      -- the full `ERROR_BANNER_PREFIXES` list in main.lua. `contains_text`
+      -- is case-insensitive on the matcher side, so the title-case
+      -- here matches the lower-cased prefixes the classifier uses.
+      matcher.contains_text("error:"),
+      matcher.contains_text("request failed"),
+      matcher.contains_text("API error"),
+      matcher.contains_text("5-hour limit"),
+      matcher.contains_text("Rate limit reached"),
+      matcher.contains_text("You've used your Pro plan"),
+      matcher.contains_text("You've used your Max plan"),
+      matcher.contains_text("You've reached your usage limit"),
+      matcher.contains_text("Credit balance is too low"),
+      matcher.contains_text("Connection error"),
+      matcher.contains_text("Connection issue"),
+      matcher.contains_text("Could not connect"),
+      matcher.contains_text("Network error"),
+      -- Prompt glyph alone is NOT a completion anchor — it
       -- appears for one frame during preambles before a tool call
       -- while the next spinner is between repaints, and `adapter.wait`
       -- would otherwise return with `waiting_for_user_input` on that
       -- frame instead of holding until the turn actually ends. Pair
       -- it with the tea-verb completion marker (`✻ <Verb> for <N>`)
       -- the TUI renders only at end-of-turn, matching the classifier's
-      -- `completed_turn` gate. Dialog / usage anchors above still
-      -- wake the matcher on their own.
+      -- `completed_turn` gate. Claude may render ghost text or a
+      -- suggested follow-up after the prompt glyph (for example
+      -- `❯ run the tests`), so do not require an empty prompt row here.
+      -- Dialog / usage anchors above still wake the matcher on their own.
       matcher.all({
-        matcher.screen_regex("(?m)^\\s*(?:>|❯)\\s*$"),
+        -- Prompt-glyph anchor: accept either `❯` followed by anything
+        -- (including a post-turn ghost-text suggestion like
+        -- `❯ run the tests`) OR a bare ASCII `>` with only whitespace
+        -- after it (the older / ASCII-fallback idle-prompt shape).
+        -- Crucially this REJECTS `> <text>` because Claude's answer
+        -- prose can include Markdown blockquotes (`> some quoted text`)
+        -- that would otherwise wake the matcher on screens the
+        -- classifier wouldn't call complete. Keeps the matcher aligned
+        -- with `has_input_prompt`, which only treats bare `>` / ` >` /
+        -- `❯…` shapes as prompts.
+        matcher.screen_regex("(?m)^\\s*(?:❯.*|>\\s*$)"),
         matcher.screen_regex("✻ \\S+ for \\d"),
       }),
     }),
@@ -904,10 +1399,83 @@ function M.dismiss_welcome(_input)
   }
 end
 
-function M.cancel(_input)
+-- Toggle expansion of the focused collapsible row (`Reading N files… (ctrl+o
+-- to expand)`, search results, Bash output, etc.). Claude Code 2.1.x binds
+-- Ctrl+O to expand/collapse the row under the cursor; callers driving the
+-- TUI from outside the keyboard use this intent so they don't have to know
+-- the key binding.
+function M.expand(_input)
   return {
     actions = {
-      action.interrupt(),
+      action.key("ctrl_o"),
+    },
+  }
+end
+
+-- Submit a slash command (`/btw`, `/clear`, `/help`, `/usage`, `/model`,
+-- `/release-notes`, project-defined commands, …). Bracketed-pastes the
+-- token then presses Enter — same shape as `send_prompt` but with two
+-- important differences:
+--
+--   1. The leading Enter dismissal is omitted. Slash commands are only
+--      meaningful when the input box already has focus (no welcome
+--      panel covering it); spurious Enter on a settled input row would
+--      submit an empty turn first, which can race with the slash text.
+--   2. `last_intent` is NOT set to `prompt_submitted`. Slash commands
+--      open a UI (modal / panel / inline action) rather than starting a
+--      conversation turn, so the classifier's mid-turn `thinking`
+--      branch must not engage. Leaving `last_intent` alone lets the
+--      classifier read whatever the slash command rendered on screen
+--      (`waiting_for_user_input` for a panel back at idle, the panel-
+--      specific dialog branches for `/model` or `/usage`, etc.).
+--
+-- Accepts either bare `name` ("btw") or the leading-slash form
+-- ("/btw"); the plugin normalises so callers don't have to.
+function M.slash_command(input)
+  local name = (input and (input.command or input.name)) or ""
+  if name == "" then
+    return { actions = {} }
+  end
+  if string.sub(name, 1, 1) ~= "/" then
+    name = "/" .. name
+  end
+  return {
+    actions = {
+      action.bracketed_paste(name),
+      action.key("enter"),
+    },
+  }
+end
+
+function M.cancel(_input)
+  -- Claude Code 2.1.x captures Escape as the mid-turn interrupt key —
+  -- the active-work indicator literally renders "esc to interrupt".
+  -- Ctrl-C is reserved for a different role at idle (one press warns,
+  -- two presses exit Claude entirely), so sending it mid-turn would
+  -- either be ignored or trigger Claude's exit confirmation flow
+  -- instead of cancelling the current turn cleanly. `action.key`
+  -- with the "escape" alias is what the active-work hint maps to.
+  return {
+    actions = {
+      action.key("escape"),
+    },
+    last_intent = "cancelling",
+  }
+end
+
+-- Two-Escape escalation for tool calls that are already in flight
+-- when the first Escape arrives. Real Claude Code occasionally needs
+-- the second press to actually interrupt — a single Escape sometimes
+-- lands during an API request that's already serializing, which
+-- Claude completes before honoring the interrupt. This intent sends
+-- both presses in one plan so callers don't have to script the
+-- escalation themselves. Same `last_intent = "cancelling"` so the
+-- classifier's hold-state behaves identically.
+function M.force_cancel(_input)
+  return {
+    actions = {
+      action.key("escape"),
+      action.key("escape"),
     },
     last_intent = "cancelling",
   }

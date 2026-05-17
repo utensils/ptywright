@@ -367,6 +367,14 @@ pub enum PluginManifestError {
 pub(crate) struct BuiltinPlugin {
     pub manifest: fn() -> PluginManifest,
     pub source: &'static str,
+    /// Optional auxiliary modules embedded alongside the main entrypoint.
+    /// Each `(name, source)` pair is evaluated by the Lua runtime before
+    /// `source` runs and registered as a global table on the plugin's Lua
+    /// state, so the entrypoint can write
+    /// `local indicators = indicators` (or any other local-alias pattern)
+    /// without needing `require` / filesystem loads. Order is preserved
+    /// in case later modules depend on earlier ones.
+    pub modules: &'static [(&'static str, &'static str)],
 }
 
 /// Every Lua plugin embedded in this binary. Adding a new built-in plugin
@@ -376,6 +384,10 @@ pub(crate) struct BuiltinPlugin {
 pub(crate) const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[BuiltinPlugin {
     manifest: claude_code_manifest,
     source: include_str!("../plugins/claude-code/main.lua"),
+    modules: &[(
+        "helpers",
+        include_str!("../plugins/claude-code/helpers.lua"),
+    )],
 }];
 
 /// TOML source for the claude-code manifest, embedded at compile time

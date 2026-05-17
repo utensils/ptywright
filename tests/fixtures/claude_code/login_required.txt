@@ -1,0 +1,18 @@
+╭─── Claude Code v2.1.143 ─────────────────────────────────────────────╮
+│                                                                      │
+│   Welcome to Claude Code                                             │
+│                                                                      │
+│   Log in to Claude Code to get started.                              │
+│                                                                      │
+│   ▸  Continue with Anthropic                                         │
+│      Sign in with your Claude account                                │
+│                                                                      │
+│   ▸  Continue with Google                                            │
+│                                                                      │
+│   Press Enter to log in. We'll open the link in your browser.        │
+│                                                                      │
+│   Or set ANTHROPIC_API_KEY in your environment and restart.          │
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯
+
+  https://claude.ai/login?return_to=anthropic.com%2Fclaude-code

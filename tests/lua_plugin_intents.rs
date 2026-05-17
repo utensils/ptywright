@@ -121,7 +121,7 @@ fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
         st_poll.state, st_poll.evidence
     );
     assert_eq!(
-        st_poll.evidence, "answer bullet plus empty input prompt visible without active work",
+        st_poll.evidence, "completion marker plus input prompt visible without active work",
         "poll-path completed_turn must own this screen"
     );
 
@@ -201,12 +201,186 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
     assert_eq!(plan.last_intent.as_deref(), Some("prompt_submitted"));
 }
 
+/// `expand` is the named intent for Claude Code's Ctrl+O binding —
+/// toggles expansion of the collapsible tool-progress row under the
+/// cursor. Generic `key("ctrl_o")` works too; this is the
+/// discoverable named-intent affordance.
 #[test]
-fn cancel_plan_emits_interrupt_and_marks_cancelling_intent() {
+fn expand_plan_sends_ctrl_o_with_no_intent() {
+    let extension = claude_plugin();
+    let plan = plan(&extension, "expand", json!({}));
+
+    assert_eq!(plan.actions, vec![Action::Key(Key::CtrlO)]);
+    assert!(
+        plan.last_intent.is_none(),
+        "expand toggles a UI affordance, not a turn — last_intent must stay unset"
+    );
+}
+
+/// Slash commands open UI panels (modal / inline) — they're not
+/// conversation turns. The plugin pastes `/<name>` and presses Enter
+/// without flipping `last_intent`, so the classifier reads whatever
+/// the slash command rendered (the `/model` picker, `/usage` screen,
+/// `/help` panel, plain back-at-idle for `/btw` / `/clear`, etc.)
+/// instead of being lied to about a turn in flight.
+#[test]
+fn slash_command_pastes_token_and_presses_enter_without_intent() {
+    let extension = claude_plugin();
+
+    // Bare name — plugin adds the leading slash.
+    let bare = plan(&extension, "slash_command", json!({ "command": "btw" }));
+    assert_eq!(
+        bare.actions,
+        vec![
+            Action::BracketedPaste("/btw".to_string()),
+            Action::Key(Key::Enter),
+        ]
+    );
+    assert!(
+        bare.last_intent.is_none(),
+        "slash command is not a turn — must not flip last_intent"
+    );
+
+    // Already-prefixed name — plugin passes through.
+    let prefixed = plan(&extension, "slash_command", json!({ "command": "/btw" }));
+    assert_eq!(
+        prefixed.actions,
+        vec![
+            Action::BracketedPaste("/btw".to_string()),
+            Action::Key(Key::Enter),
+        ]
+    );
+
+    // `name` is accepted as an alias for `command` so callers can use
+    // either field idiomatically.
+    let via_name = plan(&extension, "slash_command", json!({ "name": "usage" }));
+    assert_eq!(
+        via_name.actions,
+        vec![
+            Action::BracketedPaste("/usage".to_string()),
+            Action::Key(Key::Enter),
+        ]
+    );
+
+    // Empty / missing command — no-op (no actions, no intent change),
+    // analogous to the empty-send_prompt guard.
+    let empty = plan(&extension, "slash_command", json!({ "command": "" }));
+    assert!(empty.actions.is_empty());
+    assert!(empty.last_intent.is_none());
+
+    let missing = plan(&extension, "slash_command", json!({}));
+    assert!(missing.actions.is_empty());
+    assert!(missing.last_intent.is_none());
+}
+
+/// An empty `send_prompt` must NOT mark `last_intent = "prompt_submitted"`.
+/// The two Enters are no-ops on an empty input box, so Claude stays at
+/// idle and never renders the `✻ <Verb> for <duration>` completion
+/// marker that's the mid-turn release signal — claiming an intent here
+/// would lock the classifier in `thinking` indefinitely.
+///
+/// Equally important: an empty `send_prompt` must explicitly CLEAR any
+/// previously-recorded intent. If a real turn completed and then the
+/// caller submitted an empty prompt, leaving the stale
+/// `prompt_submitted` intent would keep mid-turn / completed-turn
+/// branches active against an idle screen. The plan signals "clear
+/// the intent" by returning `last_intent = Some("")`; the host's
+/// `apply_plan` treats the empty string as an explicit reset.
+#[test]
+fn send_prompt_refuses_empty_input_and_clears_any_stale_intent() {
+    let extension = claude_plugin();
+
+    let empty_string = plan(&extension, "send_prompt", json!({ "prompt": "" }));
+    assert!(
+        empty_string.actions.is_empty(),
+        "empty prompt must emit zero actions, got {:?}",
+        empty_string.actions
+    );
+    assert_eq!(
+        empty_string.last_intent.as_deref(),
+        Some(""),
+        "empty prompt must return Some(\"\") to explicitly clear any stale intent recorded by a prior submission"
+    );
+
+    // Missing prompt field is the same edge case — the plugin defaults
+    // it to "" and must take the same path.
+    let missing_prompt = plan(&extension, "send_prompt", json!({}));
+    assert!(missing_prompt.actions.is_empty());
+    assert_eq!(missing_prompt.last_intent.as_deref(), Some(""));
+}
+
+/// `force_cancel` sends Escape twice in one plan. Real Claude Code
+/// occasionally needs the second press to interrupt a tool call that's
+/// already serializing an API request: the first Escape lands while
+/// Claude is mid-call and gets honored only after the response returns.
+/// This intent is the named escalation path so callers don't script
+/// the second press themselves.
+#[test]
+fn force_cancel_plan_emits_two_escapes_and_marks_cancelling_intent() {
+    let extension = claude_plugin();
+    let plan = plan(&extension, "force_cancel", json!({}));
+
+    assert_eq!(
+        plan.actions,
+        vec![Action::Key(Key::Escape), Action::Key(Key::Escape)]
+    );
+    assert_eq!(
+        plan.last_intent.as_deref(),
+        Some("cancelling"),
+        "force_cancel must mark the cancelling hold-state just like cancel does"
+    );
+}
+
+/// End-to-end check that empty `send_prompt` clears a previously-set
+/// `last_intent` through `ExtensionHandle::apply_plan`. The plan
+/// returns `Some("")` which the host treats as an explicit reset.
+/// Without this, a no-op submission after a real turn would leave
+/// the classifier reading screens against a stale `prompt_submitted`
+/// intent — locking the mid-turn `thinking` branch on an idle screen.
+#[test]
+#[cfg(unix)]
+fn empty_send_prompt_clears_stale_last_intent_via_handle() {
+    use ptywright::session::Session;
+    use ptywright::target::Target;
+
+    let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "cat"]))
+        .expect("spawn /bin/sh -lc cat for PTY round-trip");
+    let extension = claude_plugin();
+    let mut handle = ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+
+    // Simulate a prior real submission having recorded the intent.
+    handle.set_last_intent(Some("prompt_submitted".to_string()));
+    assert_eq!(handle.last_intent(), Some("prompt_submitted"));
+
+    // Empty `send_prompt` must clear the stale intent, not preserve it.
+    handle
+        .send("send_prompt", json!({ "prompt": "" }))
+        .expect("send_prompt empty via ExtensionHandle");
+    assert_eq!(
+        handle.last_intent(),
+        None,
+        "empty send_prompt should explicitly reset last_intent so a stale `prompt_submitted` from a prior turn doesn't keep mid-turn branches active"
+    );
+
+    // Same for missing `prompt` field.
+    handle.set_last_intent(Some("prompt_submitted".to_string()));
+    handle
+        .send("send_prompt", json!({}))
+        .expect("send_prompt with no prompt field via ExtensionHandle");
+    assert_eq!(handle.last_intent(), None);
+}
+
+#[test]
+fn cancel_plan_emits_escape_and_marks_cancelling_intent() {
+    // Claude Code 2.1.x captures Escape as the mid-turn interrupt key
+    // (the active-work indicator literally renders "esc to interrupt").
+    // Sending Ctrl-C here used to either be ignored mid-turn or trigger
+    // Claude's idle exit-confirmation flow instead of cancelling the
+    // current turn.
     let extension = claude_plugin();
     let plan = plan(&extension, "cancel", json!({}));
 
-    assert_eq!(plan.actions, vec![Action::Interrupt]);
+    assert_eq!(plan.actions, vec![Action::Key(Key::Escape)]);
     assert_eq!(plan.last_intent.as_deref(), Some("cancelling"));
 }
 
@@ -313,6 +487,110 @@ fn key_intent_routes_expanded_special_keys() {
         assert!(
             plan.last_intent.is_none(),
             "the generic `key` intent must not mutate last_intent"
+        );
+    }
+}
+
+/// EVERY variant of `Action::Key` (from `src/action.rs`) must be
+/// represented in the Lua plugin's `KEY_ALIASES` table so the
+/// generic `key` intent routes to `action.key(...)` rather than
+/// silently falling through to `action.text`. The comment in
+/// `plugins/claude-code/main.lua` promises this contract; this test
+/// enforces it for the variants it lists.
+///
+/// **Reminder, NOT a safety net.** The variants below are hand-listed.
+/// Adding a new variant to `Key` does NOT automatically fail this
+/// test — maintainers must also add the new variant to the slice
+/// below AND to Lua's `KEY_ALIASES`. The test catches drift only for
+/// variants someone remembered to enumerate here. (`Action::Key`
+/// doesn't implement `IntoEnumIter`, so there's no compile-time way
+/// to derive the list.)
+#[test]
+fn key_intent_covers_every_rust_key_variant() {
+    let extension = claude_plugin();
+
+    // Hand-listed reminder of every `Key` variant currently shipping.
+    // The serde encoding is `rename_all = "snake_case"`, so every
+    // variant maps to the corresponding snake_case alias the Lua side
+    // accepts.
+    let variants: &[Key] = &[
+        // Submission / line editing
+        Key::Enter,
+        Key::Escape,
+        Key::Tab,
+        Key::ShiftTab,
+        Key::Backspace,
+        Key::Delete,
+        Key::Space,
+        // Arrows
+        Key::Up,
+        Key::Down,
+        Key::Left,
+        Key::Right,
+        // Navigation cluster
+        Key::Home,
+        Key::End,
+        Key::PageUp,
+        Key::PageDown,
+        Key::Insert,
+        // Ctrl combos. Note that `ctrl_h` / `ctrl_i` / `ctrl_j` / `ctrl_m`
+        // are NOT defined as variants in `Key` — those control codes
+        // are intentionally represented by the semantic aliases
+        // (`backspace` / `tab` / `enter`) so transcripts stay readable
+        // and the alias table doesn't carry two equivalent names for
+        // the same wire byte.
+        Key::CtrlA,
+        Key::CtrlB,
+        Key::CtrlC,
+        Key::CtrlD,
+        Key::CtrlE,
+        Key::CtrlF,
+        Key::CtrlG,
+        Key::CtrlK,
+        Key::CtrlL,
+        Key::CtrlN,
+        Key::CtrlO,
+        Key::CtrlP,
+        Key::CtrlQ,
+        Key::CtrlR,
+        Key::CtrlS,
+        Key::CtrlT,
+        Key::CtrlU,
+        Key::CtrlV,
+        Key::CtrlW,
+        Key::CtrlX,
+        Key::CtrlY,
+        Key::CtrlZ,
+        // Function keys
+        Key::F1,
+        Key::F2,
+        Key::F3,
+        Key::F4,
+        Key::F5,
+        Key::F6,
+        Key::F7,
+        Key::F8,
+        Key::F9,
+        Key::F10,
+        Key::F11,
+        Key::F12,
+    ];
+
+    for variant in variants {
+        // Round-trip through serde to get the wire-form alias rather
+        // than re-implementing snake_case here; if the rename_all
+        // attribute on Key ever changes, this test follows it.
+        let alias = serde_json::to_value(variant)
+            .expect("Key serializes to JSON")
+            .as_str()
+            .expect("Key encodes as a string")
+            .to_string();
+        let plan = plan(&extension, "key", json!({ "key": alias.clone() }));
+        assert_eq!(
+            plan.actions,
+            vec![Action::Key(variant.clone())],
+            "Key::{variant:?} (snake_case alias `{alias}`) does not route through the Lua KEY_ALIASES table — \
+             add it to `plugins/claude-code/main.lua::KEY_ALIASES` so the generic `key` intent stays in sync with the Rust enum"
         );
     }
 }
@@ -453,9 +731,9 @@ fn wait_cancel_settled_matcher_returns_screen_stable_threshold() {
 
 #[test]
 fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
-    // The empty-prompt anchor in wait_turn_matcher is now paired with
+    // The prompt anchor in wait_turn_matcher is now paired with
     // the tea-verb completion marker — both must appear on the screen
-    // for the empty-prompt branch to fire. This mirrors the
+    // for the prompt branch to fire. This mirrors the
     // classifier's `completed_turn` gate exactly so `adapter.wait`
     // can't return before the classifier would.
     let extension = claude_plugin();
@@ -491,8 +769,42 @@ fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
 }
 
 #[test]
+fn wait_turn_matcher_matches_prompt_with_suggested_text_after_completion_marker() {
+    let extension = claude_plugin();
+    let matcher = wait_matcher(
+        &extension,
+        "wait_turn_matcher",
+        json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+    );
+    let snapshot = ScreenSnapshot {
+        size: TerminalSize::new(4, 60),
+        cursor: CursorState {
+            row: 2,
+            col: 2,
+            visible: true,
+        },
+        sequence: 1,
+        plain_text: "work complete\n✻ Cooked for 48s\n❯\u{00a0}run the tests\r\n".to_string(),
+        cells: Vec::new(),
+        alternate_screen: false,
+        application_cursor: false,
+        application_keypad: false,
+        title: None,
+    };
+
+    assert!(matcher.is_match_with_context(
+        &snapshot,
+        "",
+        MatcherContext {
+            stable_for: Duration::from_millis(COMPLETED_TURN_STABLE_MS),
+            process_exited: false,
+        },
+    ));
+}
+
+#[test]
 fn wait_turn_matcher_does_not_fire_on_preamble_without_completion_marker() {
-    // Regression for the bug Copilot called out: the empty-prompt
+    // Regression for the bug Copilot called out: the prompt
     // anchor used to wake `adapter.wait` on its own, which fired on
     // preamble-before-tool-use screens (answer-bullet line plus an
     // empty `❯` for a single frame while the next spinner was between
@@ -651,7 +963,7 @@ fn classifier_completed_turn_paths() {
     assert_eq!(poll.state, "completed_turn");
     assert_eq!(
         poll.evidence,
-        "answer bullet plus empty input prompt visible without active work"
+        "completion marker plus input prompt visible without active work"
     );
     assert!(
         poll.confidence < stable.confidence,
@@ -689,6 +1001,159 @@ fn classifier_completed_turn_paths() {
     assert_ne!(
         preamble.state, "completed_turn",
         "preamble (bullet + empty prompt but no ✻ marker) must not fire completed_turn"
+    );
+
+    // (e) Same regression with Claude's tool-progress row visible. This is
+    // the exact shape observed from claude-stream before it exited early:
+    // a preamble bullet, "Reading 1 file...", and an empty prompt row, but
+    // still no TUI completion marker.
+    let preamble_with_tool_progress = classify_state(
+        &extension,
+        "⏺ I'll read through the key files in this project to give you a comprehensive summary.\n  Reading 1 file... (ctrl+o to expand)\n\n>",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        preamble_with_tool_progress.state, "completed_turn",
+        "preamble with tool progress but no ✻ marker must not fire completed_turn"
+    );
+
+    // (f) Claude Code can render suggested follow-up text after the
+    // prompt glyph once the turn is over. The completion marker is still
+    // the durable boundary; the prompt row does not have to be empty.
+    let completed_with_suggestion = classify_state(
+        &extension,
+        "⏺ work completed\n\n✻ Cooked for 48s\n\n❯\u{00a0}run the tests",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_with_suggestion.state, "completed_turn",
+        "completed screen with suggested prompt text must still fire completed_turn"
+    );
+
+    // (g) Long answers can push the original answer bullet out of the
+    // visible screen before the completion marker and prompt row render.
+    // The marker plus prompt is the durable end-of-turn signal.
+    let completed_after_scroll = classify_state(
+        &extension,
+        "Current State\n- Stable: Generic core abstractions\n- Platform: macOS, Linux\n\n✻ Brewed for 36s\n❯\u{00a0}what's this branch about",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_after_scroll.state, "completed_turn",
+        "completed screen must not require the answer bullet to remain visible"
+    );
+
+    // (h) Premature completed_turn regression — a screen where a
+    // `✻ <Verb> for <N>` line is present (from some parser-captured
+    // intermediate render or a transient Claude rendering) but tool
+    // progress is STILL on screen below it must not fire
+    // completed_turn. The structural check requires nothing meaningful
+    // after the marker. This was the live bug producing 37-char-body
+    // exits from claude-stream when Claude was actually still reading
+    // files. Active-work indicator is also off here (between spinner
+    // repaints) so the `(ctrl+o to expand)` anchor is what holds.
+    let mid_turn_with_stray_marker = classify_state(
+        &extension,
+        "⏺ I'll explore the project structure first, then read the key files.\n\n✻ Brewed for 4s\n\n⏺ Reading 2 files… (ctrl+o to expand)",
+        7,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        mid_turn_with_stray_marker.state, "completed_turn",
+        "stray mid-turn marker followed by tool-progress content must NOT fire completed_turn"
+    );
+
+    // (i) The `(ctrl+o to expand)` hint is itself a mid-turn signal
+    // (Claude Code's collapsible tool-progress rows render it). With
+    // NO marker but tool progress visible, classifier must NOT fire
+    // completed_turn — even though `⏺` isn't a spinner glyph and the
+    // active-work indicator's spinner-line path won't fire either.
+    let tool_progress_alone = classify_state(
+        &extension,
+        "⏺ I'll explore the project structure.\n\n⏺ Reading 1 file… (ctrl+o to expand)",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        tool_progress_alone.state, "thinking",
+        "ctrl+o-to-expand tool-progress row is an active-work signal even without spinner glyph; state must be `thinking`"
+    );
+    assert_eq!(
+        tool_progress_alone.evidence, "active work indicator detected",
+        "active-work branch must own the classification, not the mid-turn fallback"
+    );
+}
+
+/// When a turn is in flight (`last_intent == "prompt_submitted"`) and no
+/// completion marker is on screen yet, the classifier must return
+/// `thinking` regardless of whether the active-work indicator is visible
+/// on this particular frame. Without this branch, the classifier
+/// oscillates between `thinking` (spinner glyph captured) and
+/// `waiting_for_user_input` (between spinner repaints — the submitted
+/// prompt is still visible so `has_input_prompt` keeps returning true)
+/// on every polling tick, which makes downstream consumers see spurious
+/// state churn. The fix is timing-independent: the completion marker
+/// (`✻ <Verb> for <duration>`) is the TUI's structural end-of-turn
+/// signal, so its absence is the durable mid-turn signal.
+#[test]
+fn classifier_returns_thinking_mid_turn_even_between_spinner_frames() {
+    let extension = claude_plugin();
+
+    // The submitted prompt is still visible on screen, and the spinner
+    // happens to be between repaints this tick. Pre-fix, this classified
+    // as `waiting_for_user_input`. Post-fix, `thinking`.
+    let between_spinner_frames = classify_state(
+        &extension,
+        "❯ Read all files in this project and summarize it.\n\n⏺ I'll explore the project structure.\n\n>",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        between_spinner_frames.state, "thinking",
+        "mid-turn frames without the completion marker must stay on `thinking` instead of flipping to `waiting_for_user_input`"
+    );
+    assert_eq!(
+        between_spinner_frames.evidence,
+        "turn in flight; no accepted completion marker on screen"
+    );
+
+    // The spinner-visible frame must still resolve via the higher-confidence
+    // active-work branch, not the mid-turn fallback.
+    let spinner_visible = classify_state(
+        &extension,
+        "❯ Read all files in this project and summarize it.\n\n✶ Razzle-dazzling…\n\n>",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(spinner_visible.state, "thinking");
+    assert_eq!(spinner_visible.evidence, "active work indicator detected");
+    assert!(
+        spinner_visible.confidence > between_spinner_frames.confidence,
+        "active-work branch should win on confidence when the spinner IS visible"
+    );
+
+    // Once the completion marker lands, the mid-turn branch must release
+    // so completed_turn can fire.
+    let post_completion = classify_state(
+        &extension,
+        "❯ Read all files in this project and summarize it.\n\n⏺ Done.\n\n✻ Brewed for 5s\n\n>",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        post_completion.state, "completed_turn",
+        "mid-turn branch must release once the completion marker is on screen"
     );
 }
 

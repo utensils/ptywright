@@ -1,0 +1,12 @@
+{
+  "state": "starting",
+  "evidence": "welcome screen visible",
+  "last_intent": null,
+  "min_confidence": 0.6,
+  "metadata": {
+    "status": {
+      "model": "Sonnet 4.6",
+      "permission_mode": "auto"
+    }
+  }
+}

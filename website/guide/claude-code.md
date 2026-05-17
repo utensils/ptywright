@@ -58,6 +58,8 @@ The classifier returns one of:
 - `waiting_for_permission`
 - `waiting_for_plan_approval`
 - `waiting_for_trust`
+- `waiting_for_login`
+- `waiting_for_model_select`
 - `waiting_for_user_input`
 - `completed_turn`
 - `cancelling`
@@ -117,17 +119,49 @@ Drive the plugin entirely through [`adapter.*`](../reference/json-rpc.md#adapter
 
 Plugin intents available via `adapter.send`:
 
-| Intent            | Params                | Notes                                                                                   |
-| ----------------- | --------------------- | --------------------------------------------------------------------------------------- |
-| `send_prompt`     | `{ "prompt": "..." }` | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`. |
-| `approve`         | `{}`                  | Presses Enter to accept the current permission / plan-approval dialog.                  |
-| `deny`            | `{}`                  | Presses Escape to dismiss the current dialog.                                           |
-| `cancel`          | `{}`                  | Sends Ctrl-C. Sets `last_intent = "cancelling"`.                                        |
-| `approve_trust`   | `{}`                  | Types `1` + Enter for the workspace-trust dialog.                                       |
-| `deny_trust`      | `{}`                  | Types `2` + Enter for the workspace-trust dialog.                                       |
-| `dismiss_welcome` | `{}`                  | Presses Enter to clear the first-launch welcome panel.                                  |
+| Intent            | Params                                                          | Notes                                                                                                                                                                                                        |
+| ----------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `send_prompt`     | `{ "prompt": "..." }`                                           | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`.                                                                                                                      |
+| `approve`         | `{}`                                                            | Presses Enter to accept the current permission / plan-approval dialog.                                                                                                                                       |
+| `deny`            | `{}`                                                            | Presses Escape to dismiss the current dialog.                                                                                                                                                                |
+| `cancel`          | `{}`                                                            | Sends Escape (Claude Code 2.1.x's documented mid-turn interrupt key). Sets `last_intent = "cancelling"`.                                                                                                     |
+| `force_cancel`    | `{}`                                                            | Sends Escape twice for tool calls already mid-API-request when the first Escape arrives. Same `last_intent = "cancelling"` as `cancel`.                                                                      |
+| `steer`           | `{ "prompt": "..." }`                                           | Mid-turn prompt injection — same bytes as `send_prompt` but does NOT flip `last_intent` to `prompt_submitted`, so the classifier keeps waiting for the original turn to actually finish.                     |
+| `key`             | `{ "key": "..." }`                                              | Generic single-key/text send: aliases (`enter`, `escape`, `tab`, `ctrl_c`, `shift_tab`, `f1`–`f12`, etc., with `-` or `_` separators) route to `action.key`; anything else falls through to `action.text`.   |
+| `approve_trust`   | `{}`                                                            | Types `1` + Enter for the workspace-trust dialog.                                                                                                                                                            |
+| `deny_trust`      | `{}`                                                            | Types `2` + Enter for the workspace-trust dialog.                                                                                                                                                            |
+| `dismiss_welcome` | `{}`                                                            | Presses Enter to clear the first-launch welcome panel.                                                                                                                                                       |
+| `expand`          | `{}`                                                            | Sends Ctrl+O — toggles expansion of the focused collapsible row (`Reading N files…`, search results, Bash output). Mirrors Claude Code 2.1.x's keyboard binding so callers don't have to remember the alias. |
+| `slash_command`   | `{ "command": "btw" }` (or `{"name":...}`, accepts leading `/`) | Bracketed-pastes `/<name>` and presses Enter. Does NOT flip `last_intent` to `prompt_submitted` because slash commands open a panel/modal, they aren't conversation turns. Empty `command` is a no-op.       |
 
 Diagnostic reads — `adapter.snapshot`, `adapter.transcript`, `adapter.inspect` — work the same way as their `session.*` counterparts and redact by default. `adapter.inspect` additionally returns the `body_text` / `status_text` split the classifier sees, so misclassification reports can be reproduced without spinning up a parallel `session.*` connection.
+
+## Streaming demo
+
+`scripts/claude-stream.py` is a single-command driver that spawns `ptywright serve --stdio`, starts the built-in `claude-code` adapter, auto-handles the workspace-trust dialog, submits a prompt, and streams the live screen body + state transitions until the turn completes. It is wired into the Nix devshell as the `claude-stream` command:
+
+```bash
+nix develop --command claude-stream "List exactly three .rs files under src/ and report their paths."
+# or read the prompt from a file / stdin:
+claude-stream @./prompt.md
+echo "what changed since last week?" | claude-stream -
+```
+
+Defaults that matter:
+
+- `--model sonnet` — Sonnet engages with tool-using prompts reliably; switch to `--model haiku` for fast smoke tests, accepting that Haiku sometimes acknowledges-and-stops on broad prompts.
+- `--timeout 600` — the outer hard deadline. Almost every internal wait is driven by screen-content evidence (`adapter.wait` matchers, `session.exited` notifications, classifier state transitions). The one exception is the bounded initial settle wait in `submit()` — capped at 3 s before the prompt-acknowledgement loop takes over — which is skipped entirely when the startup loop already observed `waiting_for_user_input`.
+- `--heartbeat-ms 50` — poll cadence. Pulses `session.output` redraws but the script does not itself depend on this being any particular value.
+
+What the script demonstrates (and what an integrator should copy):
+
+1. Bounded settle wait before submission, so `send_prompt` doesn't race a paste against a not-yet-rendered prompt.
+2. Auto-approval of the workspace-trust dialog via the plugin's `approve_trust` intent.
+3. Single deterministic `completed_turn` exit signal — no consecutive-poll debouncing, no minimum-bytes thresholds, just the classifier's view of the TUI's own end-of-turn marker.
+4. Fallback dump of the body's answer region if the streaming diff caught nothing (covers the edge case where the model produces its entire reply between two polling ticks).
+5. SIGINT handler that terminates the ptywright subprocess and lets the main thread clean up RPC state outside the signal context.
+
+The script doubles as a worked example of every primitive a real consumer would touch: `adapter.start`, `adapter.send`, `adapter.state`, `adapter.inspect`, `adapter.transcript`, `adapter.wait`, `adapter.close`, plus the `session.output` / `session.exited` notification subscription. Most of the file is comments documenting why each guard exists; the actual control flow is short. The test surface lives in `tests/scripts/test_claude_stream.py` (stdlib `unittest`) and locks down the chrome filter, the answer-region fallback, the terminal-state taxonomy, and the JSON-RPC framing contracts that determine whether the streaming output is legible and how failures terminate.
 
 ## Safety and limitations
 
