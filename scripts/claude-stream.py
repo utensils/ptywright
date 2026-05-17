@@ -571,19 +571,29 @@ def main() -> int:
             st = stream.poll_state()
             state = st["state"]
             evidence = st.get("evidence") or ""
-            if st["state"] == "waiting_for_trust":
+            if state == "waiting_for_trust":
                 emit(YELLOW("? workspace-trust dialog detected, auto-approving"))
                 client.rpc("adapter.send",
                            {"adapter": aid, "intent": "approve_trust", "params": {}}, t=5.0)
                 # Loop again — we'll either re-detect trust (try again) or
                 # see a different state next iteration.
                 continue
-            if "no screen evidence" in evidence or state == "starting":
+            # Fail fast on terminal failure states — no point waiting them
+            # out until the global deadline only to report "deadline expired"
+            # when the real problem is a startup error or classifier crash.
+            if state in {"error", "plugin_error"}:
+                emit(RED(f"✗ adapter entered {state} during startup"), DIM(evidence))
+                stream.close()
+                return 1
+            # Only keep waiting while the classifier hasn't seen anything
+            # real yet. The welcome screen reports `starting` with evidence
+            # "welcome screen visible" but is dismissible — send_prompt's
+            # leading Enter handles it, so treat it as a green light rather
+            # than spinning until the global timeout.
+            if state == "starting" and "no screen evidence" in evidence:
                 time.sleep(stream.heartbeat)
                 continue
-            if state in {"waiting_for_user_input", "ready"}:
-                break
-            time.sleep(stream.heartbeat)
+            break
 
         ok, reason = stream.submit(prompt)
         if not ok:
