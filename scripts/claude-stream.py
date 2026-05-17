@@ -320,6 +320,19 @@ class Stream:
         # Alive ticker — overwrites in place on a TTY.
         self._last_alive_at = 0.0
         self._alive_phase = 0
+        # Transcript length at the moment the prompt was acknowledged.
+        # Set by `submit()`. Used by the completion-time answer dump so
+        # we can scan only the content this turn added to the scrollback
+        # — the transcript is the canonical record of everything Claude
+        # rendered, even rows that scrolled past the visible body. The
+        # visible body is a 60×200 alt-screen snapshot; on a long answer
+        # the early tool-call output rotates out of it before the
+        # classifier fires `completed_turn`, but the transcript still has
+        # every byte.
+        self._transcript_baseline: int = 0
+        # Submitted prompt text — used as an anchor in the transcript
+        # answer-region scan.
+        self._submitted_prompt: str = ""
 
     # ─── time discipline ─────────────────────────────────────────────────
     def _budget(self) -> float:
@@ -518,6 +531,92 @@ class Stream:
         if printed:
             sys.stdout.flush()
 
+    # ─── fallback: dump answer region from transcript scrollback ────────
+    def _dump_answer_region_from_transcript(self) -> bool:
+        """Print the answer region using the full transcript scrollback.
+
+        The visible body is a single alt-screen snapshot (60×200 cells
+        by default). On a long answer the early tool-call output and
+        even Claude's prose can scroll OUT of the visible body before
+        the classifier fires `completed_turn` — at that point the body
+        only shows the last few rows plus the marker plus the idle
+        prompt, and `_dump_answer_region(body)` prints nothing because
+        there are no content lines between its anchors.
+
+        The transcript captures every PTY byte that landed since
+        `_transcript_baseline` was set (right before `send_prompt`).
+        We scan from there, find the LAST submitted-prompt echo
+        (`❯ <prompt text>`), find the FIRST completion marker after
+        that, and print everything between, filtering chrome the same
+        way the streaming loop does.
+
+        Returns True if anything was printed, False otherwise.
+        """
+        try:
+            trans = self.client.rpc("adapter.transcript",
+                {"adapter": self.aid, "redact": False}, t=5.0)["text"]
+        except (RuntimeError, TimeoutError):
+            return False
+        # Only scan content this turn added to the scrollback — pre-turn
+        # noise (welcome banner, status-bar refreshes, prior turns) lives
+        # before `_transcript_baseline`.
+        delta = trans[self._transcript_baseline:]
+        if not delta.strip():
+            return False
+
+        lines = delta.splitlines()
+
+        # Anchor on the LAST line containing the submitted prompt text
+        # (the input box echoes the prompt as the user types and then
+        # again on paste). Use the prompt text rather than a `❯` glyph
+        # match so a multi-line / wrapped paste is anchored on its
+        # final occurrence regardless of glyph variant.
+        anchor = self._submitted_prompt.strip().splitlines()[0] if self._submitted_prompt.strip() else ""
+        start = 0
+        if anchor:
+            for i in range(len(lines) - 1, -1, -1):
+                if anchor in lines[i]:
+                    start = i + 1
+                    break
+
+        # End at the FIRST line after `start` that looks like the
+        # completion marker (`✻ <Verb> for <N>` with no ellipsis tail).
+        # If we don't find one, dump everything to end-of-delta.
+        end = len(lines)
+        for i in range(start, len(lines)):
+            s = lines[i].strip()
+            if s.startswith("✻") and " for " in s and not s.endswith("…"):
+                end = i + 1
+                break
+
+        printed = False
+        # Dedup so we don't double-print intermediate frames the
+        # transcript captured. The visible-body streaming loop already
+        # deduped what it saw, but this fallback runs blind to that
+        # set — use its own.
+        seen: set[str] = set()
+        for line in lines[start:end]:
+            s = line.strip()
+            if not s:
+                continue
+            if _is_chrome_line(s):
+                continue
+            # Skip the post-turn ghost suggestion line shape — it sits
+            # below the marker, but in transcript order it can appear
+            # interleaved with the answer if Claude redraws.
+            if (s.startswith("❯ ") or s.startswith("> ")) and not s.startswith("> >"):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            if not printed:
+                self._clear_alive()
+                printed = True
+            sys.stdout.write(line + "\n")
+        if printed:
+            sys.stdout.flush()
+        return printed
+
     # ─── action: send a single named key ─────────────────────────────────
     def send_key(self, key: str):
         self.client.rpc("adapter.send",
@@ -563,6 +662,11 @@ class Stream:
 
         baseline = len(self.client.rpc("adapter.transcript",
             {"adapter": self.aid, "redact": False}, t=5.0)["text"])
+        # Remember the baseline + prompt so `stream_until_done` can
+        # extract this turn's answer region from the transcript even if
+        # it scrolled past the visible body.
+        self._transcript_baseline = baseline
+        self._submitted_prompt = prompt
 
         self.send_prompt(prompt)
 
@@ -681,12 +785,23 @@ class Stream:
                 self._clear_alive()
                 grew_by = max(0, len(body) - baseline_len)
                 # Fallback: surface the answer region even if streaming
-                # caught nothing. Happens when Claude only added the
-                # completion marker (Haiku ack-and-stop) or when content
-                # arrived between the last diff and the terminal-state
-                # check. The user always sees what's on screen.
-                if not streamed_anything and grew_by > 0:
-                    self._dump_answer_region(body)
+                # caught nothing. Two layered fallbacks, in order of
+                # data fidelity:
+                #   1. Transcript-based — scans this turn's full PTY
+                #      scrollback (not just the visible body). Catches
+                #      the case where Claude's tool-call output and
+                #      answer rolled past the alt-screen body before
+                #      the classifier fired `completed_turn`. The
+                #      visible body is bounded; the transcript isn't.
+                #   2. Body-based — falls back to the visible body if
+                #      the transcript was empty / unavailable. Covers
+                #      the Haiku-style ack-and-stop case where the
+                #      whole reply fits in the visible body and the
+                #      transcript baseline was never properly
+                #      established (e.g. the test harness path).
+                if not streamed_anything:
+                    if not self._dump_answer_region_from_transcript() and grew_by > 0:
+                        self._dump_answer_region(body)
                 if state == self.SUCCESS_STATE:
                     emit(GREEN(f"✓ {state}"), DIM(f"(+{grew_by} chars in body)"))
                     return 0

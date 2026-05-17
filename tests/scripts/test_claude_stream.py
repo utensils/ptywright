@@ -177,6 +177,103 @@ class ExtractRecentActivityTests(unittest.TestCase):
         self.assertEqual(activity, "⏺ Bash(cargo test)")
 
 
+class DumpAnswerRegionFromTranscriptTests(unittest.TestCase):
+    """Primary fallback at completion — pulls the answer region out
+    of the full PTY scrollback. The visible body is bounded (alt-screen
+    snapshot of ~60 rows); the transcript isn't. When Claude's tool
+    output and prose scroll past the visible body, this fallback is the
+    only thing that surfaces the actual reply."""
+
+    def _make_stream(self) -> "CS.Stream":
+        stream = CS.Stream.__new__(CS.Stream)
+        stream._closed = False
+        stream._last_alive_at = 0.0
+        # Fake an RPC client that returns canned transcript text.
+        stream.client = mock.Mock()
+        stream.aid = "e-test"
+        stream._transcript_baseline = 0
+        stream._submitted_prompt = ""
+        return stream
+
+    def test_dumps_answer_region_when_body_scrolled_past(self):
+        stream = self._make_stream()
+        # The full transcript is what the user "would see" if they
+        # could scroll back. Pretend the visible body only shows the
+        # last few rows by the time we're called.
+        transcript_text = "\n".join([
+            "Welcome chrome",
+            "",
+            "❯ List exactly three .rs files.",
+            "",
+            "⏺ I'll find three .rs files.",
+            "Reading project structure… (ctrl+o to expand)",  # in-flight chrome
+            "⏺ Glob(**/*.rs)",
+            "  src/lib.rs",
+            "  src/main.rs",
+            "  src/action.rs",
+            "",
+            "✻ Brewed for 2s",
+            "",
+            "❯",
+        ])
+        stream._transcript_baseline = 0
+        stream._submitted_prompt = "List exactly three .rs files."
+        stream.client.rpc.return_value = {"text": transcript_text}
+
+        captured = io.StringIO()
+        with mock.patch.object(sys, "stdout", captured):
+            printed = stream._dump_answer_region_from_transcript()
+        out = captured.getvalue()
+
+        self.assertTrue(printed)
+        self.assertIn("⏺ I'll find three .rs files.", out)
+        self.assertIn("⏺ Glob(**/*.rs)", out)
+        self.assertIn("src/lib.rs", out)
+        self.assertIn("✻ Brewed for 2s", out)
+        # In-flight chrome line is filtered.
+        self.assertNotIn("Reading project structure…", out)
+        # Welcome chrome above the prompt echo is filtered.
+        self.assertNotIn("Welcome chrome", out)
+
+    def test_returns_false_when_transcript_empty(self):
+        stream = self._make_stream()
+        stream._transcript_baseline = 100
+        stream._submitted_prompt = "anything"
+        stream.client.rpc.return_value = {"text": "x" * 100}  # baseline eats it all
+
+        captured = io.StringIO()
+        with mock.patch.object(sys, "stdout", captured):
+            printed = stream._dump_answer_region_from_transcript()
+        self.assertFalse(printed)
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_anchors_on_last_prompt_occurrence(self):
+        # Bracketed paste echoes the prompt text more than once during
+        # the input box's stages. The anchor must be the LAST occurrence
+        # so the answer region doesn't include the in-progress echoes.
+        stream = self._make_stream()
+        transcript_text = "\n".join([
+            "❯ summarize",  # mid-paste partial echo
+            "❯ summarize the project",  # full echo (the anchor)
+            "",
+            "⏺ Project summary:",
+            "- Rust CLI for PTY automation",
+            "✻ Brewed for 1s",
+        ])
+        stream._transcript_baseline = 0
+        stream._submitted_prompt = "summarize the project"
+        stream.client.rpc.return_value = {"text": transcript_text}
+
+        captured = io.StringIO()
+        with mock.patch.object(sys, "stdout", captured):
+            stream._dump_answer_region_from_transcript()
+        out = captured.getvalue()
+
+        self.assertIn("⏺ Project summary:", out)
+        self.assertIn("Rust CLI for PTY automation", out)
+        self.assertIn("✻ Brewed for 1s", out)
+
+
 class DumpAnswerRegionTests(unittest.TestCase):
     """Fallback that surfaces the answer when the streaming loop's
     body-diff path caught nothing (very brief reply, in-place rewrite)."""

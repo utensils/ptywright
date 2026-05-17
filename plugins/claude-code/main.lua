@@ -180,6 +180,13 @@ end
 
 local TURN_COMPLETION_GLYPH = "✻"
 
+-- Trailing collapse-hint phrase Claude Code 2.1.x appends to every
+-- collapsible tool-progress row (`⏺ Reading 1 file… (ctrl+o to expand)`).
+-- Declared near the top so the helpers below can reference it without
+-- relying on Lua's hoisting (which only works for the function names,
+-- not the values they close over).
+local CTRL_O_HINT = "(ctrl+o to expand)"
+
 -- Lines we expect to find AFTER a real end-of-turn `✻ <Verb> for <N>`
 -- marker on a settled screen:
 --   * blank lines,
@@ -226,6 +233,38 @@ local function is_post_marker_trailing_line(line)
   return false
 end
 
+-- Returns true if `line` looks like the user's submitted-prompt echo
+-- or a post-turn ghost suggestion — both render as `❯ <text>` /
+-- `> <text>`. These are NOT content (they don't represent something
+-- Claude wrote in answer to the prompt), so they don't count when
+-- proving real work happened.
+local function is_prompt_echo_line(line)
+  local t = trim(line)
+  if starts_with(t, "❯ ") or starts_with(t, "> ") then return true end
+  if starts_with(t, "❯\194\160") or starts_with(t, ">\194\160") then return true end
+  return false
+end
+
+-- Returns true if `line` looks like spinner / progress chrome that
+-- doesn't prove real work happened. Spinner lines (leading spinner
+-- glyph + ellipsis tail) AND collapsible tool-progress rows
+-- (`⏺ Reading… (ctrl+o to expand)`) both fall through to the marker
+-- mid-turn but neither represents *completed* work above the marker.
+-- A real completion has either a stable `⏺ Read(file)` row (no
+-- ellipsis) OR prose answer text above the marker.
+local function is_progress_chrome_line(line)
+  local t = trim(line)
+  if t == "" then return false end
+  if starts_with_spinner_glyph(t) and line_ends_with_ellipsis(t) then return true end
+  if string.sub(t, 1, 3) == "⏺"
+      and #t >= #CTRL_O_HINT
+      and string.sub(t, -#CTRL_O_HINT) == CTRL_O_HINT
+  then
+    return true
+  end
+  return false
+end
+
 local function has_turn_completion_marker(text)
   -- Claude Code 2.1.x renders a "tea verb" completion line at the very
   -- end of every turn — e.g. "✻ Brewed for 1s", "✻ Worked for 5s",
@@ -236,15 +275,23 @@ local function has_turn_completion_marker(text)
   -- The spinner cycle ALSO uses `✻` via "✻ Working…" etc., so the
   -- glyph alone isn't enough. Spinner lines end with the ellipsis;
   -- completion lines end with a numeric duration (` for %d`). That tail
-  -- difference is necessary but not sufficient: parser-captured
-  -- intermediate renders can occasionally show a `✻ <verb> for <N>`
-  -- frame mid-turn (between spinner repaints, when the counter-only
-  -- variant happens to land in the snapshot). To rule that out we
-  -- additionally require the marker to be STRUCTURALLY TERMINAL — no
-  -- content lines after it, just blank rows / the input prompt /
-  -- horizontal rules / the status bar. End-of-turn screens satisfy
-  -- this; mid-turn screens have tool-progress rows (`⏺ Reading…`,
-  -- `⎿ result`, etc.) below whatever flickered into view.
+  -- difference is necessary but not sufficient — three additional
+  -- structural requirements rule out the false-positive shapes:
+  --
+  --   * STRUCTURALLY TERMINAL: everything AFTER the marker must be
+  --     trailing chrome (blank, prompt, rule, status bar). End-of-turn
+  --     screens satisfy this; mid-turn screens have tool-progress
+  --     rows below whatever flickered into view.
+  --
+  --   * SUBSTANTIVE CONTENT ABOVE: the body between the user's
+  --     submitted-prompt echo and the marker must contain at least
+  --     ONE non-chrome, non-prompt-echo content line. This rules out
+  --     the case where Claude's TUI renders a stale-looking
+  --     `✻ <Verb> for 0s` frame next to the prompt echo with no
+  --     answer prose between them — that's a flake, not a real
+  --     completion. If the prompt echo has scrolled off the visible
+  --     body (long answer pushed it past the top), we trust the
+  --     marker — Claude clearly did enough work to scroll a screen.
   local lines = {}
   for line in string.gmatch(text or "", "[^\n]+") do
     table.insert(lines, line)
@@ -264,7 +311,38 @@ local function has_turn_completion_marker(text)
             break
           end
         end
-        if terminal then return true end
+        if not terminal then
+          -- Not the real end-of-turn boundary; keep walking.
+        else
+          -- Substantive-content check: find the LAST prompt echo above
+          -- the marker (the user's submission). If found, require ≥1
+          -- non-chrome, non-prompt-echo content line between them.
+          -- If the prompt echo isn't visible (scrolled off the top of
+          -- the body), trust the marker.
+          local echo_idx = 0
+          for j = i - 1, 1, -1 do
+            if is_prompt_echo_line(lines[j]) then
+              echo_idx = j
+              break
+            end
+          end
+          if echo_idx == 0 then
+            -- Prompt scrolled off — trust the marker.
+            return true
+          end
+          local has_content = false
+          for j = echo_idx + 1, i - 1 do
+            local s = trim(lines[j])
+            if s ~= "" and not is_progress_chrome_line(lines[j])
+                and not is_prompt_echo_line(lines[j])
+                and not s:match("^[─━═]+$")
+            then
+              has_content = true
+              break
+            end
+          end
+          if has_content then return true end
+        end
       end
     end
   end
@@ -281,7 +359,8 @@ end
 -- inside an answer, but it can't render it as part of a
 -- `⏺ <verb> N <thing>… (ctrl+o to expand)` row in the body during
 -- a completed turn.
-local CTRL_O_HINT = "(ctrl+o to expand)"
+-- (`CTRL_O_HINT` is declared near the top of this file so the
+--  marker-substance check can use it; see above.)
 
 local function has_collapsible_tool_progress_row(text)
   for line in string.gmatch(text or "", "[^\n]+") do
