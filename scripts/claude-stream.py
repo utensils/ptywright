@@ -150,8 +150,18 @@ class Client:
         with self.lock: self.responses[rid] = q
         req: dict = {"jsonrpc":"2.0","id":rid,"method":method}
         if params: req["params"] = params
-        self.proc.stdin.write(json.dumps(req) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(req) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            # Subprocess closed stdin / was terminated between the _dead
+            # check above and this write. Surface a clean RuntimeError so
+            # the stream loop's existing exception handler returns 1
+            # instead of leaking a traceback. Common race: SIGINT handler
+            # calls client.proc.terminate() while the main thread is mid-rpc.
+            self._dead = True
+            with self.lock: self.responses.pop(rid, None)
+            raise RuntimeError(f"ptywright server has exited (write failed: {e})") from e
         try:
             msg = q.get(timeout=t)
         except queue.Empty:

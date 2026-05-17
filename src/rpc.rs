@@ -1278,20 +1278,7 @@ impl RpcServer {
         };
         let mut target = Target::new(program).args(args).size(size);
         target.cwd = params.cwd;
-        // Env resolution: start from the manifest's declared default env
-        // (TUI knobs the plugin needs to keep its classifier stable), then
-        // overlay the caller's env. Caller wins on conflict; manifest
-        // keys the caller omits are inherited. To clear a manifest
-        // default the caller passes that key with whatever override
-        // value they want.
-        if let Some(default_env) = manifest_default.as_ref().map(|t| &t.env) {
-            for (k, v) in default_env {
-                target.env.insert(k.clone(), v.clone());
-            }
-        }
-        for (k, v) in params.env {
-            target.env.insert(k, v);
-        }
+        target.env = merge_env(manifest_default.as_ref().map(|t| &t.env), params.env);
         let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
         let handle = ExtensionHandle::start(
             Box::new(extension),
@@ -1629,6 +1616,20 @@ impl Default for RpcServer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Merge a plugin manifest's `default_target.env` with caller-supplied
+/// `env` from `adapter.start`. Manifest defaults are applied first; the
+/// caller's map is overlaid on top, so caller wins on key conflict and
+/// keys the caller omits are inherited from the manifest. A missing
+/// manifest map is treated as empty.
+fn merge_env(
+    manifest_default: Option<&BTreeMap<String, String>>,
+    caller: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = manifest_default.cloned().unwrap_or_default();
+    merged.extend(caller);
+    merged
 }
 
 /// Run an NDJSON-framed JSON-RPC server over arbitrary input/output streams.
@@ -2463,6 +2464,74 @@ mod tests {
             &format!(
                 r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
             ),
+        );
+    }
+
+    #[test]
+    fn merge_env_overlays_caller_on_manifest_defaults() {
+        // Manifest defaults form the base; caller env overlays. Three
+        // properties to lock:
+        //   * keys present only in the manifest survive (inherited)
+        //   * keys present only in the caller appear in the merged map
+        //   * keys present in both take the caller's value (caller wins)
+        let manifest: BTreeMap<String, String> =
+            [("MANIFEST_ONLY", "kept"), ("SHARED", "manifest_value")]
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+        let caller: BTreeMap<String, String> =
+            [("CALLER_ONLY", "added"), ("SHARED", "caller_value")]
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+
+        let merged = merge_env(Some(&manifest), caller);
+
+        assert_eq!(
+            merged.get("MANIFEST_ONLY").map(String::as_str),
+            Some("kept"),
+            "manifest-only keys must be inherited"
+        );
+        assert_eq!(
+            merged.get("CALLER_ONLY").map(String::as_str),
+            Some("added"),
+            "caller-only keys must appear in merged map"
+        );
+        assert_eq!(
+            merged.get("SHARED").map(String::as_str),
+            Some("caller_value"),
+            "caller value must override manifest default on key conflict"
+        );
+        assert_eq!(
+            merged.len(),
+            3,
+            "merged map must contain exactly the union of keys"
+        );
+    }
+
+    #[test]
+    fn merge_env_with_no_manifest_default_returns_caller_env() {
+        let caller: BTreeMap<String, String> = [("A", "v")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let merged = merge_env(None, caller.clone());
+        assert_eq!(
+            merged, caller,
+            "missing manifest default must passthrough caller env"
+        );
+    }
+
+    #[test]
+    fn merge_env_with_empty_caller_returns_manifest_default_clone() {
+        let manifest: BTreeMap<String, String> = [("A", "v")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let merged = merge_env(Some(&manifest), BTreeMap::new());
+        assert_eq!(
+            merged, manifest,
+            "empty caller env must yield the manifest defaults verbatim"
         );
     }
 

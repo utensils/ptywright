@@ -150,8 +150,8 @@ The single plugin-driving surface. Any built-in plugin (today, `claude-code`) is
 | --- | --- | --- |
 | `adapter.list` | — | `{plugins: [PluginManifest, ...]}` |
 | `adapter.live` | — | `{adapters: [{adapter, plugin, session}, ...]}` (process-wide live registry; useful for a second client attaching) |
-| `adapter.start` | `{plugin, program?, args?, cwd?, env?, rows?, cols?, pixel_width?, pixel_height?}` | `{adapter, plugin, state}` |
-| `adapter.resume` | `{plugin, program?, args?, cwd?, env?, rows?, cols?, prior_adapter?}` | `{adapter, plugin, state}` — same shape as `adapter.start`, but logs the consumer's intent to re-bind a prior adapter (`prior_adapter` is best-effort; if missing or already closed the call still succeeds) |
+| `adapter.start` | `{plugin, program?, args?, cwd?, env?, rows?, cols?, pixel_width?, pixel_height?}` | `{adapter, plugin, session, state}` — `session` is the underlying session id, usable directly with `session.*` methods (e.g. for snapshots that bypass the per-adapter mutex held by a long-running `adapter.wait`) |
+| `adapter.resume` | `{plugin, program?, args?, cwd?, env?, rows?, cols?, prior_adapter?}` | `{adapter, plugin, session, state}` — same shape as `adapter.start`, but logs the consumer's intent to re-bind a prior adapter (`prior_adapter` is best-effort; if missing or already closed the call still succeeds) |
 | `adapter.state` | `{adapter}` | `{state}` |
 | `adapter.send` | `{adapter, intent, params?}` | `{state}` |
 | `adapter.wait` | `{adapter, intent?="wait_turn_matcher", params?, timeout_ms?=120000}` | `{state, matched}` — `matched` is the structured `MatchOutcome` describing which matcher branch fired (see below); `null` is reserved for future cancellation paths |
