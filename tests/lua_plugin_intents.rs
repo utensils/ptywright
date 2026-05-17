@@ -806,6 +806,48 @@ fn classifier_completed_turn_paths() {
         completed_after_scroll.state, "completed_turn",
         "completed screen must not require the answer bullet to remain visible"
     );
+
+    // (h) Premature completed_turn regression — a screen where a
+    // `✻ <Verb> for <N>` line is present (from some parser-captured
+    // intermediate render or a transient Claude rendering) but tool
+    // progress is STILL on screen below it must not fire
+    // completed_turn. The structural check requires nothing meaningful
+    // after the marker. This was the live bug producing 37-char-body
+    // exits from claude-stream when Claude was actually still reading
+    // files. Active-work indicator is also off here (between spinner
+    // repaints) so the `(ctrl+o to expand)` anchor is what holds.
+    let mid_turn_with_stray_marker = classify_state(
+        &extension,
+        "⏺ I'll explore the project structure first, then read the key files.\n\n✻ Brewed for 4s\n\n⏺ Reading 2 files… (ctrl+o to expand)",
+        7,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_ne!(
+        mid_turn_with_stray_marker.state, "completed_turn",
+        "stray mid-turn marker followed by tool-progress content must NOT fire completed_turn"
+    );
+
+    // (i) The `(ctrl+o to expand)` hint is itself a mid-turn signal
+    // (Claude Code's collapsible tool-progress rows render it). With
+    // NO marker but tool progress visible, classifier must NOT fire
+    // completed_turn — even though `⏺` isn't a spinner glyph and the
+    // active-work indicator's spinner-line path won't fire either.
+    let tool_progress_alone = classify_state(
+        &extension,
+        "⏺ I'll explore the project structure.\n\n⏺ Reading 1 file… (ctrl+o to expand)",
+        5,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        tool_progress_alone.state, "thinking",
+        "ctrl+o-to-expand tool-progress row is an active-work signal even without spinner glyph; state must be `thinking`"
+    );
+    assert_eq!(
+        tool_progress_alone.evidence, "active work indicator detected",
+        "active-work branch must own the classification, not the mid-turn fallback"
+    );
 }
 
 /// When a turn is in flight (`last_intent == "prompt_submitted"`) and no

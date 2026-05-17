@@ -160,30 +160,78 @@ end
 
 local TURN_COMPLETION_GLYPH = "✻"
 
+-- Lines we expect to find AFTER a real end-of-turn `✻ <Verb> for <N>`
+-- marker on a settled screen:
+--   * blank lines,
+--   * the empty input prompt (`❯` / `>` alone),
+--   * the prompt with a post-turn suggested follow-up (`❯ run the
+--     tests`), which Claude Code 2.1.x renders as ghost text after a
+--     completed turn,
+--   * horizontal rules,
+--   * the status-bar rows (`user @ host …`, `⏵⏵ … on …`).
+-- Anything else (tool-progress rows like `⏺ Reading 1 file…`, answer
+-- bullets, search results, `⎿` tool output) means we're looking at an
+-- intermediate render or a still-in-flight turn, not the actual end
+-- boundary. The submitted prompt echo (`❯ Read all files…`) renders
+-- ABOVE the answer/marker in Claude Code's layout, never below, so
+-- accepting `❯ <text>` here cannot let a mid-turn marker match by
+-- mistaking the submitted prompt for trailing chrome.
+local function is_post_marker_trailing_line(line)
+  local t = trim(line)
+  if t == "" then return true end
+  if t == ">" or t == "❯" then return true end
+  -- Prompt with text — post-turn ghost-text suggestion.
+  if starts_with(t, "❯ ") or starts_with(t, "> ") then return true end
+  -- Same with NBSP (U+00A0, bytes 0xC2 0xA0) — Claude Code pads ghost
+  -- text with a non-breaking space rather than a regular space.
+  if starts_with(t, "❯\194\160") or starts_with(t, ">\194\160") then return true end
+  -- Horizontal rule — single repeated box-drawing character.
+  if t:match("^[─━═]+$") then return true end
+  -- Status bar shapes Claude Code 2.1.x renders below the prompt.
+  if starts_with(t, "user ") then return true end
+  if t:find("⏵⏵") then return true end
+  return false
+end
+
 local function has_turn_completion_marker(text)
   -- Claude Code 2.1.x renders a "tea verb" completion line at the very
   -- end of every turn — e.g. "✻ Brewed for 1s", "✻ Worked for 5s",
   -- "✻ Heated for 12s". The verb rotates from a fixed set; what's stable
   -- across versions is the leading `✻` glyph plus a "for <duration>"
-  -- tail. This line never appears mid-turn (between tool calls, during
-  -- preambles, etc.); the TUI renders it only when the assistant has
-  -- produced its final reply and the turn has settled.
+  -- tail.
   --
-  -- The spinner cycle uses `✻` too via "✻ Working…" etc., so the glyph
-  -- alone isn't enough. Spinner lines END with the ellipsis glyph; the
-  -- completion line ends with a numeric duration (matched by
-  -- ` for %d`). Distinguishing on the ellipsis vs duration tail is what
-  -- separates "mid-turn spinner frame" from "turn is actually over".
-  --
-  -- This is the structural anchor the completed_turn branches need —
-  -- without it, a preamble line like "⏺ I'll explore the project..."
-  -- plus an empty `❯` plus an instant where the spinner happens not to
-  -- have repainted yet looks identical to a real turn boundary.
+  -- The spinner cycle ALSO uses `✻` via "✻ Working…" etc., so the
+  -- glyph alone isn't enough. Spinner lines end with the ellipsis;
+  -- completion lines end with a numeric duration (` for %d`). That tail
+  -- difference is necessary but not sufficient: parser-captured
+  -- intermediate renders can occasionally show a `✻ <verb> for <N>`
+  -- frame mid-turn (between spinner repaints, when the counter-only
+  -- variant happens to land in the snapshot). To rule that out we
+  -- additionally require the marker to be STRUCTURALLY TERMINAL — no
+  -- content lines after it, just blank rows / the input prompt /
+  -- horizontal rules / the status bar. End-of-turn screens satisfy
+  -- this; mid-turn screens have tool-progress rows (`⏺ Reading…`,
+  -- `⎿ result`, etc.) below whatever flickered into view.
+  local lines = {}
   for line in string.gmatch(text or "", "[^\n]+") do
-    local trimmed = trim(line)
+    table.insert(lines, line)
+  end
+  -- Walk lines in reverse so we find the LAST marker on screen; that's
+  -- the candidate end-of-turn boundary.
+  for i = #lines, 1, -1 do
+    local trimmed = trim(lines[i])
     if string.sub(trimmed, 1, #TURN_COMPLETION_GLYPH) == TURN_COMPLETION_GLYPH then
       if not line_ends_with_ellipsis(trimmed) and trimmed:find(" for %d") then
-        return true
+        -- Structural-terminal check: everything after this row must be
+        -- trailing chrome (blank, prompt, rule, status bar).
+        local terminal = true
+        for j = i + 1, #lines do
+          if not is_post_marker_trailing_line(lines[j]) then
+            terminal = false
+            break
+          end
+        end
+        if terminal then return true end
       end
     end
   end
@@ -197,7 +245,18 @@ local function has_active_work_indicator(text)
   --   * "esc to interrupt"   — control hint shown only while a turn is
   --                            in flight (Claude never writes this in
   --                            answer text)
-  --   * "(esc to interrupt)" — bracketed variant
+  --   * "(ctrl+o to expand)" — Claude Code 2.1.x's tool-progress hint
+  --                            rendered on every collapsible interim
+  --                            row ("Reading 1 file…", "Searching for
+  --                            1 pattern…", "Bash(cmd)", etc.). These
+  --                            rows START with `⏺` rather than a
+  --                            spinner glyph, so `has_thinking_spinner_line`
+  --                            misses them; without this anchor the
+  --                            classifier reads the gap between two
+  --                            tool calls as "no active work" and can
+  --                            mis-fire `completed_turn` while Claude
+  --                            is still mid-turn. The hint phrase
+  --                            never appears in assistant prose.
   -- The bare word "thinking" alone (and "running tool", "reading file",
   -- "searching" etc.) was removed in favor of the structural anchors
   -- below — those bare words frequently appear in assistant prose when
@@ -205,6 +264,7 @@ local function has_active_work_indicator(text)
   -- ever reaching `completed_turn` on those turns.
   if contains_any(text, {
     "esc to interrupt",
+    "(ctrl+o to expand)",
   }) then
     return true
   end
