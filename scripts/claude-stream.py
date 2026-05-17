@@ -505,8 +505,15 @@ class Stream:
 
     @staticmethod
     def _format_kbps(kbps: float) -> str:
+        # Show the zero-rate case explicitly (`idle`) rather than empty
+        # string — when Sonnet 4.6 spawns an Explore subagent and prep-
+        # thinks for tens of seconds, the PTY produces nothing and the
+        # rate is genuinely 0. Without this branch the ticker shows
+        # only `thinking [Ns]` with no suffix, which looks identical to
+        # a hung process. Surfacing `idle` makes it clear that the
+        # sample ran and confirms no PTY activity.
         if kbps <= 0:
-            return ""
+            return "idle"
         if kbps < 1.0:
             return f"+{int(kbps * 1024)} B/s"
         return f"+{kbps:.1f} KB/s"
