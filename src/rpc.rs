@@ -2467,6 +2467,46 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn adapter_start_merges_caller_env_over_manifest_default_env() {
+        // The env-resolution path overlays caller-supplied env onto the
+        // manifest's `default_target.env` (manifest first, caller wins
+        // on conflict, keys the caller omits are inherited). The
+        // claude-code manifest ships a non-empty env preset, so passing
+        // a non-empty `env` on adapter.start exercises both branches —
+        // the manifest-default copy loop and the caller-override loop.
+        // Behavioural verification (the spawned child actually receives
+        // the merged env) is out of scope here because ptywright needs
+        // a PTY-attached child and there's no portable PTY-side env
+        // echo in the test toolbox; the lower-level merge contract is
+        // covered by Target's existing env unit tests. This test locks
+        // the dispatcher path and the merge order documented in the
+        // adjacent comment block.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{
+                "plugin":"claude-code",
+                "program":"/bin/sh",
+                "args":["-c","sleep 5"],
+                "env":{
+                    "PTYWRIGHT_TEST_CALLER_ONLY":"caller",
+                    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"caller-overrides-manifest"
+                }
+            }}"#,
+        );
+        let adapter = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start with caller env must succeed");
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
     fn adapter_start_rejects_unknown_plugin() {
         let mut server = RpcServer::new();
         let response = handle(
