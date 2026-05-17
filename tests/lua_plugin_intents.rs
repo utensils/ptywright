@@ -121,7 +121,7 @@ fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
         st_poll.state, st_poll.evidence
     );
     assert_eq!(
-        st_poll.evidence, "answer bullet plus empty input prompt visible without active work",
+        st_poll.evidence, "completion marker plus input prompt visible without active work",
         "poll-path completed_turn must own this screen"
     );
 
@@ -453,9 +453,9 @@ fn wait_cancel_settled_matcher_returns_screen_stable_threshold() {
 
 #[test]
 fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
-    // The empty-prompt anchor in wait_turn_matcher is now paired with
+    // The prompt anchor in wait_turn_matcher is now paired with
     // the tea-verb completion marker — both must appear on the screen
-    // for the empty-prompt branch to fire. This mirrors the
+    // for the prompt branch to fire. This mirrors the
     // classifier's `completed_turn` gate exactly so `adapter.wait`
     // can't return before the classifier would.
     let extension = claude_plugin();
@@ -491,8 +491,42 @@ fn wait_turn_matcher_matches_idle_prompt_glyph_when_screen_settles() {
 }
 
 #[test]
+fn wait_turn_matcher_matches_prompt_with_suggested_text_after_completion_marker() {
+    let extension = claude_plugin();
+    let matcher = wait_matcher(
+        &extension,
+        "wait_turn_matcher",
+        json!({ "completed_turn_stable_ms": COMPLETED_TURN_STABLE_MS }),
+    );
+    let snapshot = ScreenSnapshot {
+        size: TerminalSize::new(4, 60),
+        cursor: CursorState {
+            row: 2,
+            col: 2,
+            visible: true,
+        },
+        sequence: 1,
+        plain_text: "work complete\n✻ Cooked for 48s\n❯\u{00a0}run the tests\r\n".to_string(),
+        cells: Vec::new(),
+        alternate_screen: false,
+        application_cursor: false,
+        application_keypad: false,
+        title: None,
+    };
+
+    assert!(matcher.is_match_with_context(
+        &snapshot,
+        "",
+        MatcherContext {
+            stable_for: Duration::from_millis(COMPLETED_TURN_STABLE_MS),
+            process_exited: false,
+        },
+    ));
+}
+
+#[test]
 fn wait_turn_matcher_does_not_fire_on_preamble_without_completion_marker() {
-    // Regression for the bug Copilot called out: the empty-prompt
+    // Regression for the bug Copilot called out: the prompt
     // anchor used to wake `adapter.wait` on its own, which fired on
     // preamble-before-tool-use screens (answer-bullet line plus an
     // empty `❯` for a single frame while the next spinner was between
@@ -651,7 +685,7 @@ fn classifier_completed_turn_paths() {
     assert_eq!(poll.state, "completed_turn");
     assert_eq!(
         poll.evidence,
-        "answer bullet plus empty input prompt visible without active work"
+        "completion marker plus input prompt visible without active work"
     );
     assert!(
         poll.confidence < stable.confidence,
@@ -705,6 +739,36 @@ fn classifier_completed_turn_paths() {
     assert_ne!(
         preamble_with_tool_progress.state, "completed_turn",
         "preamble with tool progress but no ✻ marker must not fire completed_turn"
+    );
+
+    // (f) Claude Code can render suggested follow-up text after the
+    // prompt glyph once the turn is over. The completion marker is still
+    // the durable boundary; the prompt row does not have to be empty.
+    let completed_with_suggestion = classify_state(
+        &extension,
+        "⏺ work completed\n\n✻ Cooked for 48s\n\n❯\u{00a0}run the tests",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_with_suggestion.state, "completed_turn",
+        "completed screen with suggested prompt text must still fire completed_turn"
+    );
+
+    // (g) Long answers can push the original answer bullet out of the
+    // visible screen before the completion marker and prompt row render.
+    // The marker plus prompt is the durable end-of-turn signal.
+    let completed_after_scroll = classify_state(
+        &extension,
+        "Current State\n- Stable: Generic core abstractions\n- Platform: macOS, Linux\n\n✻ Brewed for 36s\n❯\u{00a0}what's this branch about",
+        6,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_after_scroll.state, "completed_turn",
+        "completed screen must not require the answer bullet to remain visible"
     );
 }
 

@@ -289,7 +289,7 @@ class Stream:
         return st["state"]
 
     # ─── primitive: wait for the server's notion of "screen settled" ─────
-    def wait_for_settled(self) -> None:
+    def wait_for_settled(self, max_wait_s: float | None = None) -> None:
         """Block until the server reports the PTY screen has been stable.
 
         Uses the server-side `screen_stable` matcher rather than client-side
@@ -299,10 +299,14 @@ class Stream:
         on what "stable" means — there is no client-side timing decision to
         keep in sync with the server.
 
-        Bounded only by the overall hard deadline; uses the entire remaining
-        budget as the matcher timeout.
+        Bounded by the overall hard deadline, or by `max_wait_s` when the
+        caller wants this to be a best-effort settle before trying a
+        separately verified action.
         """
-        budget_ms = int(self._budget() * 1000)
+        budget = self._budget()
+        if max_wait_s is not None:
+            budget = min(budget, max_wait_s)
+        budget_ms = int(budget * 1000)
         if budget_ms <= 0: return
         try:
             self.client.rpc("adapter.wait", {
@@ -313,7 +317,7 @@ class Stream:
                 # matcher — no client-side timing magic.
                 "params": {},
                 "timeout_ms": budget_ms,
-            }, t=self._budget() + 5.0)
+            }, t=budget + 5.0)
         except (RuntimeError, TimeoutError):
             # Wait timed out or matcher failed; that's OK — the caller's
             # next step (which always has its own verification path) will
@@ -366,7 +370,7 @@ class Stream:
         Returns (success, failure_reason).
         """
         emit(DIM("· waiting for Claude's input box to settle"))
-        self.wait_for_settled()
+        self.wait_for_settled(max_wait_s=3.0)
         if self._expired(): return False, "deadline expired before initial settle"
 
         baseline = len(self.client.rpc("adapter.transcript",
@@ -565,6 +569,8 @@ def main() -> int:
         # (skip — workspace was already trusted).
         while not stream._expired():
             st = stream.poll_state()
+            state = st["state"]
+            evidence = st.get("evidence") or ""
             if st["state"] == "waiting_for_trust":
                 emit(YELLOW("? workspace-trust dialog detected, auto-approving"))
                 client.rpc("adapter.send",
@@ -572,7 +578,10 @@ def main() -> int:
                 # Loop again — we'll either re-detect trust (try again) or
                 # see a different state next iteration.
                 continue
-            if st["state"] != "starting" or "no screen evidence" not in (st.get("evidence") or ""):
+            if "no screen evidence" in evidence or state == "starting":
+                time.sleep(stream.heartbeat)
+                continue
+            if state in {"waiting_for_user_input", "ready"}:
                 break
             time.sleep(stream.heartbeat)
 

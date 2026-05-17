@@ -98,41 +98,6 @@ local function has_error_indicator(screen)
   return false
 end
 
--- Returns true if the body contains a line that is *just* an input
--- prompt glyph (`>` or `❯`) with optional whitespace — the universal
--- "Claude is back at idle, ready for the next turn" signal. Used by the
--- poll-path `completed_turn` branch in classify().
---
--- Two byte-level gotchas this implementation works around:
---
---   1. `❯` is U+276F encoded as 3 bytes (`\xe2\x9d\xaf`). Lua patterns
---      operate on bytes; a character class like `[>❯]` does NOT match
---      the multi-byte sequence as a unit — it would only match `>` or
---      the individual bytes `\xe2` / `\x9d` / `\xaf`. So we iterate the
---      glyphs and embed each one literally in its own pattern, which
---      DOES match the full byte sequence.
---   2. Claude Code 2.1.x pads the empty prompt with U+00A0 NBSP for
---      visual alignment. Lua's `%s` only matches ASCII whitespace; we
---      add NBSP explicitly so the trailing `❯\xa0 ` pattern matches.
-local WS = "[%s\194\160]"
-local PROMPT_GLYPHS = { ">", "❯" }
-
-local function has_empty_input_prompt_line(text)
-  if not text or text == "" then return false end
-  for _, glyph in ipairs(PROMPT_GLYPHS) do
-    -- Pattern: (start | newline) + WS* + literal-glyph + WS* + (newline | end)
-    local p1 = "^" .. WS .. "*" .. glyph .. WS .. "*\n"
-    local p2 = "\n" .. WS .. "*" .. glyph .. WS .. "*\n"
-    local p3 = "\n" .. WS .. "*" .. glyph .. WS .. "*$"
-    local p4 = "^" .. WS .. "*" .. glyph .. WS .. "*$"
-    if text:match(p1) then return true end
-    if text:match(p2) then return true end
-    if text:match(p3) then return true end
-    if text:match(p4) then return true end
-  end
-  return false
-end
-
 local function has_input_prompt(screen)
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = trim(line)
@@ -686,19 +651,20 @@ function M.classify(input)
   end
 
   -- Poll-path completed_turn — fires when adapter.state polling sees
-  -- the "Claude is back at idle after answering" pattern: answer bullet
-  -- present + empty input prompt visible + tea-verb completion marker
-  -- on screen + no active work spinner.
+  -- the "Claude is back at idle after answering" pattern: input
+  -- prompt visible + tea-verb completion marker on screen + no active
+  -- work spinner.
   --
   -- The completion-marker (`✻ <Verb> for <duration>`) gate is what
   -- prevents the classic preamble false positive: a turn that starts
-  -- with "⏺ I'll explore the project..." renders the answer bullet and
-  -- shows an empty `❯` prompt for a moment before the next tool spinner
-  -- repaints; without the marker requirement, that frame looks
-  -- identical to a real turn boundary and the classifier flips to
-  -- `completed_turn` mid-stream. The `✻ <Verb> for <duration>` line is
-  -- the TUI's own end-of-turn signal — it's never rendered between tool
-  -- calls.
+  -- with "⏺ I'll explore the project..." renders a prompt for a moment
+  -- before the next tool spinner repaints; without the marker
+  -- requirement, that frame looks identical to a real turn boundary and
+  -- the classifier flips to `completed_turn` mid-stream. The
+  -- `✻ <Verb> for <duration>` line is the TUI's own end-of-turn signal
+  -- — it's never rendered between tool calls. Long answers can scroll
+  -- the original answer bullet out of the visible body by the time the
+  -- completion marker appears, so do not require `⏺` here.
   --
   -- Gated on `stable_ms < completed_turn_stable_ms` so callers driving
   -- `adapter.wait` (which always supplies a stable_ms >= the threshold)
@@ -708,14 +674,13 @@ function M.classify(input)
   if last_intent == "prompt_submitted"
       and (stable_ms == 0 or completed_turn_stable_ms == 0 or stable_ms < completed_turn_stable_ms)
       and not has_active_work_indicator(body_text)
-      and contains(body, "⏺")
       and has_turn_completion_marker(screen)
-      and has_empty_input_prompt_line(body)
+      and has_input_prompt(body)
   then
     return state_snapshot(
       "completed_turn",
       0.7,
-      "answer bullet plus empty input prompt visible without active work",
+      "completion marker plus input prompt visible without active work",
       sequence
     )
   end
@@ -835,17 +800,19 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
-      -- Empty prompt glyph alone is NOT a completion anchor — it
+      -- Prompt glyph alone is NOT a completion anchor — it
       -- appears for one frame during preambles before a tool call
       -- while the next spinner is between repaints, and `adapter.wait`
       -- would otherwise return with `waiting_for_user_input` on that
       -- frame instead of holding until the turn actually ends. Pair
       -- it with the tea-verb completion marker (`✻ <Verb> for <N>`)
       -- the TUI renders only at end-of-turn, matching the classifier's
-      -- `completed_turn` gate. Dialog / usage anchors above still
-      -- wake the matcher on their own.
+      -- `completed_turn` gate. Claude may render ghost text or a
+      -- suggested follow-up after the prompt glyph (for example
+      -- `❯ run the tests`), so do not require an empty prompt row here.
+      -- Dialog / usage anchors above still wake the matcher on their own.
       matcher.all({
-        matcher.screen_regex("(?m)^\\s*(?:>|❯)\\s*$"),
+        matcher.screen_regex("(?m)^\\s*(?:>|❯).*"),
         matcher.screen_regex("✻ \\S+ for \\d"),
       }),
     }),
