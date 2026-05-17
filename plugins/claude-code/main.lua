@@ -53,12 +53,31 @@ local function state_snapshot(state, confidence, evidence, sequence, metadata)
 end
 
 local function has_error_indicator(screen)
+  -- Lines anchored at the start of a line so prose mentions of the
+  -- words "error" or "limit reached" inside an assistant reply do not
+  -- trip the detector. The TUI renders its error / rate-limit banners
+  -- as their own row, not as fragments inside flowing prose.
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = lower(trim(line))
     if starts_with(text, "error:")
       or starts_with(text, "request failed")
+      or starts_with(text, "api error")
       or contains(text, "please retry")
-      or contains(text, "press r to retry") then
+      or contains(text, "press r to retry")
+      -- Rate-limit / plan-limit banners. Claude Code 2.1.x renders
+      -- one of these as the body when you exhaust your plan budget.
+      or contains(text, "5-hour limit reached")
+      or contains(text, "5-hour limit")
+      or contains(text, "rate limit reached")
+      or contains(text, "you've used your pro plan")
+      or contains(text, "you've used your max plan")
+      or contains(text, "you've reached your usage limit")
+      or contains(text, "credit balance is too low")
+      -- Connection / network failure banner.
+      or contains(text, "connection error")
+      or contains(text, "connection issue")
+      or contains(text, "could not connect")
+      or contains(text, "network error") then
       return true
     end
   end
@@ -433,6 +452,34 @@ local function has_trust_indicator(text)
     })
 end
 
+-- Claude Code's signed-out / not-authenticated screen. Two shapes:
+--   * an OAuth prompt: "Log in to Claude Code" / "Press Enter to log in"
+--     with a hint about an `anthropic.com` URL,
+--   * an API-key fallback: "Sign in to Claude" / "API key" / "Enter your
+--     API key:".
+-- A turn whose prose mentions "log in" can't realistically combine all
+-- three anchors at once (URL hint + action verb + prompt phrase), so the
+-- two-anchor pairing keeps prose mentions from tripping the detector.
+local function has_login_indicator(text)
+  local has_login_phrase = contains_any(text, {
+    "log in to claude",
+    "sign in to claude",
+    "login to claude",
+    "press enter to log in",
+    "continue with anthropic",
+    "continue with google",
+  })
+  if not has_login_phrase then
+    return false
+  end
+  return contains_any(text, {
+    "anthropic.com",
+    "api key",
+    "press enter to log in",
+    "open the link",
+  })
+end
+
 local function has_usage_screen(text)
   return contains(text, "total cost:")
     and contains(text, "usage:")
@@ -554,9 +601,31 @@ local function has_welcome_screen(text)
   -- caller's prompt). Detect it so the classifier reports `starting`
   -- instead of `waiting_for_user_input` — Claude is not actually ready to
   -- accept a prompt yet, even though the input cursor `❯` is on screen.
-  return contains(text, "tips for getting started")
-    and contains(text, "what's new")
-    and contains_any(text, { "welcome back", "claude code v" })
+  --
+  -- Two-anchor pairing: `welcome back` / `claude code v` (a TUI-only
+  -- header phrase) PLUS one of the "what's new" / "tips for getting
+  -- started" / "ask claude to" panels. The compact-launch view that
+  -- ships under tight terminals omits one of the side panels but
+  -- always renders the welcome header AND at least one suggestion
+  -- block, so accepting either side panel keeps small terminals
+  -- working. Requiring the welcome-header anchor keeps assistant
+  -- prose that says "tips for getting started" by itself from
+  -- tripping the detector.
+  local has_welcome_header = contains_any(text, {
+    "welcome back",
+    "claude code v",
+    "welcome to claude code",
+  })
+  if not has_welcome_header then
+    return false
+  end
+  return contains_any(text, {
+    "tips for getting started",
+    "what's new",
+    "ask claude to",
+    "/release-notes for more",
+    "/help for help",
+  })
 end
 
 function M.classify(input)
@@ -636,6 +705,17 @@ function M.classify(input)
   -- structural anchors (focus glyph + numbered option, or both
   -- bracket labels on one line) rather than loose substring matches.
   local body_and_status = body_text .. "\n" .. lower(status)
+
+  -- Login / sign-in dialog runs before any other dialog branch because
+  -- nothing else is actionable when the user isn't authenticated:
+  -- send_prompt's leading Enter would either trigger the OAuth flow
+  -- (opening a browser, which a script driver can't complete) or land
+  -- in the API-key entry box. Callers must `claude login` interactively
+  -- once before driving the adapter; the script-side handler surfaces
+  -- this as a non-zero exit with a clear message.
+  if has_login_indicator(body_text) then
+    return state_snapshot("waiting_for_login", 0.86, "login / sign-in dialog detected", sequence)
+  end
 
   -- Workspace-trust dialog is checked before permission/plan because its
   -- approve action differs (numbered selection, not a single Enter press).

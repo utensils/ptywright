@@ -425,6 +425,104 @@ fn key_intent_routes_expanded_special_keys() {
     }
 }
 
+/// EVERY variant of `Action::Key` (from `src/action.rs`) must be
+/// represented in the Lua plugin's `KEY_ALIASES` table so the
+/// generic `key` intent routes to `action.key(...)` rather than
+/// silently falling through to `action.text`. The comment in
+/// `plugins/claude-code/main.lua` promises this contract; this test
+/// enforces it.
+///
+/// When a new variant is added to the Rust enum, this test will
+/// fail with a clear message naming the missing alias. The fix is
+/// to add that snake_case name to `KEY_ALIASES`.
+#[test]
+fn key_intent_covers_every_rust_key_variant() {
+    let extension = claude_plugin();
+
+    // Hand-listed because `Action::Key` doesn't implement `IntoEnumIter`.
+    // The serde encoding is `rename_all = "snake_case"`, so every
+    // variant maps to the corresponding snake_case alias the Lua side
+    // accepts.
+    let variants: &[Key] = &[
+        // Submission / line editing
+        Key::Enter,
+        Key::Escape,
+        Key::Tab,
+        Key::ShiftTab,
+        Key::Backspace,
+        Key::Delete,
+        Key::Space,
+        // Arrows
+        Key::Up,
+        Key::Down,
+        Key::Left,
+        Key::Right,
+        // Navigation cluster
+        Key::Home,
+        Key::End,
+        Key::PageUp,
+        Key::PageDown,
+        Key::Insert,
+        // Ctrl combos (ctrl_h / ctrl_i / ctrl_j / ctrl_m are deliberately
+        // absent from KEY_ALIASES — use backspace / tab / enter so
+        // transcripts stay readable. The serde form for those still
+        // exists in the Rust enum but is not exercised here).
+        Key::CtrlA,
+        Key::CtrlB,
+        Key::CtrlC,
+        Key::CtrlD,
+        Key::CtrlE,
+        Key::CtrlF,
+        Key::CtrlG,
+        Key::CtrlK,
+        Key::CtrlL,
+        Key::CtrlN,
+        Key::CtrlO,
+        Key::CtrlP,
+        Key::CtrlQ,
+        Key::CtrlR,
+        Key::CtrlS,
+        Key::CtrlT,
+        Key::CtrlU,
+        Key::CtrlV,
+        Key::CtrlW,
+        Key::CtrlX,
+        Key::CtrlY,
+        Key::CtrlZ,
+        // Function keys
+        Key::F1,
+        Key::F2,
+        Key::F3,
+        Key::F4,
+        Key::F5,
+        Key::F6,
+        Key::F7,
+        Key::F8,
+        Key::F9,
+        Key::F10,
+        Key::F11,
+        Key::F12,
+    ];
+
+    for variant in variants {
+        // Round-trip through serde to get the wire-form alias rather
+        // than re-implementing snake_case here; if the rename_all
+        // attribute on Key ever changes, this test follows it.
+        let alias = serde_json::to_value(variant)
+            .expect("Key serializes to JSON")
+            .as_str()
+            .expect("Key encodes as a string")
+            .to_string();
+        let plan = plan(&extension, "key", json!({ "key": alias.clone() }));
+        assert_eq!(
+            plan.actions,
+            vec![Action::Key(variant.clone())],
+            "Key::{variant:?} (snake_case alias `{alias}`) does not route through the Lua KEY_ALIASES table — \
+             add it to `plugins/claude-code/main.lua::KEY_ALIASES` so the generic `key` intent stays in sync with the Rust enum"
+        );
+    }
+}
+
 #[test]
 fn key_intent_falls_through_to_text_for_unrecognised_input() {
     // Single chars like "y" / "n" / "1" are sent through `action.text`

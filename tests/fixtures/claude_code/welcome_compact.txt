@@ -1,0 +1,15 @@
+╭─── Claude Code v2.1.143 ─────────────────────────────────╮
+│                                                          │
+│              Welcome back James Brink!                   │
+│                                                          │
+│              Ask Claude to help you code.                │
+│                                                          │
+│              /release-notes for more                     │
+│              /help for help, ⏎ to submit                 │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯
+
+────────────────────────────────────────────────────────────
+❯
+  user @ host /private/tmp/sample                  [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

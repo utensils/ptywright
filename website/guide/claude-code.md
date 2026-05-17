@@ -58,6 +58,7 @@ The classifier returns one of:
 - `waiting_for_permission`
 - `waiting_for_plan_approval`
 - `waiting_for_trust`
+- `waiting_for_login`
 - `waiting_for_user_input`
 - `completed_turn`
 - `cancelling`

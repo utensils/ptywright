@@ -209,21 +209,33 @@ PASTE_REACTION_BYTES = 256
 #
 #   * `_CHROME_RULE_RE` — horizontal rules made of one repeated
 #     box-drawing or em-dash character (Claude Code uses `─`).
-#   * `_CHROME_SPINNER_RE` — spinner status lines: leading glyph,
-#     then a verb ending with the horizontal ellipsis `…`, optionally
-#     followed by a parenthesized counter section like
-#     `(9s · ↑ 217 tokens · thinking)` or `(ctrl+o to expand)` that
-#     mutates every frame. The completion line (`✻ <Verb> for <N>`)
-#     does NOT end with an ellipsis and contains ` for <digit>`, so
-#     it intentionally doesn't match this pattern — it's the real
-#     end-of-turn signal we want to surface.
+#   * `_CHROME_SPINNER_RE` — spinner status lines: a leading glyph
+#     FROM THE KNOWN SPINNER SET, then a verb ending with the
+#     horizontal ellipsis `…`, optionally followed by a parenthesized
+#     counter section like `(9s · ↑ 217 tokens · thinking)` or
+#     `(ctrl+o to expand)` that mutates every frame. The completion
+#     line (`✻ <Verb> for <N>`) does NOT end with an ellipsis and
+#     contains ` for <digit>`, so it intentionally doesn't match —
+#     it's the real end-of-turn signal we want to surface. Requiring
+#     the glyph to be in the spinner set (not `\S+`) prevents
+#     legitimate one-sentence prose like `"Done… (for now)"` from
+#     matching: ordinary words aren't in the spinner glyph set.
 #   * `_CHROME_SEARCHED_RE` — Claude Code progress lines like
 #     `Searching for 1 pattern…` / `Searched for 1 pattern (ctrl+o
 #     to expand)`. These mutate (count, "ing" → "ed") every tick and
 #     would otherwise be deduped per state.
+#
+# `_CHROME_SPINNER_GLYPHS` MUST stay in sync with `SPINNER_GLYPHS` in
+# `plugins/claude-code/indicators` (currently `main.lua`). If a new
+# spinner glyph appears in a Claude Code release, add it to both.
+_CHROME_SPINNER_GLYPHS = "✶✻✺✦·•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⏺✽✳✢⏵"
 _CHROME_RULE_RE = re.compile(r"^[─━═]+$")
-_CHROME_SPINNER_RE = re.compile(r"^\S+\s+\S+…(?:\s*\([^)]*\))?$")
-_CHROME_SEARCHED_RE = re.compile(r"^(?:Searching|Searched|Reading|Read|Listing|Listed|Glob|Grep)\b.*\(ctrl\+o to expand\)$")
+_CHROME_SPINNER_RE = re.compile(
+    r"^[" + _CHROME_SPINNER_GLYPHS + r"]\s+\S.*…(?:\s*\([^)]*\))?$"
+)
+_CHROME_SEARCHED_RE = re.compile(
+    r"^(?:Searching|Searched|Reading|Read|Listing|Listed|Glob|Grep)\b.*\(ctrl\+o to expand\)$"
+)
 
 def _is_chrome_line(s: str) -> bool:
     if _CHROME_RULE_RE.match(s):
@@ -252,6 +264,14 @@ class Stream:
         self.heartbeat = args.heartbeat_ms / 1000.0
         self.deadline = hard_deadline
         self._closed = False
+        # Sticky flag set when the server emits `session.exited` for this
+        # adapter's underlying session. The poll loop checks it BEFORE
+        # the classifier state so a Claude crash mid-stream surfaces
+        # immediately rather than spinning until the hard deadline. The
+        # classifier itself never returns the literal state string
+        # `exited` (it's a host-side concept), so this flag is how the
+        # terminal-state guard in `stream_until_done` learns about it.
+        self._session_exited = False
         # Annotation memo — only print transitions, not every poll.
         self._last_state: str | None = None
         self._last_evidence: str | None = None
@@ -515,6 +535,17 @@ class Stream:
                 if n.get("method") == "session.exited":
                     self._clear_alive()
                     emit(YELLOW("◌ session.exited"))
+                    self._session_exited = True
+
+            if self._session_exited:
+                # The PTY child died — no further poll will produce
+                # meaningful state. Bail out as `exited` with a failure
+                # exit code so callers / CI know this wasn't a clean
+                # turn completion.
+                self._clear_alive()
+                grew_by = max(0, len(body) - baseline_len)
+                emit(RED("✗ exited"), DIM(f"(+{grew_by} chars in body; session closed mid-stream)"))
+                return 1
 
             if body != last_body:
                 # Walk EVERY line in the new body (not just past common
@@ -657,10 +688,30 @@ def main() -> int:
 
         stream = Stream(client, aid, args, hard_deadline)
 
-        # Auto-approve the workspace-trust dialog if it appears. Event-driven:
-        # we poll state every heartbeat until either the trust prompt is
-        # detected (approve it) or the screen settles into a non-trust state
-        # (skip — workspace was already trusted).
+        # Pre-submit gate. Three buckets of behavior on each tick:
+        #
+        #   1. Handle: workspace-trust dialog → auto-approve and reloop.
+        #   2. Fail fast: terminal failure states (`error`, `plugin_error`)
+        #      and the new `waiting_for_login` state surface their
+        #      classifier evidence with a non-zero exit instead of
+        #      burning the global deadline. `waiting_for_login` is
+        #      special-cased: send_prompt can't dismiss it, the user
+        #      has to `claude login` first, so we refuse to paste into
+        #      a sign-in dialog.
+        #   3. Allow-list to proceed: only break out of the loop when
+        #      the classifier reports a state where `send_prompt` is
+        #      safe to run. Anything else (an unrecognized state, the
+        #      classifier's no-evidence fallback) keeps polling — so a
+        #      future Claude TUI screen we haven't taught the
+        #      classifier about can't race the paste into the wrong
+        #      place. The hard deadline still bounds the wait.
+        SUBMIT_READY_STATES = {
+            "ready",
+            "waiting_for_user_input",
+            "starting",  # only with the welcome-screen evidence below
+            "thinking",  # rare; Claude finishing a prior turn from --continue
+            "completed_turn",  # last turn already done; safe to send next
+        }
         while not stream._expired():
             st = stream.poll_state()
             state = st["state"]
@@ -669,35 +720,31 @@ def main() -> int:
                 emit(YELLOW("? workspace-trust dialog detected, auto-approving"))
                 client.rpc("adapter.send",
                            {"adapter": aid, "intent": "approve_trust", "params": {}}, t=5.0)
-                # Loop again — we'll either re-detect trust (try again) or
-                # see a different state next iteration.
                 continue
-            # Fail fast on terminal failure states — no point waiting them
-            # out until the global deadline only to report "deadline expired"
-            # when the real problem is a startup error or classifier crash.
             if state in {"error", "plugin_error"}:
                 emit(RED(f"✗ adapter entered {state} during startup"), DIM(evidence))
                 stream.close()
                 return 1
-            # Only break out of the wait once the classifier has observed
-            # something that's *actually* Claude — the welcome panel, the
-            # input prompt, a dialog, or active work. Two fallbacks have to
-            # keep polling instead of letting the script paste into a
-            # not-yet-ready terminal:
-            #   * `starting` + "no screen evidence" — the PTY is up but
-            #     nothing has been rendered yet (or only ANSI churn the
-            #     parser collapsed).
-            #   * `ready` / `<intent>` + "no Claude Code-specific evidence
-            #     detected" — the classifier's last-resort fallback when
-            #     nothing matched. Shell / direnv / tool chatter before
-            #     Claude actually starts lands here; treating it as ready
-            #     would race the paste against Claude's real input box.
-            # The welcome panel (`starting` + "welcome screen visible") is
-            # a green light — `send_prompt`'s leading Enter handles it.
+            if state == "waiting_for_login":
+                emit(RED("✗ Claude requires sign-in"),
+                     DIM("run `claude` interactively once, complete the login flow, then retry"))
+                stream.close()
+                return 2
+            # The classifier's no-evidence fallbacks aren't safe to
+            # submit into — shell / direnv chatter before Claude renders
+            # its prompt lands here. Keep polling.
             if "no screen evidence" in evidence or "no Claude Code-specific evidence" in evidence:
                 time.sleep(stream.heartbeat)
                 continue
-            break
+            # Welcome panel is a green light — send_prompt's leading
+            # Enter dismisses it.
+            if state == "starting" and "welcome screen visible" in evidence:
+                break
+            if state in SUBMIT_READY_STATES:
+                break
+            # Unknown state — keep polling rather than guessing. The
+            # hard deadline bounds this.
+            time.sleep(stream.heartbeat)
 
         ok, reason = stream.submit(prompt)
         if not ok:
