@@ -1,6 +1,6 @@
 ╭─── Claude Code v2.1.142 ────────────────────────────────────────────────────────────────────────────╮
 │                                                    │ Tips for getting started                       │
-│              Welcome back James Brink!             │ Ask Claude to create a new app or clone a repo │
+│              Welcome back User!             │ Ask Claude to create a new app or clone a repo │
 │                                                    │ ────────────────────────────────────────────── │
 │                       ▐▛███▜▌                      │ What's new                                     │
 │                      ▝▜█████▛▘                     │ Added new `claude agents` flags                │

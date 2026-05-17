@@ -403,13 +403,18 @@ class TerminalStatesTests(unittest.TestCase):
 
 
 class ChromeSpinnerGlyphSetTests(unittest.TestCase):
-    """The Lua plugin's `SPINNER_GLYPHS` table and the script's
-    `_CHROME_SPINNER_GLYPHS` char class must overlap. They don't have
-    to be identical — Lua tracks all glyphs the classifier might see
-    while the script needs broader coverage to filter the streaming
-    output — but every Lua glyph must be in the Python set, otherwise
-    the streaming loop will leak the spinner frames the classifier
-    relies on to detect active work."""
+    """Reminder test: the Python `_CHROME_SPINNER_GLYPHS` char class
+    must be a SUPERSET of the Lua `SPINNER_GLYPHS` table.
+
+    This test does NOT auto-discover the Lua set — `LUA_SPINNERS` below
+    is hand-mirrored from `plugins/claude-code/main.lua`. If a new
+    glyph is added to the Lua table, this test won't catch it on its
+    own. Maintainers updating `SPINNER_GLYPHS` in Lua must also
+    propagate the addition to the Python char class AND extend this
+    LUA_SPINNERS list — failure to do so means the streaming loop
+    will leak the new spinner frames as content even though the
+    classifier filters them. Treat the list as a checklist, not a
+    safety net."""
 
     LUA_SPINNERS = ["✶", "✻", "✺", "✦", "·", "•",
                     "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -418,9 +423,9 @@ class ChromeSpinnerGlyphSetTests(unittest.TestCase):
         for glyph in self.LUA_SPINNERS:
             self.assertIn(
                 glyph, CS._CHROME_SPINNER_GLYPHS,
-                f"Lua spinner glyph `{glyph}` is not in _CHROME_SPINNER_GLYPHS; "
-                "the streaming loop will leak spinner frames the classifier "
-                "filters as active work"
+                f"Lua spinner glyph `{glyph}` (from LUA_SPINNERS in this "
+                "test) is not in _CHROME_SPINNER_GLYPHS. Update the Python "
+                "char class to cover it."
             )
 
 

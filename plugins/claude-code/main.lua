@@ -241,11 +241,14 @@ local function is_post_marker_trailing_line(line)
   local t = trim(line)
   if t == "" then return true end
   if t == ">" or t == "❯" then return true end
-  -- Prompt with text — post-turn ghost-text suggestion.
-  if starts_with(t, "❯ ") or starts_with(t, "> ") then return true end
+  -- Prompt with text — post-turn ghost-text suggestion. Restricted to
+  -- `❯ <text>` only; ASCII `> <text>` is the Markdown blockquote shape
+  -- and Claude can legitimately include blockquotes below a marker as
+  -- answer prose. The bare `>` idle form above still matches.
+  if starts_with(t, "❯ ") then return true end
   -- Same with NBSP (U+00A0, bytes 0xC2 0xA0) — Claude Code pads ghost
   -- text with a non-breaking space rather than a regular space.
-  if starts_with(t, "❯\194\160") or starts_with(t, ">\194\160") then return true end
+  if starts_with(t, "❯\194\160") then return true end
   -- Horizontal rule — single repeated box-drawing character.
   if t:match("^[─━═]+$") then return true end
   -- Status-bar rows Claude Code 2.1.x renders below the prompt. The
@@ -268,14 +271,16 @@ local function is_post_marker_trailing_line(line)
 end
 
 -- Returns true if `line` looks like the user's submitted-prompt echo
--- or a post-turn ghost suggestion — both render as `❯ <text>` /
--- `> <text>`. These are NOT content (they don't represent something
--- Claude wrote in answer to the prompt), so they don't count when
--- proving real work happened.
+-- or a post-turn ghost suggestion — both render as `❯ <text>` (with
+-- regular space or NBSP padding). Restricted to `❯` only; ASCII
+-- `> <text>` is the Markdown blockquote shape, which can legitimately
+-- appear as substantive answer content above the marker. Anchoring on
+-- a blockquote here would let the reverse scan pick it as the prompt
+-- echo and reject the real marker for "no content above".
 local function is_prompt_echo_line(line)
   local t = trim(line)
-  if starts_with(t, "❯ ") or starts_with(t, "> ") then return true end
-  if starts_with(t, "❯\194\160") or starts_with(t, ">\194\160") then return true end
+  if starts_with(t, "❯ ") then return true end
+  if starts_with(t, "❯\194\160") then return true end
   return false
 end
 
@@ -1092,7 +1097,7 @@ function M.classify(input)
     return state_snapshot(
       "thinking",
       0.6,
-      "turn in flight; no completion marker on screen",
+      "turn in flight; no accepted completion marker on screen",
       sequence
     )
   end
@@ -1289,20 +1294,30 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("ANTHROPIC_API_KEY"),
       matcher.screen_regex("(?m)^\\s*https?://[\\w./\\-_?=&%]*claude\\.ai"),
       matcher.screen_regex("(?m)^\\s*https?://[\\w./\\-_?=&%]*anthropic\\.com"),
-      -- Model picker dialog (opened by `/model`). Mirrors
-      -- `has_model_picker_indicator` so callers waiting after a
-      -- `slash_command("model")` send wake on the picker rather
-      -- than timing out.
+      -- Model picker dialog (opened by `/model`). Mirrors the full
+      -- `MODEL_PICKER_HEADERS` list in `has_model_picker_indicator`
+      -- so any of the four header shapes wakes the wait.
       matcher.contains_text("Select a model:"),
       matcher.contains_text("Switch to model:"),
-      -- Error banners that `has_error_indicator` recognises — keep
-      -- these in sync so a terminal `error` classification wakes
-      -- the wait promptly rather than letting it run to timeout.
-      matcher.contains_text("You've reached your usage limit"),
+      matcher.contains_text("Choose a model:"),
+      matcher.contains_text("Available models:"),
+      -- Error banners that `has_error_indicator` recognises — mirror
+      -- the full `ERROR_BANNER_PREFIXES` list in main.lua. `contains_text`
+      -- is case-insensitive on the matcher side, so the title-case
+      -- here matches the lower-cased prefixes the classifier uses.
+      matcher.contains_text("error:"),
+      matcher.contains_text("request failed"),
+      matcher.contains_text("API error"),
+      matcher.contains_text("5-hour limit"),
       matcher.contains_text("Rate limit reached"),
-      matcher.contains_text("API request failed"),
+      matcher.contains_text("You've used your Pro plan"),
+      matcher.contains_text("You've used your Max plan"),
+      matcher.contains_text("You've reached your usage limit"),
+      matcher.contains_text("Credit balance is too low"),
       matcher.contains_text("Connection error"),
-      matcher.contains_text("Failed to connect"),
+      matcher.contains_text("Connection issue"),
+      matcher.contains_text("Could not connect"),
+      matcher.contains_text("Network error"),
       -- Prompt glyph alone is NOT a completion anchor — it
       -- appears for one frame during preambles before a tool call
       -- while the next spinner is between repaints, and `adapter.wait`

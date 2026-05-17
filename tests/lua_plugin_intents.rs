@@ -496,16 +496,20 @@ fn key_intent_routes_expanded_special_keys() {
 /// generic `key` intent routes to `action.key(...)` rather than
 /// silently falling through to `action.text`. The comment in
 /// `plugins/claude-code/main.lua` promises this contract; this test
-/// enforces it.
+/// enforces it for the variants it lists.
 ///
-/// When a new variant is added to the Rust enum, this test will
-/// fail with a clear message naming the missing alias. The fix is
-/// to add that snake_case name to `KEY_ALIASES`.
+/// **Reminder, NOT a safety net.** The variants below are hand-listed.
+/// Adding a new variant to `Key` does NOT automatically fail this
+/// test — maintainers must also add the new variant to the slice
+/// below AND to Lua's `KEY_ALIASES`. The test catches drift only for
+/// variants someone remembered to enumerate here. (`Action::Key`
+/// doesn't implement `IntoEnumIter`, so there's no compile-time way
+/// to derive the list.)
 #[test]
 fn key_intent_covers_every_rust_key_variant() {
     let extension = claude_plugin();
 
-    // Hand-listed because `Action::Key` doesn't implement `IntoEnumIter`.
+    // Hand-listed reminder of every `Key` variant currently shipping.
     // The serde encoding is `rename_all = "snake_case"`, so every
     // variant maps to the corresponding snake_case alias the Lua side
     // accepts.
@@ -1119,7 +1123,7 @@ fn classifier_returns_thinking_mid_turn_even_between_spinner_frames() {
     );
     assert_eq!(
         between_spinner_frames.evidence,
-        "turn in flight; no completion marker on screen"
+        "turn in flight; no accepted completion marker on screen"
     );
 
     // The spinner-visible frame must still resolve via the higher-confidence

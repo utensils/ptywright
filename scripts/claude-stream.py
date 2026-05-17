@@ -382,7 +382,7 @@ class Stream:
             # Only log on actual state transitions. Evidence can flap
             # within a single state (e.g. the mid-turn `thinking` branch
             # alternates between "active work indicator detected" and
-            # "turn in flight; no completion marker on screen" as the
+            # "turn in flight; no accepted completion marker on screen" as the
             # spinner repaints), and logging each evidence change made
             # the output look like the classifier was flapping when it
             # was steady. The post-transition evidence is preserved on
@@ -648,18 +648,33 @@ class Stream:
 
         lines = delta.splitlines()
 
-        # Anchor on the LAST line containing the submitted prompt text
-        # (the input box echoes the prompt as the user types and then
-        # again on paste). Use the prompt text rather than a `❯` glyph
-        # match so a multi-line / wrapped paste is anchored on its
-        # final occurrence regardless of glyph variant.
+        # Anchor on the LAST `❯` prompt-row that contains the submitted
+        # prompt text. Two anchors combined: the line must have the
+        # prompt-echo SHAPE (`❯ <text>` or `❯<NBSP><text>`) AND contain
+        # the submitted prompt's first line as a substring. Shape alone
+        # would match the post-turn ghost suggestion; substring alone
+        # could match Claude's answer if it quotes or repeats the prompt
+        # text in prose. Both together pin the submitted-prompt echo.
+        # If only the substring matches (no shape match) we fall back
+        # to substring-only at LAST occurrence as a last resort.
         anchor = self._submitted_prompt.strip().splitlines()[0] if self._submitted_prompt.strip() else ""
         start = 0
         if anchor:
+            shape_match = -1
+            substring_match = -1
             for i in range(len(lines) - 1, -1, -1):
-                if anchor in lines[i]:
-                    start = i + 1
-                    break
+                line = lines[i]
+                if anchor in line:
+                    if substring_match < 0:
+                        substring_match = i
+                    stripped = line.lstrip()
+                    if stripped.startswith("❯ ") or stripped.startswith("❯ "):
+                        shape_match = i
+                        break
+            if shape_match >= 0:
+                start = shape_match + 1
+            elif substring_match >= 0:
+                start = substring_match + 1
 
         # End at the FIRST line after `start` that looks like the
         # completion marker (`✻ <Verb> for <N>` with no ellipsis tail).
@@ -688,8 +703,10 @@ class Stream:
             # interleaved with the answer if Claude redraws. Restrict
             # to `❯` (the actual prompt glyph) so legitimate Markdown
             # blockquotes (`> some quoted text`) in Claude's answer
-            # aren't silently dropped.
-            if s.startswith("❯ "):
+            # aren't silently dropped. Handle both regular-space and
+            # NBSP (U+00A0) padding — Claude Code 2.1.x renders ghost
+            # text with NBSP rather than regular space.
+            if s.startswith("❯ ") or s.startswith("❯ "):
                 continue
             if s in seen:
                 continue

@@ -15,9 +15,14 @@ applyTo: "tests/fixtures/claude_code/**"
      "state": "<classifier state>",
      "evidence": "<exact evidence string>",
      "last_intent": "<optional intent string or omit>",
-     "min_confidence": <float, e.g. 0.6>
+     "min_confidence": <float, e.g. 0.6>,
+     "metadata": { "<key>": "<value>" }
    }
    ```
+   `metadata` is OPTIONAL — assert specific keys / values in the
+   plugin's `state_snapshot` metadata when the test needs that
+   precision (welcome-screen / usage / permission / status-bar
+   metadata). Omit it otherwise.
 3. `tests/lua_classifier_tests.rs::classifier_matches_sanitized_claude_code_fixtures` picks it up automatically.
 
 ## Hand-edit vs real capture
@@ -38,5 +43,5 @@ Real captures from a working Claude session are accurate but messy (welcome bann
 
 - **"Add a fixture for every code change"** — fixtures are for STRUCTURAL classification variations. Logic bugs that don't change classification shape get unit tests, not fixtures.
 - **"Use raw uncleaned capture"** — leaks user-identifying info. Sanitize.
-- **"Add a `description` field to the expected JSON"** — schema is `state` / `evidence` / `last_intent` / `min_confidence` only. Test-discovery is strict about extra fields.
+- **"Add a `description` field to the expected JSON"** — the supported schema is `state` / `evidence` / `last_intent` / `min_confidence` / `metadata`. Test-discovery rejects unknown fields.
 - **"Capture against an outdated Claude Code version"** — the test matrix is the working contract against current Claude Code. If Claude Code's TUI changes, update the fixtures AND the classifier together; don't pin to old shapes.
