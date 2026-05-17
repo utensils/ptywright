@@ -22,3 +22,9 @@ target/coverage/
 
 # Playwright MCP session artifacts (logs, page snapshots)
 .playwright-mcp/
+
+# Python bytecode / caches from the claude-stream script and its
+# unittest suite (`scripts/__pycache__/`, `tests/scripts/__pycache__/`).
+__pycache__/
+*.py[cod]
+*$py.class
