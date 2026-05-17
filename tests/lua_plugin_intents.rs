@@ -304,6 +304,28 @@ fn send_prompt_refuses_empty_input_and_leaves_intent_unset() {
     assert!(missing_prompt.last_intent.is_none());
 }
 
+/// `force_cancel` sends Escape twice in one plan. Real Claude Code
+/// occasionally needs the second press to interrupt a tool call that's
+/// already serializing an API request: the first Escape lands while
+/// Claude is mid-call and gets honored only after the response returns.
+/// This intent is the named escalation path so callers don't script
+/// the second press themselves.
+#[test]
+fn force_cancel_plan_emits_two_escapes_and_marks_cancelling_intent() {
+    let extension = claude_plugin();
+    let plan = plan(&extension, "force_cancel", json!({}));
+
+    assert_eq!(
+        plan.actions,
+        vec![Action::Key(Key::Escape), Action::Key(Key::Escape)]
+    );
+    assert_eq!(
+        plan.last_intent.as_deref(),
+        Some("cancelling"),
+        "force_cancel must mark the cancelling hold-state just like cancel does"
+    );
+}
+
 #[test]
 fn cancel_plan_emits_escape_and_marks_cancelling_intent() {
     // Claude Code 2.1.x captures Escape as the mid-turn interrupt key

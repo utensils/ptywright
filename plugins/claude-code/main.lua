@@ -452,6 +452,35 @@ local function has_trust_indicator(text)
     })
 end
 
+-- `/model` opens an interactive selection panel: a "Select a model:"
+-- (or "Switch to model:") header followed by a numbered list of
+-- available models, with the focus glyph `❯` on one row. The TUI
+-- treats Enter as "pick the focused option" and arrow keys as
+-- navigation. Detect it so script drivers know they're at the model
+-- picker after running `slash_command("model")` rather than at the
+-- regular input prompt; pasting a prompt into the picker would type
+-- into the search filter and select the wrong model.
+local function has_model_picker_indicator(text)
+  local has_header = contains_any(text, {
+    "select a model",
+    "switch to model",
+    "choose a model",
+    "available models",
+  })
+  if not has_header then
+    return false
+  end
+  -- Require either a focused option (`❯ <digit>.` or `❯ <digit>)`) OR
+  -- at least two consecutive numbered entries — the dialog always
+  -- renders a multi-option list, never a single line.
+  if text:find("❯%s*%d+[%.%)]") then
+    return true
+  end
+  local first = text:find("\n%s*1[%.%)]")
+  if not first then return false end
+  return text:find("\n%s*2[%.%)]") ~= nil
+end
+
 -- Claude Code's signed-out / not-authenticated screen. Two shapes:
 --   * an OAuth prompt: "Log in to Claude Code" / "Press Enter to log in"
 --     with a hint about an `anthropic.com` URL,
@@ -723,6 +752,13 @@ function M.classify(input)
   -- status bar carries only navigation hints.
   if has_trust_indicator(body_text) then
     return state_snapshot("waiting_for_trust", 0.86, "workspace trust dialog detected", sequence)
+  end
+
+  -- Model picker (opened by `/model`). Anchored on the header phrase
+  -- plus either a focused numbered option or two consecutive numbered
+  -- list entries, so prose mentioning "select a model" can't trip it.
+  if has_model_picker_indicator(body_text) then
+    return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence)
   end
 
   if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
@@ -1077,6 +1113,24 @@ function M.cancel(_input)
   -- with the "escape" alias is what the active-work hint maps to.
   return {
     actions = {
+      action.key("escape"),
+    },
+    last_intent = "cancelling",
+  }
+end
+
+-- Two-Escape escalation for tool calls that are already in flight
+-- when the first Escape arrives. Real Claude Code occasionally needs
+-- the second press to actually interrupt — a single Escape sometimes
+-- lands during an API request that's already serializing, which
+-- Claude completes before honoring the interrupt. This intent sends
+-- both presses in one plan so callers don't have to script the
+-- escalation themselves. Same `last_intent = "cancelling"` so the
+-- classifier's hold-state behaves identically.
+function M.force_cancel(_input)
+  return {
+    actions = {
+      action.key("escape"),
       action.key("escape"),
     },
     last_intent = "cancelling",

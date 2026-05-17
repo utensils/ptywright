@@ -59,6 +59,7 @@ The classifier returns one of:
 - `waiting_for_plan_approval`
 - `waiting_for_trust`
 - `waiting_for_login`
+- `waiting_for_model_select`
 - `waiting_for_user_input`
 - `completed_turn`
 - `cancelling`
@@ -124,6 +125,7 @@ Plugin intents available via `adapter.send`:
 | `approve`         | `{}`                                                            | Presses Enter to accept the current permission / plan-approval dialog.                                                                                                                                       |
 | `deny`            | `{}`                                                            | Presses Escape to dismiss the current dialog.                                                                                                                                                                |
 | `cancel`          | `{}`                                                            | Sends Escape (Claude Code 2.1.x's documented mid-turn interrupt key). Sets `last_intent = "cancelling"`.                                                                                                     |
+| `force_cancel`    | `{}`                                                            | Sends Escape twice for tool calls already mid-API-request when the first Escape arrives. Same `last_intent = "cancelling"` as `cancel`.                                                                      |
 | `steer`           | `{ "prompt": "..." }`                                           | Mid-turn prompt injection — same bytes as `send_prompt` but does NOT flip `last_intent` to `prompt_submitted`, so the classifier keeps waiting for the original turn to actually finish.                     |
 | `key`             | `{ "key": "..." }`                                              | Generic single-key/text send: aliases (`enter`, `escape`, `tab`, `ctrl_c`, `shift_tab`, `f1`–`f12`, etc., with `-` or `_` separators) route to `action.key`; anything else falls through to `action.text`.   |
 | `approve_trust`   | `{}`                                                            | Types `1` + Enter for the workspace-trust dialog.                                                                                                                                                            |

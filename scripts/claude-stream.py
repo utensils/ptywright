@@ -482,6 +482,18 @@ class Stream:
                 return True, ""
             self._tick_alive(f"waiting for Claude to acknowledge paste (+{grew}B)")
             time.sleep(self.heartbeat)
+        # Deadline expired while the paste was in flight. The send_prompt
+        # actions already landed in the PTY, so if Claude is just slow we
+        # don't want to leave a half-submitted turn running server-side
+        # after we return. Best-effort `cancel` (sends Escape — see
+        # `M.cancel` in the Lua plugin) before the caller closes the
+        # adapter. Wrapped because the server might already be unhealthy
+        # when this fires; failure here is informational, not fatal.
+        try:
+            self.client.rpc("adapter.send",
+                {"adapter": self.aid, "intent": "cancel", "params": {}}, t=2.0)
+        except (RuntimeError, TimeoutError):
+            pass
         return False, "deadline expired waiting for Claude to acknowledge paste"
 
     # ─── compound: stream body deltas until classifier signals completion ─
