@@ -128,6 +128,8 @@ Plugin intents available via `adapter.send`:
 | `approve_trust`   | `{}`                  | Types `1` + Enter for the workspace-trust dialog.                                       |
 | `deny_trust`      | `{}`                  | Types `2` + Enter for the workspace-trust dialog.                                       |
 | `dismiss_welcome` | `{}`                  | Presses Enter to clear the first-launch welcome panel.                                  |
+| `expand`          | `{}`                  | Sends Ctrl+O — toggles expansion of the focused collapsible row (`Reading N files…`, search results, Bash output). Mirrors Claude Code 2.1.x's keyboard binding so callers don't have to remember the alias. |
+| `slash_command`   | `{ "command": "btw" }` (or `{"name":...}`, accepts leading `/`) | Bracketed-pastes `/<name>` and presses Enter. Does NOT flip `last_intent` to `prompt_submitted` because slash commands open a panel/modal, they aren't conversation turns. Empty `command` is a no-op. |
 
 Diagnostic reads — `adapter.snapshot`, `adapter.transcript`, `adapter.inspect` — work the same way as their `session.*` counterparts and redact by default. `adapter.inspect` additionally returns the `body_text` / `status_text` split the classifier sees, so misclassification reports can be reproduced without spinning up a parallel `session.*` connection.
 

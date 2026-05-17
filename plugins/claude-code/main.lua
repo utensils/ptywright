@@ -972,6 +972,54 @@ function M.dismiss_welcome(_input)
   }
 end
 
+-- Toggle expansion of the focused collapsible row (`Reading N files… (ctrl+o
+-- to expand)`, search results, Bash output, etc.). Claude Code 2.1.x binds
+-- Ctrl+O to expand/collapse the row under the cursor; callers driving the
+-- TUI from outside the keyboard use this intent so they don't have to know
+-- the key binding.
+function M.expand(_input)
+  return {
+    actions = {
+      action.key("ctrl_o"),
+    },
+  }
+end
+
+-- Submit a slash command (`/btw`, `/clear`, `/help`, `/usage`, `/model`,
+-- `/release-notes`, project-defined commands, …). Bracketed-pastes the
+-- token then presses Enter — same shape as `send_prompt` but with two
+-- important differences:
+--
+--   1. The leading Enter dismissal is omitted. Slash commands are only
+--      meaningful when the input box already has focus (no welcome
+--      panel covering it); spurious Enter on a settled input row would
+--      submit an empty turn first, which can race with the slash text.
+--   2. `last_intent` is NOT set to `prompt_submitted`. Slash commands
+--      open a UI (modal / panel / inline action) rather than starting a
+--      conversation turn, so the classifier's mid-turn `thinking`
+--      branch must not engage. Leaving `last_intent` alone lets the
+--      classifier read whatever the slash command rendered on screen
+--      (`waiting_for_user_input` for a panel back at idle, the panel-
+--      specific dialog branches for `/model` or `/usage`, etc.).
+--
+-- Accepts either bare `name` ("btw") or the leading-slash form
+-- ("/btw"); the plugin normalises so callers don't have to.
+function M.slash_command(input)
+  local name = (input and (input.command or input.name)) or ""
+  if name == "" then
+    return { actions = {} }
+  end
+  if string.sub(name, 1, 1) ~= "/" then
+    name = "/" .. name
+  end
+  return {
+    actions = {
+      action.bracketed_paste(name),
+      action.key("enter"),
+    },
+  }
+end
+
 function M.cancel(_input)
   -- Claude Code 2.1.x captures Escape as the mid-turn interrupt key —
   -- the active-work indicator literally renders "esc to interrupt".

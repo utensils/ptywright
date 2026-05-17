@@ -201,6 +201,78 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
     assert_eq!(plan.last_intent.as_deref(), Some("prompt_submitted"));
 }
 
+/// `expand` is the named intent for Claude Code's Ctrl+O binding —
+/// toggles expansion of the collapsible tool-progress row under the
+/// cursor. Generic `key("ctrl_o")` works too; this is the
+/// discoverable named-intent affordance.
+#[test]
+fn expand_plan_sends_ctrl_o_with_no_intent() {
+    let extension = claude_plugin();
+    let plan = plan(&extension, "expand", json!({}));
+
+    assert_eq!(plan.actions, vec![Action::Key(Key::CtrlO)]);
+    assert!(
+        plan.last_intent.is_none(),
+        "expand toggles a UI affordance, not a turn — last_intent must stay unset"
+    );
+}
+
+/// Slash commands open UI panels (modal / inline) — they're not
+/// conversation turns. The plugin pastes `/<name>` and presses Enter
+/// without flipping `last_intent`, so the classifier reads whatever
+/// the slash command rendered (the `/model` picker, `/usage` screen,
+/// `/help` panel, plain back-at-idle for `/btw` / `/clear`, etc.)
+/// instead of being lied to about a turn in flight.
+#[test]
+fn slash_command_pastes_token_and_presses_enter_without_intent() {
+    let extension = claude_plugin();
+
+    // Bare name — plugin adds the leading slash.
+    let bare = plan(&extension, "slash_command", json!({ "command": "btw" }));
+    assert_eq!(
+        bare.actions,
+        vec![
+            Action::BracketedPaste("/btw".to_string()),
+            Action::Key(Key::Enter),
+        ]
+    );
+    assert!(
+        bare.last_intent.is_none(),
+        "slash command is not a turn — must not flip last_intent"
+    );
+
+    // Already-prefixed name — plugin passes through.
+    let prefixed = plan(&extension, "slash_command", json!({ "command": "/btw" }));
+    assert_eq!(
+        prefixed.actions,
+        vec![
+            Action::BracketedPaste("/btw".to_string()),
+            Action::Key(Key::Enter),
+        ]
+    );
+
+    // `name` is accepted as an alias for `command` so callers can use
+    // either field idiomatically.
+    let via_name = plan(&extension, "slash_command", json!({ "name": "usage" }));
+    assert_eq!(
+        via_name.actions,
+        vec![
+            Action::BracketedPaste("/usage".to_string()),
+            Action::Key(Key::Enter),
+        ]
+    );
+
+    // Empty / missing command — no-op (no actions, no intent change),
+    // analogous to the empty-send_prompt guard.
+    let empty = plan(&extension, "slash_command", json!({ "command": "" }));
+    assert!(empty.actions.is_empty());
+    assert!(empty.last_intent.is_none());
+
+    let missing = plan(&extension, "slash_command", json!({}));
+    assert!(missing.actions.is_empty());
+    assert!(missing.last_intent.is_none());
+}
+
 /// An empty `send_prompt` must NOT mark `last_intent = "prompt_submitted"`.
 /// The two Enters are no-ops on an empty input box, so Claude stays at
 /// idle and never renders the `✻ <Verb> for <duration>` completion
