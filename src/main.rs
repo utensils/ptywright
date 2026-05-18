@@ -297,7 +297,7 @@ fn logs_command(paths: &Paths, filter: Option<String>, lines: u64) -> ptywright:
                 }
             }
             Err(error) => {
-                eprintln!("ptywright logs --tail: read error: {error}");
+                eprintln!("ptywright logs: read error: {error}");
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -315,13 +315,7 @@ fn newest_log_file(logs_dir: &Path) -> ptywright::Result<PathBuf> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    // tracing-appender's daily rotation writes
-                    // `ptywright.YYYY-MM-DD` (no `.log` suffix in
-                    // some setups, with `.log` in others). Match both
-                    // by checking the `ptywright.` prefix only.
-                    name.starts_with("ptywright.")
-                })
+                .is_some_and(is_managed_log_filename)
         })
         .collect();
     if candidates.is_empty() {
@@ -332,6 +326,29 @@ fn newest_log_file(logs_dir: &Path) -> ptywright::Result<PathBuf> {
     }
     candidates.sort();
     Ok(candidates.pop().expect("non-empty after check"))
+}
+
+/// Whether `name` matches the daily-rotation pattern that
+/// `tracing-appender` writes: `ptywright.YYYY-MM-DD` with an optional
+/// `.log` suffix. Restricts the `ptywright logs` glob so unrelated
+/// dotfiles in the logs directory (`ptywright.notes`, `ptywright.tmp`,
+/// editor swapfiles) can't outrank the real log on lexicographic
+/// sort.
+fn is_managed_log_filename(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("ptywright.") else {
+        return false;
+    };
+    // Allow either `ptywright.YYYY-MM-DD` or
+    // `ptywright.YYYY-MM-DD.log`; the date part itself must look like
+    // a date (10 chars matching `dddd-dd-dd`).
+    let date_part = rest.strip_suffix(".log").unwrap_or(rest);
+    if date_part.len() != 10 {
+        return false;
+    }
+    date_part.chars().enumerate().all(|(i, c)| match i {
+        4 | 7 => c == '-',
+        _ => c.is_ascii_digit(),
+    })
 }
 
 fn generate_completions(shell: &str) -> ptywright::Result<ExitCode> {

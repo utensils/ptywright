@@ -1524,11 +1524,17 @@ fn classify_non_completed_state_does_not_request_turn_end_marker() {
 
 #[test]
 #[cfg(unix)]
-fn extension_handle_applies_host_marks_after_classify() {
-    // End-to-end: when classify returns `host_marks`, the host applies
-    // each one against the underlying session's transcript before
-    // returning the snapshot to the caller. The applied marker is
-    // observable via `Session::transcript_marker`.
+fn extension_handle_applies_plan_driven_mark_transcript_action() {
+    // End-to-end: when a plan contains `Action::MarkTranscript`, the
+    // host's `apply_actions` path applies it against the underlying
+    // session's transcript. The applied marker is observable via
+    // `Session::transcript_marker`. This covers the plan-driven
+    // marker path. The classifier-driven `host_marks` path is
+    // covered separately by `classify_completed_turn_requests_turn_end_marker_*`
+    // (which assert the snapshot's `host_marks` field) and by
+    // `ExtensionHandle::apply_host_marks` consuming that field
+    // immediately after classify returns (exercised on every send /
+    // wait path through the existing fixture-driven tests).
     use ptywright::session::Session;
     use ptywright::target::Target;
 

@@ -269,7 +269,8 @@ pub enum Action {
     /// [`crate::Session::mark_transcript`] alongside any PTY-mutating
     /// actions in the same plan. Plugins that want to mark from a
     /// classifier (where there is no plan) declare a
-    /// [`crate::HostMark`] on the returned snapshot instead.
+    /// [`HostMark`](crate::extension::HostMark) on the returned
+    /// snapshot instead.
     MarkTranscript { label: String },
 }
 

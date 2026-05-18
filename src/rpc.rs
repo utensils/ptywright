@@ -1891,21 +1891,28 @@ impl RpcServer {
         params: Option<Value>,
     ) -> std::result::Result<Value, RpcErrorPayload> {
         let params: AdapterCancelWaitParams = parse_params(params)?;
-        let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
-        let entry = shared.pending_waits.remove(&params.wait_id);
-        drop(shared);
-        let Some(entry) = entry else {
+        // Flip the token but DO NOT remove the entry — the originating
+        // wait's RAII cleanup guard owns the removal. Removing here
+        // would open a reuse race: between this remove and the
+        // cancelled wait's cleanup, a new wait could register the same
+        // id with a fresh token, and the cleanup guard would then
+        // remove the new entry. Read-and-flip leaves the entry in
+        // place; the cleanup guard handles the lifecycle when the
+        // wait actually unwinds.
+        let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        let Some(entry) = shared.pending_waits.get(&params.wait_id) else {
             // Idempotent: an unknown wait_id (already completed, never
-            // existed, or just removed by its own cleanup guard)
-            // returns `cancelled: false` rather than an error so
-            // callers don't have to race the wait to know whether the
-            // cancel landed.
+            // existed, or just cleaned up by its own guard) returns
+            // `cancelled: false` rather than an error so callers don't
+            // have to race the wait to know whether the cancel landed.
             return Ok(json!({ "cancelled": false }));
         };
+        let adapter = entry.adapter.clone();
         entry.token.cancel();
+        drop(shared);
         Ok(json!({
             "cancelled": true,
-            "adapter": entry.adapter,
+            "adapter": adapter,
             "wait_id": params.wait_id,
         }))
     }
@@ -3581,9 +3588,10 @@ mod tests {
         // (here two `RpcServer` instances sharing one `RpcServerState`,
         // mirroring how a Unix socket listener gives each client its
         // own server handler over the same registry). The originating
-        // wait must return promptly with the RPC-level Timeout error
-        // (-32001) — `wait_for_cancellable` surfaces `Error::Cancelled`
-        // which maps to the same Timeout code at the wire boundary.
+        // wait must return promptly with the RPC-level Cancelled error
+        // (-32005, distinct from -32001 Timeout) — `wait_for_cancellable`
+        // surfaces `Error::Cancelled` which maps to the dedicated
+        // `RpcErrorCode::Cancelled` wire code.
         use std::thread;
 
         let state = RpcServerState::default();

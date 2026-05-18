@@ -31,7 +31,7 @@ pub use config::{Config, LogFormat, LoggingConfig};
 pub use error::{Error, Result};
 pub use extension::{
     ActionPlan, ClassifyContext, Extension, ExtensionEvent, ExtensionHandle,
-    ExtensionStateSnapshot, LuaExtension, StateCandidate,
+    ExtensionStateSnapshot, HostMark, LuaExtension, StateCandidate,
 };
 pub use logging::{
     LogGuard, RedactingMakeWriter, RedactingWriter, cleanup_old_logs, init_for_oneshot,
@@ -39,7 +39,8 @@ pub use logging::{
 };
 pub use lua_plugin::{LuaPlugin, LuaPluginRegistry};
 pub use matcher::{
-    MatchResult, Matcher, MatcherContext, PluginRegistry, PredicateContext, PredicateOutcome,
+    MatchOutcome, MatchResult, Matcher, MatcherContext, PluginRegistry, PredicateContext,
+    PredicateOutcome,
 };
 pub use paths::{Paths, expand_tilde};
 pub use plugin::{

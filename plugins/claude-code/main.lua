@@ -1229,7 +1229,11 @@ function M.classify(input)
     if state == "completed_turn" and last_intent == "prompt_submitted" then
       local turn_start = markers["turn_start"]
       local turn_end = markers["turn_end"]
-      if not turn_end then
+      -- A turn_end from a previous turn is stale (turn_start has been
+      -- re-stamped by the new send_prompt at a later cursor, but
+      -- turn_end still points at the OLD turn's end). Treat as missing
+      -- so we re-emit a fresh host_mark for the current turn.
+      if not turn_end or (turn_start and turn_end < turn_start) then
         -- First completed_turn classify after submission — request the
         -- host stamp turn_end at the current cursor. Pre-compute the
         -- value the host will assign so this same response can already

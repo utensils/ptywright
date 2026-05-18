@@ -56,6 +56,18 @@ pub trait PluginRegistry: Send + Sync {
     /// errors as "predicate did not fire" rather than aborting the
     /// wait, so a transient plugin fault leaves the wait running for
     /// the next tick instead of poisoning the whole operation.
+    ///
+    /// **Determinism contract.** Predicates must return a stable
+    /// outcome for a given `(plugin, predicate, params, context)`
+    /// tuple — the wait loop is allowed to call `evaluate_predicate`
+    /// twice on the same tick when assembling the structured
+    /// [`MatchOutcome`]: once for the cheap boolean check and once
+    /// for the outcome construction. A predicate with side effects
+    /// or non-determinism (RNG, clock-based branching, mutating Lua
+    /// state) may report `true` on the first call and `false` on the
+    /// second, producing a successful wait whose `outcome` field is
+    /// `None`. Plugin authors: treat predicates as pure inspections
+    /// of the supplied context.
     fn evaluate_predicate(
         &self,
         plugin: &str,

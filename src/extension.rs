@@ -436,9 +436,18 @@ impl ExtensionHandle {
 
     /// Classify current state, surfacing plugin failures.
     pub fn try_state(&self) -> Result<ExtensionStateSnapshot> {
-        let snapshot = self.session.snapshot();
-        let transcript = self.session.transcript();
-        self.classify(&snapshot.plain_text, &transcript, snapshot.sequence, None)
+        // Atomic snapshot of screen + transcript + markers + cursor so
+        // a PTY read arriving mid-classify can't produce a context
+        // where the cursor is from a later moment than the screen.
+        let (snapshot, transcript, markers, cursor) = self.session.classify_input();
+        self.classify_atomic(
+            &snapshot.plain_text,
+            &transcript,
+            snapshot.sequence,
+            None,
+            &markers,
+            cursor,
+        )
     }
 
     /// Apply a named intent and return the post-apply state snapshot.
@@ -634,9 +643,33 @@ impl ExtensionHandle {
         sequence: u64,
         stable_ms: Option<u64>,
     ) -> Result<ExtensionStateSnapshot> {
-        let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+        // Caller has a screen / transcript / sequence from one snapshot
+        // moment but markers / cursor are read separately here, so a
+        // PTY read arriving between the caller's snapshot and our
+        // marker reads can produce a mismatched context. The
+        // wait-completion path (post-matcher-success classify) is
+        // unaffected — `wait_for_inner` already reads markers + cursor
+        // under the wait loop's state-lock acquisition.
+        //
+        // Prefer `classify_atomic` from new call sites that need
+        // strict atomicity; this signature is retained for the
+        // post-wait classify path that already has a consistent
+        // snapshot.
         let markers = self.session.transcript_markers();
         let cursor = self.session.transcript_chars_written();
+        self.classify_atomic(screen, transcript, sequence, stable_ms, &markers, cursor)
+    }
+
+    fn classify_atomic(
+        &self,
+        screen: &str,
+        transcript: &str,
+        sequence: u64,
+        stable_ms: Option<u64>,
+        markers: &std::collections::BTreeMap<String, u64>,
+        cursor: u64,
+    ) -> Result<ExtensionStateSnapshot> {
+        let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
         let ctx = ClassifyContext {
             screen,
             body_text: &body_text,
@@ -646,7 +679,7 @@ impl ExtensionHandle {
             last_intent: self.last_intent.as_deref(),
             stable_ms,
             completed_turn_stable_ms: Some(self.completed_turn_stable_ms),
-            markers: &markers,
+            markers,
             cursor,
         };
         let snapshot = self.extension.classify(&ctx)?;

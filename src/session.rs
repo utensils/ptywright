@@ -237,6 +237,33 @@ impl Session {
         state.terminal.snapshot(sequence)
     }
 
+    /// Snapshot every input the classifier needs (screen + transcript +
+    /// transcript markers + current cursor) under a single state-lock
+    /// acquisition so a PTY read arriving between component reads can't
+    /// produce a context where, e.g., `cursor` is from a later moment
+    /// than `screen`. Cheaper-than-N reads and atomic at the source.
+    ///
+    /// Caller-friendly types: owned strings/maps so the lock can drop
+    /// before the caller threads them through classification. The
+    /// returned `ScreenSnapshot` already owns its allocations.
+    #[must_use]
+    pub fn classify_input(
+        &self,
+    ) -> (
+        ScreenSnapshot,
+        String,
+        std::collections::BTreeMap<String, u64>,
+        u64,
+    ) {
+        let sequence = self.sequence();
+        let state = self.shared.state.lock().expect("session state poisoned");
+        let snapshot = state.terminal.snapshot(sequence);
+        let transcript = state.transcript.text();
+        let markers = state.transcript.markers().clone();
+        let cursor = state.transcript.chars_written();
+        (snapshot, transcript, markers, cursor)
+    }
+
     /// Whether the PTY reader or explicit lifecycle state indicates the session has finished.
     #[must_use]
     pub fn is_finished(&self) -> bool {
