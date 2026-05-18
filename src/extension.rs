@@ -473,9 +473,42 @@ impl ExtensionHandle {
         params: Value,
         timeout: Duration,
     ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        self.wait_inner(intent, params, timeout, None)
+    }
+
+    /// Cancellable variant of [`wait`](Self::wait). Polls the supplied
+    /// [`CancellationToken`] alongside the matcher; a flip from another
+    /// thread causes the wait to return [`Error::Cancelled`] (distinct
+    /// from [`Error::Timeout`]).
+    ///
+    /// Pair with `RpcServer`'s `pending_waits` registry to support
+    /// `adapter.cancel_wait { wait_id }` over JSON-RPC. The token
+    /// flows down to [`crate::Session::wait_for_cancellable`].
+    pub fn wait_with_cancel(
+        &self,
+        intent: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: &crate::session::CancellationToken,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        self.wait_inner(intent, params, timeout, Some(cancel))
+    }
+
+    fn wait_inner(
+        &self,
+        intent: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: Option<&crate::session::CancellationToken>,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
         let params = merge_wait_defaults(params, self.completed_turn_stable_ms);
         let matcher = self.extension.wait_matcher(intent, &params)?;
-        let result = self.session.wait_for(&matcher, timeout)?;
+        let result = match cancel {
+            Some(token) => self
+                .session
+                .wait_for_cancellable(&matcher, timeout, token)?,
+            None => self.session.wait_for(&matcher, timeout)?,
+        };
         let stable_ms = u64::try_from(result.stable_for.as_millis()).unwrap_or(u64::MAX);
         let state = self.classify(
             &result.snapshot.plain_text,
@@ -512,6 +545,23 @@ impl ExtensionHandle {
         let _state_after_send = self.send(send_intent, send_params)?;
         let wait_intent = wait_intent.unwrap_or("wait_turn_matcher");
         self.wait(wait_intent, wait_params, timeout)
+    }
+
+    /// Cancellable variant of [`turn`](Self::turn). The wait leg
+    /// observes the supplied [`CancellationToken`]; the send leg is
+    /// unaffected (PTY writes are fast and not worth interrupting).
+    pub fn turn_with_cancel(
+        &mut self,
+        send_intent: &str,
+        send_params: Value,
+        wait_intent: Option<&str>,
+        wait_params: Value,
+        timeout: Duration,
+        cancel: &crate::session::CancellationToken,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        let _state_after_send = self.send(send_intent, send_params)?;
+        let wait_intent = wait_intent.unwrap_or("wait_turn_matcher");
+        self.wait_with_cancel(wait_intent, wait_params, timeout, cancel)
     }
 
     /// Apply an action plan, requiring that the plan supply `last_intent` and

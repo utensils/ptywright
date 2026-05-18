@@ -82,6 +82,13 @@ struct RpcSharedState {
     /// handle without going through the shared-state mutex on every
     /// wait tick.
     plugin_registry: Arc<crate::lua_plugin::LuaPluginRegistry>,
+    /// Client-minted wait_id → CancellationToken for in-flight
+    /// `adapter.wait` / `adapter.turn` calls. `adapter.cancel_wait`
+    /// looks up the entry, flips the token, and lets the originating
+    /// wait return `Error::Cancelled`. Entries are inserted before
+    /// the wait blocks and removed when it returns (cancelled,
+    /// matched, or timed out — all three paths clean up).
+    pending_waits: HashMap<String, PendingWait>,
     /// Whether the `plugin.load` / `plugin.unload` RPC methods are enabled.
     /// `false` by default — operators opt in with `ptywright serve
     /// --allow-plugin-load`. CLI `--plugin` flags work regardless because
@@ -89,6 +96,41 @@ struct RpcSharedState {
     allow_plugin_load: bool,
     next_session: u64,
     next_extension: u64,
+}
+
+/// RAII guard that removes a `pending_waits` entry on drop.
+///
+/// Both successful matches and cancellation paths need to clean up;
+/// a guard removes the boilerplate from every `Result` exit in
+/// `adapter_wait` / `adapter_turn`. Holding a clone of
+/// `RpcServerState.shared` keeps the inner mutex reachable from
+/// Drop. The `wait_id` is `Option` so the same guard type covers the
+/// "no cancellation requested" branch with a no-op drop.
+struct PendingWaitCleanup {
+    shared: RpcServerState,
+    wait_id: Option<String>,
+}
+
+impl Drop for PendingWaitCleanup {
+    fn drop(&mut self) {
+        let Some(id) = self.wait_id.as_ref() else {
+            return;
+        };
+        if let Ok(mut shared) = self.shared.inner.lock() {
+            shared.pending_waits.remove(id);
+        }
+    }
+}
+
+/// One entry in [`RpcSharedState::pending_waits`].
+///
+/// `adapter` is recorded alongside the cancellation token so
+/// notifications and diagnostics can attribute a cancelled wait back
+/// to the adapter it was running against; v1 of `adapter.cancel_wait`
+/// looks up by `wait_id` alone, since the id is globally unique.
+struct PendingWait {
+    adapter: String,
+    token: crate::session::CancellationToken,
 }
 
 /// One entry in [`RpcSharedState::registered_plugins`].
@@ -154,6 +196,7 @@ impl Default for RpcSharedState {
             adapter_session: HashMap::new(),
             registered_plugins,
             plugin_registry,
+            pending_waits: HashMap::new(),
             allow_plugin_load: false,
             next_session: 1,
             next_extension: 1,
@@ -444,6 +487,14 @@ struct AdapterWaitParams {
     #[serde(default)]
     params: Value,
     timeout_ms: Option<u64>,
+    /// Optional client-minted identifier for the wait. When supplied,
+    /// the server registers a `CancellationToken` keyed by this id so
+    /// `adapter.cancel_wait { wait_id }` from any connection can
+    /// abort the wait early. Must be unique across all currently
+    /// in-flight waits on the server — duplicates are rejected with
+    /// `-32602 InvalidParams`.
+    #[serde(default)]
+    wait_id: Option<String>,
 }
 
 /// Atomic send-then-wait used by [`RpcServer::adapter_turn`].
@@ -475,6 +526,24 @@ struct TurnWaitParams {
     #[serde(default)]
     params: Value,
     timeout_ms: Option<u64>,
+    /// Optional client-minted wait identifier. Same contract as
+    /// [`AdapterWaitParams::wait_id`] — registers a cancellable token
+    /// so `adapter.cancel_wait { wait_id }` from any connection can
+    /// interrupt the wait leg of the turn.
+    #[serde(default)]
+    wait_id: Option<String>,
+}
+
+/// Params for `adapter.cancel_wait`. Identifies an in-flight wait by
+/// its client-minted `wait_id` and flips the bound
+/// [`crate::CancellationToken`] so the originating
+/// `adapter.wait` / `adapter.turn` call returns
+/// [`crate::Error::Cancelled`].
+#[derive(Debug, Deserialize)]
+struct AdapterCancelWaitParams {
+    /// Client-minted identifier passed to the originating
+    /// `adapter.wait` or `adapter.turn` via its `wait_id` field.
+    wait_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,6 +936,7 @@ impl RpcServer {
                     "adapter.state",
                     "adapter.send",
                     "adapter.wait",
+                    "adapter.cancel_wait",
                     "adapter.turn",
                     "adapter.snapshot",
                     "adapter.transcript",
@@ -897,6 +967,7 @@ impl RpcServer {
             "adapter.state" => self.adapter_state(request.params),
             "adapter.send" => self.adapter_send(request.params),
             "adapter.wait" => self.adapter_wait(request.params),
+            "adapter.cancel_wait" => self.adapter_cancel_wait(request.params),
             "adapter.turn" => self.adapter_turn(request.params),
             "adapter.snapshot" => self.adapter_snapshot(request.params),
             "adapter.transcript" => self.adapter_transcript(request.params),
@@ -1736,24 +1807,106 @@ impl RpcServer {
             .intent
             .unwrap_or_else(|| DEFAULT_WAIT_INTENT.to_string());
         let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(120_000));
+        // If the caller supplied `wait_id`, mint a CancellationToken
+        // and register it BEFORE we acquire the per-adapter mutex so
+        // a same-id cancel arriving from another connection during
+        // the brief lock-acquire window is not lost.
+        let cancel_token =
+            self.register_pending_wait(&params.adapter, params.wait_id.as_deref())?;
+        // Cleanup guard: dropping `Cleanup` removes the registry entry
+        // regardless of how this function returns (success, timeout,
+        // cancel, error). Using a guard avoids duplicating the
+        // remove call at every exit path below.
+        let _cleanup = PendingWaitCleanup {
+            shared: self.shared.clone(),
+            wait_id: params.wait_id.clone(),
+        };
         let entry_arc = self.extension(&params.adapter)?;
         // Holding the per-adapter mutex across `wait` blocks concurrent
         // sends to the same adapter for the duration of the wait. That is
         // intentional for v1 — wait + send on the same adapter from two
-        // clients would be ambiguous anyway. A future `adapter.cancel`
-        // method can break out of the wait without needing the mutex.
+        // clients would be ambiguous anyway. With the cancellation token
+        // bound here, `adapter.cancel_wait` from another connection can
+        // break out of the wait without contesting the per-adapter mutex.
         let entry = entry_arc.lock().expect("extension poisoned");
-        let (state, outcome) = entry
-            .handle
-            .wait(&intent, params.params, timeout)
-            .map_err(rpc_error_from_error)?;
+        let result = match &cancel_token {
+            Some(token) => entry
+                .handle
+                .wait_with_cancel(&intent, params.params, timeout, token),
+            None => entry.handle.wait(&intent, params.params, timeout),
+        };
+        let (state, outcome) = result.map_err(rpc_error_from_error)?;
         // Always emit `matched` so consumers don't have to branch on key
         // presence. Today every successful wait carries a `Some(outcome)`;
         // `null` is reserved for future paths (e.g. cancellation hooks)
         // that surface a `MatchResult` without a satisfying branch.
-        Ok(json!({
+        let mut response = json!({
             "state": state,
             "matched": outcome,
+        });
+        if let Some(id) = params.wait_id {
+            response["wait_id"] = json!(id);
+        }
+        Ok(response)
+    }
+
+    /// Register a [`crate::CancellationToken`] in `pending_waits`
+    /// when the caller supplied a `wait_id`. Returns the token (which
+    /// the wait method then passes to `wait_with_cancel`) or `None` if
+    /// the caller didn't request cancellability.
+    ///
+    /// Duplicate wait_id is rejected with `InvalidParams` — clients
+    /// should mint a fresh id (UUIDv4 etc.) per wait. The check is
+    /// strict to surface authoring bugs early rather than silently
+    /// share a token between two unrelated waits.
+    fn register_pending_wait(
+        &self,
+        adapter: &str,
+        wait_id: Option<&str>,
+    ) -> std::result::Result<Option<crate::session::CancellationToken>, RpcErrorPayload> {
+        let Some(wait_id) = wait_id else {
+            return Ok(None);
+        };
+        let token = crate::session::CancellationToken::new();
+        let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        if shared.pending_waits.contains_key(wait_id) {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!("wait_id `{wait_id}` is already in flight"),
+            )
+                .into());
+        }
+        shared.pending_waits.insert(
+            wait_id.to_string(),
+            PendingWait {
+                adapter: adapter.to_string(),
+                token: token.clone(),
+            },
+        );
+        Ok(Some(token))
+    }
+
+    fn adapter_cancel_wait(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        let params: AdapterCancelWaitParams = parse_params(params)?;
+        let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+        let entry = shared.pending_waits.remove(&params.wait_id);
+        drop(shared);
+        let Some(entry) = entry else {
+            // Idempotent: an unknown wait_id (already completed, never
+            // existed, or just removed by its own cleanup guard)
+            // returns `cancelled: false` rather than an error so
+            // callers don't have to race the wait to know whether the
+            // cancel landed.
+            return Ok(json!({ "cancelled": false }));
+        };
+        entry.token.cancel();
+        Ok(json!({
+            "cancelled": true,
+            "adapter": entry.adapter,
+            "wait_id": params.wait_id,
         }))
     }
 
@@ -1789,22 +1942,43 @@ impl RpcServer {
         self.check_adapter_permission("adapter.send", &params.adapter)?;
         self.check_adapter_permission("adapter.wait", &params.adapter)?;
         let timeout = Duration::from_millis(params.wait.timeout_ms.unwrap_or(120_000));
+        // Same `wait_id` registration + RAII cleanup as `adapter.wait`
+        // — only the wait leg participates in cancellation; the send
+        // leg is fast and not interruptible.
+        let cancel_token =
+            self.register_pending_wait(&params.adapter, params.wait.wait_id.as_deref())?;
+        let _cleanup = PendingWaitCleanup {
+            shared: self.shared.clone(),
+            wait_id: params.wait.wait_id.clone(),
+        };
         let entry_arc = self.extension(&params.adapter)?;
         let mut entry = entry_arc.lock().expect("extension poisoned");
-        let (state, outcome) = entry
-            .handle
-            .turn(
+        let result = match &cancel_token {
+            Some(token) => entry.handle.turn_with_cancel(
                 &params.send.intent,
                 params.send.params,
                 params.wait.intent.as_deref(),
                 params.wait.params,
                 timeout,
-            )
-            .map_err(rpc_error_from_error)?;
-        Ok(json!({
+                token,
+            ),
+            None => entry.handle.turn(
+                &params.send.intent,
+                params.send.params,
+                params.wait.intent.as_deref(),
+                params.wait.params,
+                timeout,
+            ),
+        };
+        let (state, outcome) = result.map_err(rpc_error_from_error)?;
+        let mut response = json!({
             "state": state,
             "matched": outcome,
-        }))
+        });
+        if let Some(id) = params.wait.wait_id {
+            response["wait_id"] = json!(id);
+        }
+        Ok(response)
     }
 
     /// `adapter.snapshot` — passthrough to the adapter's underlying session
@@ -3382,6 +3556,131 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
             ),
         );
+    }
+
+    #[test]
+    fn adapter_cancel_wait_unknown_id_returns_cancelled_false() {
+        // Idempotent: cancelling a wait_id that has no in-flight wait
+        // (already completed, never existed, or just expired) must
+        // return `cancelled: false` rather than an error so callers
+        // don't race the wait to know whether the cancel landed.
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.cancel_wait","params":{"wait_id":"never-was-registered"}}"#,
+        );
+        assert_eq!(response["result"]["cancelled"], false);
+    }
+
+    #[test]
+    fn adapter_cancel_wait_interrupts_in_flight_wait_from_another_connection() {
+        // The whole point of wait_id-keyed cancellation: a wait blocked
+        // on a long timeout in one connection's call stack can be
+        // interrupted by a cancel_wait from a SEPARATE connection
+        // (here two `RpcServer` instances sharing one `RpcServerState`,
+        // mirroring how a Unix socket listener gives each client its
+        // own server handler over the same registry). The originating
+        // wait must return promptly with the RPC-level Timeout error
+        // (-32001) — `wait_for_cancellable` surfaces `Error::Cancelled`
+        // which maps to the same Timeout code at the wire boundary.
+        use std::thread;
+
+        let state = RpcServerState::default();
+        let mut server = RpcServer::with_state(state.clone());
+
+        let start_response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","sleep 30"]}}"#,
+        );
+        let adapter = start_response["result"]["adapter"]
+            .as_str()
+            .expect("adapter id present")
+            .to_string();
+
+        // Wait on its own `RpcServer` — the wait holds `&mut self` for
+        // its full duration, exactly like a real connection would.
+        let wait_state = state.clone();
+        let wait_adapter = adapter.clone();
+        let wait_thread = thread::spawn(move || {
+            let mut wait_server = RpcServer::with_state(wait_state);
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.wait","params":{{"adapter":"{wait_adapter}","intent":"wait_turn_matcher","timeout_ms":30000,"wait_id":"cancel-test-1"}}}}"#
+            );
+            handle(&mut wait_server, &request)
+        });
+
+        // Give the wait thread a moment to register itself in
+        // pending_waits before we issue the cancel.
+        thread::sleep(Duration::from_millis(200));
+
+        // Cancel from a third (still-separate) connection.
+        let mut cancel_server = RpcServer::with_state(state.clone());
+        let cancel_response = handle(
+            &mut cancel_server,
+            r#"{"jsonrpc":"2.0","id":3,"method":"adapter.cancel_wait","params":{"wait_id":"cancel-test-1"}}"#,
+        );
+        assert_eq!(
+            cancel_response["result"]["cancelled"], true,
+            "cancel must find the pending wait; got {cancel_response}"
+        );
+        assert_eq!(cancel_response["result"]["adapter"], adapter);
+
+        let wait_response = wait_thread.join().expect("wait thread panic");
+        let error_code = wait_response["error"]["code"]
+            .as_i64()
+            .expect("cancelled wait must return a JSON-RPC error code");
+        assert_eq!(
+            error_code, -32005,
+            "cancelled wait must surface as Cancelled (-32005); got {wait_response}"
+        );
+
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn register_pending_wait_rejects_duplicate_wait_id() {
+        // The per-adapter mutex held by `adapter.wait` makes a
+        // duplicate-id scenario hard to reproduce end-to-end (the
+        // second wait blocks on the entry lock until the first
+        // releases, by which point cleanup has removed the entry).
+        // Test `register_pending_wait` directly so the guarantee is
+        // covered: the helper itself rejects the second call.
+        let state = RpcServerState::default();
+        let server = RpcServer::with_state(state);
+
+        let token = server
+            .register_pending_wait("adapter-1", Some("dup-id"))
+            .expect("first registration succeeds");
+        assert!(token.is_some(), "wait_id should mint a token");
+
+        let err = server
+            .register_pending_wait("adapter-2", Some("dup-id"))
+            .expect_err("duplicate wait_id must error");
+        assert_eq!(
+            err.code,
+            RpcErrorCode::InvalidParams,
+            "duplicate must surface as InvalidParams"
+        );
+        assert!(
+            err.message.contains("dup-id"),
+            "error message should name the duplicate id; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn register_pending_wait_returns_none_when_wait_id_omitted() {
+        let state = RpcServerState::default();
+        let server = RpcServer::with_state(state);
+        let token = server
+            .register_pending_wait("adapter-x", None)
+            .expect("no wait_id is a no-op");
+        assert!(token.is_none(), "omitted wait_id must not allocate a token");
     }
 
     #[test]
