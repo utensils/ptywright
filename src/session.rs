@@ -1,12 +1,13 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::action::{Action, Key};
+use crate::action::{Action, Key, Signal};
 use crate::error::{Error, Result};
 use crate::matcher::{MatchResult, Matcher, MatcherContext};
 use crate::redaction::RedactionPolicy;
@@ -45,6 +46,10 @@ struct SharedState {
     changed: Condvar,
     sequence: AtomicU64,
     closed: AtomicBool,
+    /// Active in-process event subscribers. Each `Session::events()`
+    /// call appends one sender; subscribers whose receiver was
+    /// dropped are pruned the next time we try to fire an event.
+    subscribers: Mutex<Vec<mpsc::Sender<SessionEvent>>>,
 }
 
 /// Exit status for a completed session child process.
@@ -56,6 +61,67 @@ pub struct SessionExitStatus {
     pub success: bool,
     /// Human-readable status text from the backend.
     pub message: String,
+}
+
+/// Cancellable wait coordinator used by [`Session::wait_for_cancellable`].
+///
+/// A `CancellationToken` is a thin `Arc<AtomicBool>` wrapper. Clone it
+/// freely — every clone observes the same flag. Calling
+/// [`CancellationToken::cancel`] flips the flag; ongoing waits poll it
+/// on each tick and return [`Error::Cancelled`] when set.
+///
+/// Pair with `wait_for_cancellable` when you need to break out of a
+/// long-running wait from another thread or RPC connection (e.g.
+/// claudette stopping a turn from its UI while ptywright is still
+/// waiting for the classifier's turn-boundary anchor to fire).
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Create a fresh, un-cancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flip the token. Already-cancelled tokens stay cancelled — the
+    /// transition is a one-way edge. Subsequent waits return
+    /// [`Error::Cancelled`] immediately.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the token has been cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Events emitted on the in-process subscription channel returned by
+/// [`Session::events`].
+///
+/// Subscribers are free to fetch the full state on receipt (call
+/// [`Session::snapshot`] / [`Session::transcript_delta_since`]) — the
+/// event itself carries only the cheap "something happened" signal so
+/// the reader thread doesn't pay snapshot-cloning cost on every PTY
+/// read for subscribers that don't care.
+///
+/// The channel is intentionally `std::sync::mpsc` so embedding callers
+/// can subscribe without pulling in an async runtime.
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    /// PTY sequence advanced (new screen or transcript bytes). Pair
+    /// with `Session::sequence()` / `Session::snapshot()` /
+    /// `Session::transcript_delta_since()` to retrieve the actual
+    /// change.
+    Changed { sequence: u64 },
+    /// Child process exited. The status mirrors `Session::wait`'s
+    /// return value; subscribers receiving this can assume no further
+    /// events will fire on the channel.
+    Exited(SessionExitStatus),
 }
 
 /// A running PTY-backed terminal session.
@@ -78,6 +144,12 @@ impl Session {
         if let Some(cwd) = &config.target.cwd {
             command.cwd(cwd.as_os_str());
         }
+        // `clear_env` strips the inherited parent env before applying
+        // the Target's overlay. Pair with a plugin manifest's
+        // `default_target.required_env` for a fully reproducible layout.
+        if config.target.clear_env {
+            command.env_clear();
+        }
         for (key, value) in &config.target.env {
             command.env(key, value);
         }
@@ -97,6 +169,7 @@ impl Session {
             changed: Condvar::new(),
             sequence: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            subscribers: Mutex::new(Vec::new()),
         });
 
         let read_shared = Arc::clone(&shared);
@@ -200,6 +273,70 @@ impl Session {
         delta
     }
 
+    /// Subscribe to in-process [`SessionEvent`] notifications.
+    ///
+    /// Returns a `std::sync::mpsc::Receiver<SessionEvent>` that yields
+    /// `Changed` on every PTY read and `Exited` once when the child
+    /// process ends. Each call returns an independent receiver; the
+    /// host fans the same event out to every active subscriber's
+    /// channel (multiple producer sites inside the library — reader
+    /// thread, `wait`, `terminate`, `kill` — drive a single
+    /// subscriber-owned receiver). Call `events()` multiple times to
+    /// fan out to independent consumers. Dropping the receiver
+    /// silently removes the subscription on the next event tick.
+    ///
+    /// Events carry only the cheap "something happened" signal; pair
+    /// with [`Session::sequence`] / [`Session::snapshot`] /
+    /// [`Session::transcript_delta_since`] to retrieve the actual
+    /// change. This keeps the reader thread cheap when subscribers
+    /// don't care about the full screen.
+    pub fn events(&self) -> mpsc::Receiver<SessionEvent> {
+        let (tx, rx) = mpsc::channel();
+        self.shared
+            .subscribers
+            .lock()
+            .expect("subscriber list poisoned")
+            .push(tx);
+        rx
+    }
+
+    /// Place a label-keyed marker at the current transcript cursor. See
+    /// [`crate::Transcript::mark`] for the storage semantics.
+    pub fn mark_transcript(&self, label: impl Into<String>) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .mark(label)
+    }
+
+    /// Cursor previously placed at `label`, or `None` if no such marker
+    /// exists. Pairs with [`Session::transcript_slice`] to retrieve the
+    /// bytes between two markers.
+    #[must_use]
+    pub fn transcript_marker(&self, label: &str) -> Option<u64> {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .marker(label)
+    }
+
+    /// Text between two transcript cursors, or `None` if either cursor
+    /// has been evicted from the ring buffer. See
+    /// [`crate::Transcript::slice_between`].
+    #[must_use]
+    pub fn transcript_slice(&self, a: u64, b: u64) -> Option<String> {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .slice_between(a, b)
+    }
+
     /// Send an action to the session.
     pub fn send(&self, action: Action) -> Result<()> {
         match action {
@@ -209,6 +346,7 @@ impl Session {
             Action::Resize(size) => self.resize(size),
             Action::Interrupt => self.send_key(Key::CtrlC),
             Action::Eof => self.send_key(Key::CtrlD),
+            Action::Signal(signal) => self.signal(signal),
             Action::Kill => self.kill(),
         }
     }
@@ -270,6 +408,39 @@ impl Session {
 
     /// Wait until a matcher succeeds or the timeout expires.
     pub fn wait_for(&self, matcher: &Matcher, timeout: Duration) -> Result<MatchResult> {
+        self.wait_for_inner(matcher, timeout, None)
+    }
+
+    /// Wait until a matcher succeeds, the timeout expires, or the
+    /// provided [`CancellationToken`] is flipped.
+    ///
+    /// Returns [`Error::Cancelled`] on a cancel (distinct from
+    /// [`Error::Timeout`]). The token is observed on every classifier
+    /// tick *and* on every Condvar wakeup, so a cancel from another
+    /// thread takes effect within one polling loop iteration even if
+    /// no new PTY bytes are arriving — the Condvar timeout is capped
+    /// at `CANCEL_POLL_INTERVAL` (50 ms) so an idle wait still wakes
+    /// promptly to check the flag.
+    pub fn wait_for_cancellable(
+        &self,
+        matcher: &Matcher,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<MatchResult> {
+        self.wait_for_inner(matcher, timeout, Some(cancel))
+    }
+
+    fn wait_for_inner(
+        &self,
+        matcher: &Matcher,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<MatchResult> {
+        /// Upper bound on a single Condvar `wait_timeout` so a
+        /// cancellation flag flip in another thread takes effect
+        /// promptly even when no PTY bytes are arriving.
+        const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
         let started = Instant::now();
         let deadline = started + timeout;
         let mut guard = self.shared.state.lock().expect("session state poisoned");
@@ -277,6 +448,11 @@ impl Session {
         let mut stable_since = started;
 
         loop {
+            if let Some(token) = cancel
+                && token.is_cancelled()
+            {
+                return Err(Error::Cancelled);
+            }
             let sequence = self.sequence();
             if sequence != stable_sequence {
                 stable_sequence = sequence;
@@ -323,12 +499,26 @@ impl Session {
                     wait_for = wait_for.min(min_stable - stable_for);
                 }
             }
+            // Cap the Condvar wait so a cancellation flag flip from
+            // another thread wakes within CANCEL_POLL_INTERVAL even
+            // when no PTY bytes are arriving. The cap only applies
+            // when a cancel token is bound; the non-cancellable path
+            // keeps its original "wait until deadline or PTY tick"
+            // behaviour to avoid spurious wakeups on long idle waits.
+            if cancel.is_some() {
+                wait_for = wait_for.min(CANCEL_POLL_INTERVAL);
+            }
             let (next_guard, timeout_result) = self
                 .shared
                 .changed
                 .wait_timeout(guard, wait_for)
                 .expect("session state poisoned");
             guard = next_guard;
+            if let Some(token) = cancel
+                && token.is_cancelled()
+            {
+                return Err(Error::Cancelled);
+            }
             if timeout_result.timed_out() && Instant::now() >= deadline {
                 return Err(Error::Timeout);
             }
@@ -340,11 +530,13 @@ impl Session {
         let status = self.child.lock().expect("child lock poisoned").wait()?;
         self.shared.closed.store(true, Ordering::SeqCst);
         self.shared.changed.notify_all();
-        Ok(SessionExitStatus {
+        let exit = SessionExitStatus {
             code: status.exit_code(),
             success: status.success(),
             message: status.to_string(),
-        })
+        };
+        broadcast_event(&self.shared, SessionEvent::Exited(exit.clone()));
+        Ok(exit)
     }
 
     /// Kill the child process.
@@ -353,6 +545,150 @@ impl Session {
         self.shared.changed.notify_all();
         self.child.lock().expect("child lock poisoned").kill()?;
         Ok(())
+    }
+
+    /// Process id of the spawned child, when known. Returns `None` if the
+    /// backend never exposed one or the child has already been reaped —
+    /// the underlying `portable_pty::Child::process_id` contract.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.lock().expect("child lock poisoned").process_id()
+    }
+
+    /// Send a POSIX-style signal to the child. See [`Signal`] for
+    /// per-platform behaviour; on Windows only [`Signal::Term`],
+    /// [`Signal::Kill`], and [`Signal::Int`] are honoured and every other
+    /// variant returns [`Error::UnsupportedOnPlatform`].
+    pub fn signal(&self, signal: Signal) -> Result<()> {
+        match signal {
+            Signal::Int => self.send_key(Key::CtrlC),
+            Signal::Kill => self.kill(),
+            _ => self.signal_native(signal),
+        }
+    }
+
+    /// Graceful-then-forceful shutdown: send [`Signal::Term`], poll for the
+    /// child up to `grace`, then [`Signal::Kill`] if still running. Returns
+    /// the observed [`SessionExitStatus`] either way. Mirrors the SIGTERM →
+    /// poll → SIGKILL ladder that consumers like claudette build manually.
+    pub fn terminate(&self, grace: Duration) -> Result<SessionExitStatus> {
+        // Best-effort SIGTERM. If the platform rejects it (Windows for
+        // non-Term/Kill/Int variants is impossible here since we're
+        // sending Term, but the backend may still error), fall through
+        // to the hard kill below — we're committed to ending the child.
+        if let Err(error) = self.signal_native(Signal::Term) {
+            tracing::debug!(?error, "ptywright: terminate SIGTERM rejected; escalating");
+        }
+
+        let deadline = Instant::now() + grace;
+        loop {
+            {
+                let mut child = self.child.lock().expect("child lock poisoned");
+                if let Some(status) = child.try_wait()? {
+                    self.shared.closed.store(true, Ordering::SeqCst);
+                    self.shared.changed.notify_all();
+                    let exit = SessionExitStatus {
+                        code: status.exit_code(),
+                        success: status.success(),
+                        message: status.to_string(),
+                    };
+                    drop(child);
+                    broadcast_event(&self.shared, SessionEvent::Exited(exit.clone()));
+                    return Ok(exit);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // Cap the sleep at the remaining time-to-deadline so the
+            // ladder doesn't overshoot `grace` by up to 20 ms on the
+            // last iteration. `Duration::ZERO` short-circuits cleanly
+            // through `min` for callers passing `grace == 0`.
+            thread::sleep(Duration::from_millis(20).min(deadline.saturating_duration_since(now)));
+        }
+
+        // Still alive past the grace window — fall back to the hard kill
+        // path. We deliberately use `wait()` (not `try_wait()`) afterwards
+        // so the returned status reflects the kill rather than a stale
+        // "still running" reading.
+        self.kill()?;
+        self.wait()
+    }
+
+    #[cfg(unix)]
+    fn signal_native(&self, signal: Signal) -> Result<()> {
+        // Translate to libc constants. Unix supports every variant; the
+        // Int/Kill branches in `signal()` short-circuit before reaching
+        // here, but mapping them keeps the table exhaustive in one place.
+        let libc_signal: libc::c_int = match signal {
+            Signal::Term => libc::SIGTERM,
+            Signal::Hup => libc::SIGHUP,
+            Signal::Quit => libc::SIGQUIT,
+            Signal::Int => libc::SIGINT,
+            Signal::Kill => libc::SIGKILL,
+            Signal::User1 => libc::SIGUSR1,
+            Signal::User2 => libc::SIGUSR2,
+        };
+        let pid = self.require_pid()?;
+        // SAFETY: `kill` is a thin libc wrapper; we pass an i32 pid and a
+        // valid signal constant. The call is async-signal-safe and has
+        // no preconditions on Rust state.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc_signal) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::Io(std::io::Error::last_os_error()))
+        }
+    }
+
+    #[cfg(windows)]
+    fn signal_native(&self, signal: Signal) -> Result<()> {
+        // Windows has no POSIX-equivalent for SIGHUP / SIGQUIT / SIGUSR*.
+        // `Term` maps to a best-effort `taskkill /T /PID` — graceful
+        // enough to give the child a chance to clean up while still
+        // ending the process tree. `Int` is handled by the caller via
+        // the PTY Ctrl-C byte, and `Kill` is the hard-kill path on the
+        // existing `ChildKiller` trait. `UnsupportedOnPlatform` is the
+        // static "no equivalent" signal — runtime failures (taskkill
+        // exits non-zero because the process is already gone or the
+        // binary is missing) surface as `Error::Io` so callers can
+        // tell "this signal kind is not supported on Windows" from
+        // "we tried, the OS rejected it."
+        if !matches!(signal, Signal::Term) {
+            return Err(Error::UnsupportedOnPlatform(format!(
+                "signal `{signal:?}` has no Windows equivalent"
+            )));
+        }
+        let pid = self.require_pid()?;
+        let status = std::process::Command::new("taskkill")
+            .args(["/T", "/PID", &pid.to_string()])
+            .status()
+            .map_err(Error::Io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::Io(std::io::Error::other(format!(
+                "taskkill exited with status {status:?}"
+            ))))
+        }
+    }
+
+    /// Resolve the child PID or return an `Error::Io` with
+    /// `NotFound`. The `pid()` accessor's `None` covers two cases —
+    /// "backend never exposed a pid" (permanent) and "child already
+    /// reaped" (transient) — but both manifest the same way to a
+    /// caller asking to signal: the PID is unavailable. Mapping to
+    /// `Error::Closed` would conflate this with the user-driven
+    /// close path; `Error::Io(NotFound)` matches the standard Rust
+    /// convention for "asked for a thing, not there."
+    fn require_pid(&self) -> Result<u32> {
+        self.pid().ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no child pid available for this session",
+            ))
+        })
     }
 
     fn write_all(&self, bytes: &[u8]) -> Result<()> {
@@ -391,13 +727,35 @@ fn read_loop(reader: &mut Box<dyn Read + Send>, shared: &SharedState) {
                     eprintln!("ptywright: transcript write error: {message}");
                     break;
                 }
-                shared.sequence.fetch_add(1, Ordering::SeqCst);
+                let sequence = shared.sequence.fetch_add(1, Ordering::SeqCst) + 1;
                 drop(state);
                 shared.changed.notify_all();
+                broadcast_event(shared, SessionEvent::Changed { sequence });
             }
             Err(_) => break,
         }
     }
+}
+
+/// Iterate every registered subscriber's sender, drop any whose
+/// receiver has hung up. Called from the reader thread on every PTY
+/// read and from the lifecycle paths (`wait`, `kill`) when emitting
+/// `Exited`. Held under a short-lived mutex; subscribers that block
+/// would never reach the slow path because we use
+/// `mpsc::Sender::send` (unbounded) which only fails on a dropped
+/// receiver.
+///
+/// Performance note: the event is cloned once per active subscriber
+/// while the mutex is held — `mpsc::Sender::send` consumes the value
+/// by design, so a single shared reference cannot fan out. The hot
+/// path is the reader thread, so subscriber count should stay small
+/// (typically O(1) — one REPL, one Tauri bridge). If a future
+/// consumer needs broad fan-out, switch to `crossbeam_channel` or a
+/// reference-counted event type rather than scaling the clone-per-tx
+/// pattern.
+fn broadcast_event(shared: &SharedState, event: SessionEvent) {
+    let mut subs = shared.subscribers.lock().expect("subscriber list poisoned");
+    subs.retain(|tx| tx.send(event.clone()).is_ok());
 }
 
 fn to_pty_size(size: TerminalSize) -> PtySize {
@@ -555,6 +913,206 @@ mod tests {
             transcript.contains("\x1b[201~"),
             "Action::BracketedPaste must emit the CSI 201~ end marker: {transcript:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellable_wait_returns_cancelled_when_token_flipped_from_another_thread() {
+        // Spawn a long-running shell, attach a cancellable wait for a
+        // string that will never appear, flip the cancel token from a
+        // sibling thread, and assert we get Error::Cancelled within a
+        // small window (not the full timeout).
+        let session = Arc::new(
+            Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+                .expect("spawn sleep"),
+        );
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            canceller.cancel();
+        });
+
+        let session_for_wait = Arc::clone(&session);
+        let started = Instant::now();
+        let result = session_for_wait.wait_for_cancellable(
+            &Matcher::ContainsText("never appears".into()),
+            Duration::from_secs(30),
+            &token,
+        );
+        let elapsed = started.elapsed();
+        match result {
+            Err(Error::Cancelled) => {}
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel must wake the wait within the poll interval; elapsed={elapsed:?}"
+        );
+        let _ = session.kill();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellable_wait_still_returns_match_when_not_cancelled() {
+        // Sanity: the cancellable path must behave identically to the
+        // plain wait_for path when the token is never flipped.
+        let session = Session::spawn_target(echo_target()).expect("spawn echo");
+        let token = CancellationToken::new();
+        let result = session
+            .wait_for_cancellable(
+                &Matcher::ContainsText("ready".into()),
+                Duration::from_secs(5),
+                &token,
+            )
+            .expect("wait should match");
+        assert!(result.matched);
+        let _ = session.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellable_wait_pre_flipped_token_returns_immediately() {
+        // Defensive: a token that's already cancelled before the wait
+        // starts must return Error::Cancelled on the first tick, not
+        // wait the full timeout.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+            .expect("spawn sleep");
+        let token = CancellationToken::new();
+        token.cancel();
+        let started = Instant::now();
+        let result = session.wait_for_cancellable(
+            &Matcher::ContainsText("never".into()),
+            Duration::from_secs(30),
+            &token,
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        let _ = session.kill();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn events_receiver_observes_changed_and_exited() {
+        // In-process subscription. The reader thread can fire `Changed`
+        // before `events()` is called if the echo child finishes
+        // before the test reaches subscribe — that race makes a strict
+        // "must see Changed" assertion flaky. We subscribe immediately
+        // after spawn (cheap, the worst case is we miss the first
+        // tick) and then drive a longer child so at least one PTY read
+        // happens after subscription.
+        let session = Session::spawn_target(
+            Target::new("/bin/sh").args(["-lc", "printf one; sleep 0.05; printf two"]),
+        )
+        .expect("spawn shell");
+        let rx = session.events();
+        let status = session.wait().expect("wait child");
+        assert!(status.success);
+
+        // Drain everything currently buffered. Channel is unbounded
+        // mpsc so try_iter() yields the full backlog without blocking.
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Changed { .. })),
+            "expected at least one Changed event; got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::Exited(_))),
+            "expected an Exited event; got {events:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn events_subscriber_dropped_is_pruned_silently() {
+        // Defensive: subscribing and dropping the receiver must not
+        // poison the subscriber list or block the broadcaster. After
+        // dropping the first rx, a second subscriber should still
+        // receive events normally.
+        let session = Session::spawn_target(echo_target()).expect("spawn echo");
+        let _rx_dropped = session.events();
+        drop(_rx_dropped);
+        let rx_kept = session.events();
+        let _ = session.wait();
+        let events: Vec<SessionEvent> = rx_kept.try_iter().collect();
+        assert!(
+            !events.is_empty(),
+            "second subscriber must still receive events after first was dropped"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_is_reported_while_child_is_alive() {
+        // Sanity-check the PID accessor — the child runs long enough
+        // that `pid()` must return Some(_) before we kill it. We can't
+        // assert any particular value, but presence is a real claim.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 5"]))
+            .expect("spawn sleep");
+        assert!(session.pid().is_some());
+        session.kill().expect("kill child");
+        let _ = session.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminate_sends_sigterm_then_returns_exit_status() {
+        // POSIX `sleep` exits cleanly on SIGTERM, so the graceful path
+        // is exercised end-to-end — no SIGKILL escalation should fire
+        // within the 2s grace window.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let status = session
+            .terminate(Duration::from_secs(2))
+            .expect("terminate session");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "graceful terminate should not wait the full grace window"
+        );
+        // SIGTERM exit codes vary by platform/shell — we just assert
+        // the child observably ended rather than locking in `code`.
+        assert!(!status.message.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminate_escalates_to_kill_when_child_ignores_sigterm() {
+        // `trap '' TERM` makes the shell ignore SIGTERM; the ladder
+        // must then escalate to SIGKILL inside the grace window.
+        let session =
+            Session::spawn_target(Target::new("/bin/sh").args(["-lc", "trap '' TERM; sleep 30"]))
+                .expect("spawn shell");
+        let status = session
+            .terminate(Duration::from_millis(150))
+            .expect("terminate session");
+        assert!(!status.message.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_signal_routes_through_session_signal() {
+        // End-to-end: dispatching `Action::Signal(Term)` must reach the
+        // child via the same path as calling `Session::signal` directly.
+        // A long `sleep` is killed by SIGTERM by default; observing the
+        // exit proves both the routing through `send()` and the libc
+        // call site landed on the right PID. We avoid asserting a
+        // specific exit code — shells normalise SIGTERM differently
+        // across platforms and that's not the property under test.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 10"]))
+            .expect("spawn shell");
+        // Tiny pause lets the shell finish exec'ing before we signal.
+        thread::sleep(Duration::from_millis(50));
+        session
+            .send(Action::Signal(Signal::Term))
+            .expect("send signal");
+        let result = session
+            .wait_for(&Matcher::ProcessExited, Duration::from_secs(3))
+            .expect("wait for exit");
+        assert!(result.matched);
+        let _ = session.wait();
     }
 
     #[test]

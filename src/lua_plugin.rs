@@ -144,6 +144,50 @@ impl LuaPlugin {
         self.permissions.contains(permission)
     }
 
+    /// Names of every function exported on the plugin's top-level
+    /// returned table.
+    ///
+    /// Used by `plugin.describe` to enumerate intents and matchers when
+    /// the plugin does not provide its own `describe()` catalog. Returns
+    /// keys in BTree order so the wire shape is deterministic regardless
+    /// of insertion order.
+    pub fn exported_function_names(&self) -> Result<Vec<String>> {
+        let result = (|| -> mlua::Result<Vec<String>> {
+            let exports: mlua::Table = self.lua.registry_value(&self.exports)?;
+            let mut names: Vec<String> = Vec::new();
+            for pair in exports.pairs::<mlua::Value, mlua::Value>() {
+                let (key, value) = pair?;
+                if !matches!(value, mlua::Value::Function(_)) {
+                    continue;
+                }
+                if let mlua::Value::String(s) = key {
+                    names.push(s.to_str()?.to_owned());
+                }
+            }
+            names.sort();
+            Ok(names)
+        })();
+        result.map_err(|error| self.error(error))
+    }
+
+    /// Whether the plugin's exports table has a function with the given
+    /// name. Used by `plugin.describe` to decide whether to call
+    /// `describe()` vs fall back to introspection.
+    ///
+    /// Surfaces introspection failures (poisoned registry, table type
+    /// changed unexpectedly) through `Error::Lua` rather than swallowing
+    /// them as `false` — silently routing a genuine introspection failure
+    /// into the fallback path would return an incomplete catalog without
+    /// any signal that something went wrong.
+    pub fn exports_function(&self, name: &str) -> Result<bool> {
+        let result = (|| -> mlua::Result<bool> {
+            let exports: mlua::Table = self.lua.registry_value(&self.exports)?;
+            let value: mlua::Value = exports.get(name)?;
+            Ok(matches!(value, mlua::Value::Function(_)))
+        })();
+        result.map_err(|error| self.error(error))
+    }
+
     fn from_source(
         name: String,
         source: &str,
@@ -375,6 +419,14 @@ fn action_api(
         action.set(
             "kill",
             lua.create_function(|lua, _: ()| tagged_unit(lua, "kill"))?,
+        )?;
+        // `signal` needs `SessionKill` rather than `InputWrite` — sending
+        // SIGTERM/SIGHUP/SIGUSR* is a lifecycle action, not input. The
+        // value is the snake_case Signal variant (see `Signal` in
+        // `src/action.rs` for the table).
+        action.set(
+            "signal",
+            lua.create_function(|lua, value: String| tagged_value(lua, "signal", value))?,
         )?;
     }
     Ok(action)

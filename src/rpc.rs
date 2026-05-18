@@ -55,6 +55,16 @@ struct RpcSharedState {
     /// documented guarantee. Reading the plugin name out of this map is
     /// O(1) and never contends with handler work.
     adapter_plugin: HashMap<String, String>,
+    /// Read-only sibling map: adapter id → session id. Same lifecycle
+    /// guarantees as `adapter_plugin` (updated in lock-step with
+    /// `extensions`). Used by `resolve_notification_filter` to translate
+    /// caller-supplied `adapters: ["e1"]` filters into the underlying
+    /// session ids without taking the per-adapter mutex — that mutex is
+    /// held by `adapter.wait` / `adapter.turn` for the entire wait, and
+    /// silently dropping the binding here would cause "subscribed to
+    /// adapter e1" to deliver zero events for the full duration of any
+    /// in-flight wait on e1, the opposite of what callers asked for.
+    adapter_session: HashMap<String, String>,
     /// Plugin manifests + Lua sources known to this server. Built-in
     /// plugins are seeded on construction; trusted-local third-party plugins
     /// arrive through CLI `--plugin <manifest.toml>` flags or the
@@ -115,6 +125,7 @@ impl Default for RpcSharedState {
             sessions: HashMap::new(),
             extensions: HashMap::new(),
             adapter_plugin: HashMap::new(),
+            adapter_session: HashMap::new(),
             registered_plugins,
             allow_plugin_load: false,
             next_session: 1,
@@ -127,6 +138,10 @@ impl Default for RpcSharedState {
 pub struct RpcServer {
     shared: RpcServerState,
     notifications_enabled: bool,
+    /// Per-connection notification scope. `None` (or both fields empty)
+    /// means "fire for every session." Set by `server.set_notifications`
+    /// when callers supply `adapters` and/or `sessions` filters.
+    notification_filter: NotificationFilter,
     last_notified_sequences: HashMap<String, u64>,
     /// Per-session cursor into the transcript's monotonic `chars_written`
     /// counter. Used to drive `session.output` notifications: each tick we
@@ -137,6 +152,22 @@ pub struct RpcServer {
     /// independently catches up after `server.set_notifications`.
     last_notified_outputs: HashMap<String, u64>,
     notified_exits: HashSet<String>,
+}
+
+/// Per-connection notification scope. Empty filters mean "everything"
+/// — that's the back-compat path for callers that just toggle the
+/// boolean. Non-empty filters fire for sessions matching `sessions`
+/// OR whose owning adapter id is in `adapters` (UNION semantics).
+#[derive(Debug, Default, Clone)]
+struct NotificationFilter {
+    adapters: Vec<String>,
+    sessions: Vec<String>,
+}
+
+impl NotificationFilter {
+    fn is_empty(&self) -> bool {
+        self.adapters.is_empty() && self.sessions.is_empty()
+    }
 }
 
 /// Per-adapter row stored in the `extensions` registry.
@@ -238,8 +269,28 @@ struct PluginUnloadParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct PluginDescribeParams {
+    /// Manifest name to introspect. Built-in or registered third-party
+    /// plugins are both fair game.
+    plugin: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct NotificationsParams {
     enabled: bool,
+    /// Optional list of adapter ids to scope notifications to. Empty
+    /// or omitted means "all adapters" (back-compat with the original
+    /// boolean-only param). Adapter ids that don't match any live
+    /// adapter at filter time are silently ignored — late binding lets
+    /// callers pre-subscribe before `adapter.start` returns.
+    #[serde(default)]
+    adapters: Option<Vec<String>>,
+    /// Optional list of session ids to scope notifications to. Combined
+    /// with `adapters` as a UNION: events fire for sessions whose id
+    /// matches `sessions` OR whose owning adapter id matches `adapters`.
+    /// Empty or omitted means "all sessions".
+    #[serde(default)]
+    sessions: Option<Vec<String>>,
 }
 
 /// One session's notification-relevant snapshot for a single `poll_notifications`
@@ -353,6 +404,37 @@ struct AdapterWaitParams {
     timeout_ms: Option<u64>,
 }
 
+/// Atomic send-then-wait used by [`RpcServer::adapter_turn`].
+///
+/// Modelled as nested `send` / `wait` sub-objects (rather than flat
+/// duplicated fields) so the wire shape stays unambiguous when the same
+/// adapter has overlapping intent / wait param vocabularies.
+#[derive(Debug, Deserialize)]
+struct AdapterTurnParams {
+    adapter: String,
+    send: TurnSendParams,
+    #[serde(default)]
+    wait: TurnWaitParams,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TurnSendParams {
+    intent: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TurnWaitParams {
+    /// Optional plugin matcher function. Defaults to `wait_turn_matcher`
+    /// so simple turns can omit the `wait` block entirely.
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    params: Value,
+    timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AdapterReadParams {
     adapter: String,
@@ -396,6 +478,12 @@ enum RpcErrorCode {
     Timeout,
     SessionClosed,
     PermissionDenied,
+    /// Wait was aborted by a [`CancellationToken`] from another thread or
+    /// connection. Distinct from `Timeout` so clients can tell "we ran
+    /// out of time" from "another thread aborted us" — same distinction
+    /// the underlying [`crate::Error::Cancelled`] makes inside the
+    /// library.
+    Cancelled,
 }
 
 impl RpcErrorCode {
@@ -409,6 +497,7 @@ impl RpcErrorCode {
             Self::Timeout => -32001,
             Self::SessionClosed => -32002,
             Self::PermissionDenied => -32004,
+            Self::Cancelled => -32005,
         }
     }
 }
@@ -506,6 +595,7 @@ impl RpcServer {
         Self {
             shared,
             notifications_enabled: false,
+            notification_filter: NotificationFilter::default(),
             last_notified_sequences: HashMap::new(),
             last_notified_outputs: HashMap::new(),
             notified_exits: HashSet::new(),
@@ -557,7 +647,11 @@ impl RpcServer {
 
     fn poll_notifications(&mut self) -> Result<Vec<String>> {
         let mut messages = Vec::new();
+        let allowed_ids = self.resolve_notification_filter();
         let mut entries = self.collect_notification_entries();
+        if let Some(allowed) = allowed_ids.as_ref() {
+            entries.retain(|entry| allowed.contains(&entry.id));
+        }
         entries.sort_by(|left, right| left.id.cmp(&right.id));
 
         for entry in entries {
@@ -725,12 +819,14 @@ impl RpcServer {
                     "adapter.state",
                     "adapter.send",
                     "adapter.wait",
+                    "adapter.turn",
                     "adapter.snapshot",
                     "adapter.transcript",
                     "adapter.inspect",
                     "adapter.close",
                     "plugin.capabilities",
                     "plugin.validate_manifest",
+                    "plugin.describe",
                     "plugin.load",
                     "plugin.unload"
                 ],
@@ -753,12 +849,14 @@ impl RpcServer {
             "adapter.state" => self.adapter_state(request.params),
             "adapter.send" => self.adapter_send(request.params),
             "adapter.wait" => self.adapter_wait(request.params),
+            "adapter.turn" => self.adapter_turn(request.params),
             "adapter.snapshot" => self.adapter_snapshot(request.params),
             "adapter.transcript" => self.adapter_transcript(request.params),
             "adapter.inspect" => self.adapter_inspect(request.params),
             "adapter.close" => self.adapter_close(request.params),
             "plugin.capabilities" => Ok(json!(PluginHostCapabilities::current())),
             "plugin.validate_manifest" => self.plugin_validate_manifest(request.params),
+            "plugin.describe" => self.plugin_describe(request.params),
             "plugin.load" => self.plugin_load(request.params),
             "plugin.unload" => self.plugin_unload(request.params),
             _ => Err((
@@ -776,6 +874,10 @@ impl RpcServer {
         let params: NotificationsParams = parse_params(params)?;
         let was_enabled = self.notifications_enabled;
         self.notifications_enabled = params.enabled;
+        self.notification_filter = NotificationFilter {
+            adapters: params.adapters.unwrap_or_default(),
+            sessions: params.sessions.unwrap_or_default(),
+        };
         // When notifications transition from off → on, seed every existing
         // session's output cursor at the current `chars_written` so the next
         // `session.output` notification only carries output produced *after*
@@ -788,7 +890,58 @@ impl RpcServer {
         if !was_enabled && params.enabled {
             self.seed_output_cursors_at_current_position();
         }
-        Ok(json!({ "enabled": self.notifications_enabled }))
+        // Echo the resolved filter back so callers can confirm what the
+        // server saw. Empty arrays are omitted to keep the response tidy
+        // when no filter is in force.
+        let mut resp = json!({ "enabled": self.notifications_enabled });
+        if !self.notification_filter.adapters.is_empty() {
+            resp.as_object_mut().unwrap().insert(
+                "adapters".to_string(),
+                json!(self.notification_filter.adapters),
+            );
+        }
+        if !self.notification_filter.sessions.is_empty() {
+            resp.as_object_mut().unwrap().insert(
+                "sessions".to_string(),
+                json!(self.notification_filter.sessions),
+            );
+        }
+        Ok(resp)
+    }
+
+    /// Resolve the current notification filter into a concrete set of
+    /// session ids. Returns `None` when no filter is in force (= deliver
+    /// every session). Adapter ids in the filter are resolved against
+    /// the live extension registry at call time; ids that don't match
+    /// anything are silently ignored, so a caller can pre-subscribe to
+    /// `adapters: ["e1"]` before the corresponding `adapter.start` call
+    /// completes and the session-id mapping arrives later.
+    ///
+    /// Reads through the `adapter_session` sibling map rather than
+    /// locking each `ExtensionEntry`. The per-adapter mutex is held
+    /// for the entire duration of `adapter.wait` / `adapter.turn`
+    /// (up to two minutes by default); a `try_lock` against a busy
+    /// adapter would silently drop its session id from the filter and
+    /// the caller would receive zero events for that adapter for the
+    /// whole wait — exactly the opposite of what
+    /// `set_notifications { adapters: [...] }` asked for. The mirror
+    /// is maintained in lock-step with `extensions` so this lookup is
+    /// O(1) and free of per-adapter contention.
+    fn resolve_notification_filter(&self) -> Option<HashSet<String>> {
+        if self.notification_filter.is_empty() {
+            return None;
+        }
+        let mut session_ids: HashSet<String> =
+            self.notification_filter.sessions.iter().cloned().collect();
+        if !self.notification_filter.adapters.is_empty() {
+            let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            for adapter_id in &self.notification_filter.adapters {
+                if let Some(session_id) = shared.adapter_session.get(adapter_id) {
+                    session_ids.insert(session_id.clone());
+                }
+            }
+        }
+        Some(session_ids)
     }
 
     fn seed_output_cursors_at_current_position(&mut self) {
@@ -991,6 +1144,102 @@ impl RpcServer {
                 (RpcErrorCode::InvalidParams, error.to_string()).into()
             })?;
         Ok(json!({ "valid": true }))
+    }
+
+    /// `plugin.describe` — return the catalog of a plugin's intents, wait
+    /// matchers, classifier states, and manifest. Used by consumers
+    /// (claudette, the REPL completer) to discover what a plugin supports
+    /// without hard-coding intent names.
+    ///
+    /// Source of truth, in order:
+    ///   1. If the plugin's Lua source exports a `describe()` function,
+    ///      its return value is used verbatim. Plugins owning a richer
+    ///      catalog (per-intent param schemas, per-state descriptions)
+    ///      should provide it.
+    ///   2. Otherwise the host falls back to introspecting the exports
+    ///      table: function names ending with `_matcher` are listed under
+    ///      `wait_matchers`; `classify` and `describe` are filtered out;
+    ///      every remaining function is listed under `intents`. `states`
+    ///      is `[]` in the fallback path because the classifier vocabulary
+    ///      lives inside the function body.
+    fn plugin_describe(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        let params: PluginDescribeParams = parse_params(params)?;
+        let entry = {
+            let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            shared.registered_plugins.get(&params.plugin).cloned()
+        };
+        let Some(entry) = entry else {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!("unknown plugin: {}", params.plugin),
+            )
+                .into());
+        };
+        // Build a one-off LuaPlugin to introspect. Cheap — the source
+        // is already in memory and Lua 5.4 + mlua loads a small chunk
+        // in milliseconds; the alternative (caching a long-lived Lua
+        // state per plugin) trades memory for cold-call latency in a
+        // method that's only ever called interactively.
+        let modules: Vec<(&str, &str)> = entry
+            .modules
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .collect();
+        let plugin = crate::lua_plugin::LuaPlugin::trusted_with_modules(
+            &entry.manifest,
+            &entry.source,
+            &modules,
+        )
+        .map_err(rpc_error_from_error)?;
+        let catalog = if plugin
+            .exports_function("describe")
+            .map_err(rpc_error_from_error)?
+        {
+            // Plugin provided its own catalog. Trust it verbatim — the
+            // shape is `{ intents, wait_matchers, states }` (each an
+            // array of objects with at minimum a `name` field). Plugins
+            // may include richer fields (params_schema, description)
+            // that downstream consumers can opt into.
+            let value: Value = plugin
+                .call_value("describe", &Value::Null)
+                .map_err(rpc_error_from_error)?;
+            value
+        } else {
+            // Introspection fallback. Anchor naming convention:
+            //   * `_matcher` suffix → wait matcher
+            //   * `classify` / `describe` → reserved, filtered out
+            //   * everything else → intent
+            let names = plugin
+                .exported_function_names()
+                .map_err(rpc_error_from_error)?;
+            let mut intents: Vec<Value> = Vec::new();
+            let mut wait_matchers: Vec<Value> = Vec::new();
+            for name in names {
+                if name == "classify" || name == "describe" {
+                    continue;
+                }
+                if name.ends_with("_matcher") {
+                    wait_matchers.push(json!({ "name": name }));
+                } else {
+                    intents.push(json!({ "name": name }));
+                }
+            }
+            json!({
+                "intents": intents,
+                "wait_matchers": wait_matchers,
+                "states": Value::Array(Vec::new()),
+            })
+        };
+        Ok(json!({
+            "plugin": entry.manifest.name,
+            "manifest": entry.manifest,
+            "intents": catalog.get("intents").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "wait_matchers": catalog.get("wait_matchers").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "states": catalog.get("states").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        }))
     }
 
     /// `plugin.load` — register a trusted-local third-party plugin from a
@@ -1301,7 +1550,11 @@ impl RpcServer {
         };
         let mut target = Target::new(program).args(args).size(size);
         target.cwd = params.cwd;
-        target.env = merge_env(manifest_default.as_ref().map(|t| &t.env), params.env);
+        target.env = merge_env(
+            manifest_default.as_ref().map(|t| &t.env),
+            params.env,
+            manifest_default.as_ref().map(|t| &t.required_env),
+        );
         let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
         let handle = ExtensionHandle::start(
             Box::new(extension),
@@ -1324,6 +1577,9 @@ impl RpcServer {
             shared
                 .adapter_plugin
                 .insert(id.clone(), params.plugin.clone());
+            shared
+                .adapter_session
+                .insert(id.clone(), session_id.clone());
         }
         Ok(json!({
             "adapter": id,
@@ -1430,6 +1686,56 @@ impl RpcServer {
         // presence. Today every successful wait carries a `Some(outcome)`;
         // `null` is reserved for future paths (e.g. cancellation hooks)
         // that surface a `MatchResult` without a satisfying branch.
+        Ok(json!({
+            "state": state,
+            "matched": outcome,
+        }))
+    }
+
+    /// `adapter.turn` — atomic `adapter.send` followed by `adapter.wait`
+    /// on the same adapter, holding the per-adapter mutex across both
+    /// legs so no other connection can slip an intent between them.
+    ///
+    /// Maps directly to [`ExtensionHandle::turn`]. Requires both
+    /// `input.write` and `matcher.wait` permissions (each pinned by the
+    /// underlying leg) — neither check is skippable.
+    ///
+    /// `wait.intent` defaults to `wait_turn_matcher` and the whole `wait`
+    /// block may be omitted entirely, which lets simple call sites express
+    /// a "submit and wait for the turn to complete" round-trip as one RPC.
+    ///
+    /// **Head-of-line blocking warning.** The per-adapter mutex is held
+    /// for the entire `wait` leg, whose default timeout is 120 s (and
+    /// caller-supplied `timeout_ms` can be longer). For the duration of
+    /// that wait, every other RPC method that touches the same adapter
+    /// (`adapter.state`, `adapter.send`, `adapter.snapshot`,
+    /// `adapter.close`, plus `plugin.unload`'s live-adapter check) on
+    /// any connection will block on this mutex. That's the intended
+    /// atomicity contract for `turn` — it's the property that rules
+    /// out a competing intent slipping in — but callers driving a busy
+    /// adapter from multiple connections should be aware of it. Use
+    /// `adapter.send` + `adapter.wait` separately when you need
+    /// finer-grained scheduling.
+    fn adapter_turn(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        let params: AdapterTurnParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.send", &params.adapter)?;
+        self.check_adapter_permission("adapter.wait", &params.adapter)?;
+        let timeout = Duration::from_millis(params.wait.timeout_ms.unwrap_or(120_000));
+        let entry_arc = self.extension(&params.adapter)?;
+        let mut entry = entry_arc.lock().expect("extension poisoned");
+        let (state, outcome) = entry
+            .handle
+            .turn(
+                &params.send.intent,
+                params.send.params,
+                params.wait.intent.as_deref(),
+                params.wait.params,
+                timeout,
+            )
+            .map_err(rpc_error_from_error)?;
         Ok(json!({
             "state": state,
             "matched": outcome,
@@ -1543,10 +1849,11 @@ impl RpcServer {
         self.check_adapter_permission("adapter.close", &params.adapter)?;
         let removed = {
             let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
-            // Remove from both the live-handle registry and the sibling
-            // adapter_plugin map atomically under the same lock so
-            // plugin.unload never sees a half-removed adapter.
+            // Remove from the live-handle registry plus both sibling
+            // maps atomically under the same lock so plugin.unload and
+            // the notification filter never see a half-removed adapter.
             shared.adapter_plugin.remove(&params.adapter);
+            shared.adapter_session.remove(&params.adapter);
             shared.extensions.remove(&params.adapter)
         };
         if let Some(entry_arc) = removed {
@@ -1641,17 +1948,29 @@ impl Default for RpcServer {
     }
 }
 
-/// Merge a plugin manifest's `default_target.env` with caller-supplied
-/// `env` from `adapter.start`. Manifest defaults are applied first; the
-/// caller's map is overlaid on top, so caller wins on key conflict and
-/// keys the caller omits are inherited from the manifest. A missing
-/// manifest map is treated as empty.
+/// Merge a plugin manifest's env with caller-supplied `env` from
+/// `adapter.start`.
+///
+/// Precedence (lowest → highest):
+///
+/// 1. Manifest `default_target.env` — plugin-recommended defaults.
+/// 2. Caller `env` — overrides manifest defaults on key conflict.
+/// 3. Manifest `default_target.required_env` — plugin-mandated keys
+///    the caller cannot override.
+///
+/// A missing manifest map is treated as empty. The required-env tier
+/// makes safety-critical knobs (terminal-title disabling,
+/// virtual-scroll suppression) stable across all callers.
 fn merge_env(
     manifest_default: Option<&BTreeMap<String, String>>,
     caller: BTreeMap<String, String>,
+    manifest_required: Option<&BTreeMap<String, String>>,
 ) -> BTreeMap<String, String> {
     let mut merged = manifest_default.cloned().unwrap_or_default();
     merged.extend(caller);
+    if let Some(required) = manifest_required {
+        merged.extend(required.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
     merged
 }
 
@@ -1829,12 +2148,14 @@ fn rpc_error_from_error(error: Error) -> RpcErrorPayload {
                 "required_permission": required.as_str(),
             })),
         ),
+        Error::Cancelled => (RpcErrorCode::Cancelled, None),
         Error::Pty(_)
         | Error::Io(_)
         | Error::Json(_)
         | Error::Lua(_)
         | Error::Rpc(_)
-        | Error::Config(_) => (RpcErrorCode::InternalError, None),
+        | Error::Config(_)
+        | Error::UnsupportedOnPlatform(_) => (RpcErrorCode::InternalError, None),
     };
     RpcErrorPayload {
         code,
@@ -2051,6 +2372,56 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":4,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#,
             ),
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn notification_filter_scopes_to_named_sessions_only() {
+        // With `server.set_notifications {enabled, sessions:["s1"]}`, only
+        // s1's events should surface; s2 stays silent even though both
+        // are producing output.
+        let mut server = RpcServer::new();
+        let create1 = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","sleep 5"]}}"#,
+            )
+            .expect("create s1");
+        let s1: Value = serde_json::from_str(&create1[0]).unwrap();
+        let s1_id = s1["result"]["session"].as_str().unwrap().to_string();
+        let create2 = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","printf hello; sleep 5"]}}"#,
+            )
+            .expect("create s2");
+        let s2: Value = serde_json::from_str(&create2[0]).unwrap();
+        let s2_id = s2["result"]["session"].as_str().unwrap().to_string();
+
+        let _ = server
+            .handle_line_messages(&format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"server.set_notifications","params":{{"enabled":true,"sessions":["{s1_id}"]}}}}"#,
+            ))
+            .expect("enable filtered notifications");
+
+        let poll = server
+            .handle_line_messages(&format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"session.wait","params":{{"session":"{s2_id}","matcher":{{"type":"contains_text","value":"hello"}},"timeout_ms":3000}}}}"#,
+            ))
+            .expect("wait for s2");
+
+        let stitched = poll.join("\n");
+        assert!(
+            !stitched.contains(&format!("\"session\":\"{s2_id}\""))
+                || !stitched.contains("session.changed"),
+            "s2 changes must not surface when filter scopes to s1; got: {stitched}"
+        );
+
+        // Cleanup.
+        let _ = server.handle_line_messages(&format!(
+            r#"{{"jsonrpc":"2.0","id":98,"method":"session.kill","params":{{"session":"{s1_id}"}}}}"#,
+        ));
+        let _ = server.handle_line_messages(&format!(
+            r#"{{"jsonrpc":"2.0","id":99,"method":"session.kill","params":{{"session":"{s2_id}"}}}}"#,
+        ));
     }
 
     #[test]
@@ -2508,7 +2879,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect();
 
-        let merged = merge_env(Some(&manifest), caller);
+        let merged = merge_env(Some(&manifest), caller, None);
 
         assert_eq!(
             merged.get("MANIFEST_ONLY").map(String::as_str),
@@ -2538,7 +2909,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let merged = merge_env(None, caller.clone());
+        let merged = merge_env(None, caller.clone(), None);
         assert_eq!(
             merged, caller,
             "missing manifest default must passthrough caller env"
@@ -2551,10 +2922,52 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let merged = merge_env(Some(&manifest), BTreeMap::new());
+        let merged = merge_env(Some(&manifest), BTreeMap::new(), None);
         assert_eq!(
             merged, manifest,
             "empty caller env must yield the manifest defaults verbatim"
+        );
+    }
+
+    #[test]
+    fn merge_env_required_overrides_caller() {
+        // Required-env tier: the plugin manifest reserves keys the
+        // caller cannot override. This is the load-bearing safety
+        // property for settings like terminal-title disabling — if the
+        // caller could turn them back on, the classifier would break.
+        let defaults: BTreeMap<String, String> = [("DEFAULT", "d")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let caller: BTreeMap<String, String> = [
+            ("DEFAULT", "caller_override_default"),
+            ("REQUIRED", "caller_attempt"),
+            ("CALLER_ONLY", "added"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        let required: BTreeMap<String, String> = [("REQUIRED", "plugin_wins")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+
+        let merged = merge_env(Some(&defaults), caller, Some(&required));
+
+        assert_eq!(
+            merged.get("DEFAULT").map(String::as_str),
+            Some("caller_override_default"),
+            "caller still overrides manifest defaults for non-required keys"
+        );
+        assert_eq!(
+            merged.get("REQUIRED").map(String::as_str),
+            Some("plugin_wins"),
+            "required_env wins over caller-supplied value"
+        );
+        assert_eq!(
+            merged.get("CALLER_ONLY").map(String::as_str),
+            Some("added"),
+            "caller-only keys still pass through"
         );
     }
 
@@ -2866,6 +3279,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn adapter_turn_chains_send_and_wait_in_one_round_trip() {
+        // adapter.turn sends an intent and waits for the matcher in a
+        // single RPC call, holding the per-adapter mutex across both
+        // legs. The fixture below prints the `Total cost:` turn-boundary
+        // anchor after a tiny delay, which is enough for the
+        // wait_turn_matcher anchor list to fire.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'Total cost: 0\\n'; sleep 5"]}}"#,
+        );
+        let adapter = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start must return an adapter id");
+
+        let response = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.turn","params":{{"adapter":"{adapter}","send":{{"intent":"approve"}},"wait":{{"timeout_ms":3000}}}}}}"#
+            ),
+        );
+        assert!(
+            response["result"]["state"].is_object(),
+            "adapter.turn must return a state snapshot; got {response}"
+        );
+        assert_eq!(
+            response["result"]["matched"]["kind"], "all",
+            "adapter.turn must surface the same structured outcome as adapter.wait; got {response}"
+        );
+
+        // Cleanup.
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
     fn rpc_error_messages_are_redacted() {
         let mut server = RpcServer::new();
         let response = handle(
@@ -2877,6 +3331,74 @@ mod tests {
         let message = response["error"]["message"].as_str().unwrap();
         assert!(message.contains("token=[REDACTED]"));
         assert!(!message.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn plugin_describe_lists_claude_code_catalog() {
+        // Plugins can either provide a `describe()` function in their
+        // Lua source or rely on the host's introspection fallback. The
+        // built-in claude-code plugin opts in, so we assert the explicit
+        // shape here (intents, wait_matchers, states all populated).
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"plugin.describe","params":{"plugin":"claude-code"}}"#,
+        );
+        let result = &response["result"];
+        assert_eq!(result["plugin"], "claude-code");
+        assert_eq!(result["manifest"]["name"], "claude-code");
+
+        let intents = result["intents"].as_array().expect("intents array");
+        let intent_names: Vec<&str> = intents.iter().filter_map(|i| i["name"].as_str()).collect();
+        for required in &[
+            "send_prompt",
+            "approve",
+            "deny",
+            "cancel",
+            "approve_trust",
+            "deny_trust",
+            "attach_file",
+        ] {
+            assert!(
+                intent_names.contains(required),
+                "intent `{required}` missing from describe(): {intent_names:?}"
+            );
+        }
+
+        let matchers = result["wait_matchers"]
+            .as_array()
+            .expect("wait_matchers array");
+        let matcher_names: Vec<&str> = matchers.iter().filter_map(|i| i["name"].as_str()).collect();
+        assert!(matcher_names.contains(&"wait_turn_matcher"));
+
+        let states = result["states"].as_array().expect("states array");
+        let state_names: Vec<&str> = states.iter().filter_map(|i| i["name"].as_str()).collect();
+        for required in &[
+            "starting",
+            "ready",
+            "completed_turn",
+            "thinking",
+            "waiting_for_permission",
+            "error",
+        ] {
+            assert!(
+                state_names.contains(required),
+                "state `{required}` missing from describe(): {state_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_describe_rejects_unknown_plugin() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"plugin.describe","params":{"plugin":"does-not-exist"}}"#,
+        );
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "missing plugin must be an InvalidParams error: {response}"
+        );
     }
 
     #[test]
@@ -3207,13 +3729,16 @@ mod tests {
                 adapter_id.clone(),
                 Arc::new(Mutex::new(ExtensionEntry {
                     plugin: "stub-no-input".to_string(),
-                    session: session_id,
+                    session: session_id.clone(),
                     handle: ext_handle,
                 })),
             );
             shared
                 .adapter_plugin
                 .insert(adapter_id.clone(), "stub-no-input".to_string());
+            shared
+                .adapter_session
+                .insert(adapter_id.clone(), session_id);
         }
 
         let mut server = RpcServer::with_state(state);

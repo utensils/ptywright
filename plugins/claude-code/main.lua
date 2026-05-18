@@ -31,6 +31,20 @@ local M = {}
 local action = ptywright.action
 local matcher = ptywright.matcher
 
+-- Module-level dialog tracking for `metadata.dialog_id` correlation.
+-- `_current_dialog_id` is updated by the classifier whenever a dialog
+-- is detected (permission, plan approval, trust); intent functions
+-- (approve / deny / approve_trust / deny_trust) cross-check the
+-- caller-supplied `dialog_id` against this value and refuse to act on
+-- a stale id rather than blindly pressing Enter on a different dialog.
+--
+-- The state persists across classifier calls because the Lua plugin
+-- runs in a single registry-held table — `M` is the same object on
+-- every call into the plugin. A nil `_current_dialog_id` means "no
+-- dialog active right now" and intent calls with a non-nil
+-- `dialog_id` are rejected.
+M._current_dialog_id = nil
+
 -- Bring the shared helpers in as locals so the rest of this file reads
 -- identically to the pre-split version. Anything new that needs a
 -- helper but isn't aliased here can still call `helpers.<fn>` directly.
@@ -40,6 +54,7 @@ local starts_with            = helpers.starts_with
 local trim                   = helpers.trim
 local lower                  = helpers.lower
 local redact_secret_patterns = helpers.redact_secret_patterns
+local fnv1a_hex              = helpers.fnv1a_hex
 local strip_dollar           = helpers.strip_dollar
 
 local function state_snapshot(state, confidence, evidence, sequence, metadata)
@@ -92,8 +107,128 @@ local function has_error_indicator(screen)
     if starts_with(text, "please retry") or starts_with(text, "press r to retry") then
       return true
     end
+    -- Auth-failure phrasing. Anchored at line start for the same
+    -- prose-quotation reason as the banner prefixes above.
+    if starts_with(text, "invalid api key")
+      or starts_with(text, "authentication failed")
+      or starts_with(text, "unauthorized")
+      or starts_with(text, "oauth failed")
+    then
+      return true
+    end
   end
   return false
+end
+
+-- Patterns for `parse_error_subtype` — anchored at line start (via
+-- `starts_with` below) so prose that quotes them mid-sentence doesn't
+-- trip classification.
+--
+-- Order matters within a kind: longer / more specific prefixes come
+-- first so a banner like `5-hour limit reached` classifies as
+-- `rate_limit` rather than falling through to `unknown`.
+local ERROR_SUBTYPE_PATTERNS = {
+  { kind = "rate_limit", prefix = "5-hour limit" },
+  { kind = "rate_limit", prefix = "rate limit reached" },
+  { kind = "rate_limit", prefix = "you've used your pro plan" },
+  { kind = "rate_limit", prefix = "you've used your max plan" },
+  { kind = "rate_limit", prefix = "you've reached your usage limit" },
+  { kind = "quota",      prefix = "credit balance is too low" },
+  { kind = "connection", prefix = "connection error" },
+  { kind = "connection", prefix = "connection issue" },
+  { kind = "connection", prefix = "could not connect" },
+  { kind = "connection", prefix = "network error" },
+  { kind = "auth",       prefix = "invalid api key" },
+  { kind = "auth",       prefix = "authentication failed" },
+  { kind = "auth",       prefix = "unauthorized" },
+  { kind = "auth",       prefix = "oauth failed" },
+  { kind = "api",        prefix = "api error" },
+  { kind = "api",        prefix = "request failed" },
+}
+
+-- Classify the visible error banner into a discrete subtype so
+-- consumers (claudette in particular) can pick a retry / surface /
+-- escalation policy without re-grepping the screen. Returns
+-- `{ error = { kind, message?, retry_after_s? } }` or nil when no
+-- banner is present.
+--
+-- `kind`:
+--   * `rate_limit` — Pro/Max plan / hour-window / usage-limit banner.
+--   * `quota`      — credit-balance banner.
+--   * `connection` — network / connection failure banner.
+--   * `auth`       — invalid API key / OAuth / unauthorised banner.
+--   * `api`        — Anthropic API-side failure ("API error", generic
+--                    "request failed" without other anchors).
+--   * `unknown`    — bare `error:` banner with no other anchor.
+--
+-- `message` is the *original-case* trimmed banner line, redacted
+-- through `redact_secret_patterns` so any token-shaped substring is
+-- masked before it ever leaves the plugin.
+--
+-- `retry_after_s` is set when the banner (or an immediately-following
+-- line) carries a numeric "retry in <N> seconds" / "retry after <N>s"
+-- phrase.
+local function parse_error_subtype(body)
+  if body == nil or body == "" then
+    return nil
+  end
+  local lines = {}
+  for line in string.gmatch(body, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  local subtype = nil
+  local message = nil
+  for idx, raw in ipairs(lines) do
+    local text = lower(trim(raw))
+    if text ~= "" then
+      for _, pattern in ipairs(ERROR_SUBTYPE_PATTERNS) do
+        if starts_with(text, pattern.prefix) then
+          subtype = pattern.kind
+          message = trim(raw)
+          break
+        end
+      end
+      if subtype then
+        -- Look for a retry-after hint on the same line or the next one.
+        local retry_search = text
+        if idx + 1 <= #lines then
+          retry_search = retry_search .. " " .. lower(trim(lines[idx + 1]))
+        end
+        local secs = retry_search:match("retry in (%d+)")
+          or retry_search:match("retry after (%d+)")
+          or retry_search:match("try again in (%d+)")
+        if secs then
+          local n = tonumber(secs)
+          if n then
+            return {
+              error = {
+                kind = subtype,
+                message = redact_secret_patterns(message),
+                retry_after_s = n,
+              }
+            }
+          end
+        end
+        return {
+          error = {
+            kind = subtype,
+            message = redact_secret_patterns(message),
+          }
+        }
+      end
+      -- Bare `error:` banner with no specific anchor — classify as
+      -- unknown rather than dropping metadata entirely.
+      if starts_with(text, "error:") then
+        return {
+          error = {
+            kind = "unknown",
+            message = redact_secret_patterns(trim(raw)),
+          }
+        }
+      end
+    end
+  end
+  return nil
 end
 
 -- Returns true if any line in `screen` is an input-prompt row.
@@ -632,6 +767,62 @@ local function parse_permission_dialog(text)
   return { permission = permission }
 end
 
+-- Extract the plan body for `metadata.plan` on the
+-- `waiting_for_plan_approval` state. Claude Code renders the plan as
+-- a "Plan ready:" (or "Plan") header followed by a numbered list, then
+-- an "Approve plan to proceed?" footer. We return the lines between
+-- the header and the footer, trimmed.
+--
+-- Returns the raw plan text as a single string with newlines, or
+-- `nil` if the structure doesn't match (which would indicate the
+-- classifier branch fired on something other than a real plan body).
+-- Consumers get this verbatim — claudette surfaces it in the UI for
+-- human review before approval.
+local function parse_plan_body(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local lines = {}
+  for line in string.gmatch(text, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  -- Find the header row: the first line whose lowercased trim starts
+  -- with "plan" and either ends with ":" or is exactly "plan".
+  local header_idx = nil
+  for idx, raw in ipairs(lines) do
+    local t = lower(trim(raw))
+    if t == "plan" or starts_with(t, "plan ready") or starts_with(t, "plan:") then
+      header_idx = idx
+      break
+    end
+  end
+  if not header_idx then
+    return nil
+  end
+  -- Find the footer row (approval question). The slice is exclusive of
+  -- the footer; if no footer is present we take everything from the
+  -- header to the end of the body.
+  local footer_idx = #lines + 1
+  for idx = header_idx + 1, #lines do
+    local t = lower(trim(lines[idx]))
+    if starts_with(t, "approve plan") or starts_with(t, "approve the plan") then
+      footer_idx = idx
+      break
+    end
+  end
+  local body_lines = {}
+  for idx = header_idx + 1, footer_idx - 1 do
+    local t = trim(lines[idx])
+    if t ~= "" then
+      table.insert(body_lines, t)
+    end
+  end
+  if #body_lines == 0 then
+    return nil
+  end
+  return table.concat(body_lines, "\n")
+end
+
 local function has_plan_indicator(text)
   -- Structural pattern: a "plan" header on its own line followed by
   -- a numbered list within a line or two. Both fixtures match this:
@@ -752,6 +943,50 @@ local LOGIN_TITLE_PREFIXES = {
   "continue with anthropic",
   "continue with google",
 }
+
+-- Extract the OAuth login URL from a login dialog. Returns the first
+-- URL on its own line whose host is `claude.ai` or `anthropic.com`,
+-- trimmed of surrounding whitespace. Accepts both bare-domain
+-- (`https://claude.ai`) and path-bearing (`https://claude.ai/login?...`)
+-- shapes — the login detector in `has_login_indicator` uses a regex
+-- with `[%w./%-_?=&%%]*` (zero-or-more path), so this extractor must
+-- match that same accepted set or a screen that classifies as a login
+-- dialog could still produce no metadata.login.url.
+--
+-- Returns nil if no URL is present — the login dialog without a URL is
+-- still valid (API-key path).
+local LOGIN_URL_HOSTS = { "https://claude.ai", "https://anthropic.com" }
+
+local function parse_login_url(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  for line in string.gmatch(text, "[^\n]+") do
+    local t = trim(line)
+    for _, host in ipairs(LOGIN_URL_HOSTS) do
+      -- A real URL is either exactly `<host>` or `<host>/` or
+      -- `<host>?`/`<host>#`. Requiring the next char to be one of
+      -- `/`, `?`, `#`, end-of-string, or whitespace prevents matches
+      -- against a hypothetical `https://claude.ai.evil.com` line —
+      -- the bare prefix check Copilot flagged conflated those.
+      if starts_with(t, host) then
+        local next_byte = t:sub(#host + 1, #host + 1)
+        if next_byte == ""
+          or next_byte == "/"
+          or next_byte == "?"
+          or next_byte == "#"
+          or string.match(next_byte, "%s") then
+          local space = t:find("%s")
+          if space then
+            return t:sub(1, space - 1)
+          end
+          return t
+        end
+      end
+    end
+  end
+  return nil
+end
 
 local function has_login_indicator(text)
   -- Anchor #1: a title-style login phrase appears somewhere in the
@@ -940,6 +1175,14 @@ local function has_welcome_screen(text)
 end
 
 function M.classify(input)
+  -- Reset module-level dialog tracking at the start of every classify
+  -- call. Any branch that detects a dialog (permission / plan / trust)
+  -- sets `_current_dialog_id` before returning. Leaving the dialog
+  -- screen — typing past it, an approve action that closes it, a
+  -- different state entirely — drops the id so subsequent approve /
+  -- deny calls with a stale id are rejected rather than blindly
+  -- pressing Enter on whatever is now on screen.
+  M._current_dialog_id = nil
   local screen = input.screen or ""
   -- body_text excludes the bottom status-bar rows so that benign status
   -- strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` do not
@@ -1025,7 +1268,9 @@ function M.classify(input)
   -- once before driving the adapter; the script-side handler surfaces
   -- this as a non-zero exit with a clear message.
   if has_login_indicator(body_text) then
-    return state_snapshot("waiting_for_login", 0.86, "login / sign-in dialog detected", sequence)
+    local login_url = parse_login_url(body)
+    local login_metadata = login_url and { login = { url = login_url } } or nil
+    return state_snapshot("waiting_for_login", 0.86, "login / sign-in dialog detected", sequence, login_metadata)
   end
 
   -- Workspace-trust dialog is checked before permission/plan because its
@@ -1033,7 +1278,21 @@ function M.classify(input)
   -- Trust questions and answers live entirely in the dialog body; the
   -- status bar carries only navigation hints.
   if has_trust_indicator(body_text) then
-    return state_snapshot("waiting_for_trust", 0.86, "workspace trust dialog detected", sequence)
+    -- Trust dialog id is derived from the workspace path the dialog
+    -- references. The same project re-opened produces the same id;
+    -- a different workspace path mints a fresh one so callers can
+    -- distinguish.
+    local workspace_path = body:match("[Aa]ccessing workspace:%s*([^\n]+)")
+    local fingerprint = "trust:" .. trim(workspace_path or "unknown")
+    local dialog_id = fnv1a_hex(fingerprint)
+    M._current_dialog_id = dialog_id
+    return state_snapshot(
+      "waiting_for_trust",
+      0.86,
+      "workspace trust dialog detected",
+      sequence,
+      { dialog_id = dialog_id }
+    )
   end
 
   -- Model picker (opened by `/model`). Anchored on THREE structural
@@ -1045,7 +1304,20 @@ function M.classify(input)
   end
 
   if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
-    return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence)
+    -- Parse against the full screen (not just body) — when the plan
+    -- footer would otherwise straddle the body/status split, the
+    -- numbered-list bullets at the bottom of the plan can land in
+    -- the status region and get dropped from `body`. Reading the
+    -- whole screen avoids that edge case; the parser ignores
+    -- everything up to the "Plan" header.
+    local plan_text = parse_plan_body(screen)
+    local plan_metadata = nil
+    if plan_text then
+      local dialog_id = fnv1a_hex("plan:" .. plan_text)
+      M._current_dialog_id = dialog_id
+      plan_metadata = { plan = plan_text, dialog_id = dialog_id }
+    end
+    return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence, plan_metadata)
   end
 
   if has_permission_indicator(screen_text) then
@@ -1055,6 +1327,15 @@ function M.classify(input)
     -- present. Original case matters for the tool name and summary
     -- ("Bash command: cargo test").
     local permission_metadata = parse_permission_dialog(screen)
+    if permission_metadata and permission_metadata.permission then
+      local p = permission_metadata.permission
+      local fingerprint = string.format("perm:%s:%s",
+        p.tool or "unknown",
+        p.summary or "")
+      local dialog_id = fnv1a_hex(fingerprint)
+      M._current_dialog_id = dialog_id
+      permission_metadata.dialog_id = dialog_id
+    end
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
   end
 
@@ -1063,7 +1344,8 @@ function M.classify(input)
   end
 
   if has_error_indicator(body) then
-    return state_snapshot("error", 0.72, "visible error banner detected", sequence)
+    local error_metadata = parse_error_subtype(body)
+    return state_snapshot("error", 0.72, "visible error banner detected", sequence, error_metadata)
   end
 
   if has_usage_screen(body_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
@@ -1259,6 +1541,41 @@ function M.steer(input)
   }
 end
 
+-- Attach a file by pasting its path into the input box. Claude Code's
+-- TUI normalises drag-and-drop and `@path` references to the same
+-- behaviour: a bracketed paste of the absolute path. Plugins consuming
+-- this intent typically follow up with `send_prompt` for any
+-- accompanying message — we deliberately do NOT submit on Enter here
+-- so callers can compose the prompt around the attachment.
+--
+-- Validation kept tight: `path` must be a non-empty string with no
+-- embedded newlines (a newline would partially submit and split the
+-- attachment across rows). The intent does NOT touch the filesystem —
+-- existence / readability / size checks belong to the caller.
+--
+-- Invalid input raises a Lua error so the host's intent dispatcher
+-- surfaces it as `Error::Lua(...)` rather than the misleading
+-- `missing field "actions"` deserialiser message that would land if
+-- we tried to return a non-ActionPlan-shaped table.
+--
+-- A future enrichment can fold `metadata.attachments = [{ path, kind }]`
+-- into the classifier output once we have fixtures of the preview row
+-- claude-code renders after an attachment lands.
+function M.attach_file(input)
+  local path = input and input.path
+  if type(path) ~= "string" or path == "" then
+    error("attach_file: path is required")
+  end
+  if path:find("\n", 1, true) ~= nil then
+    error("attach_file: path must not contain newlines")
+  end
+  return {
+    actions = {
+      action.bracketed_paste(path),
+    },
+  }
+end
+
 
 function M.wait_turn_matcher(input)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
@@ -1348,7 +1665,50 @@ function M.wait_turn_matcher(input)
   })
 end
 
-function M.approve(_input)
+-- Check caller-supplied `dialog_id` against the most recently
+-- classified dialog. Raises a Lua error (surfaced as Error::Lua to the
+-- host / -32603 InternalError on the wire) when the id doesn't match
+-- so a caller acting on a stale dialog id can't accidentally press
+-- Enter on a different dialog. Missing / nil `dialog_id` is the
+-- best-effort path — preserves backwards compatibility for callers
+-- that don't yet thread the id through.
+--
+-- IMPORTANT for callers driving the plugin directly (e.g. through
+-- `ExtensionHandle::send` from Rust without first calling `state` /
+-- `wait`): `_current_dialog_id` is reset to nil at the top of every
+-- `M.classify` call and only set when a dialog branch fires. If a
+-- caller submits an `approve { dialog_id = "abc" }` without
+-- triggering at least one classify between the dialog appearing and
+-- the intent firing, the id check will see `_current_dialog_id ==
+-- nil` and reject the id as stale even though the dialog is genuinely
+-- visible. The production poll path (`adapter.state` / `adapter.wait`
+-- / `adapter.send`) all run `classify` immediately before / after the
+-- intent so this isn't an issue there; callers driving the plugin
+-- with raw `ExtensionHandle::send` must intersperse `state()` calls
+-- when they want dialog_id correlation. Omitting `dialog_id` keeps
+-- the legacy press-Enter behaviour for those callers.
+local function check_dialog_id(input)
+  local supplied = input and input.dialog_id
+  if supplied == nil then
+    return
+  end
+  if M._current_dialog_id == nil then
+    error(string.format(
+      "stale_dialog: supplied dialog_id=%s but no dialog is currently active",
+      tostring(supplied)
+    ))
+  end
+  if M._current_dialog_id ~= supplied then
+    error(string.format(
+      "stale_dialog: supplied dialog_id=%s does not match current dialog_id=%s",
+      tostring(supplied),
+      tostring(M._current_dialog_id)
+    ))
+  end
+end
+
+function M.approve(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.key("enter"),
@@ -1356,7 +1716,8 @@ function M.approve(_input)
   }
 end
 
-function M.deny(_input)
+function M.deny(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.key("escape"),
@@ -1369,7 +1730,8 @@ end
 -- list as accepting option 1. Kept as a separate intent so callers can
 -- dispatch on `waiting_for_trust` explicitly instead of overloading
 -- `approve`.
-function M.approve_trust(_input)
+function M.approve_trust(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.text("1"),
@@ -1378,7 +1740,8 @@ function M.approve_trust(_input)
   }
 end
 
-function M.deny_trust(_input)
+function M.deny_trust(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.text("2"),
@@ -1531,6 +1894,50 @@ function M.key(input)
   return {
     actions = {
       action.text(raw),
+    },
+  }
+end
+
+-- Catalog consumed by `plugin.describe`. Plugins that don't expose this
+-- function fall through to introspection (intent names + names ending
+-- with `_matcher` go to wait_matchers) but lose the classifier
+-- state vocabulary, which lives only inside `classify`. Surfacing it
+-- explicitly lets consumers (claudette, the REPL completer) drive the
+-- adapter without hard-coding state names.
+function M.describe()
+  return {
+    intents = {
+      { name = "send_prompt" },
+      { name = "steer" },
+      { name = "attach_file" },
+      { name = "approve" },
+      { name = "deny" },
+      { name = "approve_trust" },
+      { name = "deny_trust" },
+      { name = "dismiss_welcome" },
+      { name = "expand" },
+      { name = "slash_command" },
+      { name = "cancel" },
+      { name = "force_cancel" },
+      { name = "key" },
+    },
+    wait_matchers = {
+      { name = "wait_turn_matcher" },
+      { name = "wait_cancel_settled_matcher" },
+    },
+    states = {
+      { name = "starting" },
+      { name = "ready" },
+      { name = "waiting_for_login" },
+      { name = "waiting_for_trust" },
+      { name = "waiting_for_model_select" },
+      { name = "waiting_for_plan_approval" },
+      { name = "waiting_for_permission" },
+      { name = "waiting_for_user_input" },
+      { name = "thinking" },
+      { name = "cancelling" },
+      { name = "completed_turn" },
+      { name = "error" },
     },
   }
 end

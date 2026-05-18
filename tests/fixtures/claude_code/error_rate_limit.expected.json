@@ -5,8 +5,9 @@
   "min_confidence": 0.6,
   "metadata": {
     "error": {
-      "kind": "unknown",
-      "message": "Error: request failed. Please retry."
+      "kind": "rate_limit",
+      "message": "Rate limit reached. Please try again in 42 seconds.",
+      "retry_after_s": 42
     }
   }
 }

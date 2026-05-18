@@ -48,6 +48,21 @@ pub struct Target {
     pub env: BTreeMap<String, String>,
     /// Initial terminal size.
     pub size: TerminalSize,
+    /// When `true`, the child is spawned with an empty environment
+    /// except for [`Target::env`] entries (plus the manifest's required
+    /// env when the target is built from a plugin manifest). Defaults to
+    /// `false` — the parent process env is inherited and `env` overlays
+    /// on top, matching `std::process::Command` behaviour.
+    ///
+    /// Set via [`Target::clear_env`] when consuming a plugin manifest
+    /// whose `default_target.required_env` declares safety-critical
+    /// settings that must not leak from the parent.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_env: bool,
+}
+
+const fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Target {
@@ -60,6 +75,7 @@ impl Target {
             cwd: None,
             env: BTreeMap::new(),
             size: TerminalSize::default(),
+            clear_env: false,
         }
     }
 
@@ -97,11 +113,50 @@ impl Target {
         self.size = size;
         self
     }
+
+    /// Spawn the child with an empty environment, ignoring the parent
+    /// process env. [`Target::env`] entries are still applied; combined
+    /// with a manifest's `default_target.required_env`, this is how
+    /// callers opt into a fully reproducible env layout (e.g. when the
+    /// plugin's behaviour depends on a precise env layout and parent
+    /// env should not leak).
+    #[must_use]
+    pub fn clear_env(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
+
+    /// Borrow the current env map. Useful for env-drift detection — pair
+    /// with a later resolution to spot keys added or changed between
+    /// spawns. Matches the field that ends up applied to the child's
+    /// environment after merging with the plugin manifest.
+    #[must_use]
+    pub fn env_snapshot(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_env_builder_sets_flag_and_env_snapshot_returns_overlay() {
+        // `clear_env` is a builder bool that the spawn path consults to
+        // call `command.env_clear()` before applying the overlay. The
+        // overlay itself is still visible through `env_snapshot()` so
+        // callers can compare it against a later resolution for
+        // env-drift detection.
+        let target = Target::new("demo")
+            .env("FOO", "bar")
+            .env("BAZ", "qux")
+            .clear_env();
+        assert!(target.clear_env);
+        let snapshot = target.env_snapshot();
+        assert_eq!(snapshot.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(snapshot.get("BAZ").map(String::as_str), Some("qux"));
+        assert!(!snapshot.contains_key("PATH"));
+    }
 
     #[test]
     fn target_builder_collects_program_args_cwd_env_and_size() {

@@ -5,8 +5,8 @@
   "min_confidence": 0.6,
   "metadata": {
     "error": {
-      "kind": "unknown",
-      "message": "Error: request failed. Please retry."
+      "kind": "connection",
+      "message": "Connection error. Could not reach api.anthropic.com."
     }
   }
 }

@@ -2,5 +2,9 @@
   "state": "waiting_for_plan_approval",
   "evidence": "plan approval text detected",
   "last_intent": null,
-  "min_confidence": 0.6
+  "min_confidence": 0.6,
+  "metadata": {
+    "dialog_id": "ffd2a9c4",
+    "plan": "1. Update tests\n2. Implement fix\n3. Run checks"
+  }
 }

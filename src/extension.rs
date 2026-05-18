@@ -281,6 +281,21 @@ pub struct ExtensionHandle {
     extension: Box<dyn Extension>,
     last_intent: Option<String>,
     completed_turn_stable_ms: u64,
+    state_subscribers: std::sync::Mutex<Vec<std::sync::mpsc::Sender<ExtensionEvent>>>,
+}
+
+/// Events emitted on the in-process subscription channel returned by
+/// [`ExtensionHandle::subscribe`].
+///
+/// `StateChanged` fires whenever the host re-classifies — after every
+/// `send` and every successful `wait`. Subscribers can keep an
+/// always-current view of the adapter state without polling.
+#[derive(Debug, Clone)]
+pub enum ExtensionEvent {
+    /// Classifier re-ran and produced a new state. The full snapshot
+    /// is carried in-band so subscribers don't have to call back into
+    /// the host to retrieve it.
+    StateChanged(ExtensionStateSnapshot),
 }
 
 impl ExtensionHandle {
@@ -300,7 +315,38 @@ impl ExtensionHandle {
             extension,
             last_intent: None,
             completed_turn_stable_ms,
+            state_subscribers: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Subscribe to in-process [`ExtensionEvent`] notifications.
+    ///
+    /// Returns a `std::sync::mpsc::Receiver<ExtensionEvent>` that
+    /// yields `StateChanged(_)` on every classifier re-run (after
+    /// `send` or `wait`). Dropping the receiver silently removes the
+    /// subscription on the next event tick.
+    ///
+    /// Pairs with [`Session::events`] when consumers want both
+    /// transport-level signals (PTY sequence advanced, child exited)
+    /// and classifier-level state transitions.
+    pub fn subscribe(&self) -> std::sync::mpsc::Receiver<ExtensionEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.state_subscribers
+            .lock()
+            .expect("state subscriber list poisoned")
+            .push(tx);
+        rx
+    }
+
+    fn broadcast_state(&self, snapshot: &ExtensionStateSnapshot) {
+        let mut subs = self
+            .state_subscribers
+            .lock()
+            .expect("state subscriber list poisoned");
+        subs.retain(|tx| {
+            tx.send(ExtensionEvent::StateChanged(snapshot.clone()))
+                .is_ok()
+        });
     }
 
     /// Access the underlying PTY session.
@@ -362,7 +408,9 @@ impl ExtensionHandle {
         let params = ensure_params_object(params);
         let plan = self.extension.plan(intent, &params)?;
         self.apply_plan(&plan, intent)?;
-        self.try_state()
+        let state = self.try_state()?;
+        self.broadcast_state(&state);
+        Ok(state)
     }
 
     /// Wait until the plugin's matcher for `intent` is satisfied or the
@@ -391,7 +439,35 @@ impl ExtensionHandle {
             result.sequence,
             Some(stable_ms),
         )?;
+        self.broadcast_state(&state);
         Ok((state, result.outcome))
+    }
+
+    /// Atomic [`send`](Self::send) followed by [`wait`](Self::wait) using a
+    /// single mutex-held turn.
+    ///
+    /// `claudette` and similar consumers traditionally hand-rolled
+    /// "submit prompt, then wait for the turn to complete" by chaining
+    /// `adapter.send` and `adapter.wait`. In a multi-client setup another
+    /// connection could slip a competing intent between those two calls.
+    /// [`turn`](Self::turn) keeps both legs under the same `&mut self`
+    /// borrow so this race is impossible at the type level.
+    ///
+    /// `wait_intent` defaults to the conventional `"wait_turn_matcher"` so
+    /// simple call sites can pass `None`. The returned tuple mirrors
+    /// [`wait`](Self::wait): the post-wait classifier state plus the
+    /// matcher outcome that fired.
+    pub fn turn(
+        &mut self,
+        send_intent: &str,
+        send_params: Value,
+        wait_intent: Option<&str>,
+        wait_params: Value,
+        timeout: Duration,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        let _state_after_send = self.send(send_intent, send_params)?;
+        let wait_intent = wait_intent.unwrap_or("wait_turn_matcher");
+        self.wait(wait_intent, wait_params, timeout)
     }
 
     /// Apply an action plan, requiring that the plan supply `last_intent` and

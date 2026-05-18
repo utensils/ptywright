@@ -1,9 +1,15 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
 use crate::error::Result;
+
+/// Maximum number of distinct marker labels retained per transcript.
+/// Plugins typically need only a handful (`prompt_submitted`,
+/// `turn_complete`, …); the cap keeps marker storage from growing
+/// unboundedly if a plugin author writes a label-per-event by mistake.
+const MAX_MARKERS: usize = 64;
 
 /// Configuration for optional raw transcript file streaming.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +66,10 @@ pub struct Transcript {
     /// see [`Transcript::delta_since`].
     chars_written: u64,
     raw_file: Option<File>,
+    /// Caller-placed markers: label → char cursor at the time
+    /// [`Transcript::mark`] was called. Multiple marks with the same
+    /// label overwrite (most recent wins). Capped at [`MAX_MARKERS`].
+    marks: BTreeMap<String, u64>,
 }
 
 /// Output appended to a [`Transcript`] since a subscriber's cursor.
@@ -90,6 +100,7 @@ impl Transcript {
             chars: VecDeque::new(),
             chars_written: 0,
             raw_file,
+            marks: BTreeMap::new(),
         })
     }
 
@@ -131,6 +142,74 @@ impl Transcript {
     #[must_use]
     pub const fn chars_written(&self) -> u64 {
         self.chars_written
+    }
+
+    /// Record a marker at the current write cursor and return it. Labels
+    /// are arbitrary strings; later [`Transcript::slice_between`] /
+    /// [`Transcript::marker`] lookups can use the returned cursor or the
+    /// label.
+    ///
+    /// Repeated calls with the same label overwrite (most-recent wins) —
+    /// plugins that re-enter a state can call `mark("turn_complete")` on
+    /// each entry without leaking storage. The marker table is capped at
+    /// [`MAX_MARKERS`] distinct labels; once full, additional **new**
+    /// labels are rejected (existing labels still update). The returned
+    /// cursor is the write position regardless — callers that need to
+    /// detect rejection should pair this with [`Transcript::marker`].
+    /// A rejection is also logged at `tracing::warn` level under the
+    /// `ptywright::transcript` target so a plugin author that hits the
+    /// cap learns about it without having to re-query.
+    pub fn mark(&mut self, label: impl Into<String>) -> u64 {
+        let cursor = self.chars_written;
+        let label = label.into();
+        if self.marks.contains_key(&label) || self.marks.len() < MAX_MARKERS {
+            self.marks.insert(label, cursor);
+        } else {
+            tracing::warn!(
+                target: "ptywright::transcript",
+                label = %label,
+                max_markers = MAX_MARKERS,
+                "transcript marker rejected: label table is full"
+            );
+        }
+        cursor
+    }
+
+    /// Cursor previously placed at `label`, or `None` if no such marker
+    /// exists.
+    #[must_use]
+    pub fn marker(&self, label: &str) -> Option<u64> {
+        self.marks.get(label).copied()
+    }
+
+    /// Text between two byte cursors, or `None` if either cursor refers
+    /// to text the bounded ring buffer has already evicted.
+    ///
+    /// `a` and `b` may be passed in either order; the returned text
+    /// reads from the lower to the higher cursor regardless. Both
+    /// cursors must be `<= chars_written()`; otherwise this returns
+    /// `None`.
+    ///
+    /// Pair with [`Transcript::mark`] to segment turn-bounded
+    /// transcripts: a plugin that marks `turn_start` on prompt submit
+    /// and `turn_end` on completion can later ask
+    /// `slice_between(turn_start, turn_end)` for the exact bytes
+    /// belonging to that turn.
+    #[must_use]
+    pub fn slice_between(&self, a: u64, b: u64) -> Option<String> {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let total = self.chars_written;
+        if hi > total {
+            return None;
+        }
+        let buffered = self.chars.len() as u64;
+        let earliest_retained = total.saturating_sub(buffered);
+        if lo < earliest_retained {
+            return None;
+        }
+        let skip = usize::try_from(lo - earliest_retained).ok()?;
+        let take = usize::try_from(hi - lo).ok()?;
+        Some(self.chars.iter().skip(skip).take(take).collect())
     }
 
     /// Text appended since `cursor`. Returns an empty delta when the caller is
@@ -309,6 +388,93 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read raw transcript file");
         assert_eq!(bytes, b"first\nsecond\n");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mark_and_slice_between_returns_the_marked_range() {
+        let mut transcript = Transcript::default();
+        transcript.push_bytes(b"prompt\n").expect("push prompt");
+        let turn_start = transcript.mark("turn_start");
+        transcript
+            .push_bytes(b"reply with tokens\n")
+            .expect("push reply");
+        let turn_end = transcript.mark("turn_end");
+        transcript
+            .push_bytes(b"trailing chrome")
+            .expect("push trailing");
+
+        assert_eq!(transcript.marker("turn_start"), Some(turn_start));
+        assert_eq!(transcript.marker("turn_end"), Some(turn_end));
+        assert_eq!(
+            transcript.slice_between(turn_start, turn_end).as_deref(),
+            Some("reply with tokens\n"),
+            "slice between markers must include the exact byte range"
+        );
+        // Argument order is irrelevant — slice_between sorts internally.
+        assert_eq!(
+            transcript.slice_between(turn_end, turn_start).as_deref(),
+            Some("reply with tokens\n"),
+        );
+    }
+
+    #[test]
+    fn mark_overwrites_same_label() {
+        // Plugin pattern: re-enter `completed_turn`, mark again. Second
+        // call must overwrite without growing the marker table.
+        let mut transcript = Transcript::default();
+        let first = transcript.mark("turn_complete");
+        transcript.push_bytes(b"xxxxxxxx").expect("push pad");
+        let second = transcript.mark("turn_complete");
+        assert!(second > first);
+        assert_eq!(transcript.marker("turn_complete"), Some(second));
+    }
+
+    #[test]
+    fn slice_between_returns_none_when_cursor_evicted() {
+        // Tiny ring forces eviction. The marker remains in the table
+        // (chars_written is monotonic) but its cursor refers to bytes
+        // the ring no longer holds — `slice_between` must signal that
+        // by returning None rather than a misleading partial slice.
+        let mut transcript = Transcript::new(TranscriptConfig {
+            max_chars: 4,
+            raw_file: None,
+        })
+        .expect("create transcript");
+        let early = transcript.mark("early");
+        transcript.push_bytes(b"abcdefgh").expect("push");
+        let late = transcript.mark("late");
+        assert_eq!(transcript.slice_between(early, late), None);
+    }
+
+    #[test]
+    fn slice_between_returns_none_for_cursor_beyond_written() {
+        let transcript = Transcript::default();
+        // Marker that hasn't existed: clearly out of bounds.
+        assert_eq!(transcript.slice_between(0, 100), None);
+    }
+
+    #[test]
+    fn marker_cap_rejects_new_labels_when_full() {
+        // Defensive: a plugin author that accidentally writes a
+        // label-per-event must not be able to grow the table without
+        // bound. After MAX_MARKERS distinct labels, additional ones
+        // are dropped while existing labels still update normally.
+        let mut transcript = Transcript::default();
+        for i in 0..MAX_MARKERS {
+            transcript.mark(format!("label-{i}"));
+        }
+        assert_eq!(transcript.marker("label-0"), Some(0));
+        transcript.push_bytes(b"x").expect("push");
+        transcript.mark("overflow-label");
+        assert_eq!(
+            transcript.marker("overflow-label"),
+            None,
+            "new labels past MAX_MARKERS must be rejected"
+        );
+        // Existing labels still update.
+        let bumped = transcript.mark("label-0");
+        assert_eq!(bumped, 1);
+        assert_eq!(transcript.marker("label-0"), Some(1));
     }
 
     fn unique_suffix() -> u128 {

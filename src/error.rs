@@ -46,4 +46,15 @@ pub enum Error {
         /// Permission the caller's plugin manifest needed to declare.
         required: PluginPermission,
     },
+    /// Operation has no equivalent on the current platform — see the
+    /// per-platform notes on [`crate::Signal`] for the signal subset that
+    /// maps cleanly to Windows.
+    #[error("unsupported on this platform: {0}")]
+    UnsupportedOnPlatform(String),
+    /// Cancellable wait was aborted via a
+    /// [`crate::CancellationToken`](crate::session::CancellationToken).
+    /// Distinct from `Timeout` so callers can distinguish "we ran out
+    /// of time" from "another thread / connection aborted us."
+    #[error("wait cancelled")]
+    Cancelled,
 }

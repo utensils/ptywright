@@ -192,6 +192,41 @@ impl Key {
     }
 }
 
+/// Process signal sent to a session's child via [`Action::Signal`] or
+/// [`crate::Session::signal`].
+///
+/// `Int` and `Kill` overlap with [`Action::Interrupt`] / [`Action::Kill`];
+/// they're retained here so the signal surface is exhaustive and so callers
+/// composing higher-level controllers (e.g. SIGTERM-then-SIGKILL ladders via
+/// [`crate::Session::terminate`]) don't have to mix two enums.
+///
+/// Cross-platform behaviour:
+///
+/// * Unix: every variant maps directly to its `libc` constant.
+/// * Windows: `Term` maps to a best-effort `taskkill /T /PID`, `Kill` is a
+///   hard kill via the existing `ChildKiller` path, and `Int` writes the
+///   Ctrl-C byte to the PTY (same as [`Action::Interrupt`]). The other
+///   variants return [`crate::Error::UnsupportedOnPlatform`] — Windows has
+///   no POSIX equivalent for SIGHUP / SIGQUIT / SIGUSR1 / SIGUSR2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Signal {
+    /// SIGTERM — graceful termination.
+    Term,
+    /// SIGHUP — terminal hangup.
+    Hup,
+    /// SIGQUIT — quit with core dump.
+    Quit,
+    /// SIGINT — interrupt (same byte as Ctrl-C via the PTY).
+    Int,
+    /// SIGKILL — uncatchable hard kill.
+    Kill,
+    /// SIGUSR1 — user-defined #1.
+    User1,
+    /// SIGUSR2 — user-defined #2.
+    User2,
+}
+
 /// Input or lifecycle action sent to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -221,6 +256,8 @@ pub enum Action {
     Interrupt,
     /// Send Ctrl-D.
     Eof,
+    /// Send an arbitrary process signal — see [`Signal`].
+    Signal(Signal),
     /// Kill the child process.
     Kill,
 }

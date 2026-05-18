@@ -26,12 +26,12 @@ pub mod session;
 pub mod target;
 pub mod transcript;
 
-pub use action::{Action, Key};
+pub use action::{Action, Key, Signal};
 pub use config::{Config, LogFormat, LoggingConfig};
 pub use error::{Error, Result};
 pub use extension::{
-    ActionPlan, ClassifyContext, Extension, ExtensionHandle, ExtensionStateSnapshot, LuaExtension,
-    StateCandidate,
+    ActionPlan, ClassifyContext, Extension, ExtensionEvent, ExtensionHandle,
+    ExtensionStateSnapshot, LuaExtension, StateCandidate,
 };
 pub use logging::{
     LogGuard, RedactingMakeWriter, RedactingWriter, cleanup_old_logs, init_for_oneshot,
@@ -50,7 +50,7 @@ pub use rpc::{
     serve_ndjson_with_state,
 };
 pub use screen::{CursorState, ScreenCell, ScreenCellStyle, ScreenSnapshot, Terminal};
-pub use session::{Session, SessionConfig, SessionExitStatus};
+pub use session::{CancellationToken, Session, SessionConfig, SessionEvent, SessionExitStatus};
 pub use target::{Target, TerminalSize};
 pub use transcript::{Transcript, TranscriptConfig, TranscriptFileConfig};
 

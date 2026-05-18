@@ -4,6 +4,7 @@
   "last_intent": null,
   "min_confidence": 0.6,
   "metadata": {
+    "dialog_id": "dcc4608b",
     "permission": {
       "tool": "Bash",
       "summary": "git status --short",

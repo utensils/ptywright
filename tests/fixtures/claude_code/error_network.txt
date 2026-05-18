@@ -1,0 +1,5 @@
+Claude Code
+
+Connection error. Could not reach api.anthropic.com.
+Please retry.
+>
