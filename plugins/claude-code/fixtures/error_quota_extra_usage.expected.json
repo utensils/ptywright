@@ -1,0 +1,16 @@
+{
+  "state": "error",
+  "evidence": "visible error banner detected",
+  "last_intent": null,
+  "min_confidence": 0.6,
+  "metadata": {
+    "error": {
+      "kind": "quota",
+      "message": "API Error: Extra usage is required for 1M context · run /extra-usage to enable, or /model to switch to standard context"
+    },
+    "status": {
+      "model": "Sonnet 4.6",
+      "permission_mode": "auto"
+    }
+  }
+}

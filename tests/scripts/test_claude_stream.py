@@ -401,6 +401,182 @@ class TerminalStatesTests(unittest.TestCase):
             self.assertIn(state, CS.Stream.TERMINAL_STATES,
                           f"{state} must be in TERMINAL_STATES for fail-fast exit")
 
+    def test_exit_code_constants_are_distinct(self):
+        # Wrappers (claudette, multi-account drivers) discriminate
+        # failure modes on these. Catch any accidental collision.
+        codes = {
+            CS.Stream.EXIT_OK,
+            CS.Stream.EXIT_GENERIC,
+            CS.Stream.EXIT_RATE_LIMIT,
+            CS.Stream.EXIT_QUOTA,
+            CS.Stream.EXIT_STUCK,
+        }
+        self.assertEqual(len(codes), 5,
+                         "exit code constants must be pairwise distinct")
+        self.assertEqual(CS.Stream.EXIT_OK, 0)
+
+
+class ErrorMetadataAccessorTests(unittest.TestCase):
+    """`_last_error_kind` and `_format_error_detail` shape the rate-limit
+    / quota fail-fast path. Wrong shape => wrong exit code => wrappers
+    can't swap accounts."""
+
+    def _make_stream(self):
+        stream = CS.Stream.__new__(CS.Stream)
+        stream._last_metadata = None
+        return stream
+
+    def test_kind_none_when_no_metadata(self):
+        s = self._make_stream()
+        self.assertIsNone(s._last_error_kind())
+        self.assertEqual(s._format_error_detail(), "")
+
+    def test_kind_rate_limit_with_retry(self):
+        s = self._make_stream()
+        s._last_metadata = {"error": {
+            "kind": "rate_limit",
+            "message": "Rate limit reached. Please try again in 42 seconds.",
+            "retry_after_s": 42,
+        }}
+        self.assertEqual(s._last_error_kind(), "rate_limit")
+        detail = s._format_error_detail()
+        self.assertIn("Rate limit reached", detail)
+        self.assertIn("retry_after=42s", detail)
+
+    def test_kind_quota_no_retry(self):
+        s = self._make_stream()
+        s._last_metadata = {"error": {
+            "kind": "quota",
+            "message": "Credit balance is too low",
+        }}
+        self.assertEqual(s._last_error_kind(), "quota")
+        detail = s._format_error_detail()
+        self.assertIn("Credit balance is too low", detail)
+        self.assertNotIn("retry_after", detail)
+
+    def test_malformed_metadata_returns_none(self):
+        s = self._make_stream()
+        # error subtree is not a dict — fixture parsing edge case.
+        s._last_metadata = {"error": "boom"}
+        self.assertIsNone(s._last_error_kind())
+        self.assertEqual(s._format_error_detail(), "")
+
+
+class IdleGrowthDetectorTests(unittest.TestCase):
+    """Stuck detector samples transcript length at most once per second
+    and reports seconds-since-last-growth. Verifies the bookkeeping is
+    monotonic and the rate-limit doesn't drop growth signals."""
+
+    def _make_stream(self):
+        stream = CS.Stream.__new__(CS.Stream)
+        stream.client = mock.Mock()
+        stream.aid = "e-test"
+        stream._growth_check_at = 0.0
+        stream._growth_last_len = None
+        stream._growth_last_grew_at = None
+        return stream
+
+    def _set_transcript(self, stream, text):
+        stream.client.rpc.return_value = {"text": text}
+
+    def test_first_sample_seeds_tracker(self):
+        s = self._make_stream()
+        self._set_transcript(s, "x" * 100)
+        # First call seeds — duration since growth is 0.
+        self.assertEqual(s._check_idle_growth(), 0.0)
+        self.assertEqual(s._growth_last_len, 100)
+        self.assertIsNotNone(s._growth_last_grew_at)
+
+    def test_growth_above_noise_floor_resets_timer(self):
+        import time as _time
+        s = self._make_stream()
+        self._set_transcript(s, "x" * 1000)
+        s._check_idle_growth()  # seed
+        # Force the next sample to bypass the 1.0s rate-limit and feed
+        # a burst above PASTE_REACTION_BYTES (256). The timer resets.
+        s._growth_check_at = _time.monotonic() - 2.0
+        s._growth_last_grew_at = _time.monotonic() - 5.0
+        self._set_transcript(s, "x" * (1000 + CS.PASTE_REACTION_BYTES + 10))
+        result = s._check_idle_growth()
+        self.assertEqual(result, 0.0)
+        self.assertEqual(s._growth_last_len, 1000 + CS.PASTE_REACTION_BYTES + 10)
+
+    def test_sub_threshold_trickle_does_NOT_reset_timer(self):
+        """The core regression test for the original hang. Status-bar
+        token-counter updates produce sub-256-byte growth that must
+        accumulate against the stuck timer instead of silently
+        resetting it on every poll."""
+        import time as _time
+        s = self._make_stream()
+        self._set_transcript(s, "x" * 1000)
+        s._check_idle_growth()  # seed; baseline = 1000
+        seed_grew_at = s._growth_last_grew_at
+        seed_baseline = s._growth_last_len
+        # Pretend a status-bar tick added 50 bytes — below the 256
+        # threshold. The baseline must NOT advance, and the timer
+        # must NOT reset.
+        s._growth_check_at = _time.monotonic() - 2.0
+        s._growth_last_grew_at = seed_grew_at - 10.0
+        self._set_transcript(s, "x" * 1050)
+        delta = s._check_idle_growth()
+        self.assertGreaterEqual(delta, 9.5,
+            "sub-threshold growth must not reset _growth_last_grew_at")
+        self.assertEqual(s._growth_last_len, seed_baseline,
+            "_growth_last_len must NOT advance on sub-threshold growth — "
+            "otherwise trickle silently rebases the comparison and the "
+            "next 256-byte check never triggers")
+
+    def test_trickle_accumulates_above_threshold_then_resets(self):
+        """A series of sub-threshold growths totalling >=256 bytes IS
+        real progress and must reset the timer once the accumulated
+        delta crosses the noise floor. Without this, a slow but
+        legitimate model would be wrongly classified as stuck."""
+        import time as _time
+        s = self._make_stream()
+        self._set_transcript(s, "x" * 1000)
+        s._check_idle_growth()  # seed
+        # Three small bursts of 100 bytes each (300 total > 256).
+        for grown_to in (1100, 1200, 1300):
+            s._growth_check_at = _time.monotonic() - 2.0
+            self._set_transcript(s, "x" * grown_to)
+            delta = s._check_idle_growth()
+            if grown_to < 1000 + CS.PASTE_REACTION_BYTES:
+                # Still below the accumulated threshold — timer must
+                # still be running.
+                self.assertGreater(delta, 0.0)
+            else:
+                # Crossed the threshold — timer resets.
+                self.assertEqual(delta, 0.0)
+                self.assertEqual(s._growth_last_len, grown_to)
+
+    def test_no_growth_accumulates_duration(self):
+        import time as _time
+        s = self._make_stream()
+        self._set_transcript(s, "x" * 100)
+        s._check_idle_growth()  # seed
+        # Same length, but the check is rate-limited so the RPC won't
+        # fire. The function falls back to "now - last_grew_at".
+        seed_grew_at = s._growth_last_grew_at
+        # Move the cached grew_at back to simulate elapsed time.
+        s._growth_last_grew_at = seed_grew_at - 10.0
+        # Under the 1.0s rate-limit, no fresh RPC; cached delta returned.
+        delta = s._check_idle_growth()
+        self.assertGreaterEqual(delta, 9.5)
+
+    def test_rpc_failure_does_not_corrupt_timer(self):
+        import time as _time
+        s = self._make_stream()
+        # Seed first.
+        self._set_transcript(s, "x" * 100)
+        s._check_idle_growth()
+        # Now force the rate-limit to expire AND make the RPC raise.
+        s._growth_check_at = _time.monotonic() - 2.0
+        s.client.rpc.side_effect = RuntimeError("server gone")
+        delta = s._check_idle_growth()
+        # Must still return a non-None duration, not crash. State left
+        # untouched so the next successful sample can continue.
+        self.assertIsNotNone(delta)
+
 
 class ChromeSpinnerGlyphSetTests(unittest.TestCase):
     """Reminder test: the Python `_CHROME_SPINNER_GLYPHS` char class

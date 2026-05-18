@@ -1,0 +1,16 @@
+ ▐▛███▜▌   Claude Code v2.1.143
+▝▜█████▛▘  Sonnet 4.6 · Claude Max
+  ▘▘ ▝▝    ~/Projects/utensils/ptywright
+
+❯ Say hi in one word.
+
+⏺ Let me respond.
+  ⎿  API Error: Extra usage is required for 1M context · run /extra-usage to enable, or /model to switch to standard context
+
+✻ Brewed for 0s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+  user @ host ~/Projects/utensils/ptywright    [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

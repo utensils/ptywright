@@ -86,6 +86,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--heartbeat-ms", type=int, default=50,
                     help="poll cadence in ms (default: 50). Pulses session.output notifications "
                          "and screen inspections; lower = faster perceived streaming, higher CPU.")
+    ap.add_argument("--stuck-after-seconds", type=float, default=60.0,
+                    help="while the classifier reports `thinking`, bail if no meaningful "
+                         "PTY output (>=256 bytes — see PASTE_REACTION_BYTES) has been "
+                         "observed for this many seconds (default: 60). Catches silent "
+                         "hangs where the model never produces a first token (network "
+                         "stall, account auth refresh) — robust to status-bar token-"
+                         "counter trickle that would otherwise reset a naive timer. "
+                         "The default leaves headroom for Claude to surface its own "
+                         "rate-limit / quota error banner (observed up to ~90s on the "
+                         "1M-context tier) so wrappers get exit 3 / 4 instead of exit "
+                         "5 when an account is throttled. Set to 0 to disable.")
     ap.add_argument("--ptywright", default=os.environ.get("PTYWRIGHT_BIN", "ptywright"),
                     help="path to the ptywright binary (default: $PTYWRIGHT_BIN or `ptywright`)")
     ap.add_argument("--quiet", action="store_true", help="suppress state-transition and metadata annotations")
@@ -250,6 +261,15 @@ _ACTIVITY_TOOL_BULLET_RE = re.compile(
     r"^⏺\s+\S+\(.+\)\s*$"
 )
 
+# Turn-completion marker recognizer for the streaming diff. Same
+# shape `has_turn_completion_marker` in the plugin uses: leading `✻`
+# glyph + tea-verb + ` for <N>` numeric duration. Distinguishes the
+# real end-of-turn marker from spinner frames (which end in `…`).
+# When we see this in a streamed line, we KNOW Claude has finished
+# the turn even if the classifier hasn't yet reported `completed_turn`
+# — the stuck-detector's rescue branch uses this fact.
+_COMPLETION_MARKER_RE = re.compile(r"^✻\s+\S+.*\sfor\s+\d")
+
 def _is_chrome_line(s: str) -> bool:
     if _CHROME_RULE_RE.match(s):
         return True
@@ -297,6 +317,16 @@ class Stream:
     # them as success.
     TERMINAL_STATES = {"completed_turn", "error", "exited", "plugin_error"}
 
+    # Exit-code taxonomy. Wrappers (claudette, multi-account drivers,
+    # CI) discriminate failure modes on these. 3 / 4 are reserved for
+    # the two plan-level conditions where swapping accounts is the
+    # natural remediation; everything else collapses to 1.
+    EXIT_OK = 0
+    EXIT_GENERIC = 1
+    EXIT_RATE_LIMIT = 3
+    EXIT_QUOTA = 4
+    EXIT_STUCK = 5
+
     def __init__(self, client: Client, aid: str, args: argparse.Namespace,
                  hard_deadline: float):
         self.client = client
@@ -304,6 +334,7 @@ class Stream:
         self.args = args
         self.heartbeat = args.heartbeat_ms / 1000.0
         self.deadline = hard_deadline
+        self.stuck_after = max(0.0, getattr(args, "stuck_after_seconds", 60.0))
         self._closed = False
         # Sticky flag set when the server emits `session.exited` for this
         # adapter's underlying session. The poll loop checks it BEFORE
@@ -317,6 +348,24 @@ class Stream:
         self._last_state: str | None = None
         self._last_evidence: str | None = None
         self._last_metadata_repr: str | None = None
+        # Most-recent classifier metadata dict. Captured every poll so
+        # the terminal-state branch can read `metadata.error.kind`
+        # (rate_limit / quota / connection / auth / api / unknown) and
+        # pick the right exit code without re-RPC'ing.
+        self._last_metadata: dict | None = None
+        # Stuck-detector state. Independent of the TTY-only KB/s ticker
+        # so it works under non-TTY stdout (CI piping). Sampled at
+        # most once per second to keep RPC overhead low.
+        self._growth_check_at: float = 0.0
+        self._growth_last_len: int | None = None
+        self._growth_last_grew_at: float | None = None
+        # Latched True the first time the streaming diff emits a line
+        # matching `_COMPLETION_MARKER_RE`. When the stuck-detector
+        # subsequently fires, we know Claude actually finished the
+        # turn — the classifier just got tripped by post-turn tips /
+        # spinner repaints. We exit cleanly as `completed_turn`
+        # instead of `stuck` in that case.
+        self._saw_completion_marker: bool = False
         # Alive ticker — overwrites in place on a TTY.
         self._last_alive_at = 0.0
         self._alive_phase = 0
@@ -378,6 +427,7 @@ class Stream:
         s = st["state"]["state"]
         ev = st["state"].get("evidence", "")
         md = st["state"].get("metadata")
+        self._last_metadata = md if isinstance(md, dict) else None
         if not self.args.quiet:
             # Only log on actual state transitions. Evidence can flap
             # within a single state (e.g. the mid-turn `thinking` branch
@@ -770,13 +820,63 @@ class Stream:
         self._transcript_baseline = baseline
         self._submitted_prompt = prompt
 
-        self.send_prompt(prompt)
+        # Use a short, distinctive substring of the prompt as a body-
+        # anchor. After a real submission, the prompt is echoed in
+        # the body as `❯ <prompt text>`. A failed submission leaves
+        # it ONLY in `status_text` (the input box at the bottom),
+        # so checking for the snippet inside `body_text` is a much
+        # stronger signal than "body bytes changed" (which is
+        # trivially true between any two inspects).
+        prompt_anchor = prompt.strip().splitlines()[0] if prompt.strip() else ""
+        prompt_anchor = prompt_anchor[:40]  # head only, in case of long prompts
+
+        def _do_send():
+            self.send_prompt(prompt)
+            grew = 0
+            sub_deadline = time.monotonic() + 10.0
+            while time.monotonic() < sub_deadline and not self._expired():
+                trans = self.client.rpc("adapter.transcript",
+                    {"adapter": self.aid, "redact": False}, t=5.0)["text"]
+                grew = len(trans) - baseline
+                cur_body, _ = self.inspect()
+                # Real submission echoes the prompt into BODY (not
+                # just status_text). Without this check, the launch
+                # banner's idle redraws pass a naive body-diff check
+                # even when nothing was submitted.
+                anchored = bool(prompt_anchor) and (prompt_anchor in cur_body)
+                if grew >= PASTE_REACTION_BYTES and anchored:
+                    return True, grew
+                self._tick_alive(f"waiting for Claude to accept prompt (+{grew}B)")
+                time.sleep(self.heartbeat)
+            return False, grew
+
+        ok, grew = _do_send()
+        if not ok:
+            # First attempt didn't get past the launch / interceptor
+            # state. Send an extra Enter via the plugin's
+            # `dismiss_welcome` intent (single Enter, no paste) to
+            # clear whatever's intercepting, then retry the prompt.
+            emit(DIM("· first submit didn't land — retrying after dismiss_welcome"))
+            try:
+                self.client.rpc("adapter.send",
+                    {"adapter": self.aid, "intent": "dismiss_welcome", "params": {}}, t=5.0)
+            except (RuntimeError, TimeoutError):
+                pass
+            ok, grew = _do_send()
+        if ok:
+            emit(GREEN("→ prompt submitted"),
+                 DIM(f"({len(prompt)} chars; +{grew} bytes from Claude)"))
+            return True, ""
 
         while not self._expired():
+            # Fall-through path — keep polling until either anchor
+            # lands or the hard deadline fires.
             trans = self.client.rpc("adapter.transcript",
                 {"adapter": self.aid, "redact": False}, t=5.0)["text"]
             grew = len(trans) - baseline
-            if grew >= PASTE_REACTION_BYTES:
+            cur_body, _ = self.inspect()
+            anchored = bool(prompt_anchor) and (prompt_anchor in cur_body)
+            if grew >= PASTE_REACTION_BYTES and anchored:
                 emit(GREEN("→ prompt submitted"),
                      DIM(f"({len(prompt)} chars; +{grew} bytes from Claude)"))
                 return True, ""
@@ -795,6 +895,84 @@ class Stream:
         except (RuntimeError, TimeoutError):
             pass
         return False, "deadline expired waiting for Claude to acknowledge paste"
+
+    # ─── primitive: idle-growth sampling for the stuck detector ──────────
+    def _check_idle_growth(self) -> float | None:
+        """Return seconds since the last observed MEANINGFUL transcript
+        growth, or None when we don't have enough samples yet. Samples
+        `adapter.transcript` at most once per second to keep RPC
+        overhead negligible relative to the heartbeat loop.
+
+        "Meaningful" here is growth of at least `PASTE_REACTION_BYTES`
+        (256) since the last reset point — the same noise floor the
+        submit-verification path uses. Below that the trickle is just
+        status-bar chrome (token counter, spinner, idle refresh, dim
+        elapsed timer) which keeps repainting during a genuine hang
+        and would otherwise pin a naive timer at zero forever.
+        `_growth_last_len` is deliberately NOT updated for sub-
+        threshold growth, so trickle accumulates across samples — a
+        real 256-byte burst spread across N seconds will still reset
+        the timer; only true silence (or pure status-bar repainting)
+        ticks it forward.
+
+        Independent of `_sample_bytes_rate` (which is TTY-display-only,
+        cached behind the alive ticker's gating). This path runs even
+        under non-TTY stdout so CI piping behaves the same as a live
+        terminal.
+        """
+        now = time.monotonic()
+        # Rate-limit the actual RPC to once per second; between samples
+        # report the cached duration so callers can still threshold.
+        if now - self._growth_check_at < 1.0:
+            if self._growth_last_grew_at is None: return None
+            return now - self._growth_last_grew_at
+        self._growth_check_at = now
+        try:
+            cur_len = len(self.client.rpc("adapter.transcript",
+                {"adapter": self.aid, "redact": False}, t=2.0)["text"])
+        except (RuntimeError, TimeoutError):
+            # RPC failure is a separate signal — don't penalize the
+            # stuck timer with it (the caller will surface real RPC
+            # death through its own exception handling).
+            if self._growth_last_grew_at is None: return None
+            return now - self._growth_last_grew_at
+        if self._growth_last_len is None:
+            # First sample — seed the tracker so subsequent ticks have
+            # a baseline to compare against.
+            self._growth_last_len = cur_len
+            self._growth_last_grew_at = now
+            return 0.0
+        if cur_len - self._growth_last_len >= PASTE_REACTION_BYTES:
+            # Real progress crossed the noise floor — reset the timer
+            # and the baseline so the next accumulation starts fresh.
+            self._growth_last_len = cur_len
+            self._growth_last_grew_at = now
+            return 0.0
+        # Sub-threshold growth (or none) — DO NOT update
+        # `_growth_last_len` so trickle accumulates rather than
+        # silently resetting the comparison baseline.
+        return now - (self._growth_last_grew_at or now)
+
+    # ─── error metadata accessors ────────────────────────────────────────
+    def _last_error_kind(self) -> str | None:
+        md = self._last_metadata
+        if not md: return None
+        err = md.get("error")
+        if not isinstance(err, dict): return None
+        kind = err.get("kind")
+        return kind if isinstance(kind, str) else None
+
+    def _format_error_detail(self) -> str:
+        md = self._last_metadata or {}
+        err = md.get("error") if isinstance(md.get("error"), dict) else {}
+        parts: list[str] = []
+        msg = err.get("message")
+        if isinstance(msg, str) and msg:
+            parts.append(msg)
+        retry = err.get("retry_after_s")
+        if isinstance(retry, (int, float)) and retry > 0:
+            parts.append(f"retry_after={int(retry)}s")
+        return " / ".join(parts)
 
     # ─── compound: stream body deltas until classifier signals completion ─
     def stream_until_done(self) -> int:
@@ -890,6 +1068,8 @@ class Stream:
                     if s in printed_lines:
                         continue
                     printed_lines.add(s)
+                    if _COMPLETION_MARKER_RE.match(s):
+                        self._saw_completion_marker = True
                     if not printed:
                         self._clear_alive()
                         printed = True
@@ -926,10 +1106,72 @@ class Stream:
                     self._dump_answer_region(body)
                 if state == self.SUCCESS_STATE:
                     emit(GREEN(f"✓ {state}"), DIM(f"(+{grew_by} chars in body)"))
-                    return 0
-                # error / exited / plugin_error → failure exit.
+                    return self.EXIT_OK
+                # error → discriminate on metadata.error.kind so wrappers
+                # can swap accounts on a known code. Everything else
+                # (exited / plugin_error / generic error) collapses to 1.
+                if state == "error":
+                    kind = self._last_error_kind()
+                    detail = self._format_error_detail()
+                    if kind == "rate_limit":
+                        emit(RED("✗ rate limit reached"),
+                             (DIM(detail) + "  " if detail else "") +
+                             DIM("→ exit 3 (swap account or wait and retry)"))
+                        return self.EXIT_RATE_LIMIT
+                    if kind == "quota":
+                        emit(RED("✗ usage / credit quota exhausted"),
+                             (DIM(detail) + "  " if detail else "") +
+                             DIM("→ exit 4 (swap account or top up credits)"))
+                        return self.EXIT_QUOTA
                 emit(RED(f"✗ {state}"), DIM(f"(+{grew_by} chars in body)"))
-                return 1
+                return self.EXIT_GENERIC
+
+            # Stuck-out: classifier says `thinking` but no PTY bytes
+            # have arrived for `stuck_after` seconds. Common causes
+            # the classifier alone can't see: silent server-side usage
+            # gate (limit hit before banner renders), OAuth refresh
+            # mid-request, TLS stall. Bail with EXIT_STUCK so wrappers
+            # can distinguish "real hang" from "real error".
+            if self.stuck_after > 0 and state == "thinking":
+                stuck_for = self._check_idle_growth()
+                if stuck_for is not None and stuck_for >= self.stuck_after:
+                    self._clear_alive()
+                    # Rescue path: if the streaming diff already
+                    # surfaced a `✻ <Verb> for <N>s` completion
+                    # marker, the turn IS done — the classifier just
+                    # got tripped by post-turn tip / spinner
+                    # repaints (`⎿ Tip: …`, the next spinner frame
+                    # kicking off, etc.). Treat as `completed_turn`
+                    # and dump the answer region the same way the
+                    # normal terminal-state branch does. Without
+                    # this, a successful turn followed by a "did
+                    # you know" post-turn callout flakes the script
+                    # into a stuck-out failure that wrappers would
+                    # wrongly classify as a hang.
+                    if self._saw_completion_marker:
+                        grew_by = max(0, len(body) - baseline_len)
+                        self._dump_answer_region_from_transcript(
+                            already_printed=printed_lines
+                        )
+                        emit(GREEN("✓ completed_turn"),
+                             DIM(f"(+{grew_by} chars in body; "
+                                 "marker observed via streaming diff, "
+                                 "classifier did not flip — likely a "
+                                 "post-turn tip / spinner repaint)"))
+                        return self.EXIT_OK
+                    emit(RED("✗ stuck"),
+                         f"no PTY output for {stuck_for:.0f}s while classifier reports "
+                         f"`thinking` (--stuck-after-seconds={self.stuck_after:.0f}). "
+                         + DIM("possible silent usage-limit gate / network stall; "
+                               "try swapping accounts or rerunning"))
+                    # Best-effort cancel so the half-started turn doesn't
+                    # keep burning server-side resources after we return.
+                    try:
+                        self.client.rpc("adapter.send",
+                            {"adapter": self.aid, "intent": "cancel", "params": {}}, t=2.0)
+                    except (RuntimeError, TimeoutError):
+                        pass
+                    return self.EXIT_STUCK
 
             self._tick_alive(prefix=f"{state}", body=activity_text)
             time.sleep(self.heartbeat)
