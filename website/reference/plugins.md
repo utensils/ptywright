@@ -23,6 +23,7 @@ Implemented:
 - JSON-RPC methods:
   - `plugin.capabilities`
   - `plugin.validate_manifest`
+  - `plugin.describe`
   - `plugin.load`
   - `plugin.unload`
 
@@ -117,7 +118,24 @@ permissions = [
 [default_target]
 program = "/bin/sh"
 args = ["-lc", "cat"]
+
+# Optional: keys the plugin needs in the spawned child's environment and
+# that the caller MUST NOT be allowed to override. Merged last during
+# `adapter.start`, after manifest defaults and caller env. Use this only
+# for keys that would break the plugin if a caller set them differently.
+[default_target.required_env]
+# CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"
 ```
+
+### Environment merge precedence
+
+`adapter.start` builds the spawned child's environment in three tiers, last-write-wins:
+
+1. **`default_target.env`** — plugin-supplied defaults a caller may override.
+2. **Caller `env`** — the `env` map passed to `adapter.start` overrides matching keys from tier 1.
+3. **`default_target.required_env`** — plugin-mandated keys the caller cannot override; applied last so it always wins.
+
+Keys present in only one tier pass through unchanged. The built-in claude-code manifest uses `required_env` to lock down `CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"` and `CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL = "1"` — turning either off corrupts the classifier (OSC title escapes pollute the body parser, virtual scrolling moves cells out of the vt100 grid), so they must not be at caller mercy.
 
 ```lua
 -- main.lua
