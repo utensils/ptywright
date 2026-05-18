@@ -206,6 +206,43 @@ impl Session {
         delta
     }
 
+    /// Place a label-keyed marker at the current transcript cursor. See
+    /// [`crate::Transcript::mark`] for the storage semantics.
+    pub fn mark_transcript(&self, label: impl Into<String>) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .mark(label)
+    }
+
+    /// Cursor previously placed at `label`, or `None` if no such marker
+    /// exists. Pairs with [`Session::transcript_slice`] to retrieve the
+    /// bytes between two markers.
+    #[must_use]
+    pub fn transcript_marker(&self, label: &str) -> Option<u64> {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .marker(label)
+    }
+
+    /// Text between two transcript cursors, or `None` if either cursor
+    /// has been evicted from the ring buffer. See
+    /// [`crate::Transcript::slice_between`].
+    #[must_use]
+    pub fn transcript_slice(&self, a: u64, b: u64) -> Option<String> {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .slice_between(a, b)
+    }
+
     /// Send an action to the session.
     pub fn send(&self, action: Action) -> Result<()> {
         match action {
