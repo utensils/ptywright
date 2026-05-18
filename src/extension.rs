@@ -394,6 +394,33 @@ impl ExtensionHandle {
         Ok((state, result.outcome))
     }
 
+    /// Atomic [`send`](Self::send) followed by [`wait`](Self::wait) using a
+    /// single mutex-held turn.
+    ///
+    /// `claudette` and similar consumers traditionally hand-rolled
+    /// "submit prompt, then wait for the turn to complete" by chaining
+    /// `adapter.send` and `adapter.wait`. In a multi-client setup another
+    /// connection could slip a competing intent between those two calls.
+    /// [`turn`](Self::turn) keeps both legs under the same `&mut self`
+    /// borrow so this race is impossible at the type level.
+    ///
+    /// `wait_intent` defaults to the conventional `"wait_turn_matcher"` so
+    /// simple call sites can pass `None`. The returned tuple mirrors
+    /// [`wait`](Self::wait): the post-wait classifier state plus the
+    /// matcher outcome that fired.
+    pub fn turn(
+        &mut self,
+        send_intent: &str,
+        send_params: Value,
+        wait_intent: Option<&str>,
+        wait_params: Value,
+        timeout: Duration,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        let _state_after_send = self.send(send_intent, send_params)?;
+        let wait_intent = wait_intent.unwrap_or("wait_turn_matcher");
+        self.wait(wait_intent, wait_params, timeout)
+    }
+
     /// Apply an action plan, requiring that the plan supply `last_intent` and
     /// recording it as this handle's most recent intent. Use this for
     /// mutating intents that must update the classifier's intent tracking

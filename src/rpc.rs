@@ -360,6 +360,37 @@ struct AdapterWaitParams {
     timeout_ms: Option<u64>,
 }
 
+/// Atomic send-then-wait used by [`RpcServer::adapter_turn`].
+///
+/// Modelled as nested `send` / `wait` sub-objects (rather than flat
+/// duplicated fields) so the wire shape stays unambiguous when the same
+/// adapter has overlapping intent / wait param vocabularies.
+#[derive(Debug, Deserialize)]
+struct AdapterTurnParams {
+    adapter: String,
+    send: TurnSendParams,
+    #[serde(default)]
+    wait: TurnWaitParams,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TurnSendParams {
+    intent: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TurnWaitParams {
+    /// Optional plugin matcher function. Defaults to `wait_turn_matcher`
+    /// so simple turns can omit the `wait` block entirely.
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    params: Value,
+    timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AdapterReadParams {
     adapter: String,
@@ -732,6 +763,7 @@ impl RpcServer {
                     "adapter.state",
                     "adapter.send",
                     "adapter.wait",
+                    "adapter.turn",
                     "adapter.snapshot",
                     "adapter.transcript",
                     "adapter.inspect",
@@ -761,6 +793,7 @@ impl RpcServer {
             "adapter.state" => self.adapter_state(request.params),
             "adapter.send" => self.adapter_send(request.params),
             "adapter.wait" => self.adapter_wait(request.params),
+            "adapter.turn" => self.adapter_turn(request.params),
             "adapter.snapshot" => self.adapter_snapshot(request.params),
             "adapter.transcript" => self.adapter_transcript(request.params),
             "adapter.inspect" => self.adapter_inspect(request.params),
@@ -1536,6 +1569,43 @@ impl RpcServer {
         // presence. Today every successful wait carries a `Some(outcome)`;
         // `null` is reserved for future paths (e.g. cancellation hooks)
         // that surface a `MatchResult` without a satisfying branch.
+        Ok(json!({
+            "state": state,
+            "matched": outcome,
+        }))
+    }
+
+    /// `adapter.turn` — atomic `adapter.send` followed by `adapter.wait`
+    /// on the same adapter, holding the per-adapter mutex across both
+    /// legs so no other connection can slip an intent between them.
+    ///
+    /// Maps directly to [`ExtensionHandle::turn`]. Requires both
+    /// `input.write` and `matcher.wait` permissions (each pinned by the
+    /// underlying leg) — neither check is skippable.
+    ///
+    /// `wait.intent` defaults to `wait_turn_matcher` and the whole `wait`
+    /// block may be omitted entirely, which lets simple call sites express
+    /// a "submit and wait for the turn to complete" round-trip as one RPC.
+    fn adapter_turn(
+        &mut self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        let params: AdapterTurnParams = parse_params(params)?;
+        self.check_adapter_permission("adapter.send", &params.adapter)?;
+        self.check_adapter_permission("adapter.wait", &params.adapter)?;
+        let timeout = Duration::from_millis(params.wait.timeout_ms.unwrap_or(120_000));
+        let entry_arc = self.extension(&params.adapter)?;
+        let mut entry = entry_arc.lock().expect("extension poisoned");
+        let (state, outcome) = entry
+            .handle
+            .turn(
+                &params.send.intent,
+                params.send.params,
+                params.wait.intent.as_deref(),
+                params.wait.params,
+                timeout,
+            )
+            .map_err(rpc_error_from_error)?;
         Ok(json!({
             "state": state,
             "matched": outcome,
@@ -3018,6 +3088,47 @@ mod tests {
         );
 
         // Cleanup so the sleep process doesn't outlive the test.
+        let _ = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":99,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adapter_turn_chains_send_and_wait_in_one_round_trip() {
+        // adapter.turn sends an intent and waits for the matcher in a
+        // single RPC call, holding the per-adapter mutex across both
+        // legs. The fixture below prints the `Total cost:` turn-boundary
+        // anchor after a tiny delay, which is enough for the
+        // wait_turn_matcher anchor list to fire.
+        let mut server = RpcServer::new();
+        let start = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"adapter.start","params":{"plugin":"claude-code","program":"/bin/sh","args":["-lc","printf 'Total cost: 0\\n'; sleep 5"]}}"#,
+        );
+        let adapter = start["result"]["adapter"]
+            .as_str()
+            .expect("adapter.start must return an adapter id");
+
+        let response = handle(
+            &mut server,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"adapter.turn","params":{{"adapter":"{adapter}","send":{{"intent":"approve"}},"wait":{{"timeout_ms":3000}}}}}}"#
+            ),
+        );
+        assert!(
+            response["result"]["state"].is_object(),
+            "adapter.turn must return a state snapshot; got {response}"
+        );
+        assert_eq!(
+            response["result"]["matched"]["kind"], "all",
+            "adapter.turn must surface the same structured outcome as adapter.wait; got {response}"
+        );
+
+        // Cleanup.
         let _ = handle(
             &mut server,
             &format!(
