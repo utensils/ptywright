@@ -15,6 +15,10 @@ use super::ctx::ReplCtx;
 /// even in an empty buffer.
 const DSL_COMMANDS: &[(&str, &str)] = &[
     ("plugins()", "list built-in plugins"),
+    (
+        "plugins.describe(\"\")",
+        "describe a plugin (intents, matchers, states)",
+    ),
     ("session.spawn(\"\")", "spawn an adapter for a plugin"),
     (
         "session.resume(\"\", prior_adapter=\"\")",
@@ -32,6 +36,11 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
     ("send.text(\"\")", "send a prompt to the focused adapter"),
     ("send.key(\"\")", "send a single key"),
     ("send.intent(\"\")", "invoke a plugin intent by name"),
+    ("turn(\"\")", "atomic send + wait (adapter.turn)"),
+    (
+        "turn(\"\", wait=matches(r\"\"))",
+        "atomic send + custom wait matcher",
+    ),
     (
         "wait(matches(r\"\"))",
         "wait until the screen matches a regex",
@@ -55,6 +64,14 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
     (":live", "list adapters live on the server"),
     (":attach", "attach a server adapter (id or `all`)"),
     (":notifications on", "subscribe to session.* notifications"),
+    (
+        ":notifications on adapters=",
+        "subscribe; filter to named adapters",
+    ),
+    (
+        ":notifications on sessions=",
+        "subscribe; filter to named sessions",
+    ),
     (":notifications off", "unsubscribe"),
     (":rpc ", "raw JSON-RPC escape hatch"),
     (":help", "show help"),
