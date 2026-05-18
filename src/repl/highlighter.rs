@@ -29,7 +29,10 @@ const METHOD_NAMES: &[&str] = &[
     "plugins",
     "session",
     "spawn",
+    "resume",
     "list",
+    "live",
+    "attach",
     "close",
     "focus",
     "state",
@@ -43,6 +46,7 @@ const METHOD_NAMES: &[&str] = &[
     "transcript",
     "snapshot",
     "screen",
+    "view",
     "inspect",
 ];
 
@@ -181,7 +185,7 @@ fn scan(line: &str) -> Vec<(Kind, &str)> {
         // Single-character punctuation / fallback.
         i += 1;
         let kind = match ch {
-            '.' | '(' | ')' | ',' | '=' => Kind::Punctuation,
+            '.' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '=' | ':' => Kind::Punctuation,
             _ => Kind::Other,
         };
         out.push((kind, &line[start..i]));
@@ -305,11 +309,16 @@ mod tests {
 
     #[test]
     fn punctuation_kind_assigned_to_dot_paren_comma_equals() {
-        let out = kinds("session.spawn(\"x\", rows=24)");
+        let out = kinds(r#"session.spawn("x", args=["-lc"], env={NO_COLOR:"1"}, rows=24)"#);
         assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "."));
         assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "("));
         assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == ","));
         assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "="));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "["));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "]"));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "{"));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == "}"));
+        assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == ":"));
         assert!(out.iter().any(|(k, s)| *k == Kind::Punctuation && s == ")"));
     }
 
