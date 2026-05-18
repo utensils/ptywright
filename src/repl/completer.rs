@@ -50,6 +50,14 @@ const DSL_COMMANDS: &[(&str, &str)] = &[
         "wait for the screen to settle",
     ),
     (
+        "wait(matches(r\"\"), wait_id=\"\")",
+        "cancellable wait; pass wait_id to cancel from another session",
+    ),
+    (
+        "cancel_wait(\"\")",
+        "cancel an in-flight wait by its wait_id",
+    ),
+    (
         "transcript.snapshot()",
         "dump the focused adapter's transcript",
     ),

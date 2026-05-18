@@ -889,6 +889,7 @@ fn dispatch_dsl(
         }
         "turn" => turn_command(call, client, ctx, timeout),
         "wait" => wait_command(call, client, ctx, timeout),
+        "cancel_wait" => cancel_wait_command(call, client, timeout),
         "wait.matches" => {
             let pattern = expect_one_regex(&call, "wait.matches")?;
             wait_with_params(
@@ -1244,8 +1245,10 @@ fn wait_command(
     ctx: &mut ReplCtx,
     timeout: Duration,
 ) -> Result<CmdOutcome> {
-    // `wait(matcher, timeout=2s)` — the first positional arg is either a
-    // nested call (matches/screen_stable/...) or a regex/duration shortcut.
+    // `wait(matcher, timeout=2s, wait_id="…")` — the first positional
+    // arg is either a nested call (matches/screen_stable/...) or a
+    // regex/duration shortcut. Optional `wait_id` makes the wait
+    // cancellable via `cancel_wait("…")` from another REPL session.
     let matcher_arg = call.positional.first().cloned().ok_or_else(|| {
         Error::Rpc(
             "wait() expects a matcher: wait(matches(r\"…\")) or wait(screen_stable(250ms))"
@@ -1253,8 +1256,9 @@ fn wait_command(
         )
     })?;
     let timeout_arg = duration_kwarg(&call, "timeout")?;
+    let wait_id = string_kwarg(&call, "wait_id");
     let (intent, params) = matcher_to_params(matcher_arg)?;
-    wait_with_params(client, ctx, &intent, params, timeout_arg, timeout)
+    wait_with_params_and_id(client, ctx, &intent, params, timeout_arg, wait_id, timeout)
 }
 
 fn wait_with_params(
@@ -1263,6 +1267,26 @@ fn wait_with_params(
     intent: &str,
     matcher_params: Value,
     timeout_override: Option<Duration>,
+    fallback_timeout: Duration,
+) -> Result<CmdOutcome> {
+    wait_with_params_and_id(
+        client,
+        ctx,
+        intent,
+        matcher_params,
+        timeout_override,
+        None,
+        fallback_timeout,
+    )
+}
+
+fn wait_with_params_and_id(
+    client: &RpcClient,
+    ctx: &mut ReplCtx,
+    intent: &str,
+    matcher_params: Value,
+    timeout_override: Option<Duration>,
+    wait_id: Option<String>,
     fallback_timeout: Duration,
 ) -> Result<CmdOutcome> {
     let adapter = focus_or_err(ctx)?.to_string();
@@ -1276,7 +1300,25 @@ fn wait_with_params(
             Value::from(u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
         );
     }
+    if let Some(id) = wait_id {
+        req.insert("wait_id".to_string(), Value::String(id));
+    }
     let result = client.call("adapter.wait", Value::Object(req), fallback_timeout)?;
+    Ok(CmdOutcome::Json(result))
+}
+
+/// REPL DSL: `cancel_wait("wait-id-1")` — issues `adapter.cancel_wait
+/// { wait_id }` against the server. Useful when a previously-issued
+/// `wait(..., wait_id="…")` is still in flight (typically from another
+/// REPL session or background script) and the operator wants to break
+/// it loose.
+fn cancel_wait_command(call: DslCall, client: &RpcClient, timeout: Duration) -> Result<CmdOutcome> {
+    let wait_id = expect_one_string(&call, "cancel_wait")?;
+    let result = client.call(
+        "adapter.cancel_wait",
+        json!({ "wait_id": wait_id }),
+        timeout,
+    )?;
     Ok(CmdOutcome::Json(result))
 }
 
@@ -2757,6 +2799,27 @@ mod tests {
             text.contains(":notifications on|off [adapters="),
             "help missing notifications filter syntax"
         );
+    }
+
+    #[test]
+    fn dispatch_cancel_wait_calls_adapter_cancel_wait() {
+        // `cancel_wait("some-id")` must serialize as
+        // `adapter.cancel_wait { wait_id: "some-id" }`. An unknown
+        // wait_id returns `cancelled: false` per the idempotency
+        // contract (no server-side state to verify, so a fresh in-
+        // process server is enough to exercise the wire shape).
+        let (client, _server, mut _ctx) = in_process_client();
+        let outcome = dispatch(
+            parse(r#"cancel_wait("never-was-registered")"#).unwrap(),
+            &client,
+            &mut _ctx,
+            Duration::from_secs(2),
+        )
+        .expect("cancel_wait dispatch");
+        let CmdOutcome::Json(value) = outcome else {
+            panic!("expected json outcome, got {outcome:?}")
+        };
+        assert_eq!(value["cancelled"], false);
     }
 
     #[test]
