@@ -36,7 +36,7 @@ These are the questions the spike needs to answer before code goes in. Each maps
 ## Recommended workflow for the spike
 
 1. Start a Claude Code session and ask it to spawn a few background tasks via the Task tool (e.g. "spawn three parallel tasks that each sleep 30 seconds and report when done"). This is the easiest way to populate live task state.
-2. Open the TUI's task-control surface, capture the screen at each interesting moment to `tests/fixtures/claude_code/task_*.txt`. Aim for:
+2. Open the TUI's task-control surface, capture the screen at each interesting moment to `plugins/claude-code/fixtures/task_*.txt`. Aim for:
    - `task_list.txt` — multiple tasks live
    - `task_stop_dialog.txt` — mid-stop confirmation if one exists
    - `task_stopped.txt` — post-stop steady state
@@ -51,7 +51,7 @@ Assuming the TUI exposes a task panel reachable by some key or slash command, ex
   - New intent `task.list` returning structured metadata (relies on P5's metadata channel) — or, if the TUI requires a key sequence to open the panel, an intent `task.open_panel` plus reading via subsequent `adapter.snapshot` / `adapter.state`.
   - New intent `task.stop` taking either a task id/name or an "active" marker.
   - Possibly new classifier state `viewing_tasks` if the panel is its own modal screen.
-- `tests/fixtures/claude_code/task_*.txt` + `.expected.json` — pinning the parsed metadata shape.
+- `plugins/claude-code/fixtures/task_*.txt` + `.expected.json` — pinning the parsed metadata shape.
 - `tests/lua_plugin_intents.rs` — intent contract tests for the action plans.
 - No changes expected in `src/` since the metadata channel and snapshot-based classifier are already in place.
 

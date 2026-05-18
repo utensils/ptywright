@@ -202,7 +202,7 @@ After a fresh-launch `approve_trust`, Claude Code shows a welcome panel with "We
 
 `steer` is the mid-turn injection variant: same bracketed-paste mechanics as `send_prompt`, but it does **not** set `last_intent = "prompt_submitted"`, so the classifier does not race the steered text against the in-flight turn's completion. Use it for "priority: next" follow-ups while the previous turn is still in `thinking`.
 
-> **Body/status split.** The classifier runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status) so benign status strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` cannot false-positive on substring matches in the body. The `idle_bypass_permissions.txt` fixture under `tests/fixtures/claude_code/` locks this in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test in `tests/lua_classifier_tests.rs` auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` to dump the body/status view the classifier sees when investigating new misclassifications.
+> **Body/status split.** The classifier runs against a body/status split (`STATUS_BAR_ROWS = 3` rows treated as status) so benign status strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` cannot false-positive on substring matches in the body. The `idle_bypass_permissions.txt` fixture under `plugins/claude-code/fixtures/` locks this in. Each fixture has a sibling `.expected.json` describing the expected state, evidence, optional `last_intent`, and confidence floor; the regression test in `tests/lua_classifier_tests.rs` auto-enrols every fixture, so adding a new capture is a single-file change. Use `adapter.inspect` to dump the body/status view the classifier sees when investigating new misclassifications.
 
 #### `plugin.*`
 
@@ -500,7 +500,7 @@ Two things to verify on every run:
 
 ### Fixture-driven plugin tests
 
-The repo ships sanitized Claude Code screen fixtures under `tests/fixtures/claude_code/`. When upstream Claude Code changes its TUI (new banner, renamed permission prompt, different plan UI), update the fixture and the classifier in one PR — `plugins/claude-code/main.lua` and `tests/fixtures/claude_code/` belong together. If a real session classifies the wrong state, capture the screen to a new fixture file before fixing the Lua, so the regression is locked in.
+The repo ships sanitized Claude Code screen fixtures under `plugins/claude-code/fixtures/`. When upstream Claude Code changes its TUI (new banner, renamed permission prompt, different plan UI), update the fixture and the classifier in one PR — `plugins/claude-code/main.lua` and `plugins/claude-code/fixtures/` belong together. If a real session classifies the wrong state, capture the screen to a new fixture file before fixing the Lua, so the regression is locked in.
 
 ### Wait until the screen stops changing
 

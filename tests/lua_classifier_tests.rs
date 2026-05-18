@@ -1,6 +1,6 @@
 //! Classifier regression matrix for the built-in claude-code Lua plugin.
 //!
-//! Auto-enrols every `<name>.txt` fixture under `tests/fixtures/claude_code/`
+//! Auto-enrols every `<name>.txt` fixture under `plugins/claude-code/fixtures/`
 //! that has a sibling `<name>.expected.json`. Adding a new fixture is a
 //! documentation-only change: drop the two files in and the matrix picks
 //! them up.
@@ -65,9 +65,9 @@ fn classify_fixture(
 #[test]
 fn classifier_matches_sanitized_claude_code_fixtures() {
     let fixtures_dir: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("claude_code");
+        .join("plugins")
+        .join("claude-code")
+        .join("fixtures");
 
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&fixtures_dir)
         .unwrap_or_else(|err| panic!("read fixtures dir {}: {err}", fixtures_dir.display()))

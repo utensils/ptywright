@@ -1175,7 +1175,7 @@ fn classifier_prefers_active_work_over_prompt_glyph() {
 #[test]
 fn classifier_detects_usage_screen_as_completed_turn() {
     let extension = claude_plugin();
-    let fixture = include_str!("fixtures/claude_code/usage.txt");
+    let fixture = include_str!("../plugins/claude-code/fixtures/usage.txt");
     let state = classify_state(
         &extension,
         fixture,
@@ -1192,13 +1192,13 @@ fn classifier_detects_usage_screen_as_completed_turn() {
 fn approve_with_dialog_id_succeeds_after_matching_classify() {
     // Walk the full classifier → approve dispatch so the module-level
     // `_current_dialog_id` is set by classify before the intent reads
-    // it back. The fixture under tests/fixtures/claude_code/permission.txt
+    // it back. The fixture under plugins/claude-code/fixtures/permission.txt
     // hashes to `115803ed` (locked in permission.expected.json), so
     // passing that id through approve must succeed.
     let extension = claude_plugin();
     let screen = std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/claude_code/permission.txt"),
+            .join("plugins/claude-code/fixtures/permission.txt"),
     )
     .expect("read permission fixture");
     let _ = classify_state(&extension, &screen, 1, None, Some(COMPLETED_TURN_STABLE_MS));
@@ -1213,7 +1213,7 @@ fn approve_with_stale_dialog_id_returns_error() {
     let extension = claude_plugin();
     let screen = std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/claude_code/permission.txt"),
+            .join("plugins/claude-code/fixtures/permission.txt"),
     )
     .expect("read permission fixture");
     let _ = classify_state(&extension, &screen, 1, None, Some(COMPLETED_TURN_STABLE_MS));
