@@ -144,6 +144,45 @@ impl LuaPlugin {
         self.permissions.contains(permission)
     }
 
+    /// Names of every function exported on the plugin's top-level
+    /// returned table.
+    ///
+    /// Used by `plugin.describe` to enumerate intents and matchers when
+    /// the plugin does not provide its own `describe()` catalog. Returns
+    /// keys in BTree order so the wire shape is deterministic regardless
+    /// of insertion order.
+    pub fn exported_function_names(&self) -> Result<Vec<String>> {
+        let result = (|| -> mlua::Result<Vec<String>> {
+            let exports: mlua::Table = self.lua.registry_value(&self.exports)?;
+            let mut names: Vec<String> = Vec::new();
+            for pair in exports.pairs::<mlua::Value, mlua::Value>() {
+                let (key, value) = pair?;
+                if !matches!(value, mlua::Value::Function(_)) {
+                    continue;
+                }
+                if let mlua::Value::String(s) = key {
+                    names.push(s.to_str()?.to_owned());
+                }
+            }
+            names.sort();
+            Ok(names)
+        })();
+        result.map_err(|error| self.error(error))
+    }
+
+    /// Whether the plugin's exports table has a function with the given
+    /// name. Used by `plugin.describe` to decide whether to call
+    /// `describe()` vs fall back to introspection.
+    #[must_use]
+    pub fn exports_function(&self, name: &str) -> bool {
+        let result = (|| -> mlua::Result<bool> {
+            let exports: mlua::Table = self.lua.registry_value(&self.exports)?;
+            let value: mlua::Value = exports.get(name)?;
+            Ok(matches!(value, mlua::Value::Function(_)))
+        })();
+        result.unwrap_or(false)
+    }
+
     fn from_source(
         name: String,
         source: &str,

@@ -1691,4 +1691,48 @@ function M.key(input)
   }
 end
 
+-- Catalog consumed by `plugin.describe`. Plugins that don't expose this
+-- function fall through to introspection (intent names + names ending
+-- with `_matcher` go to wait_matchers) but lose the classifier
+-- state vocabulary, which lives only inside `classify`. Surfacing it
+-- explicitly lets consumers (claudette, the REPL completer) drive the
+-- adapter without hard-coding state names.
+function M.describe()
+  return {
+    intents = {
+      { name = "send_prompt" },
+      { name = "steer" },
+      { name = "attach_file" },
+      { name = "approve" },
+      { name = "deny" },
+      { name = "approve_trust" },
+      { name = "deny_trust" },
+      { name = "dismiss_welcome" },
+      { name = "expand" },
+      { name = "slash_command" },
+      { name = "cancel" },
+      { name = "force_cancel" },
+      { name = "key" },
+    },
+    wait_matchers = {
+      { name = "wait_turn_matcher" },
+      { name = "wait_cancel_settled_matcher" },
+    },
+    states = {
+      { name = "starting" },
+      { name = "ready" },
+      { name = "waiting_for_login" },
+      { name = "waiting_for_trust" },
+      { name = "waiting_for_model_select" },
+      { name = "waiting_for_plan_approval" },
+      { name = "waiting_for_permission" },
+      { name = "waiting_for_user_input" },
+      { name = "thinking" },
+      { name = "cancelling" },
+      { name = "completed_turn" },
+      { name = "error" },
+    },
+  }
+end
+
 return M

@@ -238,6 +238,13 @@ struct PluginUnloadParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct PluginDescribeParams {
+    /// Manifest name to introspect. Built-in or registered third-party
+    /// plugins are both fair game.
+    plugin: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct NotificationsParams {
     enabled: bool,
 }
@@ -731,6 +738,7 @@ impl RpcServer {
                     "adapter.close",
                     "plugin.capabilities",
                     "plugin.validate_manifest",
+                    "plugin.describe",
                     "plugin.load",
                     "plugin.unload"
                 ],
@@ -759,6 +767,7 @@ impl RpcServer {
             "adapter.close" => self.adapter_close(request.params),
             "plugin.capabilities" => Ok(json!(PluginHostCapabilities::current())),
             "plugin.validate_manifest" => self.plugin_validate_manifest(request.params),
+            "plugin.describe" => self.plugin_describe(request.params),
             "plugin.load" => self.plugin_load(request.params),
             "plugin.unload" => self.plugin_unload(request.params),
             _ => Err((
@@ -991,6 +1000,99 @@ impl RpcServer {
                 (RpcErrorCode::InvalidParams, error.to_string()).into()
             })?;
         Ok(json!({ "valid": true }))
+    }
+
+    /// `plugin.describe` — return the catalog of a plugin's intents, wait
+    /// matchers, classifier states, and manifest. Used by consumers
+    /// (claudette, the REPL completer) to discover what a plugin supports
+    /// without hard-coding intent names.
+    ///
+    /// Source of truth, in order:
+    ///   1. If the plugin's Lua source exports a `describe()` function,
+    ///      its return value is used verbatim. Plugins owning a richer
+    ///      catalog (per-intent param schemas, per-state descriptions)
+    ///      should provide it.
+    ///   2. Otherwise the host falls back to introspecting the exports
+    ///      table: function names ending with `_matcher` are listed under
+    ///      `wait_matchers`; `classify` and `describe` are filtered out;
+    ///      every remaining function is listed under `intents`. `states`
+    ///      is `[]` in the fallback path because the classifier vocabulary
+    ///      lives inside the function body.
+    fn plugin_describe(
+        &self,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcErrorPayload> {
+        let params: PluginDescribeParams = parse_params(params)?;
+        let entry = {
+            let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            shared.registered_plugins.get(&params.plugin).cloned()
+        };
+        let Some(entry) = entry else {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!("unknown plugin: {}", params.plugin),
+            )
+                .into());
+        };
+        // Build a one-off LuaPlugin to introspect. Cheap — the source
+        // is already in memory and Lua 5.4 + mlua loads a small chunk
+        // in milliseconds; the alternative (caching a long-lived Lua
+        // state per plugin) trades memory for cold-call latency in a
+        // method that's only ever called interactively.
+        let modules: Vec<(&str, &str)> = entry
+            .modules
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .collect();
+        let plugin = crate::lua_plugin::LuaPlugin::trusted_with_modules(
+            &entry.manifest,
+            &entry.source,
+            &modules,
+        )
+        .map_err(rpc_error_from_error)?;
+        let catalog = if plugin.exports_function("describe") {
+            // Plugin provided its own catalog. Trust it verbatim — the
+            // shape is `{ intents, wait_matchers, states }` (each an
+            // array of objects with at minimum a `name` field). Plugins
+            // may include richer fields (params_schema, description)
+            // that downstream consumers can opt into.
+            let value: Value = plugin
+                .call_value("describe", &Value::Null)
+                .map_err(rpc_error_from_error)?;
+            value
+        } else {
+            // Introspection fallback. Anchor naming convention:
+            //   * `_matcher` suffix → wait matcher
+            //   * `classify` / `describe` → reserved, filtered out
+            //   * everything else → intent
+            let names = plugin
+                .exported_function_names()
+                .map_err(rpc_error_from_error)?;
+            let mut intents: Vec<Value> = Vec::new();
+            let mut wait_matchers: Vec<Value> = Vec::new();
+            for name in names {
+                if name == "classify" || name == "describe" {
+                    continue;
+                }
+                if name.ends_with("_matcher") {
+                    wait_matchers.push(json!({ "name": name }));
+                } else {
+                    intents.push(json!({ "name": name }));
+                }
+            }
+            json!({
+                "intents": intents,
+                "wait_matchers": wait_matchers,
+                "states": Value::Array(Vec::new()),
+            })
+        };
+        Ok(json!({
+            "plugin": entry.manifest.name,
+            "manifest": entry.manifest,
+            "intents": catalog.get("intents").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "wait_matchers": catalog.get("wait_matchers").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "states": catalog.get("states").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        }))
     }
 
     /// `plugin.load` — register a trusted-local third-party plugin from a
@@ -2936,6 +3038,74 @@ mod tests {
         let message = response["error"]["message"].as_str().unwrap();
         assert!(message.contains("token=[REDACTED]"));
         assert!(!message.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn plugin_describe_lists_claude_code_catalog() {
+        // Plugins can either provide a `describe()` function in their
+        // Lua source or rely on the host's introspection fallback. The
+        // built-in claude-code plugin opts in, so we assert the explicit
+        // shape here (intents, wait_matchers, states all populated).
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"plugin.describe","params":{"plugin":"claude-code"}}"#,
+        );
+        let result = &response["result"];
+        assert_eq!(result["plugin"], "claude-code");
+        assert_eq!(result["manifest"]["name"], "claude-code");
+
+        let intents = result["intents"].as_array().expect("intents array");
+        let intent_names: Vec<&str> = intents.iter().filter_map(|i| i["name"].as_str()).collect();
+        for required in &[
+            "send_prompt",
+            "approve",
+            "deny",
+            "cancel",
+            "approve_trust",
+            "deny_trust",
+            "attach_file",
+        ] {
+            assert!(
+                intent_names.contains(required),
+                "intent `{required}` missing from describe(): {intent_names:?}"
+            );
+        }
+
+        let matchers = result["wait_matchers"]
+            .as_array()
+            .expect("wait_matchers array");
+        let matcher_names: Vec<&str> = matchers.iter().filter_map(|i| i["name"].as_str()).collect();
+        assert!(matcher_names.contains(&"wait_turn_matcher"));
+
+        let states = result["states"].as_array().expect("states array");
+        let state_names: Vec<&str> = states.iter().filter_map(|i| i["name"].as_str()).collect();
+        for required in &[
+            "starting",
+            "ready",
+            "completed_turn",
+            "thinking",
+            "waiting_for_permission",
+            "error",
+        ] {
+            assert!(
+                state_names.contains(required),
+                "state `{required}` missing from describe(): {state_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_describe_rejects_unknown_plugin() {
+        let mut server = RpcServer::new();
+        let response = handle(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"plugin.describe","params":{"plugin":"does-not-exist"}}"#,
+        );
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "missing plugin must be an InvalidParams error: {response}"
+        );
     }
 
     #[test]
