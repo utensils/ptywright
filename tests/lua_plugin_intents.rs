@@ -1188,6 +1188,58 @@ fn classifier_detects_usage_screen_as_completed_turn() {
     assert_eq!(state.evidence, "stable usage screen detected");
 }
 
+#[test]
+fn attach_file_bracketed_pastes_path_without_enter() {
+    // Claude Code 2.1.x normalises drag-drop and `@<path>` references to
+    // a bracketed-paste of the absolute path. The intent deliberately
+    // does NOT append Enter so callers can compose a prompt around the
+    // attachment before submitting.
+    let extension = claude_plugin();
+    let plan = plan(
+        &extension,
+        "attach_file",
+        json!({ "path": "/tmp/diagram.png" }),
+    );
+    assert_eq!(
+        plan.actions,
+        vec![Action::BracketedPaste("/tmp/diagram.png".to_string())]
+    );
+    assert!(
+        plan.last_intent.is_none(),
+        "attach_file is non-mutating wrt turn state"
+    );
+}
+
+#[test]
+fn attach_file_rejects_empty_path() {
+    // Empty path is an obvious caller bug — surface it as a clean
+    // plugin error rather than silently bracket-pasting nothing.
+    let extension = claude_plugin();
+    let err = extension
+        .plan("attach_file", &json!({ "path": "" }))
+        .expect_err("empty path must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("path is required"),
+        "error should explain the rejection: {msg}"
+    );
+}
+
+#[test]
+fn attach_file_rejects_path_with_embedded_newline() {
+    // A newline in the path would partial-submit the paste and split
+    // the attachment across rows. Plugin guards against it.
+    let extension = claude_plugin();
+    let err = extension
+        .plan("attach_file", &json!({ "path": "/tmp/a\nb.png" }))
+        .expect_err("newline in path must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("must not contain newlines"),
+        "error should explain the rejection: {msg}"
+    );
+}
+
 /// End-to-end smoke test: build an [`ExtensionHandle`] over a `/bin/sh cat`
 /// stand-in and exercise every documented mutating intent (`send_prompt`,
 /// `approve`, `deny`, `cancel`) through the generic [`ExtensionHandle::send`]

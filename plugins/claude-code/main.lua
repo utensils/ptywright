@@ -1380,6 +1380,41 @@ function M.steer(input)
   }
 end
 
+-- Attach a file by pasting its path into the input box. Claude Code's
+-- TUI normalises drag-and-drop and `@path` references to the same
+-- behaviour: a bracketed paste of the absolute path. Plugins consuming
+-- this intent typically follow up with `send_prompt` for any
+-- accompanying message — we deliberately do NOT submit on Enter here
+-- so callers can compose the prompt around the attachment.
+--
+-- Validation kept tight: `path` must be a non-empty string with no
+-- embedded newlines (a newline would partially submit and split the
+-- attachment across rows). The intent does NOT touch the filesystem —
+-- existence / readability / size checks belong to the caller.
+--
+-- Invalid input raises a Lua error so the host's intent dispatcher
+-- surfaces it as `Error::Lua(...)` rather than the misleading
+-- `missing field "actions"` deserialiser message that would land if
+-- we tried to return a non-ActionPlan-shaped table.
+--
+-- A future enrichment can fold `metadata.attachments = [{ path, kind }]`
+-- into the classifier output once we have fixtures of the preview row
+-- claude-code renders after an attachment lands.
+function M.attach_file(input)
+  local path = input and input.path
+  if type(path) ~= "string" or path == "" then
+    error("attach_file: path is required")
+  end
+  if path:find("\n", 1, true) ~= nil then
+    error("attach_file: path must not contain newlines")
+  end
+  return {
+    actions = {
+      action.bracketed_paste(path),
+    },
+  }
+end
+
 
 function M.wait_turn_matcher(input)
   local completed_turn_stable_ms = tonumber(input.completed_turn_stable_ms) or 0
