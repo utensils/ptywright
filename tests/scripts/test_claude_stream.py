@@ -416,6 +416,33 @@ class TerminalStatesTests(unittest.TestCase):
         self.assertEqual(CS.Stream.EXIT_OK, 0)
 
 
+class CompletionMarkerLatchTests(unittest.TestCase):
+    """`_is_completion_marker` must distinguish the real end-of-turn
+    line (`✻ Brewed for 2s`) from an in-flight spinner frame whose
+    parenthesized tail happens to contain ` for <text>` (e.g.
+    `✻ Pondering… (5s · ↓ 12 tokens · for context)`). Without the
+    ellipsis guard, latching on a spinner frame would mask real
+    subsequent hangs as `EXIT_OK`.
+    """
+
+    def test_real_marker_matches(self):
+        self.assertTrue(CS._is_completion_marker("✻ Brewed for 2s"))
+        self.assertTrue(CS._is_completion_marker("✻ Worked for 45s"))
+        self.assertTrue(CS._is_completion_marker("✻ Cogitated for 1m"))
+
+    def test_spinner_frame_with_for_in_tail_does_not_match(self):
+        # Copilot review regression — must NOT latch on spinner frames.
+        self.assertFalse(CS._is_completion_marker(
+            "✻ Pondering… (5s · ↓ 12 tokens · for context)"))
+        self.assertFalse(CS._is_completion_marker("✻ Working…"))
+        self.assertFalse(CS._is_completion_marker(
+            "✻ Brewing… (12s · ↑ 217 tokens · esc to interrupt)"))
+
+    def test_non_marker_glyph_lines_do_not_match(self):
+        self.assertFalse(CS._is_completion_marker("⏺ Hi there!"))
+        self.assertFalse(CS._is_completion_marker("> just text for fun"))
+
+
 class ErrorMetadataAccessorTests(unittest.TestCase):
     """`_last_error_kind` and `_format_error_detail` shape the rate-limit
     / quota fail-fast path. Wrong shape => wrong exit code => wrappers

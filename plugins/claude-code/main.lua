@@ -229,15 +229,18 @@ local function parse_error_subtype(body)
   for idx, raw in ipairs(lines) do
     local text = lower(trim(raw))
     local stripped = strip_callout_prefix(text)
+    -- Always surface the *stripped* form to consumers reading
+    -- `metadata.error.message` so the shape is identical regardless
+    -- of which branch matched (raw vs callout-wrapped). Without this,
+    -- a callout-wrapped quota error and the same banner shown
+    -- standalone would surface with different leading bytes.
+    -- (Copilot review feedback.)
     local raw_stripped = strip_callout_prefix(trim(raw))
     if text ~= "" then
       for _, pattern in ipairs(ERROR_SUBTYPE_PATTERNS) do
-        if starts_with(text, pattern.prefix) then
-          subtype = pattern.kind
-          message = trim(raw)
-          break
-        end
-        if starts_with(stripped, pattern.prefix) then
+        if starts_with(text, pattern.prefix)
+            or starts_with(stripped, pattern.prefix)
+        then
           subtype = pattern.kind
           message = raw_stripped
           break

@@ -263,12 +263,20 @@ _ACTIVITY_TOOL_BULLET_RE = re.compile(
 
 # Turn-completion marker recognizer for the streaming diff. Same
 # shape `has_turn_completion_marker` in the plugin uses: leading `✻`
-# glyph + tea-verb + ` for <N>` numeric duration. Distinguishes the
-# real end-of-turn marker from spinner frames (which end in `…`).
-# When we see this in a streamed line, we KNOW Claude has finished
-# the turn even if the classifier hasn't yet reported `completed_turn`
-# — the stuck-detector's rescue branch uses this fact.
-_COMPLETION_MARKER_RE = re.compile(r"^✻\s+\S+.*\sfor\s+\d")
+# glyph + verb + ` for <N>s` numeric duration. Spinner frames like
+# `✻ Pondering… (5s · ↓ 12 tokens · for context)` ALSO contain the
+# ` for <digit>` substring inside their parenthesized tail, so we
+# must additionally exclude any line ending in `…` (an in-flight
+# spinner / progress indicator). Without that guard, a single
+# spinner frame would latch `_saw_completion_marker=True` and mask
+# real subsequent hangs as "completed_turn".
+_COMPLETION_MARKER_RE = re.compile(r"^✻\s+\S+.*\sfor\s+\d+\s*[sm]")
+_COMPLETION_MARKER_ELLIPSIS_TAIL = "…"
+
+def _is_completion_marker(s: str) -> bool:
+    if s.endswith(_COMPLETION_MARKER_ELLIPSIS_TAIL):
+        return False
+    return bool(_COMPLETION_MARKER_RE.match(s))
 
 def _is_chrome_line(s: str) -> bool:
     if _CHROME_RULE_RE.match(s):
@@ -867,21 +875,13 @@ class Stream:
             emit(GREEN("→ prompt submitted"),
                  DIM(f"({len(prompt)} chars; +{grew} bytes from Claude)"))
             return True, ""
-
-        while not self._expired():
-            # Fall-through path — keep polling until either anchor
-            # lands or the hard deadline fires.
-            trans = self.client.rpc("adapter.transcript",
-                {"adapter": self.aid, "redact": False}, t=5.0)["text"]
-            grew = len(trans) - baseline
-            cur_body, _ = self.inspect()
-            anchored = bool(prompt_anchor) and (prompt_anchor in cur_body)
-            if grew >= PASTE_REACTION_BYTES and anchored:
-                emit(GREEN("→ prompt submitted"),
-                     DIM(f"({len(prompt)} chars; +{grew} bytes from Claude)"))
-                return True, ""
-            self._tick_alive(f"waiting for Claude to acknowledge paste (+{grew}B)")
-            time.sleep(self.heartbeat)
+        # Both attempts (initial + dismiss_welcome retry) failed to
+        # anchor the prompt text in body_text within their 10 s
+        # windows. Further polling without re-issuing send_prompt
+        # can't recover — return immediately so the caller's
+        # cancel + cleanup path runs while the half-started turn is
+        # still bounded. (Copilot review feedback: the prior
+        # fall-through poll loop was dead code.)
         # Deadline expired while the paste was in flight. The send_prompt
         # actions already landed in the PTY, so if Claude is just slow we
         # don't want to leave a half-submitted turn running server-side
@@ -1068,7 +1068,7 @@ class Stream:
                     if s in printed_lines:
                         continue
                     printed_lines.add(s)
-                    if _COMPLETION_MARKER_RE.match(s):
+                    if _is_completion_marker(s):
                         self._saw_completion_marker = True
                     if not printed:
                         self._clear_alive()
