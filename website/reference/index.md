@@ -6,7 +6,7 @@ ptywright exposes an early CLI, Rust library, JSON-RPC automation protocol, trus
 
 - Crate: `ptywright`
 - Binary: `ptywright`
-- Current version: `0.1.0`
+- Current version: `0.1.1`
 - License: MIT
 - Repository: <https://github.com/utensils/ptywright>
 - Docs site: <https://utensils.io/ptywright/>
@@ -14,16 +14,17 @@ ptywright exposes an early CLI, Rust library, JSON-RPC automation protocol, trus
 ## Current public API families
 
 - `Target` and `TerminalSize` for spawn configuration.
-- `Session` and `SessionConfig` for PTY-backed process lifecycle.
-- `Terminal`, `ScreenSnapshot`, and `CursorState` for rendered terminal observation.
-- `Action` and `Key` for deterministic input.
-- `Matcher` and `MatchResult` for event-driven waits.
-- `Transcript` and `TranscriptConfig` for bounded output retention.
-- `RpcServer` and `serve_ndjson` for JSON-RPC automation.
-- `Extension`, `LuaExtension`, `ExtensionHandle`, `ExtensionStateSnapshot`, and `ClassifyContext` for the generic plugin-backed automation layer that drives Claude Code and any future built-in TUI plugin.
-- `LuaPlugin`, `PluginManifest`, `DefaultTarget`, `PluginRuntime`, `PluginPermission`, `builtin_manifests`, and host capability types for trusted extension planning.
+- `Session`, `SessionConfig`, `SessionEvent`, `SessionExitStatus`, `CancellationToken`, and `Signal` for PTY-backed process lifecycle (including cancellable waits and cross-platform signal delivery).
+- `Terminal`, `ScreenSnapshot`, `ScreenCell`, `ScreenCellStyle`, and `CursorState` for rendered terminal observation.
+- `Action` and `Key` for deterministic input (including `Action::MarkTranscript` for plugin-driven transcript boundary marks).
+- `Matcher`, `MatchResult`, `MatchOutcome`, `MatcherContext`, `PluginRegistry`, `PredicateContext`, and `PredicateOutcome` for event-driven waits and plugin-defined `Matcher::Lua` predicates.
+- `Transcript`, `TranscriptConfig`, and `TranscriptFileConfig` for bounded output retention with optional raw file streaming.
+- `RpcServer`, `RpcServerState`, `serve_ndjson`, `serve_lsp`, `serve_ndjson_with_state`, and `serve_lsp_with_state` for JSON-RPC automation.
+- `Extension`, `LuaExtension`, `ExtensionHandle`, `ExtensionStateSnapshot`, `ExtensionEvent`, `ActionPlan`, `ClassifyContext`, `HostMark`, and `StateCandidate` for the generic plugin-backed automation layer that drives Claude Code and any future built-in TUI plugin.
+- `LuaPlugin`, `LuaPluginRegistry`, `PluginManifest`, `PluginManifestError`, `DefaultTarget`, `PluginKind`, `PluginRuntime`, `PluginPermission`, `PluginHostCapabilities`, and `builtin_manifests` for trusted extension authoring and host capability discovery.
+- `RedactionPolicy` for opt-in caller-supplied redaction and `RedactingMakeWriter` / `RedactingWriter` for redaction-aware `tracing` sinks.
 - `Paths` and `expand_tilde` for the `~/.ptywright/` runtime directory layout.
 - `Config`, `LoggingConfig`, and `LogFormat` for on-disk configuration.
-- `init_for_run`, `init_for_serve_stdio`, `init_for_serve_socket`, `init_for_oneshot`, and `LogGuard` for the structured-logging stack with daily rotation, retention, and per-record redaction.
+- `init_for_run`, `init_for_serve_stdio`, `init_for_serve_socket`, `init_for_oneshot`, `cleanup_old_logs`, and `LogGuard` for the structured-logging stack with daily rotation, retention, and per-record redaction.
 
 See the dedicated CLI, library, JSON-RPC, plugin reference, and Claude Code guide pages for details.

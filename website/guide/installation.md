@@ -1,10 +1,23 @@
 # Installation
 
-ptywright is not published as a full automation tool yet. For now, install from source or use the release artifacts once tags are cut.
+ptywright is pre-1.0 — the surface may still shift. Pick whichever channel best matches how you plan to use it.
+
+## From crates.io
+
+```bash
+cargo install ptywright
+ptywright --help
+```
+
+The default build embeds Lua 5.4 for trusted adapter plugins, so `cargo install` needs a working C compiler on the host. The `_test-fixtures` Cargo feature is off by default; `cargo install ptywright` will not deposit the `ptywright-echo-tui` test helper into `~/.cargo/bin`.
+
+To use ptywright as a library, add it to your `Cargo.toml`:
+
+```bash
+cargo add ptywright
+```
 
 ## From source
-
-The default build embeds Lua 5.4 for trusted adapter plugins, so source builds need a working C compiler in addition to Rust.
 
 ```bash
 git clone https://github.com/utensils/ptywright

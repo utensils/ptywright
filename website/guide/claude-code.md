@@ -49,23 +49,24 @@ println!("state={}, evidence={}", next.state, next.evidence);
 
 ## State model
 
-The classifier returns one of:
+The classifier returns one of (matches the plugin's own `describe().states` catalog):
 
 - `starting`
 - `ready`
-- `prompt_submitted`
-- `thinking`
-- `waiting_for_permission`
-- `waiting_for_plan_approval`
-- `waiting_for_trust`
 - `waiting_for_login`
+- `waiting_for_trust`
 - `waiting_for_model_select`
+- `waiting_for_plan_approval`
+- `waiting_for_permission`
 - `waiting_for_user_input`
-- `completed_turn`
+- `thinking`
 - `cancelling`
-- `exited`
+- `completed_turn`
 - `error`
-- `plugin_error`
+
+The host additionally synthesizes a `plugin_error` fallback when a classifier call itself fails (Lua runtime error, malformed return value, etc.) — `plugin_error` is not plugin-owned.
+
+`prompt_submitted` is not a state; it is the `last_intent` value the plugin's `send_prompt` action returns. The host threads it back into the next `ClassifyContext.last_intent` so the classifier can disambiguate (e.g. a stable `❯` prompt after `last_intent == "prompt_submitted"` resolves to `completed_turn`, but the same prompt without that hint stays `waiting_for_user_input`).
 
 Every state response includes:
 
