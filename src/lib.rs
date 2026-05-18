@@ -26,7 +26,7 @@ pub mod session;
 pub mod target;
 pub mod transcript;
 
-pub use action::{Action, Key};
+pub use action::{Action, Key, Signal};
 pub use config::{Config, LogFormat, LoggingConfig};
 pub use error::{Error, Result};
 pub use extension::{

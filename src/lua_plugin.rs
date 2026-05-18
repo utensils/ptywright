@@ -376,6 +376,14 @@ fn action_api(
             "kill",
             lua.create_function(|lua, _: ()| tagged_unit(lua, "kill"))?,
         )?;
+        // `signal` needs `SessionKill` rather than `InputWrite` — sending
+        // SIGTERM/SIGHUP/SIGUSR* is a lifecycle action, not input. The
+        // value is the snake_case Signal variant (see `Signal` in
+        // `src/action.rs` for the table).
+        action.set(
+            "signal",
+            lua.create_function(|lua, value: String| tagged_value(lua, "signal", value))?,
+        )?;
     }
     Ok(action)
 }

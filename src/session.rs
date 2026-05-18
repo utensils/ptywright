@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::action::{Action, Key};
+use crate::action::{Action, Key, Signal};
 use crate::error::{Error, Result};
 use crate::matcher::{MatchResult, Matcher, MatcherContext};
 use crate::redaction::RedactionPolicy;
@@ -209,6 +209,7 @@ impl Session {
             Action::Resize(size) => self.resize(size),
             Action::Interrupt => self.send_key(Key::CtrlC),
             Action::Eof => self.send_key(Key::CtrlD),
+            Action::Signal(signal) => self.signal(signal),
             Action::Kill => self.kill(),
         }
     }
@@ -353,6 +354,124 @@ impl Session {
         self.shared.changed.notify_all();
         self.child.lock().expect("child lock poisoned").kill()?;
         Ok(())
+    }
+
+    /// Process id of the spawned child, when known. Returns `None` if the
+    /// backend never exposed one or the child has already been reaped —
+    /// the underlying `portable_pty::Child::process_id` contract.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.lock().expect("child lock poisoned").process_id()
+    }
+
+    /// Send a POSIX-style signal to the child. See [`Signal`] for
+    /// per-platform behaviour; on Windows only [`Signal::Term`],
+    /// [`Signal::Kill`], and [`Signal::Int`] are honoured and every other
+    /// variant returns [`Error::UnsupportedOnPlatform`].
+    pub fn signal(&self, signal: Signal) -> Result<()> {
+        match signal {
+            Signal::Int => self.send_key(Key::CtrlC),
+            Signal::Kill => self.kill(),
+            _ => self.signal_native(signal),
+        }
+    }
+
+    /// Graceful-then-forceful shutdown: send [`Signal::Term`], poll for the
+    /// child up to `grace`, then [`Signal::Kill`] if still running. Returns
+    /// the observed [`SessionExitStatus`] either way. Mirrors the SIGTERM →
+    /// poll → SIGKILL ladder that consumers like claudette build manually.
+    pub fn terminate(&self, grace: Duration) -> Result<SessionExitStatus> {
+        // Best-effort SIGTERM. If the platform rejects it (Windows for
+        // non-Term/Kill/Int variants is impossible here since we're
+        // sending Term, but the backend may still error), fall through
+        // to the hard kill below — we're committed to ending the child.
+        if let Err(error) = self.signal_native(Signal::Term) {
+            tracing::debug!(?error, "ptywright: terminate SIGTERM rejected; escalating");
+        }
+
+        let deadline = Instant::now() + grace;
+        loop {
+            {
+                let mut child = self.child.lock().expect("child lock poisoned");
+                if let Some(status) = child.try_wait()? {
+                    self.shared.closed.store(true, Ordering::SeqCst);
+                    self.shared.changed.notify_all();
+                    return Ok(SessionExitStatus {
+                        code: status.exit_code(),
+                        success: status.success(),
+                        message: status.to_string(),
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20).min(grace));
+        }
+
+        // Still alive past the grace window — fall back to the hard kill
+        // path. We deliberately use `wait()` (not `try_wait()`) afterwards
+        // so the returned status reflects the kill rather than a stale
+        // "still running" reading.
+        self.kill()?;
+        self.wait()
+    }
+
+    #[cfg(unix)]
+    fn signal_native(&self, signal: Signal) -> Result<()> {
+        // Translate to libc constants. Unix supports every variant; the
+        // Int/Kill branches in `signal()` short-circuit before reaching
+        // here, but mapping them keeps the table exhaustive in one place.
+        let libc_signal: libc::c_int = match signal {
+            Signal::Term => libc::SIGTERM,
+            Signal::Hup => libc::SIGHUP,
+            Signal::Quit => libc::SIGQUIT,
+            Signal::Int => libc::SIGINT,
+            Signal::Kill => libc::SIGKILL,
+            Signal::User1 => libc::SIGUSR1,
+            Signal::User2 => libc::SIGUSR2,
+        };
+        let Some(pid) = self.pid() else {
+            return Err(Error::Closed);
+        };
+        // SAFETY: `kill` is a thin libc wrapper; we pass an i32 pid and a
+        // valid signal constant. The call is async-signal-safe and has
+        // no preconditions on Rust state.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc_signal) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::Io(std::io::Error::last_os_error()))
+        }
+    }
+
+    #[cfg(windows)]
+    fn signal_native(&self, signal: Signal) -> Result<()> {
+        // Windows has no POSIX-equivalent for SIGHUP / SIGQUIT / SIGUSR*.
+        // `Term` maps to a best-effort `taskkill /T /PID` — graceful
+        // enough to give the child a chance to clean up while still
+        // ending the process tree. `Int` is handled by the caller via
+        // the PTY Ctrl-C byte, and `Kill` is the hard-kill path on the
+        // existing `ChildKiller` trait.
+        if !matches!(signal, Signal::Term) {
+            return Err(Error::UnsupportedOnPlatform(format!(
+                "signal `{signal:?}` has no Windows equivalent"
+            )));
+        }
+        let Some(pid) = self.pid() else {
+            return Err(Error::Closed);
+        };
+        let status = std::process::Command::new("taskkill")
+            .args(["/T", "/PID", &pid.to_string()])
+            .status()
+            .map_err(Error::Io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedOnPlatform(format!(
+                "taskkill exited with status {status:?}"
+            )))
+        }
     }
 
     fn write_all(&self, bytes: &[u8]) -> Result<()> {
@@ -555,6 +674,78 @@ mod tests {
             transcript.contains("\x1b[201~"),
             "Action::BracketedPaste must emit the CSI 201~ end marker: {transcript:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_is_reported_while_child_is_alive() {
+        // Sanity-check the PID accessor — the child runs long enough
+        // that `pid()` must return Some(_) before we kill it. We can't
+        // assert any particular value, but presence is a real claim.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 5"]))
+            .expect("spawn sleep");
+        assert!(session.pid().is_some());
+        session.kill().expect("kill child");
+        let _ = session.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminate_sends_sigterm_then_returns_exit_status() {
+        // POSIX `sleep` exits cleanly on SIGTERM, so the graceful path
+        // is exercised end-to-end — no SIGKILL escalation should fire
+        // within the 2s grace window.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let status = session
+            .terminate(Duration::from_secs(2))
+            .expect("terminate session");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "graceful terminate should not wait the full grace window"
+        );
+        // SIGTERM exit codes vary by platform/shell — we just assert
+        // the child observably ended rather than locking in `code`.
+        assert!(!status.message.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminate_escalates_to_kill_when_child_ignores_sigterm() {
+        // `trap '' TERM` makes the shell ignore SIGTERM; the ladder
+        // must then escalate to SIGKILL inside the grace window.
+        let session =
+            Session::spawn_target(Target::new("/bin/sh").args(["-lc", "trap '' TERM; sleep 30"]))
+                .expect("spawn shell");
+        let status = session
+            .terminate(Duration::from_millis(150))
+            .expect("terminate session");
+        assert!(!status.message.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_signal_routes_through_session_signal() {
+        // End-to-end: dispatching `Action::Signal(Term)` must reach the
+        // child via the same path as calling `Session::signal` directly.
+        // A long `sleep` is killed by SIGTERM by default; observing the
+        // exit proves both the routing through `send()` and the libc
+        // call site landed on the right PID. We avoid asserting a
+        // specific exit code — shells normalise SIGTERM differently
+        // across platforms and that's not the property under test.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 10"]))
+            .expect("spawn shell");
+        // Tiny pause lets the shell finish exec'ing before we signal.
+        thread::sleep(Duration::from_millis(50));
+        session
+            .send(Action::Signal(Signal::Term))
+            .expect("send signal");
+        let result = session
+            .wait_for(&Matcher::ProcessExited, Duration::from_secs(3))
+            .expect("wait for exit");
+        assert!(result.matched);
+        let _ = session.wait();
     }
 
     #[test]

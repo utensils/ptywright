@@ -46,4 +46,9 @@ pub enum Error {
         /// Permission the caller's plugin manifest needed to declare.
         required: PluginPermission,
     },
+    /// Operation has no equivalent on the current platform — see the
+    /// per-platform notes on [`crate::Signal`] for the signal subset that
+    /// maps cleanly to Windows.
+    #[error("unsupported on this platform: {0}")]
+    UnsupportedOnPlatform(String),
 }

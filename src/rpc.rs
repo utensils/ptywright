@@ -1834,7 +1834,8 @@ fn rpc_error_from_error(error: Error) -> RpcErrorPayload {
         | Error::Json(_)
         | Error::Lua(_)
         | Error::Rpc(_)
-        | Error::Config(_) => (RpcErrorCode::InternalError, None),
+        | Error::Config(_)
+        | Error::UnsupportedOnPlatform(_) => (RpcErrorCode::InternalError, None),
     };
     RpcErrorPayload {
         code,
