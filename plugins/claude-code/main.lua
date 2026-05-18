@@ -31,6 +31,20 @@ local M = {}
 local action = ptywright.action
 local matcher = ptywright.matcher
 
+-- Module-level dialog tracking for `metadata.dialog_id` correlation.
+-- `_current_dialog_id` is updated by the classifier whenever a dialog
+-- is detected (permission, plan approval, trust); intent functions
+-- (approve / deny / approve_trust / deny_trust) cross-check the
+-- caller-supplied `dialog_id` against this value and refuse to act on
+-- a stale id rather than blindly pressing Enter on a different dialog.
+--
+-- The state persists across classifier calls because the Lua plugin
+-- runs in a single registry-held table — `M` is the same object on
+-- every call into the plugin. A nil `_current_dialog_id` means "no
+-- dialog active right now" and intent calls with a non-nil
+-- `dialog_id` are rejected.
+M._current_dialog_id = nil
+
 -- Bring the shared helpers in as locals so the rest of this file reads
 -- identically to the pre-split version. Anything new that needs a
 -- helper but isn't aliased here can still call `helpers.<fn>` directly.
@@ -40,6 +54,7 @@ local starts_with            = helpers.starts_with
 local trim                   = helpers.trim
 local lower                  = helpers.lower
 local redact_secret_patterns = helpers.redact_secret_patterns
+local fnv1a_hex              = helpers.fnv1a_hex
 local strip_dollar           = helpers.strip_dollar
 
 local function state_snapshot(state, confidence, evidence, sequence, metadata)
@@ -1143,6 +1158,14 @@ local function has_welcome_screen(text)
 end
 
 function M.classify(input)
+  -- Reset module-level dialog tracking at the start of every classify
+  -- call. Any branch that detects a dialog (permission / plan / trust)
+  -- sets `_current_dialog_id` before returning. Leaving the dialog
+  -- screen — typing past it, an approve action that closes it, a
+  -- different state entirely — drops the id so subsequent approve /
+  -- deny calls with a stale id are rejected rather than blindly
+  -- pressing Enter on whatever is now on screen.
+  M._current_dialog_id = nil
   local screen = input.screen or ""
   -- body_text excludes the bottom status-bar rows so that benign status
   -- strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` do not
@@ -1238,7 +1261,21 @@ function M.classify(input)
   -- Trust questions and answers live entirely in the dialog body; the
   -- status bar carries only navigation hints.
   if has_trust_indicator(body_text) then
-    return state_snapshot("waiting_for_trust", 0.86, "workspace trust dialog detected", sequence)
+    -- Trust dialog id is derived from the workspace path the dialog
+    -- references. The same project re-opened produces the same id;
+    -- a different workspace path mints a fresh one so callers can
+    -- distinguish.
+    local workspace_path = body:match("[Aa]ccessing workspace:%s*([^\n]+)")
+    local fingerprint = "trust:" .. trim(workspace_path or "unknown")
+    local dialog_id = fnv1a_hex(fingerprint)
+    M._current_dialog_id = dialog_id
+    return state_snapshot(
+      "waiting_for_trust",
+      0.86,
+      "workspace trust dialog detected",
+      sequence,
+      { dialog_id = dialog_id }
+    )
   end
 
   -- Model picker (opened by `/model`). Anchored on THREE structural
@@ -1257,7 +1294,12 @@ function M.classify(input)
     -- whole screen avoids that edge case; the parser ignores
     -- everything up to the "Plan" header.
     local plan_text = parse_plan_body(screen)
-    local plan_metadata = plan_text and { plan = plan_text } or nil
+    local plan_metadata = nil
+    if plan_text then
+      local dialog_id = fnv1a_hex("plan:" .. plan_text)
+      M._current_dialog_id = dialog_id
+      plan_metadata = { plan = plan_text, dialog_id = dialog_id }
+    end
     return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence, plan_metadata)
   end
 
@@ -1268,6 +1310,15 @@ function M.classify(input)
     -- present. Original case matters for the tool name and summary
     -- ("Bash command: cargo test").
     local permission_metadata = parse_permission_dialog(screen)
+    if permission_metadata and permission_metadata.permission then
+      local p = permission_metadata.permission
+      local fingerprint = string.format("perm:%s:%s",
+        p.tool or "unknown",
+        p.summary or "")
+      local dialog_id = fnv1a_hex(fingerprint)
+      M._current_dialog_id = dialog_id
+      permission_metadata.dialog_id = dialog_id
+    end
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
   end
 
@@ -1597,7 +1648,35 @@ function M.wait_turn_matcher(input)
   })
 end
 
-function M.approve(_input)
+-- Check caller-supplied `dialog_id` against the most recently
+-- classified dialog. Raises a Lua error (surfaced as Error::Lua to the
+-- host / -32603 InternalError on the wire) when the id doesn't match
+-- so a caller acting on a stale dialog id can't accidentally press
+-- Enter on a different dialog. Missing / nil `dialog_id` is the
+-- best-effort path — preserves backwards compatibility for callers
+-- that don't yet thread the id through.
+local function check_dialog_id(input)
+  local supplied = input and input.dialog_id
+  if supplied == nil then
+    return
+  end
+  if M._current_dialog_id == nil then
+    error(string.format(
+      "stale_dialog: supplied dialog_id=%s but no dialog is currently active",
+      tostring(supplied)
+    ))
+  end
+  if M._current_dialog_id ~= supplied then
+    error(string.format(
+      "stale_dialog: supplied dialog_id=%s does not match current dialog_id=%s",
+      tostring(supplied),
+      tostring(M._current_dialog_id)
+    ))
+  end
+end
+
+function M.approve(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.key("enter"),
@@ -1605,7 +1684,8 @@ function M.approve(_input)
   }
 end
 
-function M.deny(_input)
+function M.deny(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.key("escape"),
@@ -1618,7 +1698,8 @@ end
 -- list as accepting option 1. Kept as a separate intent so callers can
 -- dispatch on `waiting_for_trust` explicitly instead of overloading
 -- `approve`.
-function M.approve_trust(_input)
+function M.approve_trust(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.text("1"),
@@ -1627,7 +1708,8 @@ function M.approve_trust(_input)
   }
 end
 
-function M.deny_trust(_input)
+function M.deny_trust(input)
+  check_dialog_id(input)
   return {
     actions = {
       action.text("2"),

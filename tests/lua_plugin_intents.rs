@@ -1189,6 +1189,73 @@ fn classifier_detects_usage_screen_as_completed_turn() {
 }
 
 #[test]
+fn approve_with_dialog_id_succeeds_after_matching_classify() {
+    // Walk the full classifier → approve dispatch so the module-level
+    // `_current_dialog_id` is set by classify before the intent reads
+    // it back. The fixture under tests/fixtures/claude_code/permission.txt
+    // hashes to `115803ed` (locked in permission.expected.json), so
+    // passing that id through approve must succeed.
+    let extension = claude_plugin();
+    let screen = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude_code/permission.txt"),
+    )
+    .expect("read permission fixture");
+    let _ = classify_state(&extension, &screen, 1, None, Some(COMPLETED_TURN_STABLE_MS));
+    let plan = plan(
+        &extension,
+        "approve",
+        json!({ "dialog_id": "115803ed" }),
+    );
+    assert_eq!(plan.actions, vec![Action::Key(Key::Enter)]);
+}
+
+#[test]
+fn approve_with_stale_dialog_id_returns_error() {
+    // Same fixture; passing a mismatched dialog_id must surface as a
+    // Lua error rather than silently pressing Enter on something else.
+    let extension = claude_plugin();
+    let screen = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude_code/permission.txt"),
+    )
+    .expect("read permission fixture");
+    let _ = classify_state(&extension, &screen, 1, None, Some(COMPLETED_TURN_STABLE_MS));
+    let err = extension
+        .plan("approve", &json!({ "dialog_id": "deadbeef" }))
+        .expect_err("stale dialog_id must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stale_dialog"),
+        "error should explain the rejection: {msg}"
+    );
+}
+
+#[test]
+fn approve_with_dialog_id_when_no_dialog_active_is_rejected() {
+    // Empty classifier run drops `_current_dialog_id`. Caller still
+    // passes a dialog_id (perhaps from a previous frame); the plugin
+    // must refuse.
+    let extension = claude_plugin();
+    let _ = classify_state(&extension, "no dialog here", 1, None, Some(0));
+    let err = extension
+        .plan("approve", &json!({ "dialog_id": "abc12345" }))
+        .expect_err("dialog_id without active dialog must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("stale_dialog"), "got: {msg}");
+}
+
+#[test]
+fn approve_without_dialog_id_remains_backwards_compatible() {
+    // The id check is opt-in: callers that don't thread `dialog_id`
+    // through still get the legacy "press Enter" behaviour so existing
+    // consumers don't break.
+    let extension = claude_plugin();
+    let plan = plan(&extension, "approve", json!({}));
+    assert_eq!(plan.actions, vec![Action::Key(Key::Enter)]);
+}
+
+#[test]
 fn attach_file_bracketed_pastes_path_without_enter() {
     // Claude Code 2.1.x normalises drag-drop and `@<path>` references to
     // a bracketed-paste of the absolute path. The intent deliberately

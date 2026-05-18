@@ -76,4 +76,22 @@ function M.strip_dollar(text)
   return (text:gsub("^%$", ""))
 end
 
+-- FNV-1a 32-bit hash used to mint stable dialog correlation ids. Lua
+-- 5.4's bitwise operators keep this pure-Lua. Returns 8 lowercase hex
+-- chars. Used by the dialog parsers in main.lua to seed
+-- `metadata.dialog_id` from the dialog body fingerprint — stable
+-- across reclassifications of the same dialog, distinct between
+-- dialogs whose content differs.
+function M.fnv1a_hex(s)
+  if s == nil or s == "" then
+    return "00000000"
+  end
+  local h = 2166136261
+  for i = 1, #s do
+    h = h ~ string.byte(s, i)
+    h = (h * 16777619) & 0xffffffff
+  end
+  return string.format("%08x", h)
+end
+
 return M
