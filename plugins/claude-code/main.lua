@@ -84,7 +84,13 @@ local ERROR_BANNER_PREFIXES = {
   "you've used your pro plan",
   "you've used your max plan",
   "you've reached your usage limit",
+  "you've hit your limit",
   "credit balance is too low",
+  -- Mid-turn API error wrapping a per-request usage / context-window
+  -- quota condition. Claude Code 2.1.x renders this when an account
+  -- hits its quota for the requested model variant (typically the
+  -- 1M-context tier).
+  "api error: extra usage is required",
   -- Connection / network failure banner.
   "connection error",
   "connection issue",
@@ -92,11 +98,49 @@ local ERROR_BANNER_PREFIXES = {
   "network error",
 }
 
+-- Claude Code 2.1.x tool-call result callout glyph (U+23BF). When an
+-- error fires mid-turn (e.g. `⎿ API Error: ...`), the TUI wraps the
+-- message under this callout the same way it wraps successful
+-- tool-call results. Strip it before prefix-matching so callout-
+-- wrapped errors are detectable.
+local CALLOUT_GLYPH = "⎿"
+-- Non-breaking space (U+00A0) as UTF-8 — hoisted above
+-- `strip_callout_prefix` because the callout-padding is NBSP-based,
+-- not ASCII. A second declaration lower in the file is kept for the
+-- `has_input_prompt` site that already used it.
+local NBSP_BYTES = "\194\160"
+
+-- After stripping the callout glyph, Claude Code 2.1.x pads with a
+-- non-breaking space (U+00A0, UTF-8 \194\160), NOT an ASCII space.
+-- Lua's trim only strips ASCII whitespace, so we have to peel NBSP
+-- (and ASCII whitespace) explicitly here. Without this, the leading
+-- NBSP keeps the prefix-anchored matches from ever firing on
+-- callout-wrapped errors.
+local function strip_callout_prefix(text)
+  if string.sub(text, 1, #CALLOUT_GLYPH) ~= CALLOUT_GLYPH then
+    return text
+  end
+  local rest = string.sub(text, #CALLOUT_GLYPH + 1)
+  -- Peel any mix of ASCII whitespace and NBSP from the head.
+  while #rest > 0 do
+    local b = string.byte(rest, 1)
+    if b == 0x20 or b == 0x09 or b == 0x0A or b == 0x0D then
+      rest = string.sub(rest, 2)
+    elseif string.sub(rest, 1, 2) == NBSP_BYTES then
+      rest = string.sub(rest, 3)
+    else
+      break
+    end
+  end
+  return trim(rest)
+end
+
 local function has_error_indicator(screen)
   for line in string.gmatch(screen or "", "[^\n]+") do
     local text = lower(trim(line))
+    local stripped = strip_callout_prefix(text)
     for _, prefix in ipairs(ERROR_BANNER_PREFIXES) do
-      if starts_with(text, prefix) then
+      if starts_with(text, prefix) or starts_with(stripped, prefix) then
         return true
       end
     end
@@ -133,6 +177,10 @@ local ERROR_SUBTYPE_PATTERNS = {
   { kind = "rate_limit", prefix = "you've used your pro plan" },
   { kind = "rate_limit", prefix = "you've used your max plan" },
   { kind = "rate_limit", prefix = "you've reached your usage limit" },
+  { kind = "rate_limit", prefix = "you've hit your limit" },
+  -- Specific quota variants must come before generic `api error`
+  -- so the right kind wins.
+  { kind = "quota",      prefix = "api error: extra usage is required" },
   { kind = "quota",      prefix = "credit balance is too low" },
   { kind = "connection", prefix = "connection error" },
   { kind = "connection", prefix = "connection issue" },
@@ -180,11 +228,21 @@ local function parse_error_subtype(body)
   local message = nil
   for idx, raw in ipairs(lines) do
     local text = lower(trim(raw))
+    local stripped = strip_callout_prefix(text)
+    -- Always surface the *stripped* form to consumers reading
+    -- `metadata.error.message` so the shape is identical regardless
+    -- of which branch matched (raw vs callout-wrapped). Without this,
+    -- a callout-wrapped quota error and the same banner shown
+    -- standalone would surface with different leading bytes.
+    -- (Copilot review feedback.)
+    local raw_stripped = strip_callout_prefix(trim(raw))
     if text ~= "" then
       for _, pattern in ipairs(ERROR_SUBTYPE_PATTERNS) do
-        if starts_with(text, pattern.prefix) then
+        if starts_with(text, pattern.prefix)
+            or starts_with(stripped, pattern.prefix)
+        then
           subtype = pattern.kind
-          message = trim(raw)
+          message = raw_stripped
           break
         end
       end
@@ -244,7 +302,8 @@ end
 -- match while symmetrically also accepting `>` at line start.
 -- `trim` strips ASCII whitespace only, so NBSP padding is handled
 -- explicitly with byte-level checks on the multi-byte sequence.
-local NBSP_BYTES = "\194\160"  -- U+00A0 as UTF-8
+-- `NBSP_BYTES` is declared above (next to `strip_callout_prefix`,
+-- which needs it during callout-padding peel).
 
 local function has_input_prompt(screen)
   for line in string.gmatch(screen or "", "[^\n]+") do
