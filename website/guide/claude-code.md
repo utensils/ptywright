@@ -79,15 +79,15 @@ Every state response includes:
 
 The classifier may attach the following keys to `metadata`, depending on which state is detected. All fields are optional — callers should treat any missing key as "not observed this tick".
 
-| Key                | When set                       | Shape                                                                                                  |
-| ------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `status`           | always (status-bar row parsed) | `{ "model": "...", "permission_mode": "..." }`                                                          |
-| `permission`       | `waiting_for_permission`       | `{ "tool": "Bash", "summary": "...", "options": ["Yes", "Yes, and don't ask again", "No"] }`           |
-| `plan`             | `waiting_for_plan_approval`    | Multi-line plan body text (the bullet/step list Claude Code rendered).                                  |
-| `error`            | `error`                        | `{ "kind": "rate_limit"\|"quota"\|"connection"\|"auth"\|"api"\|"unknown", "message": "...", "retry_after_s"?: number }` |
-| `login`            | `waiting_for_login`            | `{ "url": "https://..." }` — extracted sign-in URL (bare-domain forms supported, host-suffix attacks rejected). |
-| `usage`            | `/usage` panel visible         | Structured panel contents (model, limits, current usage).                                              |
-| `dialog_id`        | dialog-bearing states          | FNV-1a-keyed correlation id (see below).                                                               |
+| Key          | When set                       | Shape                                                                                                                   |
+| ------------ | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `status`     | always (status-bar row parsed) | `{ "model": "...", "permission_mode": "..." }`                                                                          |
+| `permission` | `waiting_for_permission`       | `{ "tool": "Bash", "summary": "...", "options": ["Yes", "Yes, and don't ask again", "No"] }`                            |
+| `plan`       | `waiting_for_plan_approval`    | Multi-line plan body text (the bullet/step list Claude Code rendered).                                                  |
+| `error`      | `error`                        | `{ "kind": "rate_limit"\|"quota"\|"connection"\|"auth"\|"api"\|"unknown", "message": "...", "retry_after_s"?: number }` |
+| `login`      | `waiting_for_login`            | `{ "url": "https://..." }` — extracted sign-in URL (bare-domain forms supported, host-suffix attacks rejected).         |
+| `usage`      | `/usage` panel visible         | Structured panel contents (model, limits, current usage).                                                               |
+| `dialog_id`  | dialog-bearing states          | FNV-1a-keyed correlation id (see below).                                                                                |
 
 `dialog_id` is stamped whenever the classifier sees a dialog (permission, plan approval, etc.) and is included in the matching dialog metadata block (e.g. `metadata.permission.dialog_id`). Pass it back as `params.dialog_id` on the matching intent (`approve`, `deny`, `approve_trust`, etc.) and the plugin will refuse to act on a stale dialog — returning a `stale_dialog` error rather than approving whatever Claude Code repainted between classify and act. Callers driving the plugin in a classify-then-act loop (the canonical `adapter.state` / `adapter.wait` / `adapter.send` cadence) get this for free; direct-Rust callers that fire intents without an intervening classify will see `_current_dialog_id == nil` and get `stale_dialog`, which is correct — that's the warning signal that the act-then-act path skipped the cross-check.
 

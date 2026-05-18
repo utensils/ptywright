@@ -27,14 +27,14 @@ let target = Target::new("python")
 
 Important fields:
 
-| Field       | Type                   | Meaning                                                                 |
-| ----------- | ---------------------- | ----------------------------------------------------------------------- |
-| `program`   | `String`               | Executable name or path.                                                |
-| `args`      | `Vec<String>`          | Arguments passed to the child.                                          |
-| `cwd`       | `Option<PathBuf>`      | Optional working directory.                                             |
-| `env`       | `BTreeMap<String,...>` | Environment overrides applied to the spawned child.                     |
-| `clear_env` | `bool`                 | When `true`, strip the parent environment before applying `env`.        |
-| `size`      | `TerminalSize`         | Initial rows/columns and pixels.                                        |
+| Field       | Type                   | Meaning                                                          |
+| ----------- | ---------------------- | ---------------------------------------------------------------- |
+| `program`   | `String`               | Executable name or path.                                         |
+| `args`      | `Vec<String>`          | Arguments passed to the child.                                   |
+| `cwd`       | `Option<PathBuf>`      | Optional working directory.                                      |
+| `env`       | `BTreeMap<String,...>` | Environment overrides applied to the spawned child.              |
+| `clear_env` | `bool`                 | When `true`, strip the parent environment before applying `env`. |
+| `size`      | `TerminalSize`         | Initial rows/columns and pixels.                                 |
 
 `Target::clear_env()` flips the strip-parent-env flag for callers consuming a manifest whose `default_target.required_env` declares safety-critical environment variables — without it, an inherited variable could shadow a manifest-mandated default. `Target::env_snapshot()` returns the overlay map (`&BTreeMap<String, String>`) without exposing the parent environment, which is useful for callers that want to detect env drift across a respawn.
 
@@ -55,28 +55,28 @@ let transcript = session.transcript();
 
 Key methods:
 
-| Method                  | Purpose                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------- |
-| `spawn`                 | Spawn from `SessionConfig`.                                                         |
-| `spawn_target`          | Spawn a `Target` with default transcript settings.                                  |
-| `snapshot`              | Return the current rendered screen snapshot.                                        |
-| `transcript`            | Return retained transcript text.                                                    |
-| `is_finished`           | Report whether the reader/session lifecycle ended.                                  |
-| `pid`                   | PID of the underlying child process, or `None` once it has exited.                  |
-| `send`                  | Apply an `Action` (including `Action::Signal(Signal::...)` on supported platforms). |
-| `signal`                | Deliver a `Signal` directly (`Term`, `Hup`, `Quit`, `Int`, `Kill`, `User1`, `User2`). |
-| `terminate`             | SIGTERM then escalate to SIGKILL after the supplied grace period.                   |
-| `write_text`            | Write text bytes to the PTY.                                                        |
-| `send_key`              | Send a named key sequence.                                                          |
-| `resize`                | Resize the PTY and screen parser.                                                   |
-| `wait_for`              | Wait for a `Matcher` with a timeout.                                                |
-| `wait_for_cancellable`  | Same as `wait_for`, but aborts cleanly when a shared `CancellationToken` is flipped. |
-| `events`                | Subscribe to `SessionEvent` notifications (`Changed` / `Exited`).                   |
-| `mark_transcript`       | Stamp a label-keyed marker at the current transcript cursor.                        |
-| `transcript_marker`     | Recall a previously stamped marker's offset.                                        |
-| `transcript_slice`      | Slice the transcript between two markers.                                           |
-| `wait`                  | Wait for child process exit.                                                        |
-| `kill`                  | Kill the child process.                                                             |
+| Method                 | Purpose                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------- |
+| `spawn`                | Spawn from `SessionConfig`.                                                           |
+| `spawn_target`         | Spawn a `Target` with default transcript settings.                                    |
+| `snapshot`             | Return the current rendered screen snapshot.                                          |
+| `transcript`           | Return retained transcript text.                                                      |
+| `is_finished`          | Report whether the reader/session lifecycle ended.                                    |
+| `pid`                  | PID of the underlying child process, or `None` once it has exited.                    |
+| `send`                 | Apply an `Action` (including `Action::Signal(Signal::...)` on supported platforms).   |
+| `signal`               | Deliver a `Signal` directly (`Term`, `Hup`, `Quit`, `Int`, `Kill`, `User1`, `User2`). |
+| `terminate`            | SIGTERM then escalate to SIGKILL after the supplied grace period.                     |
+| `write_text`           | Write text bytes to the PTY.                                                          |
+| `send_key`             | Send a named key sequence.                                                            |
+| `resize`               | Resize the PTY and screen parser.                                                     |
+| `wait_for`             | Wait for a `Matcher` with a timeout.                                                  |
+| `wait_for_cancellable` | Same as `wait_for`, but aborts cleanly when a shared `CancellationToken` is flipped.  |
+| `events`               | Subscribe to `SessionEvent` notifications (`Changed` / `Exited`).                     |
+| `mark_transcript`      | Stamp a label-keyed marker at the current transcript cursor.                          |
+| `transcript_marker`    | Recall a previously stamped marker's offset.                                          |
+| `transcript_slice`     | Slice the transcript between two markers.                                             |
+| `wait`                 | Wait for child process exit.                                                          |
+| `kill`                 | Kill the child process.                                                               |
 
 ```rust
 use std::time::Duration;
