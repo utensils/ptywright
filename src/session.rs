@@ -78,6 +78,12 @@ impl Session {
         if let Some(cwd) = &config.target.cwd {
             command.cwd(cwd.as_os_str());
         }
+        // `clear_env` strips the inherited parent env before applying
+        // the Target's overlay. Pair with a plugin manifest's
+        // `default_target.required_env` for a fully reproducible layout.
+        if config.target.clear_env {
+            command.env_clear();
+        }
         for (key, value) in &config.target.env {
             command.env(key, value);
         }

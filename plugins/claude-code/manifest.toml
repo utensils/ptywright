@@ -50,35 +50,19 @@ cols = 200
 # TUI-simplification env preset. Each var here disables a Claude Code 2.1.x
 # feature that produces output the classifier either can't see through,
 # can't distinguish from prose, or that simply makes the rendered body
-# noisier. Caller-supplied env on adapter.start overrides any key here;
-# keys the caller omits are inherited.
+# noisier. Two-tier precedence:
 #
-# Why these specifically:
-#   * CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 — don't re-display the submitted
-#     prompt in the input box after a turn. Without this the "empty
-#     input prompt visible" completion signal is unreliable (the prompt
-#     re-appears mid-frame after a turn).
-#   * CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 — no OSC title escapes
-#     polluting the transcript.
-#   * CLAUDE_CODE_DISABLE_MOUSE=1 — no mouse-capture escape sequences.
-#   * CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 — keep content in cell
-#     positions the vt100 parser tracks; virtual scrolling pushes
-#     earlier rendered content off the visible grid.
-#   * CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 — fewer status-bar refreshes.
-#   * CLAUDE_CODE_DISABLE_MESSAGE_ACTIONS=1 / CLAUDE_CODE_DISABLE_ATTACHMENTS=1
-#     — drop UI affordances the plugin doesn't drive.
-#   * CLAUDE_CODE_SYNTAX_HIGHLIGHT=0 / NO_COLOR=1 / FORCE_COLOR=0 — minimise
-#     SGR escape churn so body_text diffs are content-driven, not
-#     style-driven.
-#   * CLAUDE_CODE_ACCESSIBILITY=1 — keeps the native cursor visible and
-#     avoids some cursor-hiding behaviour.
-#   * CLAUDE_CODE_NO_FLICKER=0 — opt out of alt-screen / fullscreen
-#     repaint semantics that confuse single-screen vt100 capture.
+#   * `[default_target.env]` — plugin defaults the caller MAY override
+#     (e.g. NO_COLOR / FORCE_COLOR for callers who explicitly want colour).
+#   * `[default_target.required_env]` — plugin-mandated keys the caller
+#     CANNOT override. Reserved for settings whose absence breaks the
+#     classifier outright. Today: terminal-title disabling
+#     (OSC title escapes pollute the body parser regardless of caller
+#     intent) and virtual-scroll suppression (cell positions the vt100
+#     parser tracks must not move).
 [default_target.env]
 CLAUDE_CODE_SKIP_PROMPT_HISTORY = "1"
-CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"
 CLAUDE_CODE_DISABLE_MOUSE = "1"
-CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL = "1"
 CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1"
 CLAUDE_CODE_DISABLE_MESSAGE_ACTIONS = "1"
 CLAUDE_CODE_DISABLE_ATTACHMENTS = "1"
@@ -87,3 +71,10 @@ CLAUDE_CODE_ACCESSIBILITY = "1"
 CLAUDE_CODE_NO_FLICKER = "0"
 NO_COLOR = "1"
 FORCE_COLOR = "0"
+
+# Required keys — caller-supplied env on adapter.start cannot override
+# these. The classifier breaks without them, so we keep them out of
+# caller reach.
+[default_target.required_env]
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"
+CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL = "1"

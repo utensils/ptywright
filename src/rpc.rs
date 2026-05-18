@@ -1301,7 +1301,11 @@ impl RpcServer {
         };
         let mut target = Target::new(program).args(args).size(size);
         target.cwd = params.cwd;
-        target.env = merge_env(manifest_default.as_ref().map(|t| &t.env), params.env);
+        target.env = merge_env(
+            manifest_default.as_ref().map(|t| &t.env),
+            params.env,
+            manifest_default.as_ref().map(|t| &t.required_env),
+        );
         let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
         let handle = ExtensionHandle::start(
             Box::new(extension),
@@ -1641,17 +1645,29 @@ impl Default for RpcServer {
     }
 }
 
-/// Merge a plugin manifest's `default_target.env` with caller-supplied
-/// `env` from `adapter.start`. Manifest defaults are applied first; the
-/// caller's map is overlaid on top, so caller wins on key conflict and
-/// keys the caller omits are inherited from the manifest. A missing
-/// manifest map is treated as empty.
+/// Merge a plugin manifest's env with caller-supplied `env` from
+/// `adapter.start`.
+///
+/// Precedence (lowest → highest):
+///
+/// 1. Manifest `default_target.env` — plugin-recommended defaults.
+/// 2. Caller `env` — overrides manifest defaults on key conflict.
+/// 3. Manifest `default_target.required_env` — plugin-mandated keys
+///    the caller cannot override.
+///
+/// A missing manifest map is treated as empty. The required-env tier
+/// makes safety-critical knobs (terminal-title disabling,
+/// virtual-scroll suppression) stable across all callers.
 fn merge_env(
     manifest_default: Option<&BTreeMap<String, String>>,
     caller: BTreeMap<String, String>,
+    manifest_required: Option<&BTreeMap<String, String>>,
 ) -> BTreeMap<String, String> {
     let mut merged = manifest_default.cloned().unwrap_or_default();
     merged.extend(caller);
+    if let Some(required) = manifest_required {
+        merged.extend(required.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
     merged
 }
 
@@ -2509,7 +2525,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect();
 
-        let merged = merge_env(Some(&manifest), caller);
+        let merged = merge_env(Some(&manifest), caller, None);
 
         assert_eq!(
             merged.get("MANIFEST_ONLY").map(String::as_str),
@@ -2539,7 +2555,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let merged = merge_env(None, caller.clone());
+        let merged = merge_env(None, caller.clone(), None);
         assert_eq!(
             merged, caller,
             "missing manifest default must passthrough caller env"
@@ -2552,10 +2568,52 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let merged = merge_env(Some(&manifest), BTreeMap::new());
+        let merged = merge_env(Some(&manifest), BTreeMap::new(), None);
         assert_eq!(
             merged, manifest,
             "empty caller env must yield the manifest defaults verbatim"
+        );
+    }
+
+    #[test]
+    fn merge_env_required_overrides_caller() {
+        // Required-env tier: the plugin manifest reserves keys the
+        // caller cannot override. This is the load-bearing safety
+        // property for settings like terminal-title disabling — if the
+        // caller could turn them back on, the classifier would break.
+        let defaults: BTreeMap<String, String> = [("DEFAULT", "d")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let caller: BTreeMap<String, String> = [
+            ("DEFAULT", "caller_override_default"),
+            ("REQUIRED", "caller_attempt"),
+            ("CALLER_ONLY", "added"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        let required: BTreeMap<String, String> = [("REQUIRED", "plugin_wins")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+
+        let merged = merge_env(Some(&defaults), caller, Some(&required));
+
+        assert_eq!(
+            merged.get("DEFAULT").map(String::as_str),
+            Some("caller_override_default"),
+            "caller still overrides manifest defaults for non-required keys"
+        );
+        assert_eq!(
+            merged.get("REQUIRED").map(String::as_str),
+            Some("plugin_wins"),
+            "required_env wins over caller-supplied value"
+        );
+        assert_eq!(
+            merged.get("CALLER_ONLY").map(String::as_str),
+            Some("added"),
+            "caller-only keys still pass through"
         );
     }
 

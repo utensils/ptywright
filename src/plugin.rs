@@ -126,6 +126,18 @@ pub struct DefaultTarget {
     /// without converting between map types.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Environment variables the plugin requires for correct behaviour.
+    /// Unlike [`Self::env`], the caller **cannot** override entries here
+    /// — the host merges these last so they always win. Useful for
+    /// safety-critical knobs the plugin's classifier or driver depends
+    /// on (e.g. `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` prevents OSC title
+    /// escapes that would otherwise pollute the body parser).
+    ///
+    /// Omitted on the wire when empty. Precedence chain:
+    /// parent env → `env` (caller can override) → caller `env` →
+    /// `required_env` (plugin always wins).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub required_env: std::collections::BTreeMap<String, String>,
 }
 
 impl DefaultTarget {
@@ -142,6 +154,7 @@ impl DefaultTarget {
             rows: None,
             cols: None,
             env: std::collections::BTreeMap::new(),
+            required_env: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -562,6 +575,32 @@ mod tests {
             default_target.rows,
             Some(60),
             "claude-code must declare its classifier-stable rows preset"
+        );
+    }
+
+    #[test]
+    fn claude_code_manifest_marks_terminal_title_disable_as_required() {
+        // Regression: CLAUDE_CODE_DISABLE_TERMINAL_TITLE must live in
+        // `required_env`, not `env`. Without it OSC title escapes leak
+        // through the body parser and the classifier mis-bounds the
+        // status region. Caller-supplied env on `adapter.start` must not
+        // be able to turn the knob back off.
+        let manifest = claude_code_manifest();
+        let default_target = manifest
+            .default_target
+            .expect("claude-code declares default_target");
+        assert_eq!(
+            default_target
+                .required_env
+                .get("CLAUDE_CODE_DISABLE_TERMINAL_TITLE"),
+            Some(&"1".to_string()),
+            "terminal-title disabling must be enforced regardless of caller env"
+        );
+        assert!(
+            !default_target
+                .env
+                .contains_key("CLAUDE_CODE_DISABLE_TERMINAL_TITLE"),
+            "key must live in required_env, not env, so callers cannot override"
         );
     }
 
