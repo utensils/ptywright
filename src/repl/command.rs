@@ -856,14 +856,16 @@ fn session_resume(
     let mut params = Map::new();
     params.insert("plugin".to_string(), Value::String(plugin.clone()));
     insert_adapter_start_kwargs(&mut params, &call)?;
-    let prior_adapter =
-        string_kwarg(&call, "prior_adapter").or_else(|| string_kwarg(&call, "prior"));
-    if let Some(prior) = prior_adapter.clone() {
-        params.insert("prior_adapter".to_string(), Value::String(prior));
+    let prior_adapter = prior_adapter_kwarg(&call);
+    if let Some(prior) = prior_adapter.as_deref() {
+        params.insert(
+            "prior_adapter".to_string(),
+            Value::String(prior.to_string()),
+        );
     }
     let result = client.call("adapter.resume", Value::Object(params), timeout)?;
-    if let Some(prior) = prior_adapter {
-        ctx.remove_adapter(&prior);
+    if let Some(prior) = prior_adapter.as_deref() {
+        ctx.remove_adapter(prior);
     }
     adopt_started_adapter(ctx, &plugin, &result);
     Ok(CmdOutcome::Json(result))
@@ -1184,6 +1186,10 @@ fn duration_kwarg(call: &DslCall, name: &str) -> Result<Option<Duration>> {
     }
 }
 
+fn prior_adapter_kwarg(call: &DslCall) -> Option<String> {
+    string_kwarg(call, "prior_adapter").or_else(|| string_kwarg(call, "prior"))
+}
+
 fn insert_adapter_start_kwargs(params: &mut Map<String, Value>, call: &DslCall) -> Result<()> {
     if let Some(program) = string_kwarg(call, "program") {
         params.insert("program".to_string(), Value::String(program));
@@ -1308,7 +1314,7 @@ pub fn help_text() -> &'static str {
      Sessions:\n\
        plugins()                       list built-in plugins\n\
        session.spawn(\"name\")         spawn an adapter for the named plugin\n\
-       session.resume(\"name\", prior_adapter=\"id\")\n\
+       session.resume(\"name\", prior_adapter=\"id\") resume and close prior id\n\
        session.list()                  list known adapters (this REPL)\n\
        session.live()                  list adapters live on the server\n\
        session.attach(\"id\")          attach a server adapter into this REPL\n\
@@ -2069,6 +2075,31 @@ mod tests {
     }
 
     #[test]
+    fn prior_adapter_kwarg_accepts_long_and_short_alias() {
+        let long = call_kw(
+            "session.resume",
+            vec![("prior_adapter", Arg::String("e1".into()))],
+        );
+        assert_eq!(prior_adapter_kwarg(&long).as_deref(), Some("e1"));
+
+        let short = call_kw("session.resume", vec![("prior", Arg::String("e2".into()))]);
+        assert_eq!(prior_adapter_kwarg(&short).as_deref(), Some("e2"));
+
+        let both = call_kw(
+            "session.resume",
+            vec![
+                ("prior_adapter", Arg::String("e1".into())),
+                ("prior", Arg::String("e2".into())),
+            ],
+        );
+        assert_eq!(
+            prior_adapter_kwarg(&both).as_deref(),
+            Some("e1"),
+            "prior_adapter should win when both spellings are present"
+        );
+    }
+
+    #[test]
     fn adapter_start_kwargs_forward_full_rpc_start_shape() {
         let call = call_kw(
             "session.spawn",
@@ -2107,6 +2138,11 @@ mod tests {
 
     #[test]
     fn adapter_start_kwargs_reject_wrong_list_map_and_u16_types() {
+        let upper_bound = call_kw("session.spawn", vec![("rows", Arg::Int(65_535))]);
+        let mut params = Map::new();
+        insert_adapter_start_kwargs(&mut params, &upper_bound).unwrap();
+        assert_eq!(params["rows"], 65_535);
+
         let bad_args = call_kw("session.spawn", vec![("args", Arg::String("-lc".into()))]);
         let error = insert_adapter_start_kwargs(&mut Map::new(), &bad_args).unwrap_err();
         assert!(error.to_string().contains("string list"), "{error}");
@@ -2127,6 +2163,10 @@ mod tests {
 
         let bad_rows = call_kw("session.spawn", vec![("rows", Arg::Int(-1))]);
         let error = insert_adapter_start_kwargs(&mut Map::new(), &bad_rows).unwrap_err();
+        assert!(error.to_string().contains("0..65535"), "{error}");
+
+        let too_large_rows = call_kw("session.spawn", vec![("rows", Arg::Int(65_536))]);
+        let error = insert_adapter_start_kwargs(&mut Map::new(), &too_large_rows).unwrap_err();
         assert!(error.to_string().contains("0..65535"), "{error}");
     }
 
