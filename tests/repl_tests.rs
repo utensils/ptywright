@@ -40,6 +40,7 @@ fn rpc_client_surfaces_capabilities_and_adapter_methods() {
     for expected in [
         "adapter.list",
         "adapter.start",
+        "adapter.resume",
         "adapter.send",
         "adapter.wait",
         "adapter.snapshot",

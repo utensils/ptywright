@@ -95,6 +95,8 @@ The REPL is a sequential `reedline`-based loop: each command is rendered as `pty
 ```text
 plugins()                              # list built-in plugins
 session.spawn("claude-code")           # spawn an adapter
+session.spawn("claude-code", args=["--model", "haiku"], env={NO_COLOR:"1"})
+session.resume("claude-code", prior_adapter="e1", args=["--resume", "abc"])
 session.list()                         # local tabs in this REPL
 session.live()                         # all adapters live on the server
 session.attach("e3")                   # adopt a sibling connection's adapter
@@ -102,7 +104,7 @@ session.attach("all")                  # adopt every live adapter at once
 
 send.text("hello")                     # bracketed-paste a prompt
 send.key("shift-tab")                  # send a single named key
-send.intent("approve", { })            # invoke an arbitrary plugin intent
+send.intent("approve")                 # invoke an arbitrary plugin intent
 
 wait(matches(r"❯"))                    # wait for a regex match
 wait(screen_stable(250ms))             # wait for the screen to settle
@@ -112,6 +114,8 @@ screen.snapshot()                      # render the PTY inline (styled)
 transcript.snapshot()                  # dump the focused adapter's transcript
 inspect()                              # diagnostic adapter dump
 ```
+
+`session.spawn(...)` mirrors `adapter.start`: optional kwargs are `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, and `pixel_height`. `session.resume(...)` mirrors `adapter.resume` and additionally accepts `prior_adapter` (or `prior`) to close a live adapter before spawning the replacement.
 
 `send.key(...)` accepts the full host `Key` surface (see the [Lua extension API](../guide/extensions.md#host-api-exposed-to-lua-plugins)) with hyphens as a convenience: `enter`, `escape`, `tab`, `shift-tab`, `backspace`, `delete`, `space`, the arrows, the navigation cluster (`home`, `end`, `page-up`, `page-down`, `insert`), every `ctrl-a` through `ctrl-z` except the four that alias named keys (`ctrl-h`/`ctrl-i`/`ctrl-j`/`ctrl-m`), and `f1` through `f12`. Single characters that aren't aliases (`"y"`, `"n"`, `"1"`) fall through to typed text so quick acknowledgements work without dropping to `send.text`. Tab completion lists the most common keys (submit/cancel/edit, arrows, navigation) first.
 

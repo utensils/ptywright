@@ -16,6 +16,10 @@ use super::ctx::ReplCtx;
 const DSL_COMMANDS: &[(&str, &str)] = &[
     ("plugins()", "list built-in plugins"),
     ("session.spawn(\"\")", "spawn an adapter for a plugin"),
+    (
+        "session.resume(\"\", prior_adapter=\"\")",
+        "spawn a replacement adapter and close the prior id",
+    ),
     ("session.list()", "list adapters (this REPL)"),
     ("session.live()", "list adapters live on the server"),
     (
@@ -378,6 +382,12 @@ mod tests {
         let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let suggestions = completer.complete("ses", 3);
         assert!(suggestions.iter().all(|s| s.value.starts_with("session.")));
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.value.starts_with("session.resume")),
+            "session.resume should be discoverable; got {suggestions:?}"
+        );
         assert!(!suggestions.is_empty());
     }
 

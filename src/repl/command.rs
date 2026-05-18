@@ -42,6 +42,8 @@ pub enum Arg {
     Int(i64),
     Bool(bool),
     Null,
+    List(Vec<Arg>),
+    Object(BTreeMap<String, Arg>),
     Call(DslCall),
 }
 
@@ -104,8 +106,13 @@ enum Tok {
     Dot,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
     Comma,
     Eq,
+    Colon,
 }
 
 #[derive(Debug)]
@@ -269,6 +276,22 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 Tok::RParen
             }
+            '[' => {
+                self.advance();
+                Tok::LBracket
+            }
+            ']' => {
+                self.advance();
+                Tok::RBracket
+            }
+            '{' => {
+                self.advance();
+                Tok::LBrace
+            }
+            '}' => {
+                self.advance();
+                Tok::RBrace
+            }
             ',' => {
                 self.advance();
                 Tok::Comma
@@ -276,6 +299,10 @@ impl<'a> Lexer<'a> {
             '=' => {
                 self.advance();
                 Tok::Eq
+            }
+            ':' => {
+                self.advance();
+                Tok::Colon
             }
             '"' => Tok::String(self.lex_string()?),
             'r' if self.input[self.pos + 1..].starts_with('"') => {
@@ -519,8 +546,76 @@ impl Parser {
                     }
                 }
             }
+            Some(Tok::LBracket) => {
+                self.bump();
+                Ok(Arg::List(self.parse_list()?))
+            }
+            Some(Tok::LBrace) => {
+                self.bump();
+                Ok(Arg::Object(self.parse_object()?))
+            }
             Some(tok) => Err(Error::Rpc(format!("expected argument, found {tok:?}"))),
             None => Err(Error::Rpc("expected argument".to_string())),
+        }
+    }
+
+    fn parse_list(&mut self) -> Result<Vec<Arg>> {
+        let mut values = Vec::new();
+        if let Some(Tok::RBracket) = self.peek() {
+            self.bump();
+            return Ok(values);
+        }
+
+        loop {
+            values.push(self.parse_arg()?);
+            match self.bump() {
+                Some(Tok::Comma) => continue,
+                Some(Tok::RBracket) => return Ok(values),
+                Some(tok) => {
+                    return Err(Error::Rpc(format!("expected `,` or `]`, found {tok:?}")));
+                }
+                None => return Err(Error::Rpc("expected `]` to close list".to_string())),
+            }
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<BTreeMap<String, Arg>> {
+        let mut values = BTreeMap::new();
+        if let Some(Tok::RBrace) = self.peek() {
+            self.bump();
+            return Ok(values);
+        }
+
+        loop {
+            let key = match self.bump() {
+                Some(Tok::Ident(key)) | Some(Tok::String(key)) => key,
+                Some(tok) => {
+                    return Err(Error::Rpc(format!("expected object key, found {tok:?}")));
+                }
+                None => return Err(Error::Rpc("expected object key".to_string())),
+            };
+            match self.bump() {
+                Some(Tok::Colon) | Some(Tok::Eq) => {}
+                Some(tok) => {
+                    return Err(Error::Rpc(format!(
+                        "expected `:` or `=` after object key, found {tok:?}"
+                    )));
+                }
+                None => {
+                    return Err(Error::Rpc(
+                        "expected `:` or `=` after object key".to_string(),
+                    ));
+                }
+            }
+            values.insert(key, self.parse_arg()?);
+            match self.bump() {
+                Some(Tok::Comma) => continue,
+                Some(Tok::RBrace) => return Ok(values),
+                Some(tok) => {
+                    return Err(Error::Rpc(format!("expected `,` or `}}`, found {tok:?}")));
+                }
+                None => return Err(Error::Rpc("expected `}` to close object".to_string())),
+            }
         }
     }
 }
@@ -534,6 +629,8 @@ impl fmt::Display for Arg {
             Arg::Int(n) => write!(f, "{n}"),
             Arg::Bool(b) => write!(f, "{b}"),
             Arg::Null => write!(f, "null"),
+            Arg::List(values) => write!(f, "[{} item(s)]", values.len()),
+            Arg::Object(values) => write!(f, "{{{} key(s)}}", values.len()),
             Arg::Call(call) => write!(f, "{}(...)", call.path.join(".")),
         }
     }
@@ -631,6 +728,7 @@ fn dispatch_dsl(
             Ok(CmdOutcome::Json(result))
         }
         "session.spawn" => session_spawn(call, client, ctx, timeout),
+        "session.resume" => session_resume(call, client, ctx, timeout),
         "session.live" => session_live(client, timeout),
         "session.attach" => {
             let spec = match call.positional.first() {
@@ -742,25 +840,46 @@ fn session_spawn(
     let plugin = expect_one_string(&call, "session.spawn")?;
     let mut params = Map::new();
     params.insert("plugin".to_string(), Value::String(plugin.clone()));
-    if let Some(program) = string_kwarg(&call, "program") {
-        params.insert("program".to_string(), Value::String(program));
-    }
-    if let Some(rows) = int_kwarg(&call, "rows") {
-        params.insert("rows".to_string(), Value::from(rows));
-    }
-    if let Some(cols) = int_kwarg(&call, "cols") {
-        params.insert("cols".to_string(), Value::from(cols));
-    }
+    insert_adapter_start_kwargs(&mut params, &call)?;
     let result = client.call("adapter.start", Value::Object(params), timeout)?;
+    adopt_started_adapter(ctx, &plugin, &result);
+    Ok(CmdOutcome::Json(result))
+}
+
+fn session_resume(
+    call: DslCall,
+    client: &RpcClient,
+    ctx: &mut ReplCtx,
+    timeout: Duration,
+) -> Result<CmdOutcome> {
+    let plugin = expect_one_string(&call, "session.resume")?;
+    let mut params = Map::new();
+    params.insert("plugin".to_string(), Value::String(plugin.clone()));
+    insert_adapter_start_kwargs(&mut params, &call)?;
+    let prior_adapter = prior_adapter_kwarg(&call)?;
+    if let Some(prior) = prior_adapter.as_deref() {
+        params.insert(
+            "prior_adapter".to_string(),
+            Value::String(prior.to_string()),
+        );
+    }
+    let result = client.call("adapter.resume", Value::Object(params), timeout)?;
+    if let Some(prior) = prior_adapter.as_deref() {
+        ctx.remove_adapter(prior);
+    }
+    adopt_started_adapter(ctx, &plugin, &result);
+    Ok(CmdOutcome::Json(result))
+}
+
+fn adopt_started_adapter(ctx: &mut ReplCtx, requested_plugin: &str, result: &Value) {
     if let Some(adapter) = result.get("adapter").and_then(Value::as_str) {
         let response_plugin = result
             .get("plugin")
             .and_then(Value::as_str)
-            .unwrap_or(&plugin);
+            .unwrap_or(requested_plugin);
         ctx.upsert_adapter(adapter, response_plugin);
         ctx.focus = Some(adapter.to_string());
     }
-    Ok(CmdOutcome::Json(result))
 }
 
 fn session_live(client: &RpcClient, timeout: Duration) -> Result<CmdOutcome> {
@@ -1050,13 +1169,6 @@ fn string_kwarg(call: &DslCall, name: &str) -> Option<String> {
     }
 }
 
-fn int_kwarg(call: &DslCall, name: &str) -> Option<i64> {
-    match call.kwargs.get(name)? {
-        Arg::Int(n) => Some(*n),
-        _ => None,
-    }
-}
-
 fn bool_kwarg(call: &DslCall, name: &str) -> Option<bool> {
     match call.kwargs.get(name)? {
         Arg::Bool(b) => Some(*b),
@@ -1070,6 +1182,115 @@ fn duration_kwarg(call: &DslCall, name: &str) -> Result<Option<Duration>> {
         Some(Arg::Duration(d)) => Ok(Some(*d)),
         Some(other) => Err(Error::Rpc(format!(
             "{name}= expected a duration, got {other}"
+        ))),
+    }
+}
+
+fn prior_adapter_kwarg(call: &DslCall) -> Result<Option<String>> {
+    if let Some(arg) = call.kwargs.get("prior_adapter") {
+        return match arg {
+            Arg::String(s) => Ok(Some(s.clone())),
+            other => Err(Error::Rpc(format!(
+                "prior_adapter= expected a string, got {other}"
+            ))),
+        };
+    }
+    if let Some(arg) = call.kwargs.get("prior") {
+        return match arg {
+            Arg::String(s) => Ok(Some(s.clone())),
+            other => Err(Error::Rpc(format!("prior= expected a string, got {other}"))),
+        };
+    }
+    Ok(None)
+}
+
+fn insert_adapter_start_kwargs(params: &mut Map<String, Value>, call: &DslCall) -> Result<()> {
+    if let Some(program) = string_kwarg(call, "program") {
+        params.insert("program".to_string(), Value::String(program));
+    }
+    if let Some(args) = string_list_kwarg(call, "args")? {
+        params.insert(
+            "args".to_string(),
+            Value::Array(args.into_iter().map(Value::String).collect()),
+        );
+    }
+    if let Some(cwd) = string_kwarg(call, "cwd") {
+        params.insert("cwd".to_string(), Value::String(cwd));
+    }
+    if let Some(env) = string_map_kwarg(call, "env")? {
+        params.insert(
+            "env".to_string(),
+            Value::Object(
+                env.into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            ),
+        );
+    }
+    for name in ["rows", "cols", "pixel_width", "pixel_height"] {
+        if let Some(value) = u16_kwarg(call, name)? {
+            params.insert(name.to_string(), Value::from(value));
+        }
+    }
+    Ok(())
+}
+
+fn string_list_kwarg(call: &DslCall, name: &str) -> Result<Option<Vec<String>>> {
+    let Some(arg) = call.kwargs.get(name) else {
+        return Ok(None);
+    };
+    let Arg::List(values) = arg else {
+        return Err(Error::Rpc(format!(
+            "{name}= expected a string list, got {arg}"
+        )));
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Arg::String(s) => out.push(s.clone()),
+            other => {
+                return Err(Error::Rpc(format!(
+                    "{name}= expected a string list, got item {other}"
+                )));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+fn string_map_kwarg(call: &DslCall, name: &str) -> Result<Option<BTreeMap<String, String>>> {
+    let Some(arg) = call.kwargs.get(name) else {
+        return Ok(None);
+    };
+    let Arg::Object(values) = arg else {
+        return Err(Error::Rpc(format!(
+            "{name}= expected a string object, got {arg}"
+        )));
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in values {
+        match value {
+            Arg::String(s) => {
+                out.insert(key.clone(), s.clone());
+            }
+            other => {
+                return Err(Error::Rpc(format!(
+                    "{name}= expected string values, got `{key}`={other}"
+                )));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+fn u16_kwarg(call: &DslCall, name: &str) -> Result<Option<u16>> {
+    match call.kwargs.get(name) {
+        None => Ok(None),
+        Some(Arg::Int(n)) => u16::try_from(*n)
+            .map(Some)
+            .map_err(|_| Error::Rpc(format!("{name}= expected 0..65535, got {n}"))),
+        Some(other) => Err(Error::Rpc(format!(
+            "{name}= expected an integer, got {other}"
         ))),
     }
 }
@@ -1090,6 +1311,13 @@ fn arg_to_json(arg: &Arg) -> Value {
         Arg::Int(n) => Value::from(*n),
         Arg::Bool(b) => Value::Bool(*b),
         Arg::Null => Value::Null,
+        Arg::List(values) => Value::Array(values.iter().map(arg_to_json).collect()),
+        Arg::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), arg_to_json(value)))
+                .collect(),
+        ),
         Arg::Call(call) => Value::String(format!("{}(...)", call.path.join("."))),
     }
 }
@@ -1100,6 +1328,7 @@ pub fn help_text() -> &'static str {
      Sessions:\n\
        plugins()                       list built-in plugins\n\
        session.spawn(\"name\")         spawn an adapter for the named plugin\n\
+       session.resume(\"name\", prior_adapter=\"id\") resume and close prior id (alias: prior)\n\
        session.list()                  list known adapters (this REPL)\n\
        session.live()                  list adapters live on the server\n\
        session.attach(\"id\")          attach a server adapter into this REPL\n\
@@ -1193,6 +1422,27 @@ mod tests {
         let Cmd::Dsl(call) = cmd else { panic!() };
         assert_eq!(call.kwargs.get("rows"), Some(&Arg::Int(24)));
         assert_eq!(call.kwargs.get("cols"), Some(&Arg::Int(80)));
+    }
+
+    #[test]
+    fn parse_lists_and_objects_for_start_params() {
+        let cmd = parse(
+            r#"session.spawn("claude-code", args=["--model", "haiku"], env={NO_COLOR:"1", "X_FLAG"="yes"})"#,
+        )
+        .unwrap();
+        let Cmd::Dsl(call) = cmd else { panic!() };
+        assert_eq!(
+            call.kwargs.get("args"),
+            Some(&Arg::List(vec![
+                Arg::String("--model".into()),
+                Arg::String("haiku".into())
+            ]))
+        );
+
+        let mut expected_env = BTreeMap::new();
+        expected_env.insert("NO_COLOR".to_string(), Arg::String("1".into()));
+        expected_env.insert("X_FLAG".to_string(), Arg::String("yes".into()));
+        assert_eq!(call.kwargs.get("env"), Some(&Arg::Object(expected_env)));
     }
 
     #[test]
@@ -1411,6 +1661,106 @@ mod tests {
         );
         assert!(ctx.adapters.is_empty());
         assert!(ctx.focus.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatch_session_resume_replaces_prior_adapter_and_focuses_new_one() {
+        let (client, _server, mut ctx) = in_process_client();
+        let first = dispatch(
+            parse(r#"session.spawn("claude-code", program="/bin/sh", args=["-c", "sleep 5"])"#)
+                .unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("spawn prior");
+        let CmdOutcome::Json(first_value) = first else {
+            panic!("expected json outcome from spawn")
+        };
+        let prior = first_value["adapter"]
+            .as_str()
+            .expect("prior adapter")
+            .to_string();
+
+        let resumed = dispatch(
+            parse(&format!(
+                r#"session.resume("claude-code", program="/bin/sh", args=["-c", "sleep 5"], prior_adapter="{prior}")"#
+            ))
+            .unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("resume");
+        let CmdOutcome::Json(resumed_value) = resumed else {
+            panic!("expected json outcome from resume")
+        };
+        let replacement = resumed_value["adapter"]
+            .as_str()
+            .expect("replacement adapter");
+        assert_ne!(prior, replacement);
+        assert_eq!(ctx.focus.as_deref(), Some(replacement));
+        assert!(ctx.adapter(&prior).is_none(), "prior tab must be removed");
+        assert!(
+            ctx.adapter(replacement).is_some(),
+            "replacement tab missing"
+        );
+
+        let _ = dispatch(
+            parse("session.close()").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatch_session_resume_accepts_prior_alias() {
+        let (client, _server, mut ctx) = in_process_client();
+        let first = dispatch(
+            parse(r#"session.spawn("claude-code", program="/bin/sh", args=["-c", "sleep 5"])"#)
+                .unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("spawn prior");
+        let CmdOutcome::Json(first_value) = first else {
+            panic!("expected json outcome from spawn")
+        };
+        let prior = first_value["adapter"]
+            .as_str()
+            .expect("prior adapter")
+            .to_string();
+
+        let resumed = dispatch(
+            parse(&format!(
+                r#"session.resume("claude-code", program="/bin/sh", args=["-c", "sleep 5"], prior="{prior}")"#
+            ))
+            .unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("resume with prior alias");
+        let CmdOutcome::Json(resumed_value) = resumed else {
+            panic!("expected json outcome from resume")
+        };
+        let replacement = resumed_value["adapter"]
+            .as_str()
+            .expect("replacement adapter");
+        assert_ne!(prior, replacement);
+        assert!(ctx.adapter(&prior).is_none(), "prior tab must be removed");
+        assert_eq!(ctx.focus.as_deref(), Some(replacement));
+
+        let _ = dispatch(
+            parse("session.close()").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        );
     }
 
     #[test]
@@ -1645,6 +1995,14 @@ mod tests {
         assert_eq!(format!("{}", Arg::Int(42)), "42");
         assert_eq!(format!("{}", Arg::Bool(true)), "true");
         assert_eq!(format!("{}", Arg::Null), "null");
+        assert_eq!(format!("{}", Arg::List(vec![Arg::Int(1)])), "[1 item(s)]");
+        assert_eq!(
+            format!(
+                "{}",
+                Arg::Object([("a".to_string(), Arg::Int(1))].into_iter().collect())
+            ),
+            "{1 key(s)}"
+        );
         assert_eq!(
             format!("{}", Arg::Call(call("matches", vec![]))),
             "matches(...)"
@@ -1748,13 +2106,11 @@ mod tests {
             ],
         );
         assert_eq!(string_kwarg(&c, "program").as_deref(), Some("/bin/sh"));
-        assert_eq!(int_kwarg(&c, "rows"), Some(24));
         assert_eq!(bool_kwarg(&c, "verbose"), Some(true));
 
         // Wrong types silently return None — the dispatcher then errors
         // with a usage message rather than coercing a bool into a string.
         assert!(string_kwarg(&c, "rows").is_none());
-        assert!(int_kwarg(&c, "program").is_none());
         assert!(bool_kwarg(&c, "rows").is_none());
 
         // Missing key is always None.
@@ -1781,6 +2137,110 @@ mod tests {
     }
 
     #[test]
+    fn prior_adapter_kwarg_accepts_long_and_short_alias() {
+        let long = call_kw(
+            "session.resume",
+            vec![("prior_adapter", Arg::String("e1".into()))],
+        );
+        assert_eq!(prior_adapter_kwarg(&long).unwrap().as_deref(), Some("e1"));
+
+        let short = call_kw("session.resume", vec![("prior", Arg::String("e2".into()))]);
+        assert_eq!(prior_adapter_kwarg(&short).unwrap().as_deref(), Some("e2"));
+
+        let both = call_kw(
+            "session.resume",
+            vec![
+                ("prior_adapter", Arg::String("e1".into())),
+                ("prior", Arg::String("e2".into())),
+            ],
+        );
+        assert_eq!(
+            prior_adapter_kwarg(&both).unwrap().as_deref(),
+            Some("e1"),
+            "prior_adapter should win when both spellings are present"
+        );
+
+        let wrong_long = call_kw("session.resume", vec![("prior_adapter", Arg::Int(1))]);
+        let error = prior_adapter_kwarg(&wrong_long).unwrap_err();
+        assert!(error.to_string().contains("prior_adapter="), "{error}");
+
+        let wrong_short = call_kw("session.resume", vec![("prior", Arg::Bool(true))]);
+        let error = prior_adapter_kwarg(&wrong_short).unwrap_err();
+        assert!(error.to_string().contains("prior="), "{error}");
+    }
+
+    #[test]
+    fn adapter_start_kwargs_forward_full_rpc_start_shape() {
+        let call = call_kw(
+            "session.spawn",
+            vec![
+                ("program", Arg::String("/bin/sh".into())),
+                (
+                    "args",
+                    Arg::List(vec![Arg::String("-lc".into()), Arg::String("cat".into())]),
+                ),
+                ("cwd", Arg::String("/tmp".into())),
+                (
+                    "env",
+                    Arg::Object(
+                        [("NO_COLOR".to_string(), Arg::String("1".into()))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                ),
+                ("rows", Arg::Int(60)),
+                ("cols", Arg::Int(200)),
+                ("pixel_width", Arg::Int(1200)),
+                ("pixel_height", Arg::Int(800)),
+            ],
+        );
+        let mut params = Map::new();
+        insert_adapter_start_kwargs(&mut params, &call).unwrap();
+        assert_eq!(params["program"], "/bin/sh");
+        assert_eq!(params["args"], json!(["-lc", "cat"]));
+        assert_eq!(params["cwd"], "/tmp");
+        assert_eq!(params["env"], json!({ "NO_COLOR": "1" }));
+        assert_eq!(params["rows"], 60);
+        assert_eq!(params["cols"], 200);
+        assert_eq!(params["pixel_width"], 1200);
+        assert_eq!(params["pixel_height"], 800);
+    }
+
+    #[test]
+    fn adapter_start_kwargs_reject_wrong_list_map_and_u16_types() {
+        let upper_bound = call_kw("session.spawn", vec![("rows", Arg::Int(65_535))]);
+        let mut params = Map::new();
+        insert_adapter_start_kwargs(&mut params, &upper_bound).unwrap();
+        assert_eq!(params["rows"], 65_535);
+
+        let bad_args = call_kw("session.spawn", vec![("args", Arg::String("-lc".into()))]);
+        let error = insert_adapter_start_kwargs(&mut Map::new(), &bad_args).unwrap_err();
+        assert!(error.to_string().contains("string list"), "{error}");
+
+        let bad_env = call_kw(
+            "session.spawn",
+            vec![(
+                "env",
+                Arg::Object(
+                    [("NO_COLOR".to_string(), Arg::Bool(true))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )],
+        );
+        let error = insert_adapter_start_kwargs(&mut Map::new(), &bad_env).unwrap_err();
+        assert!(error.to_string().contains("string values"), "{error}");
+
+        let bad_rows = call_kw("session.spawn", vec![("rows", Arg::Int(-1))]);
+        let error = insert_adapter_start_kwargs(&mut Map::new(), &bad_rows).unwrap_err();
+        assert!(error.to_string().contains("0..65535"), "{error}");
+
+        let too_large_rows = call_kw("session.spawn", vec![("rows", Arg::Int(65_536))]);
+        let error = insert_adapter_start_kwargs(&mut Map::new(), &too_large_rows).unwrap_err();
+        assert!(error.to_string().contains("0..65535"), "{error}");
+    }
+
+    #[test]
     fn arg_to_json_and_kwargs_to_json_roundtrip_every_variant() {
         let kwargs: BTreeMap<String, Arg> = [
             ("s".to_string(), Arg::String("hi".into())),
@@ -1789,6 +2249,18 @@ mod tests {
             ("i".to_string(), Arg::Int(-3)),
             ("b".to_string(), Arg::Bool(false)),
             ("n".to_string(), Arg::Null),
+            (
+                "list".to_string(),
+                Arg::List(vec![Arg::String("a".into()), Arg::Int(2)]),
+            ),
+            (
+                "obj".to_string(),
+                Arg::Object(
+                    [("k".to_string(), Arg::String("v".into()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
         ]
         .into_iter()
         .collect();
@@ -1799,6 +2271,8 @@ mod tests {
         assert_eq!(value["i"], -3);
         assert_eq!(value["b"], false);
         assert!(value["n"].is_null());
+        assert_eq!(value["list"], json!(["a", 2]));
+        assert_eq!(value["obj"], json!({ "k": "v" }));
 
         // Nested call collapses to its path string so that arbitrary
         // user-supplied `intent` payloads stay JSON-safe even if
@@ -2026,5 +2500,10 @@ mod tests {
         };
         assert!(text.contains("plugins()"), "help missing top-line cmds");
         assert!(text.contains("send.key"), "help missing send.key entry");
+        assert!(
+            text.contains("resume and close prior id"),
+            "help missing session.resume description"
+        );
+        assert!(text.contains("alias: prior"), "help missing prior alias");
     }
 }
