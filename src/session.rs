@@ -9,7 +9,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::action::{Action, Key, Signal};
 use crate::error::{Error, Result};
-use crate::matcher::{MatchResult, Matcher, MatcherContext};
+use crate::matcher::{MatchResult, Matcher, MatcherContext, PluginRegistry, PredicateContext};
 use crate::redaction::RedactionPolicy;
 use crate::screen::{ScreenSnapshot, Terminal};
 use crate::target::{Target, TerminalSize};
@@ -130,6 +130,12 @@ pub struct Session {
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     shared: Arc<SharedState>,
+    /// Optional plugin registry consulted when [`Matcher::Lua`] needs
+    /// evaluation in [`Session::wait_for`] /
+    /// [`Session::wait_for_cancellable`]. Bound via
+    /// [`Session::set_plugin_registry`]; `None` means Lua matchers
+    /// silently never fire.
+    plugin_registry: Option<Arc<dyn PluginRegistry>>,
 }
 
 impl Session {
@@ -182,7 +188,34 @@ impl Session {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             shared,
+            plugin_registry: None,
         })
+    }
+
+    /// Bind a [`PluginRegistry`] so subsequent waits can evaluate
+    /// [`Matcher::Lua`] branches against plugin-defined predicates.
+    /// Replaces any previously-bound registry. Pair with
+    /// [`Session::with_plugin_registry`] for builder-style setup.
+    pub fn set_plugin_registry(&mut self, registry: Arc<dyn PluginRegistry>) {
+        self.plugin_registry = Some(registry);
+    }
+
+    /// Builder variant of [`Session::set_plugin_registry`]. Useful
+    /// when constructing a session through [`Session::spawn_target`]
+    /// or [`Session::spawn`] and chaining the registry bind in one
+    /// expression.
+    #[must_use]
+    pub fn with_plugin_registry(mut self, registry: Arc<dyn PluginRegistry>) -> Self {
+        self.plugin_registry = Some(registry);
+        self
+    }
+
+    /// Currently-bound plugin registry, if any. Mostly useful for
+    /// tests that want to verify the registry plumbing without driving
+    /// a full wait.
+    #[must_use]
+    pub fn plugin_registry(&self) -> Option<&Arc<dyn PluginRegistry>> {
+        self.plugin_registry.as_ref()
     }
 
     /// Convenience constructor with default transcript retention.
@@ -202,6 +235,33 @@ impl Session {
         let sequence = self.sequence();
         let state = self.shared.state.lock().expect("session state poisoned");
         state.terminal.snapshot(sequence)
+    }
+
+    /// Snapshot every input the classifier needs (screen + transcript +
+    /// transcript markers + current cursor) under a single state-lock
+    /// acquisition so a PTY read arriving between component reads can't
+    /// produce a context where, e.g., `cursor` is from a later moment
+    /// than `screen`. Cheaper-than-N reads and atomic at the source.
+    ///
+    /// Caller-friendly types: owned strings/maps so the lock can drop
+    /// before the caller threads them through classification. The
+    /// returned `ScreenSnapshot` already owns its allocations.
+    #[must_use]
+    pub fn classify_input(
+        &self,
+    ) -> (
+        ScreenSnapshot,
+        String,
+        std::collections::BTreeMap<String, u64>,
+        u64,
+    ) {
+        let sequence = self.sequence();
+        let state = self.shared.state.lock().expect("session state poisoned");
+        let snapshot = state.terminal.snapshot(sequence);
+        let transcript = state.transcript.text();
+        let markers = state.transcript.markers().clone();
+        let cursor = state.transcript.chars_written();
+        (snapshot, transcript, markers, cursor)
     }
 
     /// Whether the PTY reader or explicit lifecycle state indicates the session has finished.
@@ -300,6 +360,20 @@ impl Session {
         rx
     }
 
+    /// Snapshot of all currently-recorded transcript markers. Returns a
+    /// fresh clone so the caller can drop the session state lock
+    /// immediately. Empty `BTreeMap` when no markers have been placed.
+    #[must_use]
+    pub fn transcript_markers(&self) -> std::collections::BTreeMap<String, u64> {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .markers()
+            .clone()
+    }
+
     /// Place a label-keyed marker at the current transcript cursor. See
     /// [`crate::Transcript::mark`] for the storage semantics.
     pub fn mark_transcript(&self, label: impl Into<String>) -> u64 {
@@ -348,6 +422,10 @@ impl Session {
             Action::Eof => self.send_key(Key::CtrlD),
             Action::Signal(signal) => self.signal(signal),
             Action::Kill => self.kill(),
+            Action::MarkTranscript { label } => {
+                self.mark_transcript(label);
+                Ok(())
+            }
         }
     }
 
@@ -462,17 +540,48 @@ impl Session {
             let process_exited = !guard.reader_open || self.shared.closed.load(Ordering::SeqCst);
             let snapshot = guard.terminal.snapshot(sequence);
             let transcript_tail = guard.transcript.tail(16 * 1024);
+            // Snapshot the marker map under the same state-lock as
+            // the terminal/transcript reads so `Matcher::Lua` predicates
+            // see a consistent view across screen + transcript + markers.
+            let markers = guard.transcript.markers().clone();
+            let cursor = guard.transcript.chars_written();
+            let stable_for = stable_since.elapsed();
             let context = MatcherContext {
-                stable_for: stable_since.elapsed(),
+                stable_for,
                 process_exited,
             };
+            let stable_ms = u64::try_from(stable_for.as_millis()).unwrap_or(u64::MAX);
+            let predicate_ctx = PredicateContext {
+                screen: &snapshot.plain_text,
+                transcript: &transcript_tail,
+                sequence,
+                stable_ms,
+                process_exited,
+                markers: &markers,
+                cursor,
+            };
+            let registry = self.plugin_registry.as_deref();
             // Cheap boolean check first so the polling loop avoids
             // building a `MatchOutcome` (and running `Regex::captures`)
             // on every tick. We only pay the structured-outcome cost once,
-            // on the success path immediately below.
-            if matcher.is_match_with_context(&snapshot, &transcript_tail, context) {
-                let outcome =
-                    matcher.describe_match_with_context(&snapshot, &transcript_tail, context);
+            // on the success path immediately below. `is_match_with_evaluator`
+            // delegates to `is_match_with_context` for non-Lua matchers,
+            // so the hot path keeps its allocation-free shape when no
+            // Lua branches are present.
+            if matcher.is_match_with_evaluator(
+                &snapshot,
+                &transcript_tail,
+                context,
+                &predicate_ctx,
+                registry,
+            ) {
+                let outcome = matcher.describe_match_with_evaluator(
+                    &snapshot,
+                    &transcript_tail,
+                    context,
+                    &predicate_ctx,
+                    registry,
+                );
                 return Ok(MatchResult {
                     matched: true,
                     sequence,
@@ -1113,6 +1222,115 @@ mod tests {
             .expect("wait for exit");
         assert!(result.matched);
         let _ = session.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_evaluates_matcher_lua_through_bound_registry() {
+        // End-to-end: Session::wait_for with a bound LuaPluginRegistry
+        // must evaluate `Matcher::Lua` by calling into the registered
+        // plugin's predicate, including the screen/transcript/markers
+        // view it sees.
+        use crate::lua_plugin::{LuaPlugin, LuaPluginRegistry};
+        use crate::matcher::MatchOutcome;
+
+        let plugin = LuaPlugin::builtin(
+            "demo",
+            r#"
+            return {
+              saw_ready = function(input)
+                if string.find(input.screen, "ready") then
+                  return { matched = true, evidence = "found ready" }
+                end
+                return false
+              end
+            }
+            "#,
+        )
+        .expect("load demo plugin");
+        let registry = Arc::new(LuaPluginRegistry::with_single("demo", plugin));
+
+        let session = Session::spawn_target(
+            Target::new("/bin/sh").args(["-lc", "printf 'ready\\n'; sleep 5"]),
+        )
+        .expect("spawn shell")
+        .with_plugin_registry(registry);
+
+        let matcher = Matcher::Lua {
+            plugin: "demo".to_string(),
+            predicate: "saw_ready".to_string(),
+            params: serde_json::Value::Null,
+        };
+        let result = session
+            .wait_for(&matcher, Duration::from_secs(3))
+            .expect("Lua matcher must fire when screen shows 'ready'");
+        assert!(result.matched);
+        match result.outcome {
+            Some(MatchOutcome::Lua {
+                plugin,
+                predicate,
+                evidence,
+                ..
+            }) => {
+                assert_eq!(plugin, "demo");
+                assert_eq!(predicate, "saw_ready");
+                assert_eq!(evidence.as_deref(), Some("found ready"));
+            }
+            other => panic!("expected Lua outcome; got {other:?}"),
+        }
+        let _ = session.kill();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_matcher_lua_returns_timeout_when_no_registry_bound() {
+        // Without a registry, `Matcher::Lua` never fires — the wait
+        // ends in Timeout (not a panic or silent always-true). Guards
+        // the contract that the registry is opt-in and missing it
+        // doesn't poison a session.
+        let session =
+            Session::spawn_target(Target::new("/bin/sh").args(["-lc", "printf ready; sleep 5"]))
+                .expect("spawn shell");
+        let matcher = Matcher::Lua {
+            plugin: "nope".to_string(),
+            predicate: "any".to_string(),
+            params: serde_json::Value::Null,
+        };
+        let err = session
+            .wait_for(&matcher, Duration::from_millis(150))
+            .expect_err("must time out without a registry");
+        assert!(matches!(err, Error::Timeout));
+        let _ = session.kill();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_mark_transcript_stamps_marker_without_pty_write() {
+        // `Action::MarkTranscript` is a metadata channel — applying it
+        // through `Session::send` must record a marker and must NOT
+        // write any bytes to the PTY. We pair the assertion with a
+        // transcript comparison: the visible bytes before and after the
+        // mark must be unchanged.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "printf hi"]))
+            .expect("spawn shell");
+        // Let the child finish so the transcript settles.
+        let _ = session.wait_for(&Matcher::ProcessExited, Duration::from_secs(3));
+
+        let transcript_before = session.transcript();
+        let cursor_before = session.transcript_chars_written();
+        assert!(session.transcript_marker("turn_start").is_none());
+
+        session
+            .send(Action::MarkTranscript {
+                label: "turn_start".to_string(),
+            })
+            .expect("apply mark_transcript");
+
+        // Marker recorded at the current cursor; transcript bytes
+        // unchanged because no PTY write happened.
+        assert_eq!(session.transcript_marker("turn_start"), Some(cursor_before));
+        assert_eq!(session.transcript(), transcript_before);
+        assert_eq!(session.transcript_chars_written(), cursor_before);
     }
 
     #[test]

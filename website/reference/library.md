@@ -195,10 +195,13 @@ session.send(Action::Text("help\n".into()))?;
 session.send(Action::Key(Key::Enter))?;
 session.send(Action::Interrupt)?;
 session.send(Action::Signal(Signal::Term))?;
+session.send(Action::MarkTranscript {
+    label: "turn_start".into(),
+})?;
 # Ok::<(), ptywright::Error>(())
 ```
 
-Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and Ctrl-D. `Action::Signal(Signal)` routes through `Session::signal` so callers can compose signal delivery into the same `Vec<Action>` plans plugins return. `Action`, `Key`, `Matcher`, `Signal`, `Target`, `TerminalSize`, and `ScreenSnapshot` are serializable for JSON-RPC use.
+Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and Ctrl-D. `Action::Signal(Signal)` routes through `Session::signal` so callers can compose signal delivery into the same `Vec<Action>` plans plugins return. `Action::MarkTranscript { label }` records a label-keyed marker at the current transcript cursor without writing any PTY bytes — see [Transcript markers](#transcript-markers) for the storage semantics. Plugin authors emit it from their action plans so a single intent call can both write input AND stamp a turn boundary in one atomic step. `Action`, `Key`, `Matcher`, `Signal`, `Target`, `TerminalSize`, and `ScreenSnapshot` are serializable for JSON-RPC use.
 
 ## Matchers
 
@@ -213,8 +216,56 @@ Initial key support includes Enter, Escape, Tab, Backspace, arrows, Ctrl-C, and 
 - `ProcessExited`
 - `Any`
 - `All`
+- `Lua { plugin, predicate, params }`
 
-`wait_for` returns `MatchResult` with elapsed time, final snapshot, transcript tail, and sequence evidence.
+`wait_for` returns `MatchResult` with elapsed time, final snapshot, transcript tail, sequence evidence, and a structured `outcome: Option<MatchOutcome>` describing which branch fired.
+
+### Plugin-defined predicates (`Matcher::Lua`)
+
+`Matcher::Lua` defers evaluation to a bound `PluginRegistry`. The trait is object-safe; the in-tree concrete impl is `LuaPluginRegistry`, which holds a `name → Arc<Mutex<LuaPlugin>>` map. The trait, predicate context type, and outcome type are all domain-neutral — any TUI plugin's predicates work through the same path.
+
+```rust
+use std::sync::Arc;
+use ptywright::{
+    LuaPlugin, LuaPluginRegistry, Matcher, MatchOutcome, Session, Target,
+};
+
+let plugin = LuaPlugin::builtin(
+    "demo",
+    r#"
+    return {
+      saw_ready = function(input)
+        if string.find(input.screen, "ready") then
+          return { matched = true, evidence = "found 'ready' in screen" }
+        end
+        return false
+      end
+    }
+    "#,
+)?;
+let registry = Arc::new(LuaPluginRegistry::with_single("demo", plugin));
+
+let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "printf 'ready\\n'; sleep 5"]))?
+    .with_plugin_registry(registry);
+
+let result = session.wait_for(
+    &Matcher::Lua {
+        plugin: "demo".into(),
+        predicate: "saw_ready".into(),
+        params: serde_json::Value::Null,
+    },
+    std::time::Duration::from_secs(3),
+)?;
+assert!(result.matched);
+matches!(result.outcome, Some(MatchOutcome::Lua { .. }));
+# Ok::<(), ptywright::Error>(())
+```
+
+The predicate receives a single Lua table with `screen`, `transcript`, `sequence`, `stable_ms`, `process_exited`, `markers` (the current transcript marker map), `cursor`, and `params` (the JSON forwarded from the matcher). It returns either a boolean shorthand or `{ matched, evidence?, capture? }`. Booleans become a `PredicateOutcome { matched, .. }`; the structured form deserializes directly.
+
+**State separation.** The registry's plugin instances are SEPARATE from any `LuaExtension`'s adapter-side `LuaPlugin`. Predicates therefore cannot read module-level state (e.g. claude-code's `_current_dialog_id`) set by the adapter's classifier — predicates that need shared state must carry it through the `params` table. v1 limitation; revisit if a real consumer needs the shared-state path.
+
+**Without a registry**, `Matcher::Lua` evaluation silently returns `false` (`is_match_with_context` keeps its existing pure signature). Bind a registry via `Session::set_plugin_registry` / `Session::with_plugin_registry` to opt in. Sessions spawned through `adapter.start` are bound to the server's shared registry automatically.
 
 ## Driving a TUI plugin
 
@@ -262,6 +313,16 @@ let (state, outcome) = handle.turn(
 println!("state={}, matched={:?}", state.state, outcome);
 # Ok::<(), ptywright::Error>(())
 ```
+
+`ExtensionHandle::wait_with_cancel(intent, params, timeout, &cancel)` and `turn_with_cancel(...)` thread a `CancellationToken` through to the underlying `Session::wait_for_cancellable`, so the wait leg can be aborted from another thread (or from a JSON-RPC `adapter.cancel_wait` on the wire side).
+
+### Plugin-driven transcript markers (`host_marks` + `markers`)
+
+`ExtensionStateSnapshot` carries an optional `host_marks: Vec<HostMark>` channel that plugins populate when their classifier wants the host to stamp a transcript marker at the current cursor — e.g. claude-code's classifier emits `HostMark { label: "turn_end" }` the moment it transitions to `completed_turn`. The host applies each entry via `Session::mark_transcript` after `classify` returns; the snapshot ships `host_marks` echoed for transparency.
+
+`ClassifyContext` exposes `markers: &BTreeMap<String, u64>` (the full marker map) and `cursor: u64` (current `chars_written`) so plugins can compose metadata like `metadata.transcript = { turn_start, turn_end }` in the SAME classify response that requests the `turn_end` mark — pre-compute the resulting cursor value from `cursor`, no one-tick-later delay.
+
+The mechanism is plugin-agnostic — any plugin can emit any label; the host treats every entry the same way.
 
 `ExtensionHandle::subscribe()` returns an `mpsc::Receiver<ExtensionEvent>` that yields `StateChanged(ExtensionStateSnapshot)` after every classify pass — useful for drivers that want event-driven state updates instead of polling `state()`. Each call returns an independent receiver; the host fans out events to every active subscriber.
 

@@ -1,10 +1,10 @@
 ---
-applyTo: "tests/fixtures/claude_code/**"
+applyTo: "plugins/claude-code/fixtures/**"
 ---
 
 # Claude Code classifier fixtures
 
-`tests/fixtures/claude_code/<name>.txt` is a sanitized screen capture. The sibling `<name>.expected.json` declares the expected classification.
+`plugins/claude-code/fixtures/<name>.txt` is a sanitized screen capture. The sibling `<name>.expected.json` declares the expected classification.
 
 ## Adding a fixture (documentation-only change)
 

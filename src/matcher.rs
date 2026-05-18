@@ -1,11 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use regex::Regex;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::error::Result;
 use crate::screen::ScreenSnapshot;
 
 /// Runtime context for temporal/lifecycle matcher evaluation.
@@ -26,6 +28,98 @@ impl MatcherContext {
             process_exited: false,
         }
     }
+}
+
+/// Object-safe trait for evaluating plugin-defined predicates against a
+/// terminal session. Implementors hold whatever runtime state is
+/// necessary to invoke a named predicate function on a named plugin —
+/// typically a map from plugin name to an `Arc<Mutex<LuaPlugin>>`.
+///
+/// `Matcher::Lua { plugin, predicate, params }` defers to a bound
+/// registry at evaluation time. Plain string fields on the matcher
+/// keep [`Matcher`] fully serializable; the trait object lives on the
+/// session (see [`crate::Session::set_plugin_registry`]) rather than
+/// inside the matcher.
+///
+/// The trait is domain-neutral — it takes a string plugin name and a
+/// string predicate name. Any TUI plugin's predicates work through the
+/// same path; the host does not bake in knowledge of which plugins
+/// exist.
+pub trait PluginRegistry: Send + Sync {
+    /// Invoke `predicate` on `plugin` with the supplied `params` and
+    /// terminal `context`. Implementors return the predicate's
+    /// structured outcome (matched + optional evidence / capture).
+    ///
+    /// Errors surface as [`crate::Error::Lua`] (or any matching crate
+    /// error variant) when the plugin doesn't exist, the predicate
+    /// isn't exported, or the call faults — the wait loop treats
+    /// errors as "predicate did not fire" rather than aborting the
+    /// wait, so a transient plugin fault leaves the wait running for
+    /// the next tick instead of poisoning the whole operation.
+    ///
+    /// **Determinism contract.** Predicates must return a stable
+    /// outcome for a given `(plugin, predicate, params, context)`
+    /// tuple — the wait loop is allowed to call `evaluate_predicate`
+    /// twice on the same tick when assembling the structured
+    /// [`MatchOutcome`]: once for the cheap boolean check and once
+    /// for the outcome construction. A predicate with side effects
+    /// or non-determinism (RNG, clock-based branching, mutating Lua
+    /// state) may report `true` on the first call and `false` on the
+    /// second, producing a successful wait whose `outcome` field is
+    /// `None`. Plugin authors: treat predicates as pure inspections
+    /// of the supplied context.
+    fn evaluate_predicate(
+        &self,
+        plugin: &str,
+        predicate: &str,
+        params: &Value,
+        context: &PredicateContext<'_>,
+    ) -> Result<PredicateOutcome>;
+}
+
+/// Context handed to a [`PluginRegistry`] implementation when
+/// evaluating a `Matcher::Lua` predicate.
+///
+/// Reference-bound to avoid per-tick cloning on the hot wait path.
+/// Predicates that need a body/status split (a plugin-specific
+/// convention) can compute it themselves from `screen` — the core
+/// matcher layer stays neutral on whether such a split exists.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PredicateContext<'a> {
+    /// Full visible screen text.
+    pub screen: &'a str,
+    /// Retained transcript tail.
+    pub transcript: &'a str,
+    /// Session sequence observed when this context was assembled.
+    pub sequence: u64,
+    /// How long the current screen has been stable, in milliseconds.
+    pub stable_ms: u64,
+    /// Whether the PTY/session lifecycle indicates the process has
+    /// exited or closed.
+    pub process_exited: bool,
+    /// All currently-recorded transcript markers — same view the
+    /// classifier sees through [`crate::ClassifyContext::markers`].
+    pub markers: &'a BTreeMap<String, u64>,
+    /// Current transcript `chars_written` cursor.
+    pub cursor: u64,
+}
+
+/// Structured result returned by a [`PluginRegistry`] for a single
+/// predicate evaluation. The host turns `matched = true` into a wait
+/// completion and surfaces `evidence` / `capture` (when present) on
+/// the resulting [`MatchOutcome::Lua`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateOutcome {
+    /// Whether the predicate fires this tick.
+    pub matched: bool,
+    /// Optional human-readable evidence string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    /// Optional captured substring (analogous to a regex first
+    /// capture). Predicates that report a meaningful payload populate
+    /// this so callers can correlate the match with the substance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
 }
 
 /// Evidence returned from a successful or failed wait.
@@ -97,6 +191,15 @@ pub enum MatchOutcome {
     /// [`Matcher::All`] succeeded — every nested matcher's outcome in
     /// source order.
     All(Vec<MatchOutcome>),
+    /// [`Matcher::Lua`] predicate fired. `evidence` and `capture` are
+    /// the optional fields the plugin populated on its
+    /// [`PredicateOutcome`] return value.
+    Lua {
+        plugin: String,
+        predicate: String,
+        evidence: Option<String>,
+        capture: Option<String>,
+    },
 }
 
 impl Serialize for MatchOutcome {
@@ -161,6 +264,25 @@ impl Serialize for MatchOutcome {
                 map.serialize_entry("matched", branches)?;
                 map.end()
             }
+            Self::Lua {
+                plugin,
+                predicate,
+                evidence,
+                capture,
+            } => {
+                let len = 3 + usize::from(evidence.is_some()) + usize::from(capture.is_some());
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("kind", "lua")?;
+                map.serialize_entry("plugin", plugin)?;
+                map.serialize_entry("predicate", predicate)?;
+                if let Some(value) = evidence {
+                    map.serialize_entry("evidence", value)?;
+                }
+                if let Some(value) = capture {
+                    map.serialize_entry("capture", value)?;
+                }
+                map.end()
+            }
         }
     }
 }
@@ -187,6 +309,26 @@ pub enum Matcher {
     Any(Vec<Matcher>),
     /// All nested matchers succeed.
     All(Vec<Matcher>),
+    /// A plugin-defined predicate evaluated by the bound
+    /// [`PluginRegistry`]. Domain-neutral: any plugin's exported
+    /// predicate function works through the same wire shape.
+    ///
+    /// Requires a registry bound on the [`crate::Session`] via
+    /// [`crate::Session::set_plugin_registry`]. Without a registry,
+    /// evaluation through [`Matcher::is_match_with_context`] (the
+    /// stateless API) returns `false` — call
+    /// [`Matcher::is_match_with_evaluator`] for the registry-aware
+    /// path.
+    Lua {
+        /// Plugin name (manifest `name` field).
+        plugin: String,
+        /// Predicate function name exported by the plugin's Lua source.
+        predicate: String,
+        /// JSON params forwarded to the predicate. Omitted on the
+        /// wire when null.
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        params: Value,
+    },
 }
 
 impl Matcher {
@@ -224,6 +366,63 @@ impl Matcher {
             Self::All(matchers) => matchers
                 .iter()
                 .all(|matcher| matcher.is_match_with_context(snapshot, transcript, context)),
+            // `Matcher::Lua` requires a bound `PluginRegistry`. The
+            // stateless API cannot evaluate it; callers wanting the
+            // plugin-driven path go through `is_match_with_evaluator`.
+            // Returning `false` here keeps existing call sites working
+            // without surprising panics if a Lua matcher leaks into a
+            // registry-less wait path.
+            Self::Lua { .. } => false,
+        }
+    }
+
+    /// Like [`Matcher::is_match_with_context`] but also evaluates
+    /// [`Matcher::Lua`] branches against the supplied registry +
+    /// predicate context. Non-Lua variants ignore the registry and
+    /// delegate to [`Matcher::is_match_with_context`].
+    ///
+    /// The wait loop on [`crate::Session`] uses this method whenever a
+    /// plugin registry is bound; the predicate context is rebuilt
+    /// every tick from the current screen / transcript / markers.
+    pub fn is_match_with_evaluator(
+        &self,
+        snapshot: &ScreenSnapshot,
+        transcript: &str,
+        context: MatcherContext,
+        predicate_context: &PredicateContext<'_>,
+        registry: Option<&dyn PluginRegistry>,
+    ) -> bool {
+        match self {
+            Self::Lua {
+                plugin,
+                predicate,
+                params,
+            } => registry
+                .and_then(|r| {
+                    r.evaluate_predicate(plugin, predicate, params, predicate_context)
+                        .ok()
+                })
+                .map(|outcome| outcome.matched)
+                .unwrap_or(false),
+            Self::Any(matchers) => matchers.iter().any(|matcher| {
+                matcher.is_match_with_evaluator(
+                    snapshot,
+                    transcript,
+                    context,
+                    predicate_context,
+                    registry,
+                )
+            }),
+            Self::All(matchers) => matchers.iter().all(|matcher| {
+                matcher.is_match_with_evaluator(
+                    snapshot,
+                    transcript,
+                    context,
+                    predicate_context,
+                    registry,
+                )
+            }),
+            _ => self.is_match_with_context(snapshot, transcript, context),
         }
     }
 
@@ -296,6 +495,71 @@ impl Matcher {
                 }
                 Some(MatchOutcome::All(outcomes))
             }
+            // No registry available → no outcome. Use
+            // `describe_match_with_evaluator` for the plugin-driven
+            // path (see [`Matcher::is_match_with_context`] for the
+            // analogous fallthrough).
+            Self::Lua { .. } => None,
+        }
+    }
+
+    /// Like [`Matcher::describe_match_with_context`] but evaluates
+    /// [`Matcher::Lua`] branches against the supplied registry.
+    /// Returns the same outcomes for non-Lua variants;
+    /// `Matcher::Lua` fires a [`MatchOutcome::Lua`] populated from
+    /// the registry's [`PredicateOutcome`].
+    pub fn describe_match_with_evaluator(
+        &self,
+        snapshot: &ScreenSnapshot,
+        transcript: &str,
+        context: MatcherContext,
+        predicate_context: &PredicateContext<'_>,
+        registry: Option<&dyn PluginRegistry>,
+    ) -> Option<MatchOutcome> {
+        match self {
+            Self::Lua {
+                plugin,
+                predicate,
+                params,
+            } => {
+                let outcome = registry.and_then(|r| {
+                    r.evaluate_predicate(plugin, predicate, params, predicate_context)
+                        .ok()
+                })?;
+                outcome.matched.then_some(MatchOutcome::Lua {
+                    plugin: plugin.clone(),
+                    predicate: predicate.clone(),
+                    evidence: outcome.evidence,
+                    capture: outcome.capture,
+                })
+            }
+            Self::Any(matchers) => matchers
+                .iter()
+                .find_map(|matcher| {
+                    matcher.describe_match_with_evaluator(
+                        snapshot,
+                        transcript,
+                        context,
+                        predicate_context,
+                        registry,
+                    )
+                })
+                .map(|inner| MatchOutcome::Any(Box::new(inner))),
+            Self::All(matchers) => {
+                let mut outcomes = Vec::with_capacity(matchers.len());
+                for matcher in matchers {
+                    let outcome = matcher.describe_match_with_evaluator(
+                        snapshot,
+                        transcript,
+                        context,
+                        predicate_context,
+                        registry,
+                    )?;
+                    outcomes.push(outcome);
+                }
+                Some(MatchOutcome::All(outcomes))
+            }
+            _ => self.describe_match_with_context(snapshot, transcript, context),
         }
     }
 
@@ -572,5 +836,215 @@ mod tests {
         assert_eq!(json["kind"], "screen_regex");
         assert_eq!(json["pattern"], "rea.y");
         assert_eq!(json["capture"], "ready");
+    }
+
+    /// Minimal `PluginRegistry` impl that returns a fixed outcome
+    /// regardless of input. Used by the Lua-matcher tests below — we
+    /// don't need a real Lua state to verify the threading through
+    /// `is_match_with_evaluator`.
+    struct FixedOutcomeRegistry {
+        outcome: PredicateOutcome,
+        expected_plugin: &'static str,
+        expected_predicate: &'static str,
+    }
+
+    impl PluginRegistry for FixedOutcomeRegistry {
+        fn evaluate_predicate(
+            &self,
+            plugin: &str,
+            predicate: &str,
+            _params: &Value,
+            _context: &PredicateContext<'_>,
+        ) -> crate::error::Result<PredicateOutcome> {
+            assert_eq!(plugin, self.expected_plugin);
+            assert_eq!(predicate, self.expected_predicate);
+            Ok(self.outcome.clone())
+        }
+    }
+
+    #[test]
+    fn matcher_lua_serializes_with_struct_value_payload() {
+        let matcher = Matcher::Lua {
+            plugin: "claude-code".into(),
+            predicate: "is_settled".into(),
+            params: serde_json::json!({ "anchor": "ready" }),
+        };
+        let wire = serde_json::to_value(&matcher).expect("serialize Matcher::Lua");
+        assert_eq!(wire["type"], "lua");
+        assert_eq!(wire["value"]["plugin"], "claude-code");
+        assert_eq!(wire["value"]["predicate"], "is_settled");
+        assert_eq!(wire["value"]["params"]["anchor"], "ready");
+    }
+
+    #[test]
+    fn matcher_lua_round_trips_through_serde() {
+        let original = Matcher::Lua {
+            plugin: "demo".into(),
+            predicate: "ready".into(),
+            params: serde_json::json!({}),
+        };
+        let wire = serde_json::to_string(&original).expect("serialize");
+        let parsed: Matcher = serde_json::from_str(&wire).expect("deserialize");
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn is_match_with_context_returns_false_for_lua_without_registry() {
+        // The stateless API cannot evaluate plugin predicates — the
+        // registry-less path must return false (not panic) so existing
+        // call sites keep working if a Lua matcher leaks in.
+        let snap = snapshot("anything");
+        let matcher = Matcher::Lua {
+            plugin: "x".into(),
+            predicate: "y".into(),
+            params: serde_json::Value::Null,
+        };
+        assert!(!matcher.is_match(&snap, ""));
+        assert!(matcher.describe_match(&snap, "").is_none());
+    }
+
+    #[test]
+    fn is_match_with_evaluator_consults_registry_for_lua() {
+        let snap = snapshot("session ready");
+        let registry = FixedOutcomeRegistry {
+            outcome: PredicateOutcome {
+                matched: true,
+                evidence: Some("plugin saw ready".into()),
+                capture: Some("ready".into()),
+            },
+            expected_plugin: "demo",
+            expected_predicate: "is_ready",
+        };
+        let markers = BTreeMap::new();
+        let predicate_ctx = PredicateContext {
+            screen: "session ready",
+            transcript: "",
+            sequence: 0,
+            stable_ms: 0,
+            process_exited: false,
+            markers: &markers,
+            cursor: 0,
+        };
+        let matcher = Matcher::Lua {
+            plugin: "demo".into(),
+            predicate: "is_ready".into(),
+            params: serde_json::Value::Null,
+        };
+        assert!(matcher.is_match_with_evaluator(
+            &snap,
+            "",
+            MatcherContext::stateless(),
+            &predicate_ctx,
+            Some(&registry),
+        ));
+    }
+
+    #[test]
+    fn describe_match_with_evaluator_returns_lua_outcome() {
+        let snap = snapshot("anything");
+        let registry = FixedOutcomeRegistry {
+            outcome: PredicateOutcome {
+                matched: true,
+                evidence: Some("hit".into()),
+                capture: Some("captured".into()),
+            },
+            expected_plugin: "demo",
+            expected_predicate: "fires",
+        };
+        let markers = BTreeMap::new();
+        let predicate_ctx = PredicateContext {
+            screen: "anything",
+            transcript: "",
+            sequence: 0,
+            stable_ms: 0,
+            process_exited: false,
+            markers: &markers,
+            cursor: 0,
+        };
+        let matcher = Matcher::Lua {
+            plugin: "demo".into(),
+            predicate: "fires".into(),
+            params: serde_json::Value::Null,
+        };
+        let outcome = matcher.describe_match_with_evaluator(
+            &snap,
+            "",
+            MatcherContext::stateless(),
+            &predicate_ctx,
+            Some(&registry),
+        );
+        match outcome {
+            Some(MatchOutcome::Lua {
+                plugin,
+                predicate,
+                evidence,
+                capture,
+            }) => {
+                assert_eq!(plugin, "demo");
+                assert_eq!(predicate, "fires");
+                assert_eq!(evidence.as_deref(), Some("hit"));
+                assert_eq!(capture.as_deref(), Some("captured"));
+            }
+            other => panic!("expected MatchOutcome::Lua; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_match_outcome_lua_serialises_with_kind_tag() {
+        let outcome = MatchOutcome::Lua {
+            plugin: "p".into(),
+            predicate: "q".into(),
+            evidence: Some("note".into()),
+            capture: None,
+        };
+        let json = serde_json::to_value(&outcome).expect("serialize Lua outcome");
+        assert_eq!(json["kind"], "lua");
+        assert_eq!(json["plugin"], "p");
+        assert_eq!(json["predicate"], "q");
+        assert_eq!(json["evidence"], "note");
+        assert!(json.get("capture").is_none(), "absent fields stay absent");
+    }
+
+    #[test]
+    fn evaluator_combinators_compose_with_lua_branches() {
+        // Any/All combinators must recurse into Lua branches via the
+        // evaluator-aware path. Mixing native and Lua matchers is the
+        // typical real-world shape ("wait for the screen to stabilise
+        // AND for the plugin's custom predicate to fire").
+        let snap = snapshot("waiting…");
+        let registry = FixedOutcomeRegistry {
+            outcome: PredicateOutcome {
+                matched: true,
+                evidence: None,
+                capture: None,
+            },
+            expected_plugin: "demo",
+            expected_predicate: "ok",
+        };
+        let markers = BTreeMap::new();
+        let predicate_ctx = PredicateContext {
+            screen: "waiting…",
+            transcript: "",
+            sequence: 0,
+            stable_ms: 0,
+            process_exited: false,
+            markers: &markers,
+            cursor: 0,
+        };
+        let matcher = Matcher::All(vec![
+            Matcher::ContainsText("waiting".into()),
+            Matcher::Lua {
+                plugin: "demo".into(),
+                predicate: "ok".into(),
+                params: serde_json::Value::Null,
+            },
+        ]);
+        assert!(matcher.is_match_with_evaluator(
+            &snap,
+            "",
+            MatcherContext::stateless(),
+            &predicate_ctx,
+            Some(&registry),
+        ));
     }
 }

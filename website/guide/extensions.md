@@ -77,7 +77,7 @@ Recorded screen fixtures live under `tests/fixtures/<plugin>/`. Each fixture is 
 - `<name>.txt` — sanitized screen capture.
 - `<name>.expected.json` — expected state, evidence, optional `last_intent`, and confidence floor.
 
-The Claude Code classifier regression test auto-enrols every fixture under `tests/fixtures/claude_code/`: dropping in a new `.txt` plus its `.expected.json` is enough for the next `cargo test` run to assert against it. Fixtures without an `.expected.json` sibling are skipped with a warning so exploratory captures can sit alongside graded ones.
+The Claude Code classifier regression test auto-enrols every fixture under `plugins/claude-code/fixtures/`: dropping in a new `.txt` plus its `.expected.json` is enough for the next `cargo test` run to assert against it. Fixtures without an `.expected.json` sibling are skipped with a warning so exploratory captures can sit alongside graded ones.
 
 When upstream Claude Code changes its TUI (new banner, renamed permission prompt, different plan UI), update the fixture and the classifier in the same PR. The body/status split (with `STATUS_BAR_ROWS = 3`) means status-bar additions usually do not require Lua changes, but body-region changes do.
 

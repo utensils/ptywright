@@ -18,6 +18,21 @@ The core must stay generic. Do not bake a single target application into core na
 
 Long-form design notes, milestone history, and open questions may live in a local-only, git-ignored `SPEC.md`. If that file exists in the working tree, read it before making structural changes; do not assume it is present in fresh clones.
 
+## Core principle: TUI-agnostic library and CLI
+
+**This is the load-bearing rule for every change in this repository.** The Rust library (`src/`) and the `ptywright` binary must remain reusable for any future TUI — Codex, Gemini, shell wrappers, custom REPLs, anything someone might want to drive through a PTY. Claude Code is the first plugin we ship; it must not be the only TUI ptywright can express.
+
+Concretely:
+
+- **No claude-specific identifiers in `src/`** beyond the single `BUILTIN_PLUGINS[0]` entry in `src/plugin.rs` (which pairs `claude_code_manifest()` with `include_str!("../plugins/claude-code/main.lua")`). State names (`waiting_for_permission`, `completed_turn`, …), intent names (`send_prompt`, `approve_trust`, `attach_file`, …), classifier rules, fixture conventions, metadata shapes (`metadata.permission.tool`, `metadata.usage.cost_usd`, …), and dialog-id hashing all live in `plugins/claude-code/`. Not in `src/extension.rs`. Not in `src/rpc.rs`. Not in `src/matcher.rs`.
+- **No claude-specific RPC namespaces.** The wire format is the generic `adapter.*` surface plus `plugin.*` registry methods. There is no `claude.*` namespace and there must not be one for any future plugin either.
+- **No claude-specific matcher kinds.** `Matcher` variants are domain-neutral primitives (`ContainsText`, `ScreenRegex`, `ScreenStable`, `Any`, `All`, `Lua { plugin, predicate, params }`, …). Plugins compose them; plugins do not get to add new kinds to the enum.
+- **Generic primitives are fine in core.** `Matcher::Lua` takes a string plugin name and string predicate name; it is plugin-agnostic. `PluginRegistry`, `PredicateContext`, transcript markers, `default_target.required_env`, `metadata: Option<Value>`, the `Extension` trait — all are domain-neutral. Adding one is fine when the design works for *any* plugin, not just claude-code.
+
+Before writing or accepting any change under `src/`, ask: **"would this name, type, RPC method, matcher kind, or state string still make sense if claude-code never existed?"** If the answer is no, the change belongs in `plugins/<name>/`, not in core. When threading new infrastructure through `Session` / `RpcServerState` / `ExtensionHandle`, prove the design works for a hypothetical second TUI plugin before committing.
+
+The boundary is enforced socially, not by the type system. Reviewers and authors share responsibility for catching drift.
+
 ## Abstraction rules
 
 Prefer small, explicit layers:
@@ -48,7 +63,7 @@ Use test-driven development for behavior changes wherever practical:
 - For PTY behavior, use deterministic fixture commands and platform-aware test helpers instead of sleeps or host-specific shell assumptions.
 - Keep tests cross-platform unless a test is explicitly gated with `#[cfg(...)]` and the limitation is documented.
 - Do not mark a milestone complete until tests and docs for that milestone are updated.
-- When changing `claude_code` adapter behavior, regenerate or hand-update the relevant fixtures under `tests/fixtures/claude_code/` in the same PR and explain the diff (e.g. "captured against Claude Code <version>" or "manual edit to cover X transition") in the PR description.
+- When changing `claude_code` adapter behavior, regenerate or hand-update the relevant fixtures under `plugins/claude-code/fixtures/` in the same PR and explain the diff (e.g. "captured against Claude Code <version>" or "manual edit to cover X transition") in the PR description.
 
 ## Cross-platform requirements
 
@@ -153,10 +168,10 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/repl/tui.rs` — **sequential reedline-based REPL**. Each command renders as `pty> <syntax-highlighted DSL>` and the result follows on the next line as `↳ <dim summary>`. Line editing, completion, syntax highlighting, history, and ghost-text hinting are all delegated to reedline; this module owns the read-eval-print loop, the prompt, and how each `CmdOutcome` is printed (including the inline styled `ScreenSnapshot` rendering for `screen.snapshot()` / `view()`). Server-side notifications surface above the prompt via reedline's `ExternalPrinter`. **No application-specific identifiers live in any of these modules** — the REPL is a client of the generic `adapter.*` surface.
 - Tests:
   - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
-  - `tests/lua_classifier_tests.rs` — auto-enrolling classifier regression matrix. Loads every `<name>.txt` fixture under `tests/fixtures/claude_code/` with a sibling `<name>.expected.json` and drives it through `LuaExtension::built_in("claude-code")`.
+  - `tests/lua_classifier_tests.rs` — auto-enrolling classifier regression matrix. Loads every `<name>.txt` fixture under `plugins/claude-code/fixtures/` with a sibling `<name>.expected.json` and drives it through `LuaExtension::built_in("claude-code")`.
   - `tests/lua_plugin_intents.rs` — per-intent contract tests (`send_prompt`, `approve`, `deny`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`, `wait_turn_matcher`, the `cancelling` hold-state) driven through the generic `ExtensionHandle` API. Doubles as a reference for plugin authors writing new TUI plugins.
   - `tests/repl_tests.rs` — gated `#[cfg(feature = "repl")]`. Drives `RpcClient` + `command::dispatch` against an in-process `serve_ndjson_with_state` over pipes: capabilities, full spawn→state→close cycle, raw `:rpc` passthrough, adapter-flavored `session.changed` notifications.
-  - `tests/fixtures/claude_code/` — recorded screen fixtures for the classifier; update these when Claude Code's UI shifts. Adding a new fixture is a single-PR documentation-only change: drop a `<name>.txt` and sibling `<name>.expected.json` and the matrix picks them up.
+  - `plugins/claude-code/fixtures/` — recorded screen fixtures for the classifier; update these when Claude Code's UI shifts. Adding a new fixture is a single-PR documentation-only change: drop a `<name>.txt` and sibling `<name>.expected.json` and the matrix picks them up.
 - Tooling and packaging:
   - `website/` — VitePress docs site.
   - `.github/workflows/` — CI, docs deploy (`pages.yml`), and release packaging (`release.yml`).

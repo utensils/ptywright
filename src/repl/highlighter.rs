@@ -43,6 +43,7 @@ const METHOD_NAMES: &[&str] = &[
     "intent",
     "turn",
     "wait",
+    "cancel_wait",
     "matches",
     "screen_stable",
     "transcript",

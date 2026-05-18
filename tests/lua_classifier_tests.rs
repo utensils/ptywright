@@ -1,6 +1,6 @@
 //! Classifier regression matrix for the built-in claude-code Lua plugin.
 //!
-//! Auto-enrols every `<name>.txt` fixture under `tests/fixtures/claude_code/`
+//! Auto-enrols every `<name>.txt` fixture under `plugins/claude-code/fixtures/`
 //! that has a sibling `<name>.expected.json`. Adding a new fixture is a
 //! documentation-only change: drop the two files in and the matrix picks
 //! them up.
@@ -49,6 +49,7 @@ fn classify_fixture(
     last_intent: Option<&str>,
 ) -> ptywright::Result<ExtensionStateSnapshot> {
     let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+    let markers = std::collections::BTreeMap::new();
     let ctx = ClassifyContext {
         screen,
         body_text: &body_text,
@@ -58,6 +59,8 @@ fn classify_fixture(
         last_intent,
         stable_ms: Some(COMPLETED_TURN_STABLE_MS),
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+        markers: &markers,
+        cursor: 0,
     };
     extension.classify(&ctx)
 }
@@ -65,9 +68,9 @@ fn classify_fixture(
 #[test]
 fn classifier_matches_sanitized_claude_code_fixtures() {
     let fixtures_dir: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("claude_code");
+        .join("plugins")
+        .join("claude-code")
+        .join("fixtures");
 
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&fixtures_dir)
         .unwrap_or_else(|err| panic!("read fixtures dir {}: {err}", fixtures_dir.display()))

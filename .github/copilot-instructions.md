@@ -11,7 +11,7 @@ These reflect concrete past incidents. Suggestions that violate them are regress
 3. **Be vigilant against breaking working state.** This codebase has a working baseline that real users run. Suggest the minimum diff that fixes the stated problem; do not bundle refactors, naming changes, or "drive-by" improvements with bug fixes. When in doubt, propose the narrow fix and flag the broader concern separately.
 4. **Cross-platform applies.** Linux, macOS, and Windows (ConPTY) are all tier-1. Do not assume POSIX-only APIs, `python3` launcher, `fork`-based concurrency, or Unix path conventions. CI exercises all three.
 5. **No nonsense abstractions.** Do not propose traits for one implementation, builder patterns for two-field structs, or generic helpers used by one caller. Three similar lines is better than a premature abstraction. The classifier and matcher layers were intentionally flattened; do not re-layer them.
-6. **TDD for behavior changes.** A new fixture under `tests/fixtures/claude_code/<name>.txt` + sibling `.expected.json` is the conventional way to lock a classifier change. A new test in `tests/scripts/test_claude_stream.py` (stdlib `unittest`, NO pytest) locks Python script behavior.
+6. **TDD for behavior changes.** A new fixture under `plugins/claude-code/fixtures/<name>.txt` + sibling `.expected.json` is the conventional way to lock a classifier change. A new test in `tests/scripts/test_claude_stream.py` (stdlib `unittest`, NO pytest) locks Python script behavior.
 
 ## Common review anti-patterns to avoid
 
@@ -35,6 +35,6 @@ These reflect concrete past incidents. Suggestions that violate them are regress
 - `src/` — generic abstractions: `Target`, `Session`, `Screen`, `Action`, `Matcher`, `Transcript`, `Extension`, RPC. No Claude-specific code.
 - `plugins/claude-code/` — Lua plugin (`main.lua`, `helpers.lua`, `manifest.toml`). All TUI knowledge.
 - `scripts/claude-stream.py` — single-turn Python wrapper. Stdlib-only. Demonstrates every primitive a real consumer would touch.
-- `tests/fixtures/claude_code/` — sanitized recorded screens + expected classification. Adding a fixture is a documentation-only change.
+- `plugins/claude-code/fixtures/` — sanitized recorded screens + expected classification. Adding a fixture is a documentation-only change.
 - `tests/scripts/test_claude_stream.py` — Python script unit tests. Stdlib `unittest`.
 - `website/` — VitePress docs site.

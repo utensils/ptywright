@@ -77,6 +77,29 @@ pub struct ExtensionStateSnapshot {
     /// "no metadata" case stays cheap to render.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Passive host directives the classifier wants the host to execute
+    /// before returning the snapshot to the caller. Today this is a list
+    /// of transcript markers ([`HostMark`]) the plugin wants stamped at
+    /// the current cursor — e.g. a TUI plugin signalling "turn_end" the
+    /// moment its classifier transitions to `completed_turn`. The host
+    /// applies each mark via [`crate::Session::mark_transcript`] after
+    /// `classify` returns; the snapshot is delivered to the caller with
+    /// `host_marks` echoed for transparency. Domain-neutral: any plugin
+    /// can populate it, the host treats every entry the same way.
+    /// Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_marks: Vec<HostMark>,
+}
+
+/// Plugin-issued request that the host stamp a transcript marker at the
+/// current cursor before delivering the classifier snapshot to the
+/// caller. See [`ExtensionStateSnapshot::host_marks`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMark {
+    /// Marker label to pass to [`crate::Session::mark_transcript`].
+    /// Repeated labels overwrite each other — see
+    /// [`crate::Transcript::mark`] for the storage semantics.
+    pub label: String,
 }
 
 impl ExtensionStateSnapshot {
@@ -95,6 +118,7 @@ impl ExtensionStateSnapshot {
             sequence,
             candidates: Vec::new(),
             metadata: None,
+            host_marks: Vec::new(),
         }
     }
 }
@@ -167,6 +191,25 @@ pub struct ClassifyContext<'a> {
     /// after a completed turn". Forwarded so plugins can reuse the same value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_turn_stable_ms: Option<u64>,
+    /// Snapshot of all transcript markers placed via
+    /// [`crate::Session::mark_transcript`] (whether plan-driven through
+    /// [`Action::MarkTranscript`] or classifier-driven through
+    /// [`HostMark`]). Empty map when no markers have been placed.
+    ///
+    /// Plugins compose transcript metadata from this view — e.g. a TUI
+    /// plugin that marks `turn_start` on prompt submit and `turn_end` on
+    /// classifier transition to a completion state can surface
+    /// `metadata.transcript = { turn_start, turn_end }` once both keys
+    /// are present.
+    pub markers: &'a std::collections::BTreeMap<String, u64>,
+    /// Current transcript cursor — `chars_written` at classify time.
+    /// Plugins that emit a [`HostMark`] for the host to stamp can
+    /// pre-compute the resulting metadata using this cursor, since the
+    /// host will mark approximately here (with no PTY writes between
+    /// classify return and mark application). Lets plugins surface
+    /// `metadata.transcript.turn_end` in the *same* classify response
+    /// that requests the `turn_end` mark.
+    pub cursor: u64,
 }
 
 /// Action plan returned by extension intents (e.g. `send_prompt`, `approve`).
@@ -387,14 +430,24 @@ impl ExtensionHandle {
                 sequence: self.session.sequence(),
                 candidates: Vec::new(),
                 metadata: None,
+                host_marks: Vec::new(),
             })
     }
 
     /// Classify current state, surfacing plugin failures.
     pub fn try_state(&self) -> Result<ExtensionStateSnapshot> {
-        let snapshot = self.session.snapshot();
-        let transcript = self.session.transcript();
-        self.classify(&snapshot.plain_text, &transcript, snapshot.sequence, None)
+        // Atomic snapshot of screen + transcript + markers + cursor so
+        // a PTY read arriving mid-classify can't produce a context
+        // where the cursor is from a later moment than the screen.
+        let (snapshot, transcript, markers, cursor) = self.session.classify_input();
+        self.classify_atomic(
+            &snapshot.plain_text,
+            &transcript,
+            snapshot.sequence,
+            None,
+            &markers,
+            cursor,
+        )
     }
 
     /// Apply a named intent and return the post-apply state snapshot.
@@ -429,9 +482,42 @@ impl ExtensionHandle {
         params: Value,
         timeout: Duration,
     ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        self.wait_inner(intent, params, timeout, None)
+    }
+
+    /// Cancellable variant of [`wait`](Self::wait). Polls the supplied
+    /// [`CancellationToken`] alongside the matcher; a flip from another
+    /// thread causes the wait to return [`Error::Cancelled`] (distinct
+    /// from [`Error::Timeout`]).
+    ///
+    /// Pair with `RpcServer`'s `pending_waits` registry to support
+    /// `adapter.cancel_wait { wait_id }` over JSON-RPC. The token
+    /// flows down to [`crate::Session::wait_for_cancellable`].
+    pub fn wait_with_cancel(
+        &self,
+        intent: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: &crate::session::CancellationToken,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        self.wait_inner(intent, params, timeout, Some(cancel))
+    }
+
+    fn wait_inner(
+        &self,
+        intent: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: Option<&crate::session::CancellationToken>,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
         let params = merge_wait_defaults(params, self.completed_turn_stable_ms);
         let matcher = self.extension.wait_matcher(intent, &params)?;
-        let result = self.session.wait_for(&matcher, timeout)?;
+        let result = match cancel {
+            Some(token) => self
+                .session
+                .wait_for_cancellable(&matcher, timeout, token)?,
+            None => self.session.wait_for(&matcher, timeout)?,
+        };
         let stable_ms = u64::try_from(result.stable_for.as_millis()).unwrap_or(u64::MAX);
         let state = self.classify(
             &result.snapshot.plain_text,
@@ -468,6 +554,23 @@ impl ExtensionHandle {
         let _state_after_send = self.send(send_intent, send_params)?;
         let wait_intent = wait_intent.unwrap_or("wait_turn_matcher");
         self.wait(wait_intent, wait_params, timeout)
+    }
+
+    /// Cancellable variant of [`turn`](Self::turn). The wait leg
+    /// observes the supplied [`CancellationToken`]; the send leg is
+    /// unaffected (PTY writes are fast and not worth interrupting).
+    pub fn turn_with_cancel(
+        &mut self,
+        send_intent: &str,
+        send_params: Value,
+        wait_intent: Option<&str>,
+        wait_params: Value,
+        timeout: Duration,
+        cancel: &crate::session::CancellationToken,
+    ) -> Result<(ExtensionStateSnapshot, Option<MatchOutcome>)> {
+        let _state_after_send = self.send(send_intent, send_params)?;
+        let wait_intent = wait_intent.unwrap_or("wait_turn_matcher");
+        self.wait_with_cancel(wait_intent, wait_params, timeout, cancel)
     }
 
     /// Apply an action plan, requiring that the plan supply `last_intent` and
@@ -540,6 +643,32 @@ impl ExtensionHandle {
         sequence: u64,
         stable_ms: Option<u64>,
     ) -> Result<ExtensionStateSnapshot> {
+        // Caller has a screen / transcript / sequence from one snapshot
+        // moment but markers / cursor are read separately here, so a
+        // PTY read arriving between the caller's snapshot and our
+        // marker reads can produce a mismatched context. The
+        // wait-completion path (post-matcher-success classify) is
+        // unaffected — `wait_for_inner` already reads markers + cursor
+        // under the wait loop's state-lock acquisition.
+        //
+        // Prefer `classify_atomic` from new call sites that need
+        // strict atomicity; this signature is retained for the
+        // post-wait classify path that already has a consistent
+        // snapshot.
+        let markers = self.session.transcript_markers();
+        let cursor = self.session.transcript_chars_written();
+        self.classify_atomic(screen, transcript, sequence, stable_ms, &markers, cursor)
+    }
+
+    fn classify_atomic(
+        &self,
+        screen: &str,
+        transcript: &str,
+        sequence: u64,
+        stable_ms: Option<u64>,
+        markers: &std::collections::BTreeMap<String, u64>,
+        cursor: u64,
+    ) -> Result<ExtensionStateSnapshot> {
         let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
         let ctx = ClassifyContext {
             screen,
@@ -550,8 +679,22 @@ impl ExtensionHandle {
             last_intent: self.last_intent.as_deref(),
             stable_ms,
             completed_turn_stable_ms: Some(self.completed_turn_stable_ms),
+            markers,
+            cursor,
         };
-        self.extension.classify(&ctx)
+        let snapshot = self.extension.classify(&ctx)?;
+        self.apply_host_marks(&snapshot.host_marks);
+        Ok(snapshot)
+    }
+
+    /// Apply plugin-requested transcript markers from a freshly-returned
+    /// snapshot. Domain-neutral: any plugin that wants the host to stamp
+    /// a marker at classifier time can populate
+    /// [`ExtensionStateSnapshot::host_marks`].
+    fn apply_host_marks(&self, marks: &[HostMark]) {
+        for mark in marks {
+            self.session.mark_transcript(&mark.label);
+        }
     }
 }
 
@@ -712,6 +855,7 @@ mod tests {
     /// missing fields as nil and the fallback works as intended.
     #[test]
     fn classify_context_serialises_with_omitted_none_fields() {
+        let empty_markers = std::collections::BTreeMap::new();
         let ctx = ClassifyContext {
             screen: "",
             body_text: "",
@@ -721,6 +865,8 @@ mod tests {
             last_intent: None,
             stable_ms: None,
             completed_turn_stable_ms: None,
+            markers: &empty_markers,
+            cursor: 0,
         };
         let value = serde_json::to_value(ctx).expect("serialise ClassifyContext");
         let object = value
@@ -797,6 +943,7 @@ mod tests {
             sequence: 0,
             candidates: Vec::new(),
             metadata: None,
+            host_marks: Vec::new(),
         };
         let wire = serde_json::to_string(&snapshot).expect("serialize");
         assert!(

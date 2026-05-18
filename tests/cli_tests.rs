@@ -1231,3 +1231,89 @@ fn plugin_load_allowed_with_flag_drives_full_lifecycle() {
         response = responses[1]
     );
 }
+
+#[test]
+fn logs_tail_streams_recent_lines_from_newest_file() {
+    // Synthesize a log file matching the daily-rotation pattern, then
+    // run `ptywright logs --lines 200` to verify the tail subcommand
+    // finds the file, prints the header, and includes the seeded
+    // lines. Synthetic file avoids the cross-platform `/bin/sh`
+    // preflight previously used.
+    use std::io::Write;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!("ptywright-logs-{}-{unique}", std::process::id()));
+    let logs_dir = home.join("logs");
+    std::fs::create_dir_all(&logs_dir).expect("create logs dir");
+
+    // `is_managed_log_filename` requires the YYYY-MM-DD shape. Use a
+    // fixed historical date so the file isn't tied to test-run time.
+    let log_path = logs_dir.join("ptywright.2026-05-18.log");
+    let mut file = std::fs::File::create(&log_path).expect("create synthetic log");
+    writeln!(file, "TEST-MARKER-line-XYZ").expect("write marker");
+    drop(file);
+
+    // Spawn `ptywright logs` in the background; let it print the
+    // backfill, give the OS time to flush stdout into the pipe, then
+    // kill the process. 1.5 s is generous — the backfill is a single
+    // synchronous file read, so this only needs to outpace OS pipe
+    // buffering, not real I/O.
+    let mut child = bin()
+        .env("PTYWRIGHT_HOME", &home)
+        .args(["logs", "--lines", "200"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright logs");
+
+    std::thread::sleep(Duration::from_millis(1500));
+    child.kill().expect("kill ptywright logs");
+    let output = child
+        .wait_with_output()
+        .expect("collect ptywright logs output");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(
+        stdout.contains("==> tailing"),
+        "expected tail header; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("TEST-MARKER-line-XYZ"),
+        "expected the marker we seeded to be in the tail; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn logs_command_errors_when_no_logs_exist() {
+    // No prior `ptywright` invocation under this fresh home → no
+    // log files. The subcommand should fail with a clear message
+    // rather than panicking or hanging on an empty tail.
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let home =
+        std::env::temp_dir().join(format!("ptywright-nologs-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(home.join("logs")).expect("create logs dir");
+
+    let output = bin()
+        .env("PTYWRIGHT_HOME", &home)
+        .args(["logs"])
+        .output()
+        .expect("run ptywright logs");
+    assert!(
+        !output.status.success(),
+        "logs against an empty home should fail; got: {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(
+        stderr.contains("no ptywright log files"),
+        "expected a clear error; got:\n{stderr}"
+    );
+}

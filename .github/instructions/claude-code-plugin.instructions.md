@@ -1,5 +1,5 @@
 ---
-applyTo: "plugins/claude-code/**,tests/fixtures/claude_code/**,tests/lua_classifier_tests.rs,tests/lua_plugin_intents.rs"
+applyTo: "plugins/claude-code/**,tests/lua_classifier_tests.rs,tests/lua_plugin_intents.rs"
 ---
 
 # Claude Code plugin — review constraints
@@ -59,7 +59,7 @@ The plugin manifest declares `default_target` with `rows = 60, cols = 200`. This
 2. **Multi-turn stale-marker is a known limitation.** If a prior turn's `✻ X for N` is still on screen when the next prompt submits, the poll-path can fire `completed_turn` against the new turn. claude-stream is single-turn so it's not exercised — proposed fixes need plugin-state-across-calls and should be flagged as a separate PR.
 3. **Use `screen_text` (full screen) not `body_text` for active-work detection.** Spinner / token-counter often renders in the status bar during subagent runs. The body-only restriction was a misguided optimization; status-bar rows have a known structural shape and don't match any active-work pattern.
 4. **Use `screen` (full screen) not `body` for `has_input_prompt` in completion gates.** Real Claude screens render `separator + ❯ + 2 status rows` at the bottom where `body_text` strips the prompt row.
-5. **TDD for classifier changes.** Add a fixture under `tests/fixtures/claude_code/<name>.txt` + sibling `.expected.json`. The matrix auto-discovers it. Hand-edit fixtures rather than capturing fresh ones if the change is structural (you'll edit a real capture to isolate the variation you're testing).
+5. **TDD for classifier changes.** Add a fixture under `plugins/claude-code/fixtures/<name>.txt` + sibling `.expected.json`. The matrix auto-discovers it. Hand-edit fixtures rather than capturing fresh ones if the change is structural (you'll edit a real capture to isolate the variation you're testing).
 6. **Wait-matcher anchors mirror classifier states.** Every classifier-recognised non-`starting`/`thinking` state needs a corresponding anchor in `wait_turn_matcher` so callers using `adapter.wait` wake at the same time `adapter.state` would report the state. Login, model-picker, error banners, dialogs all need anchors.
 7. **No prose anchors.** If your detector matches a phrase that could appear in Claude's answer text (`"permission denied"`, `"thinking about"`, `"reading file"`), the detector will false-positive on turns whose answer summarises that phrase. Use structural shape — glyph position + line layout + adjacency — instead of single-substring matching.
 

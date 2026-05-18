@@ -1207,16 +1207,46 @@ function M.classify(input)
   -- one-liner without having to thread `status_metadata` through 13 call
   -- sites. Branches that already attach their own metadata (the
   -- `completed_turn` usage screen) get a shallow merge with status on top.
+  --
+  -- Also handles turn-boundary transcript marking: when the classifier
+  -- transitions to `completed_turn` after a `send_prompt` (which
+  -- already marked `turn_start` via Action::MarkTranscript), emit a
+  -- `host_marks = {{label="turn_end"}}` request so the host stamps the
+  -- closing marker. The host applies marks AFTER classify returns;
+  -- `input.cursor` carries the chars_written at classify time so the
+  -- plugin can pre-compute `metadata.transcript.turn_end` in the same
+  -- response. Once both markers exist, surface
+  -- `metadata.transcript = { turn_start, turn_end }` on every
+  -- subsequent classify too — domain-neutral primitive, plugin owns
+  -- the metadata key choice.
   local outer_state_snapshot = state_snapshot
   local status_metadata = parse_status_bar(status)
+  local markers = input.markers or {}
+  local cursor = tonumber(input.cursor) or 0
   local function state_snapshot(state, confidence, evidence, seq, metadata)
-    return outer_state_snapshot(
-      state,
-      confidence,
-      evidence,
-      seq,
-      merge_metadata(status_metadata, metadata)
-    )
+    local merged = merge_metadata(status_metadata, metadata)
+    local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
+    if state == "completed_turn" and last_intent == "prompt_submitted" then
+      local turn_start = markers["turn_start"]
+      local turn_end = markers["turn_end"]
+      -- A turn_end from a previous turn is stale (turn_start has been
+      -- re-stamped by the new send_prompt at a later cursor, but
+      -- turn_end still points at the OLD turn's end). Treat as missing
+      -- so we re-emit a fresh host_mark for the current turn.
+      if not turn_end or (turn_start and turn_end < turn_start) then
+        -- First completed_turn classify after submission — request the
+        -- host stamp turn_end at the current cursor. Pre-compute the
+        -- value the host will assign so this same response can already
+        -- carry metadata.transcript.turn_end.
+        snap.host_marks = { { label = "turn_end" } }
+        turn_end = cursor
+      end
+      if turn_start and turn_end then
+        local transcript_md = { transcript = { turn_start = turn_start, turn_end = turn_end } }
+        snap.metadata = merge_metadata(snap.metadata, transcript_md)
+      end
+    end
+    return snap
   end
 
   if trim(text) == "" then
@@ -1505,9 +1535,14 @@ function M.send_prompt(input)
   if prompt == "" then
     return { actions = {}, last_intent = "" }
   end
+  -- Mark the transcript at the start of the turn so consumers can later
+  -- slice the per-turn output via `Session::transcript_slice`. The
+  -- matching `turn_end` mark fires from the classifier's
+  -- `completed_turn` branch via `host_marks` (see `M.classify`).
   return {
     actions = {
       action.key("enter"),
+      action.mark_transcript("turn_start"),
       action.bracketed_paste(prompt),
       action.key("enter"),
     },

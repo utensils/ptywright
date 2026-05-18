@@ -260,6 +260,18 @@ pub enum Action {
     Signal(Signal),
     /// Kill the child process.
     Kill,
+    /// Record a label-keyed marker at the current transcript cursor. No
+    /// PTY bytes are written. See [`crate::Transcript::mark`] for the
+    /// storage semantics (capped at `MAX_MARKERS = 64` distinct labels;
+    /// repeated calls with the same label overwrite the cursor). This
+    /// variant lets plugins request transcript segmentation as part of
+    /// their action plans — the host applies it via
+    /// [`crate::Session::mark_transcript`] alongside any PTY-mutating
+    /// actions in the same plan. Plugins that want to mark from a
+    /// classifier (where there is no plan) declare a
+    /// [`HostMark`](crate::extension::HostMark) on the returned
+    /// snapshot instead.
+    MarkTranscript { label: String },
 }
 
 #[cfg(test)]
