@@ -50,7 +50,7 @@ pub use rpc::{
     serve_ndjson_with_state,
 };
 pub use screen::{CursorState, ScreenCell, ScreenCellStyle, ScreenSnapshot, Terminal};
-pub use session::{Session, SessionConfig, SessionEvent, SessionExitStatus};
+pub use session::{CancellationToken, Session, SessionConfig, SessionEvent, SessionExitStatus};
 pub use target::{Target, TerminalSize};
 pub use transcript::{Transcript, TranscriptConfig, TranscriptFileConfig};
 

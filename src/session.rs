@@ -63,6 +63,43 @@ pub struct SessionExitStatus {
     pub message: String,
 }
 
+/// Cancellable wait coordinator used by [`Session::wait_for_cancellable`].
+///
+/// A `CancellationToken` is a thin `Arc<AtomicBool>` wrapper. Clone it
+/// freely — every clone observes the same flag. Calling
+/// [`CancellationToken::cancel`] flips the flag; ongoing waits poll it
+/// on each tick and return [`Error::Cancelled`] when set.
+///
+/// Pair with `wait_for_cancellable` when you need to break out of a
+/// long-running wait from another thread or RPC connection (e.g.
+/// claudette stopping a turn from its UI while ptywright is still
+/// waiting for the classifier's turn-boundary anchor to fire).
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Create a fresh, un-cancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flip the token. Already-cancelled tokens stay cancelled — the
+    /// transition is a one-way edge. Subsequent waits return
+    /// [`Error::Cancelled`] immediately.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the token has been cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
 /// Events emitted on the in-process subscription channel returned by
 /// [`Session::events`].
 ///
@@ -368,6 +405,39 @@ impl Session {
 
     /// Wait until a matcher succeeds or the timeout expires.
     pub fn wait_for(&self, matcher: &Matcher, timeout: Duration) -> Result<MatchResult> {
+        self.wait_for_inner(matcher, timeout, None)
+    }
+
+    /// Wait until a matcher succeeds, the timeout expires, or the
+    /// provided [`CancellationToken`] is flipped.
+    ///
+    /// Returns [`Error::Cancelled`] on a cancel (distinct from
+    /// [`Error::Timeout`]). The token is observed on every classifier
+    /// tick *and* on every Condvar wakeup, so a cancel from another
+    /// thread takes effect within one polling loop iteration even if
+    /// no new PTY bytes are arriving — the Condvar timeout is capped
+    /// at `CANCEL_POLL_INTERVAL` (50 ms) so an idle wait still wakes
+    /// promptly to check the flag.
+    pub fn wait_for_cancellable(
+        &self,
+        matcher: &Matcher,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<MatchResult> {
+        self.wait_for_inner(matcher, timeout, Some(cancel))
+    }
+
+    fn wait_for_inner(
+        &self,
+        matcher: &Matcher,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<MatchResult> {
+        /// Upper bound on a single Condvar `wait_timeout` so a
+        /// cancellation flag flip in another thread takes effect
+        /// promptly even when no PTY bytes are arriving.
+        const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
         let started = Instant::now();
         let deadline = started + timeout;
         let mut guard = self.shared.state.lock().expect("session state poisoned");
@@ -375,6 +445,11 @@ impl Session {
         let mut stable_since = started;
 
         loop {
+            if let Some(token) = cancel
+                && token.is_cancelled()
+            {
+                return Err(Error::Cancelled);
+            }
             let sequence = self.sequence();
             if sequence != stable_sequence {
                 stable_sequence = sequence;
@@ -421,12 +496,26 @@ impl Session {
                     wait_for = wait_for.min(min_stable - stable_for);
                 }
             }
+            // Cap the Condvar wait so a cancellation flag flip from
+            // another thread wakes within CANCEL_POLL_INTERVAL even
+            // when no PTY bytes are arriving. The cap only applies
+            // when a cancel token is bound; the non-cancellable path
+            // keeps its original "wait until deadline or PTY tick"
+            // behaviour to avoid spurious wakeups on long idle waits.
+            if cancel.is_some() {
+                wait_for = wait_for.min(CANCEL_POLL_INTERVAL);
+            }
             let (next_guard, timeout_result) = self
                 .shared
                 .changed
                 .wait_timeout(guard, wait_for)
                 .expect("session state poisoned");
             guard = next_guard;
+            if let Some(token) = cancel
+                && token.is_cancelled()
+            {
+                return Err(Error::Cancelled);
+            }
             if timeout_result.timed_out() && Instant::now() >= deadline {
                 return Err(Error::Timeout);
             }
@@ -789,6 +878,82 @@ mod tests {
             transcript.contains("\x1b[201~"),
             "Action::BracketedPaste must emit the CSI 201~ end marker: {transcript:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellable_wait_returns_cancelled_when_token_flipped_from_another_thread() {
+        // Spawn a long-running shell, attach a cancellable wait for a
+        // string that will never appear, flip the cancel token from a
+        // sibling thread, and assert we get Error::Cancelled within a
+        // small window (not the full timeout).
+        let session = Arc::new(
+            Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+                .expect("spawn sleep"),
+        );
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            canceller.cancel();
+        });
+
+        let session_for_wait = Arc::clone(&session);
+        let started = Instant::now();
+        let result = session_for_wait.wait_for_cancellable(
+            &Matcher::ContainsText("never appears".into()),
+            Duration::from_secs(30),
+            &token,
+        );
+        let elapsed = started.elapsed();
+        match result {
+            Err(Error::Cancelled) => {}
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel must wake the wait within the poll interval; elapsed={elapsed:?}"
+        );
+        let _ = session.kill();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellable_wait_still_returns_match_when_not_cancelled() {
+        // Sanity: the cancellable path must behave identically to the
+        // plain wait_for path when the token is never flipped.
+        let session = Session::spawn_target(echo_target()).expect("spawn echo");
+        let token = CancellationToken::new();
+        let result = session
+            .wait_for_cancellable(
+                &Matcher::ContainsText("ready".into()),
+                Duration::from_secs(5),
+                &token,
+            )
+            .expect("wait should match");
+        assert!(result.matched);
+        let _ = session.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellable_wait_pre_flipped_token_returns_immediately() {
+        // Defensive: a token that's already cancelled before the wait
+        // starts must return Error::Cancelled on the first tick, not
+        // wait the full timeout.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+            .expect("spawn sleep");
+        let token = CancellationToken::new();
+        token.cancel();
+        let started = Instant::now();
+        let result = session.wait_for_cancellable(
+            &Matcher::ContainsText("never".into()),
+            Duration::from_secs(30),
+            &token,
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        let _ = session.kill();
     }
 
     #[test]

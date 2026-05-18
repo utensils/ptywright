@@ -2101,6 +2101,7 @@ fn rpc_error_from_error(error: Error) -> RpcErrorPayload {
                 "required_permission": required.as_str(),
             })),
         ),
+        Error::Cancelled => (RpcErrorCode::Timeout, None),
         Error::Pty(_)
         | Error::Io(_)
         | Error::Json(_)

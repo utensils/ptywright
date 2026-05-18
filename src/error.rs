@@ -51,4 +51,10 @@ pub enum Error {
     /// maps cleanly to Windows.
     #[error("unsupported on this platform: {0}")]
     UnsupportedOnPlatform(String),
+    /// Cancellable wait was aborted via a
+    /// [`crate::CancellationToken`](crate::session::CancellationToken).
+    /// Distinct from `Timeout` so callers can distinguish "we ran out
+    /// of time" from "another thread / connection aborted us."
+    #[error("wait cancelled")]
+    Cancelled,
 }
