@@ -1,0 +1,4 @@
+Claude Code
+
+Rate limit reached. Please try again in 42 seconds.
+>

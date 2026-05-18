@@ -92,8 +92,128 @@ local function has_error_indicator(screen)
     if starts_with(text, "please retry") or starts_with(text, "press r to retry") then
       return true
     end
+    -- Auth-failure phrasing. Anchored at line start for the same
+    -- prose-quotation reason as the banner prefixes above.
+    if starts_with(text, "invalid api key")
+      or starts_with(text, "authentication failed")
+      or starts_with(text, "unauthorized")
+      or starts_with(text, "oauth failed")
+    then
+      return true
+    end
   end
   return false
+end
+
+-- Patterns for `parse_error_subtype` — anchored at line start (via
+-- `starts_with` below) so prose that quotes them mid-sentence doesn't
+-- trip classification.
+--
+-- Order matters within a kind: longer / more specific prefixes come
+-- first so a banner like `5-hour limit reached` classifies as
+-- `rate_limit` rather than falling through to `unknown`.
+local ERROR_SUBTYPE_PATTERNS = {
+  { kind = "rate_limit", prefix = "5-hour limit" },
+  { kind = "rate_limit", prefix = "rate limit reached" },
+  { kind = "rate_limit", prefix = "you've used your pro plan" },
+  { kind = "rate_limit", prefix = "you've used your max plan" },
+  { kind = "rate_limit", prefix = "you've reached your usage limit" },
+  { kind = "quota",      prefix = "credit balance is too low" },
+  { kind = "connection", prefix = "connection error" },
+  { kind = "connection", prefix = "connection issue" },
+  { kind = "connection", prefix = "could not connect" },
+  { kind = "connection", prefix = "network error" },
+  { kind = "auth",       prefix = "invalid api key" },
+  { kind = "auth",       prefix = "authentication failed" },
+  { kind = "auth",       prefix = "unauthorized" },
+  { kind = "auth",       prefix = "oauth failed" },
+  { kind = "api",        prefix = "api error" },
+  { kind = "api",        prefix = "request failed" },
+}
+
+-- Classify the visible error banner into a discrete subtype so
+-- consumers (claudette in particular) can pick a retry / surface /
+-- escalation policy without re-grepping the screen. Returns
+-- `{ error = { kind, message?, retry_after_s? } }` or nil when no
+-- banner is present.
+--
+-- `kind`:
+--   * `rate_limit` — Pro/Max plan / hour-window / usage-limit banner.
+--   * `quota`      — credit-balance banner.
+--   * `connection` — network / connection failure banner.
+--   * `auth`       — invalid API key / OAuth / unauthorised banner.
+--   * `api`        — Anthropic API-side failure ("API error", generic
+--                    "request failed" without other anchors).
+--   * `unknown`    — bare `error:` banner with no other anchor.
+--
+-- `message` is the *original-case* trimmed banner line, redacted
+-- through `redact_secret_patterns` so any token-shaped substring is
+-- masked before it ever leaves the plugin.
+--
+-- `retry_after_s` is set when the banner (or an immediately-following
+-- line) carries a numeric "retry in <N> seconds" / "retry after <N>s"
+-- phrase.
+local function parse_error_subtype(body)
+  if body == nil or body == "" then
+    return nil
+  end
+  local lines = {}
+  for line in string.gmatch(body, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  local subtype = nil
+  local message = nil
+  for idx, raw in ipairs(lines) do
+    local text = lower(trim(raw))
+    if text ~= "" then
+      for _, pattern in ipairs(ERROR_SUBTYPE_PATTERNS) do
+        if starts_with(text, pattern.prefix) then
+          subtype = pattern.kind
+          message = trim(raw)
+          break
+        end
+      end
+      if subtype then
+        -- Look for a retry-after hint on the same line or the next one.
+        local retry_search = text
+        if idx + 1 <= #lines then
+          retry_search = retry_search .. " " .. lower(trim(lines[idx + 1]))
+        end
+        local secs = retry_search:match("retry in (%d+)")
+          or retry_search:match("retry after (%d+)")
+          or retry_search:match("try again in (%d+)")
+        if secs then
+          local n = tonumber(secs)
+          if n then
+            return {
+              error = {
+                kind = subtype,
+                message = redact_secret_patterns(message),
+                retry_after_s = n,
+              }
+            }
+          end
+        end
+        return {
+          error = {
+            kind = subtype,
+            message = redact_secret_patterns(message),
+          }
+        }
+      end
+      -- Bare `error:` banner with no specific anchor — classify as
+      -- unknown rather than dropping metadata entirely.
+      if starts_with(text, "error:") then
+        return {
+          error = {
+            kind = "unknown",
+            message = redact_secret_patterns(trim(raw)),
+          }
+        }
+      end
+    end
+  end
+  return nil
 end
 
 -- Returns true if any line in `screen` is an input-prompt row.
@@ -1063,7 +1183,8 @@ function M.classify(input)
   end
 
   if has_error_indicator(body) then
-    return state_snapshot("error", 0.72, "visible error banner detected", sequence)
+    local error_metadata = parse_error_subtype(body)
+    return state_snapshot("error", 0.72, "visible error banner detected", sequence, error_metadata)
   end
 
   if has_usage_screen(body_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
