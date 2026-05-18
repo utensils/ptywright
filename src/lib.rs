@@ -37,8 +37,10 @@ pub use logging::{
     LogGuard, RedactingMakeWriter, RedactingWriter, cleanup_old_logs, init_for_oneshot,
     init_for_run, init_for_serve_socket, init_for_serve_stdio,
 };
-pub use lua_plugin::LuaPlugin;
-pub use matcher::{MatchResult, Matcher, MatcherContext};
+pub use lua_plugin::{LuaPlugin, LuaPluginRegistry};
+pub use matcher::{
+    MatchResult, Matcher, MatcherContext, PluginRegistry, PredicateContext, PredicateOutcome,
+};
 pub use paths::{Paths, expand_tilde};
 pub use plugin::{
     DefaultTarget, PluginHostCapabilities, PluginKind, PluginManifest, PluginManifestError,

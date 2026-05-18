@@ -74,6 +74,14 @@ struct RpcSharedState {
     /// fresh `LuaExtension` per `adapter.start` call without re-reading the
     /// source from disk.
     registered_plugins: HashMap<String, RegisteredPlugin>,
+    /// Live plugin instances bound to every adapter session so
+    /// `Matcher::Lua` predicates can resolve. Kept in lockstep with
+    /// `registered_plugins` — entries land at registration time
+    /// (`plugin.load` or built-in init) and disappear on `plugin.unload`.
+    /// Shared via `Arc` so each adapter session can hold a stable
+    /// handle without going through the shared-state mutex on every
+    /// wait tick.
+    plugin_registry: Arc<crate::lua_plugin::LuaPluginRegistry>,
     /// Whether the `plugin.load` / `plugin.unload` RPC methods are enabled.
     /// `false` by default — operators opt in with `ptywright serve
     /// --allow-plugin-load`. CLI `--plugin` flags work regardless because
@@ -105,21 +113,39 @@ struct RegisteredPlugin {
 impl Default for RpcSharedState {
     fn default() -> Self {
         let mut registered_plugins = HashMap::new();
+        let plugin_registry = Arc::new(crate::lua_plugin::LuaPluginRegistry::new());
         for entry in BUILTIN_PLUGINS {
             let manifest = (entry.manifest)();
-            registered_plugins.insert(
-                manifest.name.clone(),
-                RegisteredPlugin {
-                    manifest,
-                    source: entry.source.to_string(),
-                    modules: entry
-                        .modules
-                        .iter()
-                        .map(|(name, source)| ((*name).to_string(), (*source).to_string()))
-                        .collect(),
-                    builtin: true,
-                },
-            );
+            let registered = RegisteredPlugin {
+                manifest: manifest.clone(),
+                source: entry.source.to_string(),
+                modules: entry
+                    .modules
+                    .iter()
+                    .map(|(name, source)| ((*name).to_string(), (*source).to_string()))
+                    .collect(),
+                builtin: true,
+            };
+            // Seed the live registry with a freshly-loaded LuaPlugin
+            // for predicate evaluation. A registry load failure here
+            // would indicate a malformed embedded plugin, which is a
+            // build-time bug — log + skip so the server still boots
+            // (legacy waits don't depend on Lua predicates).
+            match build_registry_plugin(&registered) {
+                Ok(plugin) => {
+                    plugin_registry.insert(manifest.name.clone(), plugin);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "ptywright::rpc",
+                        plugin = %manifest.name,
+                        ?error,
+                        "failed to seed built-in plugin into LuaPluginRegistry; \
+                         Matcher::Lua predicates against this plugin will not fire"
+                    );
+                }
+            }
+            registered_plugins.insert(manifest.name.clone(), registered);
         }
         Self {
             sessions: HashMap::new(),
@@ -127,11 +153,27 @@ impl Default for RpcSharedState {
             adapter_plugin: HashMap::new(),
             adapter_session: HashMap::new(),
             registered_plugins,
+            plugin_registry,
             allow_plugin_load: false,
             next_session: 1,
             next_extension: 1,
         }
     }
+}
+
+/// Load a [`RegisteredPlugin`]'s manifest + source into a fresh
+/// [`LuaPlugin`] instance suitable for insertion into a
+/// [`crate::lua_plugin::LuaPluginRegistry`]. Same code path as
+/// `adapter.start` uses for the adapter-side instance — keeping
+/// them in lockstep avoids a class of "predicate sees a different
+/// plugin than the adapter" bugs at the source.
+fn build_registry_plugin(entry: &RegisteredPlugin) -> Result<crate::lua_plugin::LuaPlugin> {
+    let module_refs: Vec<(&str, &str)> = entry
+        .modules
+        .iter()
+        .map(|(name, source)| (name.as_str(), source.as_str()))
+        .collect();
+    crate::lua_plugin::LuaPlugin::trusted_with_modules(&entry.manifest, &entry.source, &module_refs)
 }
 
 /// Stateful JSON-RPC handler for one client connection.
@@ -561,15 +603,21 @@ impl RpcServerState {
                 "plugin `{name}` is already registered"
             )));
         }
-        shared.registered_plugins.insert(
-            name,
-            RegisteredPlugin {
-                manifest,
-                source,
-                modules: Vec::new(),
-                builtin: false,
-            },
-        );
+        let registered = RegisteredPlugin {
+            manifest,
+            source,
+            modules: Vec::new(),
+            builtin: false,
+        };
+        // Mirror the registration into the live plugin registry so
+        // subsequent `Matcher::Lua` predicate evaluations resolve.
+        // Failure to build the registry instance is a hard error —
+        // unlike the seed path (which only logs because the server
+        // must boot), `register_plugin` is called interactively and
+        // the caller can surface the failure to the operator.
+        let registry_plugin = build_registry_plugin(&registered)?;
+        shared.plugin_registry.insert(name.clone(), registry_plugin);
+        shared.registered_plugins.insert(name, registered);
         Ok(())
     }
 
@@ -1313,6 +1361,12 @@ impl RpcServer {
                 .into());
         }
         shared.registered_plugins.remove(&params.plugin);
+        // Mirror the unload into the live registry. The Arc<Mutex<LuaPlugin>>
+        // returned here is dropped immediately — any in-flight wait
+        // holding a clone keeps the instance alive until it completes,
+        // so unloading mid-wait is safe even though subsequent waits
+        // will fail with "plugin not registered".
+        shared.plugin_registry.remove(&params.plugin);
         Ok(json!({ "unloaded": true }))
     }
 
@@ -1555,7 +1609,18 @@ impl RpcServer {
             params.env,
             manifest_default.as_ref().map(|t| &t.required_env),
         );
-        let session = Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
+        let mut session =
+            Session::spawn(SessionConfig::new(target)).map_err(rpc_error_from_error)?;
+        // Bind the shared plugin registry so `Matcher::Lua` predicates
+        // resolve through `Session::wait_for[_cancellable]`. The
+        // registry's plugin instances are SEPARATE from this adapter's
+        // `LuaExtension` instance — predicates cannot read classifier
+        // module-level state (see `LuaPluginRegistry` docs).
+        let registry = {
+            let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            Arc::clone(&shared.plugin_registry)
+        };
+        session.set_plugin_registry(registry);
         let handle = ExtensionHandle::start(
             Box::new(extension),
             session,

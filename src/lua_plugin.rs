@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use mlua::LuaSerdeExt;
@@ -10,6 +10,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::matcher::{PluginRegistry, PredicateContext, PredicateOutcome};
 use crate::plugin::{PluginManifest, PluginManifestError, PluginPermission, PluginRuntime};
 
 const LUA_INSTRUCTION_HOOK_INTERVAL: u32 = 10_000;
@@ -284,6 +285,164 @@ impl LuaPlugin {
 
     fn error(&self, error: mlua::Error) -> Error {
         lua_error(&self.name, error)
+    }
+}
+
+/// Concrete [`PluginRegistry`] backed by a name → `Arc<Mutex<LuaPlugin>>`
+/// map. Threaded into a [`crate::Session`] (via
+/// [`crate::Session::set_plugin_registry`]) so the wait loop can
+/// evaluate [`crate::Matcher::Lua`] branches against plugin-defined
+/// predicates.
+///
+/// **State separation.** The Lua instances held by this registry are
+/// distinct from any [`crate::LuaExtension`]'s own
+/// [`LuaPlugin`] — predicates therefore cannot read or mutate
+/// module-level state set by a classifier or intent on the
+/// adapter-side instance (e.g. claude-code's `_current_dialog_id`).
+/// v1 limitation: predicates are stateless w.r.t. classifier state.
+/// Predicates that need shared state must carry it through the
+/// `params` table on `Matcher::Lua`.
+#[derive(Default)]
+pub struct LuaPluginRegistry {
+    plugins: RwLock<HashMap<String, Arc<Mutex<LuaPlugin>>>>,
+}
+
+impl fmt::Debug for LuaPluginRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let plugins = self.plugins.read().expect("registry lock poisoned");
+        let names: Vec<&String> = plugins.keys().collect();
+        formatter
+            .debug_struct("LuaPluginRegistry")
+            .field("plugins", &names)
+            .finish()
+    }
+}
+
+impl LuaPluginRegistry {
+    /// Create an empty registry. Add plugins via [`Self::insert`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convenience constructor wrapping a single plugin. Most plugin
+    /// authors writing tests for a `Matcher::Lua`-emitting plugin only
+    /// need the one registry entry.
+    #[must_use]
+    pub fn with_single(name: impl Into<String>, plugin: LuaPlugin) -> Self {
+        let registry = Self::new();
+        registry.insert(name, plugin);
+        registry
+    }
+
+    /// Register a [`LuaPlugin`] under `name`. Replaces any prior entry
+    /// with the same name; returns the displaced entry for callers
+    /// that want to keep a reference (e.g. graceful unload).
+    pub fn insert(
+        &self,
+        name: impl Into<String>,
+        plugin: LuaPlugin,
+    ) -> Option<Arc<Mutex<LuaPlugin>>> {
+        self.plugins
+            .write()
+            .expect("registry lock poisoned")
+            .insert(name.into(), Arc::new(Mutex::new(plugin)))
+    }
+
+    /// Remove the plugin registered under `name`. Returns the
+    /// displaced entry if one was present.
+    pub fn remove(&self, name: &str) -> Option<Arc<Mutex<LuaPlugin>>> {
+        self.plugins
+            .write()
+            .expect("registry lock poisoned")
+            .remove(name)
+    }
+
+    /// Whether the registry contains an entry for `name`.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.plugins
+            .read()
+            .expect("registry lock poisoned")
+            .contains_key(name)
+    }
+
+    /// Names of every registered plugin, in BTree order so the wire
+    /// shape is deterministic.
+    #[must_use]
+    pub fn plugin_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .plugins
+            .read()
+            .expect("registry lock poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+impl PluginRegistry for LuaPluginRegistry {
+    fn evaluate_predicate(
+        &self,
+        plugin: &str,
+        predicate: &str,
+        params: &Value,
+        context: &PredicateContext<'_>,
+    ) -> Result<PredicateOutcome> {
+        let plugin_arc = self
+            .plugins
+            .read()
+            .expect("registry lock poisoned")
+            .get(plugin)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Lua(format!(
+                    "plugin `{plugin}` not registered in plugin registry"
+                ))
+            })?;
+
+        // Build the Lua input table: serialize the predicate context to
+        // JSON, then merge `params` in under a reserved `params` key.
+        // The Lua side sees `input.screen`, `input.markers`,
+        // `input.params.foo` etc. Keeping params under its own key
+        // avoids collisions with predicate-context field names if the
+        // caller's params table contained one of them.
+        let mut input = serde_json::to_value(context).map_err(|error| {
+            Error::Lua(format!(
+                "predicate context serialization for `{plugin}.{predicate}`: {error}"
+            ))
+        })?;
+        if let Value::Object(ref mut obj) = input {
+            obj.insert("params".to_string(), params.clone());
+        }
+
+        let plugin_guard = plugin_arc.lock().expect("plugin lock poisoned");
+        let raw: Value = plugin_guard.call_value(predicate, &input)?;
+        parse_predicate_result(plugin, predicate, raw)
+    }
+}
+
+/// Accept either a boolean shorthand or a structured table from a
+/// plugin predicate. Booleans become a [`PredicateOutcome`] with no
+/// evidence/capture; tables deserialize directly. Anything else is
+/// flagged as a plugin-side bug so authors notice quickly.
+fn parse_predicate_result(plugin: &str, predicate: &str, raw: Value) -> Result<PredicateOutcome> {
+    match raw {
+        Value::Bool(matched) => Ok(PredicateOutcome {
+            matched,
+            ..PredicateOutcome::default()
+        }),
+        Value::Null => Ok(PredicateOutcome::default()),
+        value @ Value::Object(_) => serde_json::from_value(value).map_err(|error| {
+            Error::Lua(format!(
+                "predicate `{plugin}.{predicate}` returned an unparseable table: {error}"
+            ))
+        }),
+        other => Err(Error::Lua(format!(
+            "predicate `{plugin}.{predicate}` must return bool, nil, or {{matched, evidence?, capture?}} — got {other}"
+        ))),
     }
 }
 
@@ -742,6 +901,115 @@ mod tests {
 
         assert!(matches!(error, Error::Lua(_)));
         assert!(error.to_string().contains("instruction limit exceeded"));
+    }
+
+    #[test]
+    fn lua_plugin_registry_evaluates_real_predicate_through_lua() {
+        // End-to-end through `LuaPluginRegistry`: load a tiny plugin
+        // with a predicate that returns a structured table, evaluate
+        // it via the registry, assert the outcome rides back through
+        // serde correctly. Verifies the wire shape between Rust's
+        // `PredicateOutcome` and Lua's table-or-bool convention.
+        let plugin = LuaPlugin::builtin(
+            "demo",
+            r#"
+            return {
+              wants_ready = function(input)
+                if string.find(input.screen, input.params.anchor) then
+                  return { matched = true, evidence = "anchor found", capture = input.params.anchor }
+                end
+                return false
+              end
+            }
+            "#,
+        )
+        .expect("load demo plugin");
+        let registry = LuaPluginRegistry::with_single("demo", plugin);
+
+        let markers = std::collections::BTreeMap::new();
+        let ctx = PredicateContext {
+            screen: "session ready",
+            transcript: "",
+            sequence: 0,
+            stable_ms: 0,
+            process_exited: false,
+            markers: &markers,
+            cursor: 0,
+        };
+        let outcome = registry
+            .evaluate_predicate("demo", "wants_ready", &json!({ "anchor": "ready" }), &ctx)
+            .expect("evaluate predicate");
+        assert!(outcome.matched);
+        assert_eq!(outcome.evidence.as_deref(), Some("anchor found"));
+        assert_eq!(outcome.capture.as_deref(), Some("ready"));
+
+        // Boolean-shorthand return is accepted too.
+        let ctx_no_anchor = PredicateContext {
+            screen: "nothing here",
+            transcript: "",
+            sequence: 0,
+            stable_ms: 0,
+            process_exited: false,
+            markers: &markers,
+            cursor: 0,
+        };
+        let outcome = registry
+            .evaluate_predicate(
+                "demo",
+                "wants_ready",
+                &json!({ "anchor": "ready" }),
+                &ctx_no_anchor,
+            )
+            .expect("evaluate predicate (no match)");
+        assert!(!outcome.matched);
+        assert!(outcome.evidence.is_none());
+    }
+
+    #[test]
+    fn lua_plugin_registry_errors_on_unknown_plugin() {
+        let registry = LuaPluginRegistry::new();
+        let markers = std::collections::BTreeMap::new();
+        let ctx = PredicateContext {
+            screen: "",
+            transcript: "",
+            sequence: 0,
+            stable_ms: 0,
+            process_exited: false,
+            markers: &markers,
+            cursor: 0,
+        };
+        let err = registry
+            .evaluate_predicate("missing", "any", &json!({}), &ctx)
+            .expect_err("unknown plugin must error");
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn lua_plugin_registry_rejects_garbage_predicate_return_shape() {
+        let plugin = LuaPlugin::builtin(
+            "demo",
+            r#"
+            return {
+              wrong_shape = function(_input) return "i am a string, not a predicate" end
+            }
+            "#,
+        )
+        .expect("load plugin");
+        let registry = LuaPluginRegistry::with_single("demo", plugin);
+        let markers = std::collections::BTreeMap::new();
+        let ctx = PredicateContext {
+            screen: "",
+            transcript: "",
+            sequence: 0,
+            stable_ms: 0,
+            process_exited: false,
+            markers: &markers,
+            cursor: 0,
+        };
+        let err = registry
+            .evaluate_predicate("demo", "wrong_shape", &json!({}), &ctx)
+            .expect_err("string return must be rejected");
+        assert!(err.to_string().contains("must return bool, nil, or"));
     }
 
     #[test]
