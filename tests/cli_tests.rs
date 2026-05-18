@@ -1231,3 +1231,114 @@ fn plugin_load_allowed_with_flag_drives_full_lifecycle() {
         response = responses[1]
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn logs_tail_streams_recent_lines_from_newest_file() {
+    // Run something that writes to the log file (any subcommand
+    // honours PTYWRIGHT_HOME and writes via the logging stack), then
+    // run `logs --lines 100` to verify the tail subcommand finds the
+    // file, prints the header, and includes the recent lines.
+    use std::io::Write;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!("ptywright-logs-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("create home");
+
+    // Run any subcommand that writes a log file. `run` with a tiny
+    // shell command does the job and exits fast.
+    let preflight = bin()
+        .env("PTYWRIGHT_HOME", &home)
+        .env("PTYWRIGHT_LOG", "info")
+        .args(["run", "--", "/bin/sh", "-lc", "printf logs-tail-test"])
+        .output()
+        .expect("preflight run");
+    assert!(
+        preflight.status.success(),
+        "preflight failed: {preflight:?}"
+    );
+
+    let logs_dir = home.join("logs");
+    assert!(logs_dir.exists(), "logs dir must exist after preflight");
+
+    // Append a known marker line directly to the newest log file so
+    // we can assert the tail captured it. Avoids racing against
+    // tracing's async writer for the preflight's own entries.
+    let mut entries: Vec<_> = std::fs::read_dir(&logs_dir)
+        .expect("read logs")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ptywright."))
+        })
+        .collect();
+    entries.sort();
+    let newest = entries.pop().expect("at least one log file");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&newest)
+        .expect("open newest log");
+    writeln!(file, "TEST-MARKER-line-XYZ").expect("write marker");
+    drop(file);
+
+    // Spawn `ptywright logs` in the background; let it print the tail
+    // and capture stdout for ~1 second, then kill it.
+    let mut child = bin()
+        .env("PTYWRIGHT_HOME", &home)
+        .args(["logs", "--lines", "200"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ptywright logs");
+
+    std::thread::sleep(Duration::from_millis(800));
+    child.kill().expect("kill ptywright logs");
+    let output = child
+        .wait_with_output()
+        .expect("collect ptywright logs output");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(
+        stdout.contains("==> tailing"),
+        "expected tail header; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("TEST-MARKER-line-XYZ"),
+        "expected the marker we wrote to be in the tail; got:\n{stdout}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn logs_command_errors_when_no_logs_exist() {
+    // No prior `ptywright` invocation under this fresh home → no
+    // log files. The subcommand should fail with a clear message
+    // rather than panicking or hanging on an empty tail.
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let home =
+        std::env::temp_dir().join(format!("ptywright-nologs-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(home.join("logs")).expect("create logs dir");
+
+    let output = bin()
+        .env("PTYWRIGHT_HOME", &home)
+        .args(["logs"])
+        .output()
+        .expect("run ptywright logs");
+    assert!(
+        !output.status.success(),
+        "logs against an empty home should fail; got: {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(
+        stderr.contains("no ptywright log files"),
+        "expected a clear error; got:\n{stderr}"
+    );
+}

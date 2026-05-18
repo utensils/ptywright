@@ -90,6 +90,23 @@ enum Commands {
         )]
         command: Vec<String>,
     },
+    /// Tail the most recent ptywright log file under `~/.ptywright/logs/`.
+    ///
+    /// Reads `ptywright.YYYY-MM-DD.log` (the newest file matching the
+    /// rotation pattern) and prints the last `--lines` lines, then
+    /// follows the file for new content until Ctrl-C. Use `--filter`
+    /// to restrict output to lines containing a substring. Honours
+    /// `PTYWRIGHT_HOME` for the runtime directory root.
+    Logs {
+        /// Filter to log lines containing this substring.
+        #[arg(long, value_name = "SUBSTRING")]
+        filter: Option<String>,
+        /// Print the last N lines before following the file. Defaults
+        /// to 20 to mirror `tail -n 20 -f` behaviour.
+        #[arg(long, default_value_t = 20)]
+        lines: u64,
+    },
+
     /// Generate shell completions.
     #[command(after_long_help = "\
 Setup instructions:
@@ -185,6 +202,7 @@ fn run() -> ptywright::Result<ExitCode> {
             framing,
             command,
         }) => repl_command(socket, stdio, framing, command),
+        Some(Commands::Logs { filter, lines }) => logs_command(&paths, filter, lines),
         Some(Commands::Completions { shell }) => generate_completions(&shell),
         None => {
             let mut command = Cli::command();
@@ -215,8 +233,105 @@ fn init_logging_for(
         }
         #[cfg(feature = "repl")]
         Some(Commands::Repl { .. }) => init_for_oneshot(logging),
-        Some(Commands::Completions { .. }) | None => init_for_oneshot(logging),
+        Some(Commands::Completions { .. }) | Some(Commands::Logs { .. }) | None => {
+            init_for_oneshot(logging)
+        }
     }
+}
+
+fn logs_command(paths: &Paths, filter: Option<String>, lines: u64) -> ptywright::Result<ExitCode> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let logs_dir = paths.logs_dir();
+    let path = newest_log_file(&logs_dir)?;
+    let mut file = File::open(&path).map_err(|error| {
+        ptywright::Error::Config(format!("open log file `{}`: {error}", path.display()))
+    })?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "==> tailing {} <==", path.display()).ok();
+
+    // Stream the last `lines` lines first so the operator sees recent
+    // context, then continue streaming any new content. Simpler than
+    // a true reverse-scan: read everything, keep the tail, then seek
+    // to the current end for follow mode. Daily-rotated logs stay
+    // small enough that the full read is cheap.
+    let mut buffer = String::new();
+    file.read_to_string(&mut buffer).map_err(|error| {
+        ptywright::Error::Config(format!("read log file `{}`: {error}", path.display()))
+    })?;
+    let len = buffer.lines().count();
+    let skip = len.saturating_sub(lines as usize);
+    for line in buffer.lines().skip(skip) {
+        if filter.as_deref().is_none_or(|needle| line.contains(needle)) {
+            writeln!(out, "{line}").ok();
+        }
+    }
+    out.flush().ok();
+
+    // Follow mode. Re-open via BufReader for efficient line-at-a-time
+    // reads and seek to the position we already consumed.
+    let position = file.stream_position().map_err(|error| {
+        ptywright::Error::Config(format!("tell on log file `{}`: {error}", path.display()))
+    })?;
+    let file = File::open(&path).map_err(|error| {
+        ptywright::Error::Config(format!("reopen log file `{}`: {error}", path.display()))
+    })?;
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(position)).ok();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => sleep(Duration::from_millis(200)),
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']);
+                if filter
+                    .as_deref()
+                    .is_none_or(|needle| trimmed.contains(needle))
+                {
+                    writeln!(out, "{trimmed}").ok();
+                    out.flush().ok();
+                }
+            }
+            Err(error) => {
+                eprintln!("ptywright logs --tail: read error: {error}");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    }
+}
+
+/// Find the newest `ptywright.YYYY-MM-DD.log` file under `logs_dir`.
+/// Returns an error if the directory is missing or empty.
+fn newest_log_file(logs_dir: &Path) -> ptywright::Result<PathBuf> {
+    let entries = std::fs::read_dir(logs_dir).map_err(|error| {
+        ptywright::Error::Config(format!("read logs dir `{}`: {error}", logs_dir.display()))
+    })?;
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    // tracing-appender's daily rotation writes
+                    // `ptywright.YYYY-MM-DD` (no `.log` suffix in
+                    // some setups, with `.log` in others). Match both
+                    // by checking the `ptywright.` prefix only.
+                    name.starts_with("ptywright.")
+                })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(ptywright::Error::Config(format!(
+            "no ptywright log files under `{}` — run ptywright at least once first",
+            logs_dir.display()
+        )));
+    }
+    candidates.sort();
+    Ok(candidates.pop().expect("non-empty after check"))
 }
 
 fn generate_completions(shell: &str) -> ptywright::Result<ExitCode> {
