@@ -277,10 +277,13 @@ impl Session {
     ///
     /// Returns a `std::sync::mpsc::Receiver<SessionEvent>` that yields
     /// `Changed` on every PTY read and `Exited` once when the child
-    /// process ends. The channel is single-producer / single-consumer
-    /// per call — call `events()` multiple times to fan out to multiple
-    /// independent subscribers. Dropping the receiver silently removes
-    /// the subscription on the next event tick.
+    /// process ends. Each call returns an independent receiver; the
+    /// host fans the same event out to every active subscriber's
+    /// channel (multiple producer sites inside the library — reader
+    /// thread, `wait`, `terminate`, `kill` — drive a single
+    /// subscriber-owned receiver). Call `events()` multiple times to
+    /// fan out to independent consumers. Dropping the receiver
+    /// silently removes the subscription on the next event tick.
     ///
     /// Events carry only the cheap "something happened" signal; pair
     /// with [`Session::sequence`] / [`Session::snapshot`] /
@@ -594,10 +597,15 @@ impl Session {
                     return Ok(exit);
                 }
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 break;
             }
-            thread::sleep(Duration::from_millis(20).min(grace));
+            // Cap the sleep at the remaining time-to-deadline so the
+            // ladder doesn't overshoot `grace` by up to 20 ms on the
+            // last iteration. `Duration::ZERO` short-circuits cleanly
+            // through `min` for callers passing `grace == 0`.
+            thread::sleep(Duration::from_millis(20).min(deadline.saturating_duration_since(now)));
         }
 
         // Still alive past the grace window — fall back to the hard kill
@@ -622,9 +630,7 @@ impl Session {
             Signal::User1 => libc::SIGUSR1,
             Signal::User2 => libc::SIGUSR2,
         };
-        let Some(pid) = self.pid() else {
-            return Err(Error::Closed);
-        };
+        let pid = self.require_pid()?;
         // SAFETY: `kill` is a thin libc wrapper; we pass an i32 pid and a
         // valid signal constant. The call is async-signal-safe and has
         // no preconditions on Rust state.
@@ -643,15 +649,18 @@ impl Session {
         // enough to give the child a chance to clean up while still
         // ending the process tree. `Int` is handled by the caller via
         // the PTY Ctrl-C byte, and `Kill` is the hard-kill path on the
-        // existing `ChildKiller` trait.
+        // existing `ChildKiller` trait. `UnsupportedOnPlatform` is the
+        // static "no equivalent" signal — runtime failures (taskkill
+        // exits non-zero because the process is already gone or the
+        // binary is missing) surface as `Error::Io` so callers can
+        // tell "this signal kind is not supported on Windows" from
+        // "we tried, the OS rejected it."
         if !matches!(signal, Signal::Term) {
             return Err(Error::UnsupportedOnPlatform(format!(
                 "signal `{signal:?}` has no Windows equivalent"
             )));
         }
-        let Some(pid) = self.pid() else {
-            return Err(Error::Closed);
-        };
+        let pid = self.require_pid()?;
         let status = std::process::Command::new("taskkill")
             .args(["/T", "/PID", &pid.to_string()])
             .status()
@@ -659,10 +668,27 @@ impl Session {
         if status.success() {
             Ok(())
         } else {
-            Err(Error::UnsupportedOnPlatform(format!(
+            Err(Error::Io(std::io::Error::other(format!(
                 "taskkill exited with status {status:?}"
-            )))
+            ))))
         }
+    }
+
+    /// Resolve the child PID or return an `Error::Io` with
+    /// `NotFound`. The `pid()` accessor's `None` covers two cases —
+    /// "backend never exposed a pid" (permanent) and "child already
+    /// reaped" (transient) — but both manifest the same way to a
+    /// caller asking to signal: the PID is unavailable. Mapping to
+    /// `Error::Closed` would conflate this with the user-driven
+    /// close path; `Error::Io(NotFound)` matches the standard Rust
+    /// convention for "asked for a thing, not there."
+    fn require_pid(&self) -> Result<u32> {
+        self.pid().ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no child pid available for this session",
+            ))
+        })
     }
 
     fn write_all(&self, bytes: &[u8]) -> Result<()> {
@@ -718,6 +744,15 @@ fn read_loop(reader: &mut Box<dyn Read + Send>, shared: &SharedState) {
 /// would never reach the slow path because we use
 /// `mpsc::Sender::send` (unbounded) which only fails on a dropped
 /// receiver.
+///
+/// Performance note: the event is cloned once per active subscriber
+/// while the mutex is held — `mpsc::Sender::send` consumes the value
+/// by design, so a single shared reference cannot fan out. The hot
+/// path is the reader thread, so subscriber count should stay small
+/// (typically O(1) — one REPL, one Tauri bridge). If a future
+/// consumer needs broad fan-out, switch to `crossbeam_channel` or a
+/// reference-counted event type rather than scaling the clone-per-tx
+/// pattern.
 fn broadcast_event(shared: &SharedState, event: SessionEvent) {
     let mut subs = shared.subscribers.lock().expect("subscriber list poisoned");
     subs.retain(|tx| tx.send(event.clone()).is_ok());
@@ -959,12 +994,17 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn events_receiver_observes_changed_and_exited() {
-        // In-process subscription: subscribe before spawning is done,
-        // drive a short-lived child to completion, and assert at least
-        // one Changed plus a final Exited landed on the channel.
-        // Tests both the reader-thread broadcast site and the
-        // wait()/Exited fan-out.
-        let session = Session::spawn_target(echo_target()).expect("spawn echo");
+        // In-process subscription. The reader thread can fire `Changed`
+        // before `events()` is called if the echo child finishes
+        // before the test reaches subscribe — that race makes a strict
+        // "must see Changed" assertion flaky. We subscribe immediately
+        // after spawn (cheap, the worst case is we miss the first
+        // tick) and then drive a longer child so at least one PTY read
+        // happens after subscription.
+        let session = Session::spawn_target(
+            Target::new("/bin/sh").args(["-lc", "printf one; sleep 0.05; printf two"]),
+        )
+        .expect("spawn shell");
         let rx = session.events();
         let status = session.wait().expect("wait child");
         assert!(status.success);

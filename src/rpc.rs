@@ -55,6 +55,16 @@ struct RpcSharedState {
     /// documented guarantee. Reading the plugin name out of this map is
     /// O(1) and never contends with handler work.
     adapter_plugin: HashMap<String, String>,
+    /// Read-only sibling map: adapter id → session id. Same lifecycle
+    /// guarantees as `adapter_plugin` (updated in lock-step with
+    /// `extensions`). Used by `resolve_notification_filter` to translate
+    /// caller-supplied `adapters: ["e1"]` filters into the underlying
+    /// session ids without taking the per-adapter mutex — that mutex is
+    /// held by `adapter.wait` / `adapter.turn` for the entire wait, and
+    /// silently dropping the binding here would cause "subscribed to
+    /// adapter e1" to deliver zero events for the full duration of any
+    /// in-flight wait on e1, the opposite of what callers asked for.
+    adapter_session: HashMap<String, String>,
     /// Plugin manifests + Lua sources known to this server. Built-in
     /// plugins are seeded on construction; trusted-local third-party plugins
     /// arrive through CLI `--plugin <manifest.toml>` flags or the
@@ -115,6 +125,7 @@ impl Default for RpcSharedState {
             sessions: HashMap::new(),
             extensions: HashMap::new(),
             adapter_plugin: HashMap::new(),
+            adapter_session: HashMap::new(),
             registered_plugins,
             allow_plugin_load: false,
             next_session: 1,
@@ -467,6 +478,12 @@ enum RpcErrorCode {
     Timeout,
     SessionClosed,
     PermissionDenied,
+    /// Wait was aborted by a [`CancellationToken`] from another thread or
+    /// connection. Distinct from `Timeout` so clients can tell "we ran
+    /// out of time" from "another thread aborted us" — same distinction
+    /// the underlying [`crate::Error::Cancelled`] makes inside the
+    /// library.
+    Cancelled,
 }
 
 impl RpcErrorCode {
@@ -480,6 +497,7 @@ impl RpcErrorCode {
             Self::Timeout => -32001,
             Self::SessionClosed => -32002,
             Self::PermissionDenied => -32004,
+            Self::Cancelled => -32005,
         }
     }
 }
@@ -898,6 +916,17 @@ impl RpcServer {
     /// anything are silently ignored, so a caller can pre-subscribe to
     /// `adapters: ["e1"]` before the corresponding `adapter.start` call
     /// completes and the session-id mapping arrives later.
+    ///
+    /// Reads through the `adapter_session` sibling map rather than
+    /// locking each `ExtensionEntry`. The per-adapter mutex is held
+    /// for the entire duration of `adapter.wait` / `adapter.turn`
+    /// (up to two minutes by default); a `try_lock` against a busy
+    /// adapter would silently drop its session id from the filter and
+    /// the caller would receive zero events for that adapter for the
+    /// whole wait — exactly the opposite of what
+    /// `set_notifications { adapters: [...] }` asked for. The mirror
+    /// is maintained in lock-step with `extensions` so this lookup is
+    /// O(1) and free of per-adapter contention.
     fn resolve_notification_filter(&self) -> Option<HashSet<String>> {
         if self.notification_filter.is_empty() {
             return None;
@@ -907,10 +936,8 @@ impl RpcServer {
         if !self.notification_filter.adapters.is_empty() {
             let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
             for adapter_id in &self.notification_filter.adapters {
-                if let Some(arc) = shared.extensions.get(adapter_id)
-                    && let Ok(entry) = arc.try_lock()
-                {
-                    session_ids.insert(entry.session.clone());
+                if let Some(session_id) = shared.adapter_session.get(adapter_id) {
+                    session_ids.insert(session_id.clone());
                 }
             }
         }
@@ -1167,7 +1194,10 @@ impl RpcServer {
             &modules,
         )
         .map_err(rpc_error_from_error)?;
-        let catalog = if plugin.exports_function("describe") {
+        let catalog = if plugin
+            .exports_function("describe")
+            .map_err(rpc_error_from_error)?
+        {
             // Plugin provided its own catalog. Trust it verbatim — the
             // shape is `{ intents, wait_matchers, states }` (each an
             // array of objects with at minimum a `name` field). Plugins
@@ -1547,6 +1577,9 @@ impl RpcServer {
             shared
                 .adapter_plugin
                 .insert(id.clone(), params.plugin.clone());
+            shared
+                .adapter_session
+                .insert(id.clone(), session_id.clone());
         }
         Ok(json!({
             "adapter": id,
@@ -1670,6 +1703,19 @@ impl RpcServer {
     /// `wait.intent` defaults to `wait_turn_matcher` and the whole `wait`
     /// block may be omitted entirely, which lets simple call sites express
     /// a "submit and wait for the turn to complete" round-trip as one RPC.
+    ///
+    /// **Head-of-line blocking warning.** The per-adapter mutex is held
+    /// for the entire `wait` leg, whose default timeout is 120 s (and
+    /// caller-supplied `timeout_ms` can be longer). For the duration of
+    /// that wait, every other RPC method that touches the same adapter
+    /// (`adapter.state`, `adapter.send`, `adapter.snapshot`,
+    /// `adapter.close`, plus `plugin.unload`'s live-adapter check) on
+    /// any connection will block on this mutex. That's the intended
+    /// atomicity contract for `turn` — it's the property that rules
+    /// out a competing intent slipping in — but callers driving a busy
+    /// adapter from multiple connections should be aware of it. Use
+    /// `adapter.send` + `adapter.wait` separately when you need
+    /// finer-grained scheduling.
     fn adapter_turn(
         &mut self,
         params: Option<Value>,
@@ -1803,10 +1849,11 @@ impl RpcServer {
         self.check_adapter_permission("adapter.close", &params.adapter)?;
         let removed = {
             let mut shared = self.shared.inner.lock().expect("rpc shared state poisoned");
-            // Remove from both the live-handle registry and the sibling
-            // adapter_plugin map atomically under the same lock so
-            // plugin.unload never sees a half-removed adapter.
+            // Remove from the live-handle registry plus both sibling
+            // maps atomically under the same lock so plugin.unload and
+            // the notification filter never see a half-removed adapter.
             shared.adapter_plugin.remove(&params.adapter);
+            shared.adapter_session.remove(&params.adapter);
             shared.extensions.remove(&params.adapter)
         };
         if let Some(entry_arc) = removed {
@@ -2101,7 +2148,7 @@ fn rpc_error_from_error(error: Error) -> RpcErrorPayload {
                 "required_permission": required.as_str(),
             })),
         ),
-        Error::Cancelled => (RpcErrorCode::Timeout, None),
+        Error::Cancelled => (RpcErrorCode::Cancelled, None),
         Error::Pty(_)
         | Error::Io(_)
         | Error::Json(_)
@@ -3682,13 +3729,16 @@ mod tests {
                 adapter_id.clone(),
                 Arc::new(Mutex::new(ExtensionEntry {
                     plugin: "stub-no-input".to_string(),
-                    session: session_id,
+                    session: session_id.clone(),
                     handle: ext_handle,
                 })),
             );
             shared
                 .adapter_plugin
                 .insert(adapter_id.clone(), "stub-no-input".to_string());
+            shared
+                .adapter_session
+                .insert(adapter_id.clone(), session_id);
         }
 
         let mut server = RpcServer::with_state(state);

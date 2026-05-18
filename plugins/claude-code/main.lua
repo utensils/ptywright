@@ -945,27 +945,44 @@ local LOGIN_TITLE_PREFIXES = {
 }
 
 -- Extract the OAuth login URL from a login dialog. Returns the first
--- URL on its own line that starts with `https://claude.ai/` or
--- `https://anthropic.com/` (the two domains the TUI ships today),
--- trimmed of surrounding whitespace. Returns nil if no URL is present
--- — the login dialog without a URL is still valid (API-key path).
+-- URL on its own line whose host is `claude.ai` or `anthropic.com`,
+-- trimmed of surrounding whitespace. Accepts both bare-domain
+-- (`https://claude.ai`) and path-bearing (`https://claude.ai/login?...`)
+-- shapes — the login detector in `has_login_indicator` uses a regex
+-- with `[%w./%-_?=&%%]*` (zero-or-more path), so this extractor must
+-- match that same accepted set or a screen that classifies as a login
+-- dialog could still produce no metadata.login.url.
+--
+-- Returns nil if no URL is present — the login dialog without a URL is
+-- still valid (API-key path).
+local LOGIN_URL_HOSTS = { "https://claude.ai", "https://anthropic.com" }
+
 local function parse_login_url(text)
   if text == nil or text == "" then
     return nil
   end
   for line in string.gmatch(text, "[^\n]+") do
     local t = trim(line)
-    -- Anchored URL scrape: must look like a real https URL with no
-    -- prose context to its left. `^%s*` is already absorbed by trim;
-    -- check the start of the trimmed line directly.
-    if starts_with(t, "https://claude.ai/") or starts_with(t, "https://anthropic.com/") then
-      -- Stop at the first whitespace — Claude renders URLs alone on
-      -- a line but be defensive about trailing chrome.
-      local space = t:find("%s")
-      if space then
-        return t:sub(1, space - 1)
+    for _, host in ipairs(LOGIN_URL_HOSTS) do
+      -- A real URL is either exactly `<host>` or `<host>/` or
+      -- `<host>?`/`<host>#`. Requiring the next char to be one of
+      -- `/`, `?`, `#`, end-of-string, or whitespace prevents matches
+      -- against a hypothetical `https://claude.ai.evil.com` line —
+      -- the bare prefix check Copilot flagged conflated those.
+      if starts_with(t, host) then
+        local next_byte = t:sub(#host + 1, #host + 1)
+        if next_byte == ""
+          or next_byte == "/"
+          or next_byte == "?"
+          or next_byte == "#"
+          or string.match(next_byte, "%s") then
+          local space = t:find("%s")
+          if space then
+            return t:sub(1, space - 1)
+          end
+          return t
+        end
       end
-      return t
     end
   end
   return nil
@@ -1655,6 +1672,21 @@ end
 -- Enter on a different dialog. Missing / nil `dialog_id` is the
 -- best-effort path — preserves backwards compatibility for callers
 -- that don't yet thread the id through.
+--
+-- IMPORTANT for callers driving the plugin directly (e.g. through
+-- `ExtensionHandle::send` from Rust without first calling `state` /
+-- `wait`): `_current_dialog_id` is reset to nil at the top of every
+-- `M.classify` call and only set when a dialog branch fires. If a
+-- caller submits an `approve { dialog_id = "abc" }` without
+-- triggering at least one classify between the dialog appearing and
+-- the intent firing, the id check will see `_current_dialog_id ==
+-- nil` and reject the id as stale even though the dialog is genuinely
+-- visible. The production poll path (`adapter.state` / `adapter.wait`
+-- / `adapter.send`) all run `classify` immediately before / after the
+-- intent so this isn't an issue there; callers driving the plugin
+-- with raw `ExtensionHandle::send` must intersperse `state()` calls
+-- when they want dialog_id correlation. Omitting `dialog_id` keeps
+-- the legacy press-Enter behaviour for those callers.
 local function check_dialog_id(input)
   local supplied = input and input.dialog_id
   if supplied == nil then

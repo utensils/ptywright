@@ -152,13 +152,25 @@ impl Transcript {
     /// Repeated calls with the same label overwrite (most-recent wins) —
     /// plugins that re-enter a state can call `mark("turn_complete")` on
     /// each entry without leaking storage. The marker table is capped at
-    /// [`MAX_MARKERS`] distinct labels; once full, additional labels are
-    /// rejected silently rather than evicting an existing entry.
+    /// [`MAX_MARKERS`] distinct labels; once full, additional **new**
+    /// labels are rejected (existing labels still update). The returned
+    /// cursor is the write position regardless — callers that need to
+    /// detect rejection should pair this with [`Transcript::marker`].
+    /// A rejection is also logged at `tracing::warn` level under the
+    /// `ptywright::transcript` target so a plugin author that hits the
+    /// cap learns about it without having to re-query.
     pub fn mark(&mut self, label: impl Into<String>) -> u64 {
         let cursor = self.chars_written;
         let label = label.into();
         if self.marks.contains_key(&label) || self.marks.len() < MAX_MARKERS {
             self.marks.insert(label, cursor);
+        } else {
+            tracing::warn!(
+                target: "ptywright::transcript",
+                label = %label,
+                max_markers = MAX_MARKERS,
+                "transcript marker rejected: label table is full"
+            );
         }
         cursor
     }

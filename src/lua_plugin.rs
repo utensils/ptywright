@@ -173,14 +173,19 @@ impl LuaPlugin {
     /// Whether the plugin's exports table has a function with the given
     /// name. Used by `plugin.describe` to decide whether to call
     /// `describe()` vs fall back to introspection.
-    #[must_use]
-    pub fn exports_function(&self, name: &str) -> bool {
+    ///
+    /// Surfaces introspection failures (poisoned registry, table type
+    /// changed unexpectedly) through `Error::Lua` rather than swallowing
+    /// them as `false` — silently routing a genuine introspection failure
+    /// into the fallback path would return an incomplete catalog without
+    /// any signal that something went wrong.
+    pub fn exports_function(&self, name: &str) -> Result<bool> {
         let result = (|| -> mlua::Result<bool> {
             let exports: mlua::Table = self.lua.registry_value(&self.exports)?;
             let value: mlua::Value = exports.get(name)?;
             Ok(matches!(value, mlua::Value::Function(_)))
         })();
-        result.unwrap_or(false)
+        result.map_err(|error| self.error(error))
     }
 
     fn from_source(
