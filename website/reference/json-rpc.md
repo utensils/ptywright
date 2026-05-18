@@ -247,7 +247,7 @@ The Lua plugin exposes the following intents through `adapter.send`:
 | `deny_trust`      | `{}`                  | Types `2` + Enter to deny workspace trust.                                                                       |
 | `dismiss_welcome` | `{}`                  | Presses Enter to clear the first-launch welcome panel.                                                           |
 
-Plugin-defined state strings the classifier emits: `starting`, `ready`, `prompt_submitted`, `thinking`, `waiting_for_permission`, `waiting_for_plan_approval`, `waiting_for_trust`, `waiting_for_login`, `waiting_for_model_select`, `waiting_for_user_input`, `completed_turn`, `cancelling`, `exited`, `error`, `plugin_error`. The state vocabulary is owned by the Lua plugin — the Rust core does not interpret it.
+Plugin-defined state strings the classifier emits (matches the plugin's own `describe().states` catalog): `starting`, `ready`, `waiting_for_login`, `waiting_for_trust`, `waiting_for_model_select`, `waiting_for_plan_approval`, `waiting_for_permission`, `waiting_for_user_input`, `thinking`, `cancelling`, `completed_turn`, `error`. The host additionally synthesizes a `plugin_error` fallback state when a classifier call itself fails (e.g. Lua runtime error); this is not plugin-owned. The classifier also threads a separate `last_intent` string (e.g. `"prompt_submitted"`, `"cancelling"`) — that lives on the snapshot's `last_intent` field, not on `state`. The state vocabulary is owned by the Lua plugin — the Rust core does not interpret it.
 
 See the [Extensions guide](../guide/extensions.md) for plugin authoring and the [Claude Code adapter guide](../guide/claude-code.md) for state semantics and limitations of the built-in claude-code plugin.
 
@@ -283,6 +283,7 @@ Every `adapter.*` method consults the bound plugin manifest's declared `permissi
 | Method                                                   | Required permission               |
 | -------------------------------------------------------- | --------------------------------- |
 | `adapter.start`                                          | `session.spawn`                   |
+| `adapter.resume`                                         | `session.spawn`                   |
 | `adapter.send`                                           | `input.write`                     |
 | `adapter.wait`                                           | `matcher.wait`                    |
 | `adapter.turn`                                           | `input.write` AND `matcher.wait`  |

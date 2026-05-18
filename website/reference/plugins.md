@@ -75,6 +75,7 @@ Every `adapter.*` JSON-RPC method consults the bound plugin manifest's declared 
 | Method                                                   | Required permission               |
 | -------------------------------------------------------- | --------------------------------- |
 | `adapter.start`                                          | `session.spawn`                   |
+| `adapter.resume`                                         | `session.spawn`                   |
 | `adapter.send`                                           | `input.write`                     |
 | `adapter.wait`                                           | `matcher.wait`                    |
 | `adapter.turn`                                           | `input.write` AND `matcher.wait`  |

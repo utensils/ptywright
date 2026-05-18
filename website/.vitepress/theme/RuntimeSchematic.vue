@@ -405,40 +405,46 @@ const annotations = [
            where the in-SVG text (sized in viewBox coordinates) becomes
            unreadable. Below that breakpoint we hide the SVG and present
            the same nine layers as a vertical card stack with arrow
-           connectors. Observation flows top → bottom; the dashed
-           writeback connector at the bottom mirrors the SVG's amber
-           control-loop arrow. -->
-      <ol
+           connectors. Observation flows top → bottom; the writeback
+           note below the list mirrors the SVG's amber control-loop
+           arrow. -->
+      <div
         class="op-schem-mobile"
-        aria-label="Runtime layers, observation flowing top to bottom"
+        role="group"
+        aria-label="Runtime layers diagram"
       >
-        <li v-for="(n, i) in nodes" :key="n.id" class="op-schem-mobile-node">
-          <div class="op-schem-mobile-card">
-            <div class="op-schem-mobile-head">
-              <span class="op-schem-mobile-num"
-                >N{{ String(i).padStart(2, '0') }}</span
-              >
-              <span class="op-schem-mobile-label">{{ n.label }}</span>
-              <span v-if="n.file" class="op-schem-mobile-file">{{
-                n.file
-              }}</span>
+        <ol
+          class="op-schem-mobile-list"
+          aria-label="Runtime layers, observation flowing top to bottom"
+        >
+          <li v-for="(n, i) in nodes" :key="n.id" class="op-schem-mobile-node">
+            <div class="op-schem-mobile-card">
+              <div class="op-schem-mobile-head">
+                <span class="op-schem-mobile-num"
+                  >N{{ String(i).padStart(2, '0') }}</span
+                >
+                <span class="op-schem-mobile-label">{{ n.label }}</span>
+                <span v-if="n.file" class="op-schem-mobile-file">{{
+                  n.file
+                }}</span>
+              </div>
+              <div class="op-schem-mobile-sub">{{ n.sub }}</div>
             </div>
-            <div class="op-schem-mobile-sub">{{ n.sub }}</div>
-          </div>
-          <div
-            v-if="i < nodes.length - 1"
-            class="op-schem-mobile-arrow"
-            aria-hidden="true"
-          >
-            ↓
-          </div>
-        </li>
-        <li class="op-schem-mobile-loop">
+            <div
+              v-if="i < nodes.length - 1"
+              class="op-schem-mobile-arrow"
+              aria-hidden="true"
+            >
+              ↓
+            </div>
+          </li>
+        </ol>
+        <div class="op-schem-mobile-loop">
           <span class="op-schem-mobile-loop-text">
             ↑ writeback · action → session
           </span>
-        </li>
-      </ol>
+        </div>
+      </div>
 
       <footer class="op-schem-foot">
         <div>
@@ -614,6 +620,12 @@ const annotations = [
   display: none;
 }
 
+.op-schem-mobile-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
 .op-schem-edge {
   stroke: var(--schem-edge);
   stroke-width: 1.4;
@@ -747,9 +759,6 @@ const annotations = [
   }
   .op-schem-mobile {
     display: block;
-    list-style: none;
-    margin: 0;
-    padding: 0;
   }
 }
 
