@@ -3573,6 +3573,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn adapter_cancel_wait_interrupts_in_flight_wait_from_another_connection() {
         // The whole point of wait_id-keyed cancellation: a wait blocked
         // on a long timeout in one connection's call stack can be

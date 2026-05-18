@@ -1198,6 +1198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wait_for_evaluates_matcher_lua_through_bound_registry() {
         // End-to-end: Session::wait_for with a bound LuaPluginRegistry
         // must evaluate `Matcher::Lua` by calling into the registered
@@ -1254,6 +1255,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wait_for_matcher_lua_returns_timeout_when_no_registry_bound() {
         // Without a registry, `Matcher::Lua` never fires — the wait
         // ends in Timeout (not a panic or silent always-true). Guards
@@ -1275,6 +1277,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn action_mark_transcript_stamps_marker_without_pty_write() {
         // `Action::MarkTranscript` is a metadata channel — applying it
         // through `Session::send` must record a marker and must NOT

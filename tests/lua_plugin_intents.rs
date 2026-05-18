@@ -1523,6 +1523,7 @@ fn classify_non_completed_state_does_not_request_turn_end_marker() {
 }
 
 #[test]
+#[cfg(unix)]
 fn extension_handle_applies_host_marks_after_classify() {
     // End-to-end: when classify returns `host_marks`, the host applies
     // each one against the underlying session's transcript before
