@@ -450,11 +450,25 @@ fn parse_notifications_tail(tail: &str) -> Result<NotificationsRequest> {
     };
     let mut adapters: Vec<String> = Vec::new();
     let mut sessions: Vec<String> = Vec::new();
+    // `current` tracks which filter list a bare continuation token
+    // belongs to. This lets `:notifications on adapters=e1, e2` (with
+    // a space after the comma) parse as `adapters=[e1, e2]` instead of
+    // erroring on `e2` as an unknown token — the comma+space form is
+    // what operators reach for naturally and matches how the same
+    // filter would be written in plain English.
+    let mut current: Option<&mut Vec<String>> = None;
     for part in parts {
         if let Some(rest) = part.strip_prefix("adapters=") {
-            adapters = parse_id_list(rest);
+            adapters.extend(parse_id_list(rest));
+            current = Some(&mut adapters);
         } else if let Some(rest) = part.strip_prefix("sessions=") {
-            sessions = parse_id_list(rest);
+            sessions.extend(parse_id_list(rest));
+            current = Some(&mut sessions);
+        } else if let Some(target) = current.as_deref_mut() {
+            // Continuation: the previous token left a trailing comma
+            // or stopped on whitespace inside a list, so this is more
+            // ids for the same filter list.
+            target.extend(parse_id_list(part));
         } else {
             return Err(Error::Rpc(format!(
                 ":notifications: unknown filter token `{part}` (expected `adapters=…` or `sessions=…`)",
@@ -1196,10 +1210,19 @@ fn turn_command(
         wait_obj.insert("intent".to_string(), Value::String(wait_intent));
     }
     if let Some(timeout_override) = duration_kwarg(&call, "timeout")? {
-        wait_obj.insert(
-            "timeout_ms".to_string(),
-            Value::from(u64::try_from(timeout_override.as_millis()).unwrap_or(u64::MAX)),
-        );
+        // A `u128 -> u64` saturate here would silently turn a malformed
+        // multi-day timeout into `u64::MAX` and the wait leg would hold
+        // the per-adapter mutex for the entire (unbounded) duration —
+        // which is exactly the head-of-line blocking trap adapter.turn
+        // warns against. Reject the overflow explicitly so the caller
+        // hears about the bad duration instead of sleeping forever.
+        let millis = u64::try_from(timeout_override.as_millis()).map_err(|_| {
+            Error::Rpc(format!(
+                "turn(timeout=…) is too large to encode as milliseconds: {:?}",
+                timeout_override
+            ))
+        })?;
+        wait_obj.insert("timeout_ms".to_string(), Value::from(millis));
     }
 
     let mut params = Map::new();
@@ -1726,6 +1749,21 @@ mod tests {
     fn parse_meta_notifications_rejects_unknown_filter_token() {
         let error = parse(":notifications on widgets=foo").unwrap_err();
         assert!(error.to_string().contains("widgets=foo"), "{error}");
+    }
+
+    #[test]
+    fn parse_meta_notifications_accepts_comma_space_separated_lists() {
+        // Operators reach for `adapters=e1, e2` (comma + space) by
+        // muscle memory — `split_whitespace()` alone would tokenize
+        // `e2` as a stray bareword. The parser must treat a bare
+        // continuation token as more ids for the previous filter list.
+        let parsed = parse(":notifications on adapters=e1, e2 sessions=s1, s2").unwrap();
+        let Cmd::Meta(MetaCmd::Notifications(request)) = parsed else {
+            panic!("expected MetaCmd::Notifications, got {parsed:?}");
+        };
+        assert!(request.enabled);
+        assert_eq!(request.adapters, vec!["e1".to_string(), "e2".to_string()]);
+        assert_eq!(request.sessions, vec!["s1".to_string(), "s2".to_string()]);
     }
 
     #[test]

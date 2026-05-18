@@ -36,7 +36,7 @@ Important fields:
 | `clear_env` | `bool`                 | When `true`, strip the parent environment before applying `env`. |
 | `size`      | `TerminalSize`         | Initial rows/columns and pixels.                                 |
 
-`Target::clear_env()` flips the strip-parent-env flag for callers consuming a manifest whose `default_target.required_env` declares safety-critical environment variables — without it, an inherited variable could shadow a manifest-mandated default. `Target::env_snapshot()` returns the overlay map (`&BTreeMap<String, String>`) without exposing the parent environment, which is useful for callers that want to detect env drift across a respawn.
+`Target::clear_env()` flips the strip-parent-env flag so the spawned child inherits _only_ the keys declared on the `Target` (and, downstream, the manifest's `default_target.env` / `required_env`). Use it when callers want a reproducible, fully-declared child environment — unrelated parent-process keys (`PATH`, `HOME`, locale, debug toggles, …) won't leak through. Note that `default_target.required_env` is already merged last and always wins on a per-key basis, so `clear_env` is about _which keys exist at all_, not about overriding precedence. `Target::env_snapshot()` returns the overlay map (`&BTreeMap<String, String>`) without exposing the parent environment, which is useful for callers that want to detect env drift across a respawn.
 
 ## Sessions
 

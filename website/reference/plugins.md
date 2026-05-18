@@ -129,8 +129,9 @@ args = ["-lc", "cat"]
 
 ### Environment merge precedence
 
-`adapter.start` builds the spawned child's environment in three tiers, last-write-wins:
+`adapter.start` layers the spawned child's environment in four tiers, last-write-wins:
 
+0. **Inherited parent environment** — `ptywright`'s own process environment passes through to the child by default. Set `Target::clear_env()` (or call sites that propagate it) to strip this tier so only the explicit overlays below reach the child.
 1. **`default_target.env`** — plugin-supplied defaults a caller may override.
 2. **Caller `env`** — the `env` map passed to `adapter.start` overrides matching keys from tier 1.
 3. **`default_target.required_env`** — plugin-mandated keys the caller cannot override; applied last so it always wins.
