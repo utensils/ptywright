@@ -1202,11 +1202,7 @@ fn approve_with_dialog_id_succeeds_after_matching_classify() {
     )
     .expect("read permission fixture");
     let _ = classify_state(&extension, &screen, 1, None, Some(COMPLETED_TURN_STABLE_MS));
-    let plan = plan(
-        &extension,
-        "approve",
-        json!({ "dialog_id": "115803ed" }),
-    );
+    let plan = plan(&extension, "approve", json!({ "dialog_id": "115803ed" }));
     assert_eq!(plan.actions, vec![Action::Key(Key::Enter)]);
 }
 
@@ -1305,6 +1301,40 @@ fn attach_file_rejects_path_with_embedded_newline() {
         msg.contains("must not contain newlines"),
         "error should explain the rejection: {msg}"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn extension_subscribe_observes_state_changes_after_send() {
+    use ptywright::ExtensionEvent;
+    use ptywright::session::Session;
+    use ptywright::target::Target;
+
+    let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "cat"]))
+        .expect("spawn /bin/sh -lc cat for PTY round-trip");
+    let extension = claude_plugin();
+    let mut handle = ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+
+    let rx = handle.subscribe();
+    handle
+        .send("send_prompt", json!({ "prompt": "hello from lua" }))
+        .expect("send_prompt via ExtensionHandle");
+    handle
+        .session()
+        .wait_for(
+            &ptywright::Matcher::TranscriptContains("hello from lua".to_string()),
+            Duration::from_secs(2),
+        )
+        .expect("transcript should contain the bracketed-paste payload");
+
+    let events: Vec<ExtensionEvent> = rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ExtensionEvent::StateChanged(_))),
+        "expected at least one StateChanged event after send; got {events:?}"
+    );
+    let _ = handle.session().kill();
 }
 
 /// End-to-end smoke test: build an [`ExtensionHandle`] over a `/bin/sh cat`

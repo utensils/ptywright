@@ -281,6 +281,21 @@ pub struct ExtensionHandle {
     extension: Box<dyn Extension>,
     last_intent: Option<String>,
     completed_turn_stable_ms: u64,
+    state_subscribers: std::sync::Mutex<Vec<std::sync::mpsc::Sender<ExtensionEvent>>>,
+}
+
+/// Events emitted on the in-process subscription channel returned by
+/// [`ExtensionHandle::subscribe`].
+///
+/// `StateChanged` fires whenever the host re-classifies — after every
+/// `send` and every successful `wait`. Subscribers can keep an
+/// always-current view of the adapter state without polling.
+#[derive(Debug, Clone)]
+pub enum ExtensionEvent {
+    /// Classifier re-ran and produced a new state. The full snapshot
+    /// is carried in-band so subscribers don't have to call back into
+    /// the host to retrieve it.
+    StateChanged(ExtensionStateSnapshot),
 }
 
 impl ExtensionHandle {
@@ -300,7 +315,38 @@ impl ExtensionHandle {
             extension,
             last_intent: None,
             completed_turn_stable_ms,
+            state_subscribers: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Subscribe to in-process [`ExtensionEvent`] notifications.
+    ///
+    /// Returns a `std::sync::mpsc::Receiver<ExtensionEvent>` that
+    /// yields `StateChanged(_)` on every classifier re-run (after
+    /// `send` or `wait`). Dropping the receiver silently removes the
+    /// subscription on the next event tick.
+    ///
+    /// Pairs with [`Session::events`] when consumers want both
+    /// transport-level signals (PTY sequence advanced, child exited)
+    /// and classifier-level state transitions.
+    pub fn subscribe(&self) -> std::sync::mpsc::Receiver<ExtensionEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.state_subscribers
+            .lock()
+            .expect("state subscriber list poisoned")
+            .push(tx);
+        rx
+    }
+
+    fn broadcast_state(&self, snapshot: &ExtensionStateSnapshot) {
+        let mut subs = self
+            .state_subscribers
+            .lock()
+            .expect("state subscriber list poisoned");
+        subs.retain(|tx| {
+            tx.send(ExtensionEvent::StateChanged(snapshot.clone()))
+                .is_ok()
+        });
     }
 
     /// Access the underlying PTY session.
@@ -362,7 +408,9 @@ impl ExtensionHandle {
         let params = ensure_params_object(params);
         let plan = self.extension.plan(intent, &params)?;
         self.apply_plan(&plan, intent)?;
-        self.try_state()
+        let state = self.try_state()?;
+        self.broadcast_state(&state);
+        Ok(state)
     }
 
     /// Wait until the plugin's matcher for `intent` is satisfied or the
@@ -391,6 +439,7 @@ impl ExtensionHandle {
             result.sequence,
             Some(stable_ms),
         )?;
+        self.broadcast_state(&state);
         Ok((state, result.outcome))
     }
 

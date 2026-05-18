@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,6 +46,10 @@ struct SharedState {
     changed: Condvar,
     sequence: AtomicU64,
     closed: AtomicBool,
+    /// Active in-process event subscribers. Each `Session::events()`
+    /// call appends one sender; subscribers whose receiver was
+    /// dropped are pruned the next time we try to fire an event.
+    subscribers: Mutex<Vec<mpsc::Sender<SessionEvent>>>,
 }
 
 /// Exit status for a completed session child process.
@@ -56,6 +61,30 @@ pub struct SessionExitStatus {
     pub success: bool,
     /// Human-readable status text from the backend.
     pub message: String,
+}
+
+/// Events emitted on the in-process subscription channel returned by
+/// [`Session::events`].
+///
+/// Subscribers are free to fetch the full state on receipt (call
+/// [`Session::snapshot`] / [`Session::transcript_delta_since`]) — the
+/// event itself carries only the cheap "something happened" signal so
+/// the reader thread doesn't pay snapshot-cloning cost on every PTY
+/// read for subscribers that don't care.
+///
+/// The channel is intentionally `std::sync::mpsc` so embedding callers
+/// can subscribe without pulling in an async runtime.
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    /// PTY sequence advanced (new screen or transcript bytes). Pair
+    /// with `Session::sequence()` / `Session::snapshot()` /
+    /// `Session::transcript_delta_since()` to retrieve the actual
+    /// change.
+    Changed { sequence: u64 },
+    /// Child process exited. The status mirrors `Session::wait`'s
+    /// return value; subscribers receiving this can assume no further
+    /// events will fire on the channel.
+    Exited(SessionExitStatus),
 }
 
 /// A running PTY-backed terminal session.
@@ -103,6 +132,7 @@ impl Session {
             changed: Condvar::new(),
             sequence: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            subscribers: Mutex::new(Vec::new()),
         });
 
         let read_shared = Arc::clone(&shared);
@@ -204,6 +234,30 @@ impl Session {
         let mut delta = self.transcript_delta_since(cursor);
         delta.text = policy.redact(&delta.text);
         delta
+    }
+
+    /// Subscribe to in-process [`SessionEvent`] notifications.
+    ///
+    /// Returns a `std::sync::mpsc::Receiver<SessionEvent>` that yields
+    /// `Changed` on every PTY read and `Exited` once when the child
+    /// process ends. The channel is single-producer / single-consumer
+    /// per call — call `events()` multiple times to fan out to multiple
+    /// independent subscribers. Dropping the receiver silently removes
+    /// the subscription on the next event tick.
+    ///
+    /// Events carry only the cheap "something happened" signal; pair
+    /// with [`Session::sequence`] / [`Session::snapshot`] /
+    /// [`Session::transcript_delta_since`] to retrieve the actual
+    /// change. This keeps the reader thread cheap when subscribers
+    /// don't care about the full screen.
+    pub fn events(&self) -> mpsc::Receiver<SessionEvent> {
+        let (tx, rx) = mpsc::channel();
+        self.shared
+            .subscribers
+            .lock()
+            .expect("subscriber list poisoned")
+            .push(tx);
+        rx
     }
 
     /// Place a label-keyed marker at the current transcript cursor. See
@@ -384,11 +438,13 @@ impl Session {
         let status = self.child.lock().expect("child lock poisoned").wait()?;
         self.shared.closed.store(true, Ordering::SeqCst);
         self.shared.changed.notify_all();
-        Ok(SessionExitStatus {
+        let exit = SessionExitStatus {
             code: status.exit_code(),
             success: status.success(),
             message: status.to_string(),
-        })
+        };
+        broadcast_event(&self.shared, SessionEvent::Exited(exit.clone()));
+        Ok(exit)
     }
 
     /// Kill the child process.
@@ -439,11 +495,14 @@ impl Session {
                 if let Some(status) = child.try_wait()? {
                     self.shared.closed.store(true, Ordering::SeqCst);
                     self.shared.changed.notify_all();
-                    return Ok(SessionExitStatus {
+                    let exit = SessionExitStatus {
                         code: status.exit_code(),
                         success: status.success(),
                         message: status.to_string(),
-                    });
+                    };
+                    drop(child);
+                    broadcast_event(&self.shared, SessionEvent::Exited(exit.clone()));
+                    return Ok(exit);
                 }
             }
             if Instant::now() >= deadline {
@@ -553,13 +612,26 @@ fn read_loop(reader: &mut Box<dyn Read + Send>, shared: &SharedState) {
                     eprintln!("ptywright: transcript write error: {message}");
                     break;
                 }
-                shared.sequence.fetch_add(1, Ordering::SeqCst);
+                let sequence = shared.sequence.fetch_add(1, Ordering::SeqCst) + 1;
                 drop(state);
                 shared.changed.notify_all();
+                broadcast_event(shared, SessionEvent::Changed { sequence });
             }
             Err(_) => break,
         }
     }
+}
+
+/// Iterate every registered subscriber's sender, drop any whose
+/// receiver has hung up. Called from the reader thread on every PTY
+/// read and from the lifecycle paths (`wait`, `kill`) when emitting
+/// `Exited`. Held under a short-lived mutex; subscribers that block
+/// would never reach the slow path because we use
+/// `mpsc::Sender::send` (unbounded) which only fails on a dropped
+/// receiver.
+fn broadcast_event(shared: &SharedState, event: SessionEvent) {
+    let mut subs = shared.subscribers.lock().expect("subscriber list poisoned");
+    subs.retain(|tx| tx.send(event.clone()).is_ok());
 }
 
 fn to_pty_size(size: TerminalSize) -> PtySize {
@@ -716,6 +788,53 @@ mod tests {
         assert!(
             transcript.contains("\x1b[201~"),
             "Action::BracketedPaste must emit the CSI 201~ end marker: {transcript:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn events_receiver_observes_changed_and_exited() {
+        // In-process subscription: subscribe before spawning is done,
+        // drive a short-lived child to completion, and assert at least
+        // one Changed plus a final Exited landed on the channel.
+        // Tests both the reader-thread broadcast site and the
+        // wait()/Exited fan-out.
+        let session = Session::spawn_target(echo_target()).expect("spawn echo");
+        let rx = session.events();
+        let status = session.wait().expect("wait child");
+        assert!(status.success);
+
+        // Drain everything currently buffered. Channel is unbounded
+        // mpsc so try_iter() yields the full backlog without blocking.
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Changed { .. })),
+            "expected at least one Changed event; got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::Exited(_))),
+            "expected an Exited event; got {events:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn events_subscriber_dropped_is_pruned_silently() {
+        // Defensive: subscribing and dropping the receiver must not
+        // poison the subscriber list or block the broadcaster. After
+        // dropping the first rx, a second subscriber should still
+        // receive events normally.
+        let session = Session::spawn_target(echo_target()).expect("spawn echo");
+        let _rx_dropped = session.events();
+        drop(_rx_dropped);
+        let rx_kept = session.events();
+        let _ = session.wait();
+        let events: Vec<SessionEvent> = rx_kept.try_iter().collect();
+        assert!(
+            !events.is_empty(),
+            "second subscriber must still receive events after first was dropped"
         );
     }
 
