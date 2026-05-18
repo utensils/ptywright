@@ -752,6 +752,62 @@ local function parse_permission_dialog(text)
   return { permission = permission }
 end
 
+-- Extract the plan body for `metadata.plan` on the
+-- `waiting_for_plan_approval` state. Claude Code renders the plan as
+-- a "Plan ready:" (or "Plan") header followed by a numbered list, then
+-- an "Approve plan to proceed?" footer. We return the lines between
+-- the header and the footer, trimmed.
+--
+-- Returns the raw plan text as a single string with newlines, or
+-- `nil` if the structure doesn't match (which would indicate the
+-- classifier branch fired on something other than a real plan body).
+-- Consumers get this verbatim — claudette surfaces it in the UI for
+-- human review before approval.
+local function parse_plan_body(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local lines = {}
+  for line in string.gmatch(text, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  -- Find the header row: the first line whose lowercased trim starts
+  -- with "plan" and either ends with ":" or is exactly "plan".
+  local header_idx = nil
+  for idx, raw in ipairs(lines) do
+    local t = lower(trim(raw))
+    if t == "plan" or starts_with(t, "plan ready") or starts_with(t, "plan:") then
+      header_idx = idx
+      break
+    end
+  end
+  if not header_idx then
+    return nil
+  end
+  -- Find the footer row (approval question). The slice is exclusive of
+  -- the footer; if no footer is present we take everything from the
+  -- header to the end of the body.
+  local footer_idx = #lines + 1
+  for idx = header_idx + 1, #lines do
+    local t = lower(trim(lines[idx]))
+    if starts_with(t, "approve plan") or starts_with(t, "approve the plan") then
+      footer_idx = idx
+      break
+    end
+  end
+  local body_lines = {}
+  for idx = header_idx + 1, footer_idx - 1 do
+    local t = trim(lines[idx])
+    if t ~= "" then
+      table.insert(body_lines, t)
+    end
+  end
+  if #body_lines == 0 then
+    return nil
+  end
+  return table.concat(body_lines, "\n")
+end
+
 local function has_plan_indicator(text)
   -- Structural pattern: a "plan" header on its own line followed by
   -- a numbered list within a line or two. Both fixtures match this:
@@ -872,6 +928,33 @@ local LOGIN_TITLE_PREFIXES = {
   "continue with anthropic",
   "continue with google",
 }
+
+-- Extract the OAuth login URL from a login dialog. Returns the first
+-- URL on its own line that starts with `https://claude.ai/` or
+-- `https://anthropic.com/` (the two domains the TUI ships today),
+-- trimmed of surrounding whitespace. Returns nil if no URL is present
+-- — the login dialog without a URL is still valid (API-key path).
+local function parse_login_url(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  for line in string.gmatch(text, "[^\n]+") do
+    local t = trim(line)
+    -- Anchored URL scrape: must look like a real https URL with no
+    -- prose context to its left. `^%s*` is already absorbed by trim;
+    -- check the start of the trimmed line directly.
+    if starts_with(t, "https://claude.ai/") or starts_with(t, "https://anthropic.com/") then
+      -- Stop at the first whitespace — Claude renders URLs alone on
+      -- a line but be defensive about trailing chrome.
+      local space = t:find("%s")
+      if space then
+        return t:sub(1, space - 1)
+      end
+      return t
+    end
+  end
+  return nil
+end
 
 local function has_login_indicator(text)
   -- Anchor #1: a title-style login phrase appears somewhere in the
@@ -1145,7 +1228,9 @@ function M.classify(input)
   -- once before driving the adapter; the script-side handler surfaces
   -- this as a non-zero exit with a clear message.
   if has_login_indicator(body_text) then
-    return state_snapshot("waiting_for_login", 0.86, "login / sign-in dialog detected", sequence)
+    local login_url = parse_login_url(body)
+    local login_metadata = login_url and { login = { url = login_url } } or nil
+    return state_snapshot("waiting_for_login", 0.86, "login / sign-in dialog detected", sequence, login_metadata)
   end
 
   -- Workspace-trust dialog is checked before permission/plan because its
@@ -1165,7 +1250,15 @@ function M.classify(input)
   end
 
   if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
-    return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence)
+    -- Parse against the full screen (not just body) — when the plan
+    -- footer would otherwise straddle the body/status split, the
+    -- numbered-list bullets at the bottom of the plan can land in
+    -- the status region and get dropped from `body`. Reading the
+    -- whole screen avoids that edge case; the parser ignores
+    -- everything up to the "Plan" header.
+    local plan_text = parse_plan_body(screen)
+    local plan_metadata = plan_text and { plan = plan_text } or nil
+    return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence, plan_metadata)
   end
 
   if has_permission_indicator(screen_text) then
