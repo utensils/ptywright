@@ -77,6 +77,29 @@ pub struct ExtensionStateSnapshot {
     /// "no metadata" case stays cheap to render.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Passive host directives the classifier wants the host to execute
+    /// before returning the snapshot to the caller. Today this is a list
+    /// of transcript markers ([`HostMark`]) the plugin wants stamped at
+    /// the current cursor — e.g. a TUI plugin signalling "turn_end" the
+    /// moment its classifier transitions to `completed_turn`. The host
+    /// applies each mark via [`crate::Session::mark_transcript`] after
+    /// `classify` returns; the snapshot is delivered to the caller with
+    /// `host_marks` echoed for transparency. Domain-neutral: any plugin
+    /// can populate it, the host treats every entry the same way.
+    /// Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_marks: Vec<HostMark>,
+}
+
+/// Plugin-issued request that the host stamp a transcript marker at the
+/// current cursor before delivering the classifier snapshot to the
+/// caller. See [`ExtensionStateSnapshot::host_marks`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMark {
+    /// Marker label to pass to [`crate::Session::mark_transcript`].
+    /// Repeated labels overwrite each other — see
+    /// [`crate::Transcript::mark`] for the storage semantics.
+    pub label: String,
 }
 
 impl ExtensionStateSnapshot {
@@ -95,6 +118,7 @@ impl ExtensionStateSnapshot {
             sequence,
             candidates: Vec::new(),
             metadata: None,
+            host_marks: Vec::new(),
         }
     }
 }
@@ -167,6 +191,25 @@ pub struct ClassifyContext<'a> {
     /// after a completed turn". Forwarded so plugins can reuse the same value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_turn_stable_ms: Option<u64>,
+    /// Snapshot of all transcript markers placed via
+    /// [`crate::Session::mark_transcript`] (whether plan-driven through
+    /// [`Action::MarkTranscript`] or classifier-driven through
+    /// [`HostMark`]). Empty map when no markers have been placed.
+    ///
+    /// Plugins compose transcript metadata from this view — e.g. a TUI
+    /// plugin that marks `turn_start` on prompt submit and `turn_end` on
+    /// classifier transition to a completion state can surface
+    /// `metadata.transcript = { turn_start, turn_end }` once both keys
+    /// are present.
+    pub markers: &'a std::collections::BTreeMap<String, u64>,
+    /// Current transcript cursor — `chars_written` at classify time.
+    /// Plugins that emit a [`HostMark`] for the host to stamp can
+    /// pre-compute the resulting metadata using this cursor, since the
+    /// host will mark approximately here (with no PTY writes between
+    /// classify return and mark application). Lets plugins surface
+    /// `metadata.transcript.turn_end` in the *same* classify response
+    /// that requests the `turn_end` mark.
+    pub cursor: u64,
 }
 
 /// Action plan returned by extension intents (e.g. `send_prompt`, `approve`).
@@ -387,6 +430,7 @@ impl ExtensionHandle {
                 sequence: self.session.sequence(),
                 candidates: Vec::new(),
                 metadata: None,
+                host_marks: Vec::new(),
             })
     }
 
@@ -541,6 +585,8 @@ impl ExtensionHandle {
         stable_ms: Option<u64>,
     ) -> Result<ExtensionStateSnapshot> {
         let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+        let markers = self.session.transcript_markers();
+        let cursor = self.session.transcript_chars_written();
         let ctx = ClassifyContext {
             screen,
             body_text: &body_text,
@@ -550,8 +596,22 @@ impl ExtensionHandle {
             last_intent: self.last_intent.as_deref(),
             stable_ms,
             completed_turn_stable_ms: Some(self.completed_turn_stable_ms),
+            markers: &markers,
+            cursor,
         };
-        self.extension.classify(&ctx)
+        let snapshot = self.extension.classify(&ctx)?;
+        self.apply_host_marks(&snapshot.host_marks);
+        Ok(snapshot)
+    }
+
+    /// Apply plugin-requested transcript markers from a freshly-returned
+    /// snapshot. Domain-neutral: any plugin that wants the host to stamp
+    /// a marker at classifier time can populate
+    /// [`ExtensionStateSnapshot::host_marks`].
+    fn apply_host_marks(&self, marks: &[HostMark]) {
+        for mark in marks {
+            self.session.mark_transcript(&mark.label);
+        }
     }
 }
 
@@ -712,6 +772,7 @@ mod tests {
     /// missing fields as nil and the fallback works as intended.
     #[test]
     fn classify_context_serialises_with_omitted_none_fields() {
+        let empty_markers = std::collections::BTreeMap::new();
         let ctx = ClassifyContext {
             screen: "",
             body_text: "",
@@ -721,6 +782,8 @@ mod tests {
             last_intent: None,
             stable_ms: None,
             completed_turn_stable_ms: None,
+            markers: &empty_markers,
+            cursor: 0,
         };
         let value = serde_json::to_value(ctx).expect("serialise ClassifyContext");
         let object = value
@@ -797,6 +860,7 @@ mod tests {
             sequence: 0,
             candidates: Vec::new(),
             metadata: None,
+            host_marks: Vec::new(),
         };
         let wire = serde_json::to_string(&snapshot).expect("serialize");
         assert!(

@@ -36,6 +36,26 @@ fn classify_state(
     last_intent: Option<&str>,
     stable_ms: Option<u64>,
 ) -> ExtensionStateSnapshot {
+    classify_with_markers(
+        extension,
+        screen,
+        sequence,
+        last_intent,
+        stable_ms,
+        &std::collections::BTreeMap::new(),
+        0,
+    )
+}
+
+fn classify_with_markers(
+    extension: &LuaExtension,
+    screen: &str,
+    sequence: u64,
+    last_intent: Option<&str>,
+    stable_ms: Option<u64>,
+    markers: &std::collections::BTreeMap<String, u64>,
+    cursor: u64,
+) -> ExtensionStateSnapshot {
     let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
     let ctx = ClassifyContext {
         screen,
@@ -46,6 +66,8 @@ fn classify_state(
         last_intent,
         stable_ms,
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+        markers,
+        cursor,
     };
     extension.classify(&ctx).expect("classify via Lua plugin")
 }
@@ -167,22 +189,25 @@ fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
 
 #[test]
 fn send_prompt_plan_dismisses_then_pastes_then_submits() {
-    // The plan emits THREE actions in this exact order:
+    // The plan emits FOUR actions in this exact order:
     //   1. Enter  — dismiss any first-keypress interceptor (welcome
     //      panel, compact-launch view). On a clean empty input box
     //      Claude treats this as a no-op submit.
-    //   2. BracketedPaste(prompt) — Claude Code v2.1+ requires the
+    //   2. MarkTranscript("turn_start") — stamp a turn-boundary marker
+    //      so callers can later slice the per-turn output via
+    //      `Session::transcript_slice`. The matching `turn_end` mark
+    //      fires from the classifier's `completed_turn` branch.
+    //   3. BracketedPaste(prompt) — Claude Code v2.1+ requires the
     //      bracketed wrapper so the trailing Enter is not absorbed into
     //      the paste tokeniser on longer prompts.
-    //   3. Enter — submit the now-populated input box.
+    //   4. Enter — submit the now-populated input box.
     //
     // Without action #1, the bracketed paste's CSI-200~ open marker
     // gets consumed by Claude's first-keypress interceptor on a fresh
     // launch, the rest of the paste lands as input that's then
     // truncated, and the trailing Enter submits a partial prompt or
-    // nothing at all. Locking the three-action sequence here so a
-    // future plugin edit can't silently regress to the old two-action
-    // form.
+    // nothing at all. Locking the four-action sequence here so a
+    // future plugin edit can't silently regress.
     let extension = claude_plugin();
     let plan = plan(
         &extension,
@@ -194,6 +219,9 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
         plan.actions,
         vec![
             Action::Key(Key::Enter),
+            Action::MarkTranscript {
+                label: "turn_start".to_string()
+            },
             Action::BracketedPaste("hello Claude".to_string()),
             Action::Key(Key::Enter),
         ]
@@ -1373,6 +1401,151 @@ fn extension_handle_dispatches_mutating_intents_against_live_session() {
     handle
         .send("cancel", json!({}))
         .expect("cancel via ExtensionHandle");
+
+    let _ = handle.session().kill();
+}
+
+#[test]
+fn classify_completed_turn_requests_turn_end_marker_and_surfaces_transcript_metadata() {
+    // Auto-marking contract: when the classifier transitions to
+    // `completed_turn` after a submitted prompt, the snapshot returns
+    //   * `host_marks = [{label="turn_end"}]` — host will stamp it
+    //   * `metadata.transcript = {turn_start, turn_end}` — using the
+    //      caller-supplied `cursor` as the pre-computed `turn_end`
+    //      value, so the same response carries the metadata.
+    let extension = claude_plugin();
+    let fixture = include_str!("../plugins/claude-code/fixtures/completed.txt");
+
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 100);
+    let snapshot = classify_with_markers(
+        &extension,
+        fixture,
+        7,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+        &markers,
+        500,
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    assert_eq!(
+        snapshot.host_marks,
+        vec![ptywright::extension::HostMark {
+            label: "turn_end".to_string()
+        }],
+        "first completed_turn classify after submission must request turn_end"
+    );
+
+    let metadata = snapshot
+        .metadata
+        .as_ref()
+        .expect("metadata must be populated");
+    let transcript_md = metadata
+        .get("transcript")
+        .expect("metadata.transcript must be populated");
+    assert_eq!(transcript_md["turn_start"], 100);
+    assert_eq!(transcript_md["turn_end"], 500);
+}
+
+#[test]
+fn classify_completed_turn_does_not_re_emit_turn_end_when_marker_already_present() {
+    // Idempotency: once the host has applied turn_end and the marker
+    // is visible in the classifier context, subsequent classifies
+    // must NOT re-request the mark. They should still surface the
+    // existing metadata.transcript so callers polling adapter.state
+    // see consistent data.
+    let extension = claude_plugin();
+    let fixture = include_str!("../plugins/claude-code/fixtures/completed.txt");
+
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 100);
+    markers.insert("turn_end".to_string(), 500);
+    let snapshot = classify_with_markers(
+        &extension,
+        fixture,
+        8,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+        &markers,
+        650,
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    assert!(
+        snapshot.host_marks.is_empty(),
+        "turn_end already marked — must not re-emit host_marks"
+    );
+
+    let metadata = snapshot
+        .metadata
+        .as_ref()
+        .expect("metadata must remain populated");
+    let transcript_md = metadata
+        .get("transcript")
+        .expect("metadata.transcript must remain populated");
+    assert_eq!(transcript_md["turn_start"], 100);
+    assert_eq!(
+        transcript_md["turn_end"], 500,
+        "surfaced turn_end must come from markers, not cursor, once it exists"
+    );
+}
+
+#[test]
+fn classify_non_completed_state_does_not_request_turn_end_marker() {
+    // Guard: the turn_end host_mark must only fire on completed_turn.
+    // A thinking / dialog / cancelling classify under the same
+    // last_intent must leave host_marks empty.
+    let extension = claude_plugin();
+    let fixture = include_str!("../plugins/claude-code/fixtures/thinking.txt");
+
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 100);
+    let snapshot = classify_with_markers(
+        &extension,
+        fixture,
+        9,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+        &markers,
+        500,
+    );
+
+    assert_ne!(
+        snapshot.state, "completed_turn",
+        "fixture should classify as a mid-turn state, not completion"
+    );
+    assert!(
+        snapshot.host_marks.is_empty(),
+        "non-completion state must not request turn_end mark; got {:?}",
+        snapshot.host_marks
+    );
+}
+
+#[test]
+fn extension_handle_applies_host_marks_after_classify() {
+    // End-to-end: when classify returns `host_marks`, the host applies
+    // each one against the underlying session's transcript before
+    // returning the snapshot to the caller. The applied marker is
+    // observable via `Session::transcript_marker`.
+    use ptywright::session::Session;
+    use ptywright::target::Target;
+
+    let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "cat"]))
+        .expect("spawn /bin/sh -lc cat for PTY round-trip");
+    let extension = claude_plugin();
+    let mut handle = ExtensionHandle::start(Box::new(extension), session, COMPLETED_TURN_STABLE_MS);
+
+    // send_prompt's plan contains a `MarkTranscript("turn_start")`
+    // action — applying it stamps the marker on the live session.
+    handle
+        .send("send_prompt", json!({ "prompt": "hello there" }))
+        .expect("send_prompt via ExtensionHandle");
+
+    assert!(
+        handle.session().transcript_marker("turn_start").is_some(),
+        "send_prompt plan must have stamped turn_start via Action::MarkTranscript"
+    );
 
     let _ = handle.session().kill();
 }

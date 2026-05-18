@@ -49,6 +49,7 @@ fn classify_fixture(
     last_intent: Option<&str>,
 ) -> ptywright::Result<ExtensionStateSnapshot> {
     let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+    let markers = std::collections::BTreeMap::new();
     let ctx = ClassifyContext {
         screen,
         body_text: &body_text,
@@ -58,6 +59,8 @@ fn classify_fixture(
         last_intent,
         stable_ms: Some(COMPLETED_TURN_STABLE_MS),
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+        markers: &markers,
+        cursor: 0,
     };
     extension.classify(&ctx)
 }

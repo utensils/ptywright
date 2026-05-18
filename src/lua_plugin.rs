@@ -414,6 +414,19 @@ fn action_api(
             "eof",
             lua.create_function(|lua, _: ()| tagged_unit(lua, "eof"))?,
         )?;
+        // `mark_transcript` is a metadata annotation, not a PTY write or
+        // signal — but it is plugin-initiated state mutation, so it
+        // shares `InputWrite` gating with the other actions plugins can
+        // emit from their plans. The host applies it via
+        // `Session::mark_transcript`; no PTY bytes are written.
+        action.set(
+            "mark_transcript",
+            lua.create_function(|lua, label: String| {
+                let value = lua.create_table()?;
+                value.set("label", label)?;
+                tagged_value(lua, "mark_transcript", value)
+            })?,
+        )?;
     }
     if permissions.contains(&PluginPermission::SessionKill) {
         action.set(

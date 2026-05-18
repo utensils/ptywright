@@ -182,6 +182,20 @@ impl Transcript {
         self.marks.get(label).copied()
     }
 
+    /// Read all currently-recorded markers. Returns a borrow rather than a
+    /// clone so hot classifier paths that only need read access do not
+    /// allocate.
+    ///
+    /// Plugin classifiers receive this view through
+    /// [`crate::ClassifyContext::markers`] so they can compose transcript
+    /// metadata (e.g. `metadata.transcript = { turn_start, turn_end }`)
+    /// without round-tripping through individual [`marker`](Self::marker)
+    /// calls.
+    #[must_use]
+    pub fn markers(&self) -> &BTreeMap<String, u64> {
+        &self.marks
+    }
+
     /// Text between two byte cursors, or `None` if either cursor refers
     /// to text the bounded ring buffer has already evicted.
     ///

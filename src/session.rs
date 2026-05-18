@@ -300,6 +300,20 @@ impl Session {
         rx
     }
 
+    /// Snapshot of all currently-recorded transcript markers. Returns a
+    /// fresh clone so the caller can drop the session state lock
+    /// immediately. Empty `BTreeMap` when no markers have been placed.
+    #[must_use]
+    pub fn transcript_markers(&self) -> std::collections::BTreeMap<String, u64> {
+        self.shared
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .transcript
+            .markers()
+            .clone()
+    }
+
     /// Place a label-keyed marker at the current transcript cursor. See
     /// [`crate::Transcript::mark`] for the storage semantics.
     pub fn mark_transcript(&self, label: impl Into<String>) -> u64 {
@@ -348,6 +362,10 @@ impl Session {
             Action::Eof => self.send_key(Key::CtrlD),
             Action::Signal(signal) => self.signal(signal),
             Action::Kill => self.kill(),
+            Action::MarkTranscript { label } => {
+                self.mark_transcript(label);
+                Ok(())
+            }
         }
     }
 
@@ -1113,6 +1131,35 @@ mod tests {
             .expect("wait for exit");
         assert!(result.matched);
         let _ = session.wait();
+    }
+
+    #[test]
+    fn action_mark_transcript_stamps_marker_without_pty_write() {
+        // `Action::MarkTranscript` is a metadata channel — applying it
+        // through `Session::send` must record a marker and must NOT
+        // write any bytes to the PTY. We pair the assertion with a
+        // transcript comparison: the visible bytes before and after the
+        // mark must be unchanged.
+        let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "printf hi"]))
+            .expect("spawn shell");
+        // Let the child finish so the transcript settles.
+        let _ = session.wait_for(&Matcher::ProcessExited, Duration::from_secs(3));
+
+        let transcript_before = session.transcript();
+        let cursor_before = session.transcript_chars_written();
+        assert!(session.transcript_marker("turn_start").is_none());
+
+        session
+            .send(Action::MarkTranscript {
+                label: "turn_start".to_string(),
+            })
+            .expect("apply mark_transcript");
+
+        // Marker recorded at the current cursor; transcript bytes
+        // unchanged because no PTY write happened.
+        assert_eq!(session.transcript_marker("turn_start"), Some(cursor_before));
+        assert_eq!(session.transcript(), transcript_before);
+        assert_eq!(session.transcript_chars_written(), cursor_before);
     }
 
     #[test]
