@@ -163,19 +163,37 @@ ptywright completions fish > ~/.config/fish/completions/ptywright.fish
 
 Supported shells are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.
 
+## `ptywright logs`
+
+Tail the most recent ptywright log file under `<PTYWRIGHT_HOME>/logs/`. Reads the newest file matching `ptywright.*` (the daily-rotation pattern), prints the last `--lines` lines (default 20, matching `tail -n 20 -f` convention), and follows the file for new content until Ctrl-C.
+
+```bash
+ptywright logs                          # last 20 lines, then follow
+ptywright logs --lines 200              # backfill 200 lines before following
+ptywright logs --filter rpc             # only lines containing "rpc"
+ptywright logs --filter PermissionDenied
+```
+
+Behaviour notes:
+
+- The subcommand never writes to the log file itself; it's a passive reader.
+- An empty `<PTYWRIGHT_HOME>/logs/` exits non-zero with a clear "no ptywright log files" message — run any other subcommand once first to seed the directory.
+- Filtering is substring-based, not the `tracing-subscriber` `EnvFilter` grammar — that filter is set at server startup via `PTYWRIGHT_LOG`, not at tail time.
+- Poll cadence is 200 ms. Not real-time enough for sub-second debugging; use `tail -F` directly if you need wire-speed.
+
 ## Runtime directory and logging
 
 ptywright keeps configuration, log files, and other per-user state under `~/.ptywright/` (override the root entirely with `PTYWRIGHT_HOME=/some/path`). See the [Runtime directory guide](../guide/runtime-directory.md) for the full layout, config schema, and logging details.
 
 ### Per-mode log sinks
 
-| Subcommand                           | Stderr | File | Notes                                                                                                                                                                                                                           |
-| ------------------------------------ | :----: | :--: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ptywright run`                      |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY.                                                                                                                                             |
-| `ptywright serve --stdio`            |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                                                                                                                                                                           |
-| `ptywright serve --socket`           |   ✓    |  ✓   | Same sinks as `--stdio`.                                                                                                                                                                                                        |
-| `ptywright repl`                     |   ✓    |  ✓   | Uses the oneshot init. The REPL is a sequential reedline loop that writes its prompt to stdout interleaved with the operator's commands; stderr is rare in normal use, but any messages that do land share the same scrollback. |
-| `--help`, `--version`, `completions` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands.                                                                                                                                                                              |
+| Subcommand                                   | Stderr | File | Notes                                                                                                                                                                                                                           |
+| -------------------------------------------- | :----: | :--: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ptywright run`                              |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY.                                                                                                                                             |
+| `ptywright serve --stdio`                    |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                                                                                                                                                                           |
+| `ptywright serve --socket`                   |   ✓    |  ✓   | Same sinks as `--stdio`.                                                                                                                                                                                                        |
+| `ptywright repl`                             |   ✓    |  ✓   | Uses the oneshot init. The REPL is a sequential reedline loop that writes its prompt to stdout interleaved with the operator's commands; stderr is rare in normal use, but any messages that do land share the same scrollback. |
+| `--help`, `--version`, `completions`, `logs` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands. `logs` reads existing files without writing new entries.                                                                                                                     |
 
 ### Environment variables
 
