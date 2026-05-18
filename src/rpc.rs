@@ -127,6 +127,10 @@ impl Default for RpcSharedState {
 pub struct RpcServer {
     shared: RpcServerState,
     notifications_enabled: bool,
+    /// Per-connection notification scope. `None` (or both fields empty)
+    /// means "fire for every session." Set by `server.set_notifications`
+    /// when callers supply `adapters` and/or `sessions` filters.
+    notification_filter: NotificationFilter,
     last_notified_sequences: HashMap<String, u64>,
     /// Per-session cursor into the transcript's monotonic `chars_written`
     /// counter. Used to drive `session.output` notifications: each tick we
@@ -137,6 +141,22 @@ pub struct RpcServer {
     /// independently catches up after `server.set_notifications`.
     last_notified_outputs: HashMap<String, u64>,
     notified_exits: HashSet<String>,
+}
+
+/// Per-connection notification scope. Empty filters mean "everything"
+/// — that's the back-compat path for callers that just toggle the
+/// boolean. Non-empty filters fire for sessions matching `sessions`
+/// OR whose owning adapter id is in `adapters` (UNION semantics).
+#[derive(Debug, Default, Clone)]
+struct NotificationFilter {
+    adapters: Vec<String>,
+    sessions: Vec<String>,
+}
+
+impl NotificationFilter {
+    fn is_empty(&self) -> bool {
+        self.adapters.is_empty() && self.sessions.is_empty()
+    }
 }
 
 /// Per-adapter row stored in the `extensions` registry.
@@ -247,6 +267,19 @@ struct PluginDescribeParams {
 #[derive(Debug, Deserialize)]
 struct NotificationsParams {
     enabled: bool,
+    /// Optional list of adapter ids to scope notifications to. Empty
+    /// or omitted means "all adapters" (back-compat with the original
+    /// boolean-only param). Adapter ids that don't match any live
+    /// adapter at filter time are silently ignored — late binding lets
+    /// callers pre-subscribe before `adapter.start` returns.
+    #[serde(default)]
+    adapters: Option<Vec<String>>,
+    /// Optional list of session ids to scope notifications to. Combined
+    /// with `adapters` as a UNION: events fire for sessions whose id
+    /// matches `sessions` OR whose owning adapter id matches `adapters`.
+    /// Empty or omitted means "all sessions".
+    #[serde(default)]
+    sessions: Option<Vec<String>>,
 }
 
 /// One session's notification-relevant snapshot for a single `poll_notifications`
@@ -544,6 +577,7 @@ impl RpcServer {
         Self {
             shared,
             notifications_enabled: false,
+            notification_filter: NotificationFilter::default(),
             last_notified_sequences: HashMap::new(),
             last_notified_outputs: HashMap::new(),
             notified_exits: HashSet::new(),
@@ -595,7 +629,11 @@ impl RpcServer {
 
     fn poll_notifications(&mut self) -> Result<Vec<String>> {
         let mut messages = Vec::new();
+        let allowed_ids = self.resolve_notification_filter();
         let mut entries = self.collect_notification_entries();
+        if let Some(allowed) = allowed_ids.as_ref() {
+            entries.retain(|entry| allowed.contains(&entry.id));
+        }
         entries.sort_by(|left, right| left.id.cmp(&right.id));
 
         for entry in entries {
@@ -818,6 +856,10 @@ impl RpcServer {
         let params: NotificationsParams = parse_params(params)?;
         let was_enabled = self.notifications_enabled;
         self.notifications_enabled = params.enabled;
+        self.notification_filter = NotificationFilter {
+            adapters: params.adapters.unwrap_or_default(),
+            sessions: params.sessions.unwrap_or_default(),
+        };
         // When notifications transition from off → on, seed every existing
         // session's output cursor at the current `chars_written` so the next
         // `session.output` notification only carries output produced *after*
@@ -830,7 +872,49 @@ impl RpcServer {
         if !was_enabled && params.enabled {
             self.seed_output_cursors_at_current_position();
         }
-        Ok(json!({ "enabled": self.notifications_enabled }))
+        // Echo the resolved filter back so callers can confirm what the
+        // server saw. Empty arrays are omitted to keep the response tidy
+        // when no filter is in force.
+        let mut resp = json!({ "enabled": self.notifications_enabled });
+        if !self.notification_filter.adapters.is_empty() {
+            resp.as_object_mut().unwrap().insert(
+                "adapters".to_string(),
+                json!(self.notification_filter.adapters),
+            );
+        }
+        if !self.notification_filter.sessions.is_empty() {
+            resp.as_object_mut().unwrap().insert(
+                "sessions".to_string(),
+                json!(self.notification_filter.sessions),
+            );
+        }
+        Ok(resp)
+    }
+
+    /// Resolve the current notification filter into a concrete set of
+    /// session ids. Returns `None` when no filter is in force (= deliver
+    /// every session). Adapter ids in the filter are resolved against
+    /// the live extension registry at call time; ids that don't match
+    /// anything are silently ignored, so a caller can pre-subscribe to
+    /// `adapters: ["e1"]` before the corresponding `adapter.start` call
+    /// completes and the session-id mapping arrives later.
+    fn resolve_notification_filter(&self) -> Option<HashSet<String>> {
+        if self.notification_filter.is_empty() {
+            return None;
+        }
+        let mut session_ids: HashSet<String> =
+            self.notification_filter.sessions.iter().cloned().collect();
+        if !self.notification_filter.adapters.is_empty() {
+            let shared = self.shared.inner.lock().expect("rpc shared state poisoned");
+            for adapter_id in &self.notification_filter.adapters {
+                if let Some(arc) = shared.extensions.get(adapter_id)
+                    && let Ok(entry) = arc.try_lock()
+                {
+                    session_ids.insert(entry.session.clone());
+                }
+            }
+        }
+        Some(session_ids)
     }
 
     fn seed_output_cursors_at_current_position(&mut self) {
@@ -2240,6 +2324,56 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":4,"method":"adapter.close","params":{{"adapter":"{adapter}"}}}}"#,
             ),
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn notification_filter_scopes_to_named_sessions_only() {
+        // With `server.set_notifications {enabled, sessions:["s1"]}`, only
+        // s1's events should surface; s2 stays silent even though both
+        // are producing output.
+        let mut server = RpcServer::new();
+        let create1 = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","sleep 5"]}}"#,
+            )
+            .expect("create s1");
+        let s1: Value = serde_json::from_str(&create1[0]).unwrap();
+        let s1_id = s1["result"]["session"].as_str().unwrap().to_string();
+        let create2 = server
+            .handle_line_messages(
+                r#"{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"program":"/bin/sh","args":["-lc","printf hello; sleep 5"]}}"#,
+            )
+            .expect("create s2");
+        let s2: Value = serde_json::from_str(&create2[0]).unwrap();
+        let s2_id = s2["result"]["session"].as_str().unwrap().to_string();
+
+        let _ = server
+            .handle_line_messages(&format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"server.set_notifications","params":{{"enabled":true,"sessions":["{s1_id}"]}}}}"#,
+            ))
+            .expect("enable filtered notifications");
+
+        let poll = server
+            .handle_line_messages(&format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"session.wait","params":{{"session":"{s2_id}","matcher":{{"type":"contains_text","value":"hello"}},"timeout_ms":3000}}}}"#,
+            ))
+            .expect("wait for s2");
+
+        let stitched = poll.join("\n");
+        assert!(
+            !stitched.contains(&format!("\"session\":\"{s2_id}\""))
+                || !stitched.contains("session.changed"),
+            "s2 changes must not surface when filter scopes to s1; got: {stitched}"
+        );
+
+        // Cleanup.
+        let _ = server.handle_line_messages(&format!(
+            r#"{{"jsonrpc":"2.0","id":98,"method":"session.kill","params":{{"session":"{s1_id}"}}}}"#,
+        ));
+        let _ = server.handle_line_messages(&format!(
+            r#"{{"jsonrpc":"2.0","id":99,"method":"session.kill","params":{{"session":"{s2_id}"}}}}"#,
+        ));
     }
 
     #[test]
