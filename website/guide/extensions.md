@@ -52,6 +52,7 @@ Action constructors return tagged tables matching the JSON `Action` shape:
 - `ptywright.action.key(name)` — single-key input. `name` is a `snake_case` string matching a variant of the host's `Key` enum. The full surface covers submission/edit keys (`"enter"`, `"escape"`, `"tab"`, `"shift_tab"`, `"backspace"`, `"delete"`, `"space"`), arrows (`"up"`, `"down"`, `"left"`, `"right"`), the navigation cluster (`"home"`, `"end"`, `"page_up"`, `"page_down"`, `"insert"`), every readline-style control combo from `"ctrl_a"` through `"ctrl_z"` except the four that alias other named keys (`ctrl_h`/`ctrl_i`/`ctrl_j`/`ctrl_m` — use `backspace`/`tab`/`enter`), and `"f1"` through `"f12"`. Plugins that accept caller-supplied key strings should normalise hyphens to underscores (`"shift-tab"` → `"shift_tab"`); see the `KEY_ALIASES` table in `plugins/claude-code/main.lua` for the reference implementation.
 - `ptywright.action.interrupt()` — Ctrl-C.
 - `ptywright.action.eof()` — Ctrl-D.
+- `ptywright.action.mark_transcript(label)` — stamp a label-keyed marker at the current transcript cursor without writing any PTY bytes. Plugins emit this from action plans so a single intent dispatch can both write input AND record a turn boundary in one atomic step; the host applies it via `Session::mark_transcript`. Recall the offset later via `Session::transcript_marker(label)` or slice between two markers with `Session::transcript_slice(start, end)`. Requires `input.write` (same gate as the other plan actions).
 - `ptywright.action.kill()` — SIGKILL the child; requires the `session.kill` permission.
 - `ptywright.action.signal(name)` — deliver an arbitrary process signal; requires the `session.kill` permission. `name` is the snake_case `Signal` variant (`"term"`, `"hup"`, `"quit"`, `"int"`, `"kill"`, `"user1"`, `"user2"`). On Windows only `"term"`, `"int"`, and `"kill"` are honored; other names return `UnsupportedOnPlatform` to the caller.
 
@@ -66,13 +67,13 @@ Matcher constructors return tagged tables matching the JSON `Matcher` shape:
 - `ptywright.matcher.any({ ... })`
 - `ptywright.matcher.all({ ... })`
 
-Plugins also receive the `ClassifyContext` fields as a Lua table: `screen`, `body_text`, `status_text`, `transcript`, `sequence`, `last_intent`, `stable_ms`, and `completed_turn_stable_ms`. Body-oriented classifiers should match against `body_text` to avoid false-positives from status-bar substrings; see [Architecture](./architecture.md#abstraction-boundaries) for the body/status split rules.
+Plugins also receive the `ClassifyContext` fields as a Lua table: `screen`, `body_text`, `status_text`, `transcript`, `sequence`, `last_intent`, `stable_ms`, `completed_turn_stable_ms`, `markers` (the current `label → offset` transcript marker map), and `cursor` (the current `chars_written` count). Body-oriented classifiers should match against `body_text` to avoid false-positives from status-bar substrings; see [Architecture](./architecture.md#abstraction-boundaries) for the body/status split rules. `markers` + `cursor` let a plugin compose transcript metadata (e.g. `metadata.transcript = { turn_start, turn_end }`) in the SAME classify response that requests a `turn_end` mark — see [Plugin-driven transcript markers](../reference/library.md#plugin-driven-transcript-markers-host-marks-markers) for the `host_marks` channel the snapshot can return.
 
 Each plugin call runs under an instruction-count and wall-clock budget; runaway Lua is interrupted before it can block the host loop. The runtime does not expose filesystem, network, or process callbacks to plugins.
 
 ## Fixture-driven classifier tests
 
-Recorded screen fixtures live under `tests/fixtures/<plugin>/`. Each fixture is a pair:
+Recorded screen fixtures live under `plugins/<plugin>/fixtures/` — co-located with the plugin source they exercise so adding a fixture is a single-PR documentation-only change next to the classifier it pins down. Each fixture is a pair:
 
 - `<name>.txt` — sanitized screen capture.
 - `<name>.expected.json` — expected state, evidence, optional `last_intent`, and confidence floor.
@@ -133,7 +134,7 @@ The pieces a second adapter would need are exactly what the Claude Code plugin a
 
 4. For an out-of-tree third-party plugin, write the manifest as TOML (next to the Lua source) and register it through one of the trusted-local loading paths below. No Rust changes are needed.
 
-5. Add recorded screen fixtures under `tests/fixtures/<name>/` with sibling `.expected.json` files. If you wire the same auto-enrolling pattern `tests/lua_classifier_tests.rs` uses for claude-code, fixture additions become single-file changes.
+5. Add recorded screen fixtures under `plugins/<name>/fixtures/` (co-located with the plugin source) with sibling `.expected.json` files. If you wire the same auto-enrolling pattern `tests/lua_classifier_tests.rs` uses for claude-code, fixture additions become single-file changes.
 
 There is no per-plugin Rust shim. Application-specific state vocabulary, intent verbs, and evidence strings stay entirely in Lua. Rust callers that want a typed state enum can define one locally and convert from the plugin's state string — that translation is application-specific and intentionally not part of the library surface.
 

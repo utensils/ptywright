@@ -224,6 +224,8 @@ const annotations = [
           :viewBox="`0 0 ${SVG_W} ${SVG_H}`"
           class="op-schem-svg"
           width="100%"
+          role="img"
+          aria-label="Nine-layer runtime diagram: caller → JSON-RPC → session → screen + transcript → matcher + action → turn → adapter. Action loops back to session."
           preserveAspectRatio="xMidYMid meet"
         >
           <defs>
@@ -399,6 +401,45 @@ const annotations = [
         </svg>
       </div>
 
+      <!-- Mobile fallback. The SVG above shrinks below ~720px to the point
+           where the in-SVG text (sized in viewBox coordinates) becomes
+           unreadable. Below that breakpoint we hide the SVG and present
+           the same nine layers as a vertical card stack with arrow
+           connectors. Observation flows top → bottom; the dashed
+           writeback connector at the bottom mirrors the SVG's amber
+           control-loop arrow. -->
+      <ol
+        class="op-schem-mobile"
+        aria-label="Runtime layers, observation flowing top to bottom"
+      >
+        <li v-for="(n, i) in nodes" :key="n.id" class="op-schem-mobile-node">
+          <div class="op-schem-mobile-card">
+            <div class="op-schem-mobile-head">
+              <span class="op-schem-mobile-num"
+                >N{{ String(i).padStart(2, '0') }}</span
+              >
+              <span class="op-schem-mobile-label">{{ n.label }}</span>
+              <span v-if="n.file" class="op-schem-mobile-file">{{
+                n.file
+              }}</span>
+            </div>
+            <div class="op-schem-mobile-sub">{{ n.sub }}</div>
+          </div>
+          <div
+            v-if="i < nodes.length - 1"
+            class="op-schem-mobile-arrow"
+            aria-hidden="true"
+          >
+            ↓
+          </div>
+        </li>
+        <li class="op-schem-mobile-loop">
+          <span class="op-schem-mobile-loop-text">
+            ↑ writeback · action → session
+          </span>
+        </li>
+      </ol>
+
       <footer class="op-schem-foot">
         <div>
           <div class="op-schem-foot-label">// caller</div>
@@ -560,12 +601,17 @@ const annotations = [
 .op-schem-svg-wrap {
   position: relative;
   width: 100%;
-  overflow-x: auto;
 }
 
 .op-schem-svg {
   display: block;
-  min-width: 880px;
+  width: 100%;
+  height: auto;
+}
+
+/* Mobile fallback is hidden on desktop; the SVG above handles the diagram. */
+.op-schem-mobile {
+  display: none;
 }
 
 .op-schem-edge {
@@ -691,6 +737,128 @@ const annotations = [
   .op-schem-meta {
     text-align: left;
   }
+}
+
+/* Below 720px the SVG text (sized in viewBox coordinates) shrinks past
+ * the legibility floor. Swap to the stacked-card fallback. */
+@media (max-width: 720px) {
+  .op-schem-svg-wrap {
+    display: none;
+  }
+  .op-schem-mobile {
+    display: block;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+}
+
+.op-schem-mobile-node {
+  margin: 0;
+  padding: 0;
+}
+
+.op-schem-mobile-card {
+  background: var(--schem-node-bg);
+  border: 1px solid var(--schem-node-bd);
+  border-radius: 3px;
+  padding: 12px 14px;
+  position: relative;
+}
+
+/* L-bracket corners on each card to mirror the SVG node chrome. */
+.op-schem-mobile-card::before,
+.op-schem-mobile-card::after {
+  content: '';
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-color: var(--schem-bracket);
+  border-style: solid;
+  border-width: 0;
+}
+.op-schem-mobile-card::before {
+  top: -1px;
+  left: -1px;
+  border-top-width: 2px;
+  border-left-width: 2px;
+}
+.op-schem-mobile-card::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom-width: 2px;
+  border-right-width: 2px;
+}
+
+.op-schem-mobile-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.op-schem-mobile-num {
+  font-family: var(--op-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--op-mute);
+}
+.is-dark .op-schem-mobile-num {
+  color: var(--schem-edge);
+}
+
+.op-schem-mobile-label {
+  font-family: var(--op-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--op-ink);
+}
+.is-dark .op-schem-mobile-label {
+  font-weight: 500;
+}
+
+.op-schem-mobile-file {
+  margin-left: auto;
+  font-family: var(--op-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  color: var(--op-accent-t);
+  opacity: 0.7;
+}
+.is-dark .op-schem-mobile-file {
+  color: var(--schem-edge);
+  opacity: 1;
+}
+
+.op-schem-mobile-sub {
+  font-family: var(--op-mono);
+  font-size: 11px;
+  color: var(--op-mute);
+}
+
+.op-schem-mobile-arrow {
+  text-align: center;
+  font-family: var(--op-mono);
+  font-size: 14px;
+  color: var(--schem-arrow);
+  line-height: 1;
+  padding: 8px 0;
+}
+
+.op-schem-mobile-loop {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--schem-back-edge);
+  text-align: center;
+}
+
+.op-schem-mobile-loop-text {
+  font-family: var(--op-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--schem-back-edge);
 }
 
 .op-schem-foot-label {
