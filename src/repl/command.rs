@@ -856,7 +856,7 @@ fn session_resume(
     let mut params = Map::new();
     params.insert("plugin".to_string(), Value::String(plugin.clone()));
     insert_adapter_start_kwargs(&mut params, &call)?;
-    let prior_adapter = prior_adapter_kwarg(&call);
+    let prior_adapter = prior_adapter_kwarg(&call)?;
     if let Some(prior) = prior_adapter.as_deref() {
         params.insert(
             "prior_adapter".to_string(),
@@ -1186,8 +1186,22 @@ fn duration_kwarg(call: &DslCall, name: &str) -> Result<Option<Duration>> {
     }
 }
 
-fn prior_adapter_kwarg(call: &DslCall) -> Option<String> {
-    string_kwarg(call, "prior_adapter").or_else(|| string_kwarg(call, "prior"))
+fn prior_adapter_kwarg(call: &DslCall) -> Result<Option<String>> {
+    if let Some(arg) = call.kwargs.get("prior_adapter") {
+        return match arg {
+            Arg::String(s) => Ok(Some(s.clone())),
+            other => Err(Error::Rpc(format!(
+                "prior_adapter= expected a string, got {other}"
+            ))),
+        };
+    }
+    if let Some(arg) = call.kwargs.get("prior") {
+        return match arg {
+            Arg::String(s) => Ok(Some(s.clone())),
+            other => Err(Error::Rpc(format!("prior= expected a string, got {other}"))),
+        };
+    }
+    Ok(None)
 }
 
 fn insert_adapter_start_kwargs(params: &mut Map<String, Value>, call: &DslCall) -> Result<()> {
@@ -1314,7 +1328,7 @@ pub fn help_text() -> &'static str {
      Sessions:\n\
        plugins()                       list built-in plugins\n\
        session.spawn(\"name\")         spawn an adapter for the named plugin\n\
-       session.resume(\"name\", prior_adapter=\"id\") resume and close prior id\n\
+       session.resume(\"name\", prior_adapter=\"id\") resume and close prior id (alias: prior)\n\
        session.list()                  list known adapters (this REPL)\n\
        session.live()                  list adapters live on the server\n\
        session.attach(\"id\")          attach a server adapter into this REPL\n\
@@ -2128,10 +2142,10 @@ mod tests {
             "session.resume",
             vec![("prior_adapter", Arg::String("e1".into()))],
         );
-        assert_eq!(prior_adapter_kwarg(&long).as_deref(), Some("e1"));
+        assert_eq!(prior_adapter_kwarg(&long).unwrap().as_deref(), Some("e1"));
 
         let short = call_kw("session.resume", vec![("prior", Arg::String("e2".into()))]);
-        assert_eq!(prior_adapter_kwarg(&short).as_deref(), Some("e2"));
+        assert_eq!(prior_adapter_kwarg(&short).unwrap().as_deref(), Some("e2"));
 
         let both = call_kw(
             "session.resume",
@@ -2141,10 +2155,18 @@ mod tests {
             ],
         );
         assert_eq!(
-            prior_adapter_kwarg(&both).as_deref(),
+            prior_adapter_kwarg(&both).unwrap().as_deref(),
             Some("e1"),
             "prior_adapter should win when both spellings are present"
         );
+
+        let wrong_long = call_kw("session.resume", vec![("prior_adapter", Arg::Int(1))]);
+        let error = prior_adapter_kwarg(&wrong_long).unwrap_err();
+        assert!(error.to_string().contains("prior_adapter="), "{error}");
+
+        let wrong_short = call_kw("session.resume", vec![("prior", Arg::Bool(true))]);
+        let error = prior_adapter_kwarg(&wrong_short).unwrap_err();
+        assert!(error.to_string().contains("prior="), "{error}");
     }
 
     #[test]
@@ -2482,5 +2504,6 @@ mod tests {
             text.contains("resume and close prior id"),
             "help missing session.resume description"
         );
+        assert!(text.contains("alias: prior"), "help missing prior alias");
     }
 }
