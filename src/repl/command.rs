@@ -1702,6 +1702,54 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn dispatch_session_resume_accepts_prior_alias() {
+        let (client, _server, mut ctx) = in_process_client();
+        let first = dispatch(
+            parse(r#"session.spawn("claude-code", program="/bin/sh", args=["-c", "sleep 5"])"#)
+                .unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("spawn prior");
+        let CmdOutcome::Json(first_value) = first else {
+            panic!("expected json outcome from spawn")
+        };
+        let prior = first_value["adapter"]
+            .as_str()
+            .expect("prior adapter")
+            .to_string();
+
+        let resumed = dispatch(
+            parse(&format!(
+                r#"session.resume("claude-code", program="/bin/sh", args=["-c", "sleep 5"], prior="{prior}")"#
+            ))
+            .unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("resume with prior alias");
+        let CmdOutcome::Json(resumed_value) = resumed else {
+            panic!("expected json outcome from resume")
+        };
+        let replacement = resumed_value["adapter"]
+            .as_str()
+            .expect("replacement adapter");
+        assert_ne!(prior, replacement);
+        assert!(ctx.adapter(&prior).is_none(), "prior tab must be removed");
+        assert_eq!(ctx.focus.as_deref(), Some(replacement));
+
+        let _ = dispatch(
+            parse("session.close()").unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
     fn dispatch_meta_tabs_renders_focus_marker() {
         let (client, _server, mut ctx) = in_process_client();
         ctx.upsert_adapter("e1", "claude-code");
@@ -2430,5 +2478,9 @@ mod tests {
         };
         assert!(text.contains("plugins()"), "help missing top-line cmds");
         assert!(text.contains("send.key"), "help missing send.key entry");
+        assert!(
+            text.contains("resume and close prior id"),
+            "help missing session.resume description"
+        );
     }
 }
