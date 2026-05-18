@@ -53,7 +53,7 @@ pub enum MetaCmd {
     Quit,
     Tabs,
     Focus(String),
-    Notifications(bool),
+    Notifications(NotificationsRequest),
     /// List adapters live on the server (across all connections).
     Live,
     /// Attach a server-side adapter into this REPL's local tab list.
@@ -71,6 +71,27 @@ pub enum MetaCmd {
 pub enum AttachSpec {
     One(String),
     All,
+}
+
+/// Per-stream notification filter, optionally scoping the event stream
+/// to a named adapter / session list. Empty vectors map to "no filter
+/// in force" — the server delivers every session. Mirrors the
+/// `server.set_notifications` `adapters` / `sessions` arrays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationsRequest {
+    pub enabled: bool,
+    pub adapters: Vec<String>,
+    pub sessions: Vec<String>,
+}
+
+impl NotificationsRequest {
+    pub fn simple(enabled: bool) -> Self {
+        Self {
+            enabled,
+            adapters: Vec::new(),
+            sessions: Vec::new(),
+        }
+    }
 }
 
 /// Outcome of a dispatched command — what the TUI's history pane renders.
@@ -360,18 +381,7 @@ fn parse_meta(rest: &str) -> Result<Cmd> {
             }
             MetaCmd::Focus(tail.to_string())
         }
-        "notifications" => {
-            let enabled = match tail {
-                "on" | "true" | "1" => true,
-                "off" | "false" | "0" => false,
-                other => {
-                    return Err(Error::Rpc(format!(
-                        ":notifications expects on|off, got `{other}`",
-                    )));
-                }
-            };
-            MetaCmd::Notifications(enabled)
-        }
+        "notifications" => MetaCmd::Notifications(parse_notifications_tail(tail)?),
         "live" => MetaCmd::Live,
         "attach" => {
             if tail.is_empty() {
@@ -408,6 +418,82 @@ fn parse_meta(rest: &str) -> Result<Cmd> {
         }
     };
     Ok(Cmd::Meta(meta))
+}
+
+/// Parse the trailing args of `:notifications` into a [`NotificationsRequest`].
+///
+/// Supported forms:
+///
+/// ```text
+/// :notifications on
+/// :notifications off
+/// :notifications on adapters=e1,e2
+/// :notifications on sessions=s1,s2
+/// :notifications on adapters=e1 sessions=s1
+/// ```
+///
+/// `on`/`off` may be written as `true`/`false`/`1`/`0` for symmetry with the
+/// boolean kwargs accepted elsewhere. `adapters=` and `sessions=` take a
+/// comma-separated id list. Whitespace is the only separator between the
+/// boolean head and the filter kwargs.
+fn parse_notifications_tail(tail: &str) -> Result<NotificationsRequest> {
+    let mut parts = tail.split_whitespace();
+    let head = parts.next().unwrap_or("");
+    let enabled = match head {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => {
+            return Err(Error::Rpc(format!(
+                ":notifications expects on|off [adapters=…] [sessions=…], got `{other}`",
+            )));
+        }
+    };
+    let mut adapters: Vec<String> = Vec::new();
+    let mut sessions: Vec<String> = Vec::new();
+    // `current` tracks which filter list a bare continuation token
+    // belongs to. This lets `:notifications on adapters=e1, e2` (with
+    // a space after the comma) parse as `adapters=[e1, e2]` instead of
+    // erroring on `e2` as an unknown token — the comma+space form is
+    // what operators reach for naturally and matches how the same
+    // filter would be written in plain English.
+    let mut current: Option<&mut Vec<String>> = None;
+    for part in parts {
+        if let Some(rest) = part.strip_prefix("adapters=") {
+            adapters.extend(parse_id_list(rest));
+            current = Some(&mut adapters);
+        } else if let Some(rest) = part.strip_prefix("sessions=") {
+            sessions.extend(parse_id_list(rest));
+            current = Some(&mut sessions);
+        } else if let Some(target) = current.as_deref_mut() {
+            // Continuation: the previous token left a trailing comma
+            // or stopped on whitespace inside a list, so this is more
+            // ids for the same filter list.
+            target.extend(parse_id_list(part));
+        } else {
+            return Err(Error::Rpc(format!(
+                ":notifications: unknown filter token `{part}` (expected `adapters=…` or `sessions=…`)",
+            )));
+        }
+    }
+    if !enabled && (!adapters.is_empty() || !sessions.is_empty()) {
+        return Err(Error::Rpc(
+            ":notifications off does not take filter args".to_string(),
+        ));
+    }
+    Ok(NotificationsRequest {
+        enabled,
+        adapters,
+        sessions,
+    })
+}
+
+fn parse_id_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 struct Parser {
@@ -695,16 +781,40 @@ fn dispatch_meta(
             ctx.focus = Some(id.clone());
             Ok(CmdOutcome::Line(format!("focus → {id}")))
         }
-        MetaCmd::Notifications(enabled) => {
-            let result = client.call(
-                "server.set_notifications",
-                json!({ "enabled": enabled }),
-                timeout,
-            )?;
+        MetaCmd::Notifications(request) => {
+            let mut params = Map::new();
+            params.insert("enabled".to_string(), Value::Bool(request.enabled));
+            if !request.adapters.is_empty() {
+                params.insert(
+                    "adapters".to_string(),
+                    Value::Array(
+                        request
+                            .adapters
+                            .iter()
+                            .map(|id| Value::String(id.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !request.sessions.is_empty() {
+                params.insert(
+                    "sessions".to_string(),
+                    Value::Array(
+                        request
+                            .sessions
+                            .iter()
+                            .map(|id| Value::String(id.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            let result = client.call("server.set_notifications", Value::Object(params), timeout)?;
             // Pause the client's heartbeat in lockstep — otherwise it
             // would re-assert `set_notifications {enabled: true}` every
-            // interval and silently undo `:notifications off`.
-            client.set_heartbeat_enabled(enabled);
+            // interval and silently undo `:notifications off`. The
+            // filter contents are passive: the heartbeat only needs the
+            // enabled flag to decide whether to re-subscribe.
+            client.set_heartbeat_enabled(request.enabled);
             Ok(CmdOutcome::Json(result))
         }
         MetaCmd::Live => session_live(client, timeout),
@@ -725,6 +835,11 @@ fn dispatch_dsl(
     match call.path.join(".").as_str() {
         "plugins" => {
             let result = client.call("adapter.list", json!({}), timeout)?;
+            Ok(CmdOutcome::Json(result))
+        }
+        "plugins.describe" => {
+            let plugin = expect_one_string(&call, "plugins.describe")?;
+            let result = client.call("plugin.describe", json!({ "plugin": plugin }), timeout)?;
             Ok(CmdOutcome::Json(result))
         }
         "session.spawn" => session_spawn(call, client, ctx, timeout),
@@ -772,6 +887,7 @@ fn dispatch_dsl(
             let (intent, params) = send_key_payload(key);
             send_named_intent(client, ctx, intent, params, timeout)
         }
+        "turn" => turn_command(call, client, ctx, timeout),
         "wait" => wait_command(call, client, ctx, timeout),
         "wait.matches" => {
             let pattern = expect_one_regex(&call, "wait.matches")?;
@@ -1040,6 +1156,85 @@ fn send_named_intent(
         }),
         timeout,
     )?;
+    Ok(CmdOutcome::Json(result))
+}
+
+/// `turn("send_prompt", prompt="...", wait=matches(r"…"), timeout=5s)` —
+/// dispatch the atomic [`adapter.turn`] convenience.
+///
+/// Positional[0] = the send intent name. All remaining kwargs flow into
+/// `send.params`, except for the three reserved wait kwargs:
+///
+/// * `wait=<matcher_call>` — same shape as the `wait()` DSL (e.g.
+///   `matches(r"…")` or `screen_stable(250ms)`). Translates into the
+///   matcher's intent + params.
+/// * `wait_intent="<name>"` — override the matcher function (default
+///   `wait_turn_matcher`). Use this when a plugin owns multiple matchers
+///   and the caller wants one explicitly.
+/// * `timeout=<duration>` — wait-leg timeout; defaults to the server's
+///   120 s ceiling when omitted.
+fn turn_command(
+    call: DslCall,
+    client: &RpcClient,
+    ctx: &mut ReplCtx,
+    timeout: Duration,
+) -> Result<CmdOutcome> {
+    let intent = expect_one_string(&call, "turn")?;
+    let adapter = focus_or_err(ctx)?.to_string();
+
+    // Build send.params from kwargs, skipping the three wait-only keys.
+    let mut send_kwargs: BTreeMap<String, Arg> = BTreeMap::new();
+    for (key, value) in &call.kwargs {
+        if matches!(key.as_str(), "wait" | "wait_intent" | "timeout") {
+            continue;
+        }
+        send_kwargs.insert(key.clone(), value.clone());
+    }
+    let send_params = kwargs_to_json(&send_kwargs);
+
+    // Build the wait sub-object.
+    let mut wait_obj = Map::new();
+    if let Some(wait_arg) = call.kwargs.get("wait") {
+        let (wait_intent_resolved, wait_params) = matcher_to_params(wait_arg.clone())?;
+        wait_obj.insert("intent".to_string(), Value::String(wait_intent_resolved));
+        wait_obj.insert("params".to_string(), wait_params);
+    } else if let Some(wait_intent_arg) = call.kwargs.get("wait_intent") {
+        let wait_intent = match wait_intent_arg {
+            Arg::String(s) => s.clone(),
+            other => {
+                return Err(Error::Rpc(format!(
+                    "wait_intent= expected a string, got {other}"
+                )));
+            }
+        };
+        wait_obj.insert("intent".to_string(), Value::String(wait_intent));
+    }
+    if let Some(timeout_override) = duration_kwarg(&call, "timeout")? {
+        // A `u128 -> u64` saturate here would silently turn a malformed
+        // multi-day timeout into `u64::MAX` and the wait leg would hold
+        // the per-adapter mutex for the entire (unbounded) duration —
+        // which is exactly the head-of-line blocking trap adapter.turn
+        // warns against. Reject the overflow explicitly so the caller
+        // hears about the bad duration instead of sleeping forever.
+        let millis = u64::try_from(timeout_override.as_millis()).map_err(|_| {
+            Error::Rpc(format!(
+                "turn(timeout=…) is too large to encode as milliseconds: {:?}",
+                timeout_override
+            ))
+        })?;
+        wait_obj.insert("timeout_ms".to_string(), Value::from(millis));
+    }
+
+    let mut params = Map::new();
+    params.insert("adapter".to_string(), Value::String(adapter));
+    params.insert(
+        "send".to_string(),
+        json!({ "intent": intent, "params": send_params }),
+    );
+    if !wait_obj.is_empty() {
+        params.insert("wait".to_string(), Value::Object(wait_obj));
+    }
+    let result = client.call("adapter.turn", Value::Object(params), timeout)?;
     Ok(CmdOutcome::Json(result))
 }
 
@@ -1327,6 +1522,7 @@ pub fn help_text() -> &'static str {
      \n\
      Sessions:\n\
        plugins()                       list built-in plugins\n\
+       plugins.describe(\"name\")        return a plugin's intents / matchers / states\n\
        session.spawn(\"name\")         spawn an adapter for the named plugin\n\
        session.resume(\"name\", prior_adapter=\"id\") resume and close prior id (alias: prior)\n\
        session.list()                  list known adapters (this REPL)\n\
@@ -1340,6 +1536,8 @@ pub fn help_text() -> &'static str {
        send.text(\"…\")                 send a prompt\n\
        send.key(\"y\")                  send a single key\n\
        send.intent(\"name\", k=v, …)   invoke a plugin intent\n\
+       turn(\"intent\", k=v, …)         atomic send + wait_turn_matcher (adapter.turn)\n\
+       turn(\"intent\", k=v, wait=matches(r\"…\"), timeout=5s)\n\
        wait(matches(r\"…\"))            wait for output to match\n\
        wait(screen_stable(250ms))      wait for the screen to settle\n\
        transcript.snapshot(redact=true)\n\
@@ -1349,7 +1547,8 @@ pub fn help_text() -> &'static str {
      \n\
      Meta:\n\
        :tabs       :focus <id>   :live   :attach <id|all>\n\
-       :notifications on|off     :rpc <method> {json}\n\
+       :notifications on|off [adapters=…] [sessions=…]\n\
+       :rpc <method> {json}\n\
        :quit       :help\n"
 }
 
@@ -1506,11 +1705,11 @@ mod tests {
     fn parse_meta_notifications_on_off() {
         assert_eq!(
             parse(":notifications on").unwrap(),
-            Cmd::Meta(MetaCmd::Notifications(true))
+            Cmd::Meta(MetaCmd::Notifications(NotificationsRequest::simple(true)))
         );
         assert_eq!(
             parse(":notifications off").unwrap(),
-            Cmd::Meta(MetaCmd::Notifications(false))
+            Cmd::Meta(MetaCmd::Notifications(NotificationsRequest::simple(false)))
         );
     }
 
@@ -1518,6 +1717,53 @@ mod tests {
     fn parse_meta_notifications_rejects_garbage() {
         let error = parse(":notifications maybe").unwrap_err();
         assert!(error.to_string().contains("on|off"), "{error}");
+    }
+
+    #[test]
+    fn parse_meta_notifications_accepts_filter_kwargs() {
+        // `adapters=` / `sessions=` scope the per-stream filter that the
+        // server applies before fanning notifications out. Comma-separated,
+        // whitespace-trimmed, empty entries dropped.
+        let parsed = parse(":notifications on adapters=e1,e2 sessions=s1").unwrap();
+        let Cmd::Meta(MetaCmd::Notifications(request)) = parsed else {
+            panic!("expected MetaCmd::Notifications, got {parsed:?}");
+        };
+        assert!(request.enabled);
+        assert_eq!(request.adapters, vec!["e1".to_string(), "e2".to_string()]);
+        assert_eq!(request.sessions, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn parse_meta_notifications_rejects_filter_when_disabled() {
+        // The filter is meaningless without an active subscription —
+        // require callers to drop it when turning notifications off so
+        // the wire shape stays self-consistent.
+        let error = parse(":notifications off adapters=e1").unwrap_err();
+        assert!(
+            error.to_string().contains("off does not take filter args"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_meta_notifications_rejects_unknown_filter_token() {
+        let error = parse(":notifications on widgets=foo").unwrap_err();
+        assert!(error.to_string().contains("widgets=foo"), "{error}");
+    }
+
+    #[test]
+    fn parse_meta_notifications_accepts_comma_space_separated_lists() {
+        // Operators reach for `adapters=e1, e2` (comma + space) by
+        // muscle memory — `split_whitespace()` alone would tokenize
+        // `e2` as a stray bareword. The parser must treat a bare
+        // continuation token as more ids for the previous filter list.
+        let parsed = parse(":notifications on adapters=e1, e2 sessions=s1, s2").unwrap();
+        let Cmd::Meta(MetaCmd::Notifications(request)) = parsed else {
+            panic!("expected MetaCmd::Notifications, got {parsed:?}");
+        };
+        assert!(request.enabled);
+        assert_eq!(request.adapters, vec!["e1".to_string(), "e2".to_string()]);
+        assert_eq!(request.sessions, vec!["s1".to_string(), "s2".to_string()]);
     }
 
     #[test]
@@ -2505,5 +2751,88 @@ mod tests {
             "help missing session.resume description"
         );
         assert!(text.contains("alias: prior"), "help missing prior alias");
+        assert!(text.contains("plugins.describe"), "help missing describe");
+        assert!(text.contains("turn(\"intent\""), "help missing turn() form");
+        assert!(
+            text.contains(":notifications on|off [adapters="),
+            "help missing notifications filter syntax"
+        );
+    }
+
+    #[test]
+    fn dispatch_plugins_describe_routes_to_plugin_describe() {
+        // `plugins.describe("claude-code")` must call `plugin.describe`
+        // with `{ plugin: "claude-code" }`. The built-in claude-code
+        // plugin exports a `describe()` function, so the server should
+        // return its intents/wait_matchers/states catalog verbatim.
+        let (client, _server, mut ctx) = in_process_client();
+        let outcome = dispatch(
+            parse(r#"plugins.describe("claude-code")"#).unwrap(),
+            &client,
+            &mut ctx,
+            Duration::from_secs(5),
+        )
+        .expect("plugins.describe dispatch");
+        let CmdOutcome::Json(value) = outcome else {
+            panic!("expected json outcome, got {outcome:?}")
+        };
+        assert_eq!(value["plugin"], "claude-code");
+        let intents = value["intents"]
+            .as_array()
+            .expect("intents must be an array");
+        let names: Vec<&str> = intents
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()))
+            .collect();
+        // The plugin's own describe() must surface `send_prompt`.
+        assert!(
+            names.contains(&"send_prompt"),
+            "intents missing send_prompt: {names:?}"
+        );
+    }
+
+    #[test]
+    fn turn_command_builds_send_and_wait_blocks() {
+        // The DSL `turn("send_prompt", prompt="hi", timeout=5s)` must
+        // serialize to `{ adapter, send: { intent: "send_prompt",
+        // params: { prompt: "hi" } }, wait: { timeout_ms: 5000 } }`.
+        // Reserved kwargs (`wait`, `wait_intent`, `timeout`) MUST NOT
+        // leak into `send.params`.
+        let call = match parse(r#"turn("send_prompt", prompt="hi", timeout=5s)"#).unwrap() {
+            Cmd::Dsl(call) => call,
+            other => panic!("expected DSL call, got {other:?}"),
+        };
+        let intent = expect_one_string(&call, "turn").unwrap();
+        assert_eq!(intent, "send_prompt");
+        // send_kwargs should only contain `prompt`, not the reserved
+        // wait kwargs.
+        let mut send_kwargs = BTreeMap::new();
+        for (key, value) in &call.kwargs {
+            if matches!(key.as_str(), "wait" | "wait_intent" | "timeout") {
+                continue;
+            }
+            send_kwargs.insert(key.clone(), value.clone());
+        }
+        let send_params = kwargs_to_json(&send_kwargs);
+        assert_eq!(send_params, json!({ "prompt": "hi" }));
+        assert_eq!(
+            duration_kwarg(&call, "timeout").unwrap(),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn turn_command_resolves_wait_matcher_shortcut() {
+        // `turn(..., wait=matches(r"…"))` must walk through
+        // `matcher_to_params` so the wire shape matches what the
+        // bare `wait()` form would produce.
+        let call = match parse(r#"turn("send_prompt", wait=matches(r"completed"))"#).unwrap() {
+            Cmd::Dsl(call) => call,
+            other => panic!("expected DSL call, got {other:?}"),
+        };
+        let wait_arg = call.kwargs.get("wait").cloned().expect("wait kwarg");
+        let (intent, params) = matcher_to_params(wait_arg).unwrap();
+        assert_eq!(intent, "wait_turn_matcher");
+        assert_eq!(params, json!({ "pattern": "completed" }));
     }
 }

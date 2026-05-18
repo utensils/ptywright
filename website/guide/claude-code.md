@@ -73,8 +73,25 @@ Every state response includes:
 - `confidence`
 - `evidence`
 - `sequence`
+- `metadata` — plugin-specific structured details about the current state (see below)
 
-The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Recorded fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, the workspace-trust dialog, interrupted, completed, usage, and error-like screens. Each fixture under `tests/fixtures/claude_code/<name>.txt` carries a sibling `<name>.expected.json` describing the expected state, evidence string, optional `last_intent`, and confidence floor; adding a new fixture is a documentation-only change.
+### Metadata fields
+
+The classifier may attach the following keys to `metadata`, depending on which state is detected. All fields are optional — callers should treat any missing key as "not observed this tick".
+
+| Key          | When set                       | Shape                                                                                                                   |
+| ------------ | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `status`     | always (status-bar row parsed) | `{ "model": "...", "permission_mode": "..." }`                                                                          |
+| `permission` | `waiting_for_permission`       | `{ "tool": "Bash", "summary": "...", "options": ["Yes", "Yes, and don't ask again", "No"] }`                            |
+| `plan`       | `waiting_for_plan_approval`    | Multi-line plan body text (the bullet/step list Claude Code rendered).                                                  |
+| `error`      | `error`                        | `{ "kind": "rate_limit"\|"quota"\|"connection"\|"auth"\|"api"\|"unknown", "message": "...", "retry_after_s"?: number }` |
+| `login`      | `waiting_for_login`            | `{ "url": "https://..." }` — extracted sign-in URL (bare-domain forms supported, host-suffix attacks rejected).         |
+| `usage`      | `/usage` panel visible         | Structured panel contents (model, limits, current usage).                                                               |
+| `dialog_id`  | dialog-bearing states          | FNV-1a-keyed correlation id (see below).                                                                                |
+
+`dialog_id` is stamped whenever the classifier sees a dialog (permission, plan approval, etc.) and surfaces at the top of the metadata object — `metadata.dialog_id` — alongside the matching dialog metadata block (`metadata.permission`, `metadata.plan`, …). Pass it back as `params.dialog_id` on the matching intent (`approve`, `deny`, `approve_trust`, etc.) and the plugin will refuse to act on a stale dialog — returning a `stale_dialog` error rather than approving whatever Claude Code repainted between classify and act. Callers driving the plugin in a classify-then-act loop (the canonical `adapter.state` / `adapter.wait` / `adapter.send` cadence) get this for free; direct-Rust callers that fire intents without an intervening classify will see `_current_dialog_id == nil` and get `stale_dialog`, which is correct — that's the warning signal that the act-then-act path skipped the cross-check.
+
+The classifier is heuristic and deliberately isolated in the Lua plugin so Claude Code UI changes can be handled without changing Rust PTY/session internals. Recorded fixture tests cover ready, thinking, tool-use/streaming, permission variants, plan approval variants, the workspace-trust dialog, interrupted, completed, usage, login, error-subtype, and error-like screens. Each fixture under `tests/fixtures/claude_code/<name>.txt` carries a sibling `<name>.expected.json` describing the expected state, evidence string, optional `last_intent`, and confidence floor; adding a new fixture is a documentation-only change.
 
 Current fixtures are based on sanitized captures from Claude Code v2.1.141 / v2.1.142 on Ghostty/macOS. Treat the exact labels, footer content, and slash-command layouts as versioned UI assumptions; update the Lua plugin and fixtures together when Claude Code changes its TUI.
 
@@ -133,6 +150,7 @@ Plugin intents available via `adapter.send`:
 | `dismiss_welcome` | `{}`                                                            | Presses Enter to clear the first-launch welcome panel.                                                                                                                                                       |
 | `expand`          | `{}`                                                            | Sends Ctrl+O — toggles expansion of the focused collapsible row (`Reading N files…`, search results, Bash output). Mirrors Claude Code 2.1.x's keyboard binding so callers don't have to remember the alias. |
 | `slash_command`   | `{ "command": "btw" }` (or `{"name":...}`, accepts leading `/`) | Bracketed-pastes `/<name>` and presses Enter. Does NOT flip `last_intent` to `prompt_submitted` because slash commands open a panel/modal, they aren't conversation turns. Empty `command` is a no-op.       |
+| `attach_file`     | `{ "path": "..." }`                                             | Bracketed-pastes a file path into the prompt buffer so Claude Code's drag-and-drop attach path can pick it up. Rejects empty paths and paths with embedded newlines. Does NOT submit (no Enter).             |
 
 Diagnostic reads — `adapter.snapshot`, `adapter.transcript`, `adapter.inspect` — work the same way as their `session.*` counterparts and redact by default. `adapter.inspect` additionally returns the `body_text` / `status_text` split the classifier sees, so misclassification reports can be reproduced without spinning up a parallel `session.*` connection.
 
@@ -162,6 +180,15 @@ What the script demonstrates (and what an integrator should copy):
 5. SIGINT handler that terminates the ptywright subprocess and lets the main thread clean up RPC state outside the signal context.
 
 The script doubles as a worked example of every primitive a real consumer would touch: `adapter.start`, `adapter.send`, `adapter.state`, `adapter.inspect`, `adapter.transcript`, `adapter.wait`, `adapter.close`, plus the `session.output` / `session.exited` notification subscription. Most of the file is comments documenting why each guard exists; the actual control flow is short. The test surface lives in `tests/scripts/test_claude_stream.py` (stdlib `unittest`) and locks down the chrome filter, the answer-region fallback, the terminal-state taxonomy, and the JSON-RPC framing contracts that determine whether the streaming output is legible and how failures terminate.
+
+## Required environment
+
+The plugin manifest declares two `default_target.required_env` keys that callers cannot override on `adapter.start`:
+
+- `CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"` — without this, OSC title-set escapes appear in the screen body and pollute the body-text classifier.
+- `CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL = "1"` — without this, virtual scrolling moves cells out of the vt100 grid the classifier inspects.
+
+See the [environment merge precedence](../reference/plugins.md#environment-merge-precedence) in the plugins reference for the manifest-vs-caller-vs-required-env ladder.
 
 ## Safety and limitations
 

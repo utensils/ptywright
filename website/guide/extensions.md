@@ -53,6 +53,7 @@ Action constructors return tagged tables matching the JSON `Action` shape:
 - `ptywright.action.interrupt()` — Ctrl-C.
 - `ptywright.action.eof()` — Ctrl-D.
 - `ptywright.action.kill()` — SIGKILL the child; requires the `session.kill` permission.
+- `ptywright.action.signal(name)` — deliver an arbitrary process signal; requires the `session.kill` permission. `name` is the snake_case `Signal` variant (`"term"`, `"hup"`, `"quit"`, `"int"`, `"kill"`, `"user1"`, `"user2"`). On Windows only `"term"`, `"int"`, and `"kill"` are honored; other names return `UnsupportedOnPlatform` to the caller.
 
 Matcher constructors return tagged tables matching the JSON `Matcher` shape:
 

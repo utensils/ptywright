@@ -132,6 +132,132 @@ fn command_dispatcher_drives_full_spawn_and_close_cycle() {
 }
 
 #[test]
+fn plugins_describe_round_trips_through_dispatcher() {
+    // The DSL `plugins.describe("claude-code")` must call `plugin.describe`
+    // with the right wire shape and surface the resulting catalog.
+    let (client, _server) = in_process_client();
+    let mut ctx = ReplCtx::new();
+    let outcome = dispatch(
+        parse(r#"plugins.describe("claude-code")"#).unwrap(),
+        &client,
+        &mut ctx,
+        Duration::from_secs(5),
+    )
+    .expect("dispatch plugins.describe");
+    let CmdOutcome::Json(value) = outcome else {
+        panic!("expected json outcome, got {outcome:?}");
+    };
+    assert_eq!(value["plugin"], "claude-code");
+    // The claude-code plugin owns its describe() catalog, so the
+    // server-side fallback path should not have run — we expect at
+    // minimum the canonical `send_prompt` intent and the
+    // `wait_turn_matcher` wait function.
+    let intent_names: Vec<&str> = value["intents"]
+        .as_array()
+        .expect("intents array")
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        intent_names.contains(&"send_prompt"),
+        "describe missing send_prompt: {intent_names:?}"
+    );
+    let wait_names: Vec<&str> = value["wait_matchers"]
+        .as_array()
+        .expect("wait_matchers array")
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        wait_names.contains(&"wait_turn_matcher"),
+        "describe missing wait_turn_matcher: {wait_names:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn turn_dispatches_send_then_wait_atomically() {
+    // End-to-end smoke test: `turn(...)` must route through
+    // `adapter.turn`. The claude-code wait_turn_matcher anchors on
+    // claude-specific turn-end markers that /bin/sh can't emit, so we
+    // assert the RPC reached the server (matcher timed out -> -32001)
+    // rather than a successful wait. A timeout error proves the
+    // serialization path is intact: dispatcher → adapter.turn → plugin
+    // dispatch → matcher loop. The wire-shape contract itself is
+    // pinned by the unit tests in src/repl/command.rs.
+    let (client, _server) = in_process_client();
+    let mut ctx = ReplCtx::new();
+
+    let outcome = dispatch(
+        parse(
+            r#"session.spawn("claude-code", program="/bin/sh", args=["-lc", "printf ready; cat"])"#,
+        )
+        .unwrap(),
+        &client,
+        &mut ctx,
+        Duration::from_secs(5),
+    )
+    .expect("dispatch session.spawn");
+    let CmdOutcome::Json(value) = outcome else {
+        panic!("expected json from session.spawn, got {outcome:?}");
+    };
+    let adapter = value["adapter"].as_str().expect("adapter id").to_string();
+
+    // Tight 250 ms wait so the test fails fast on regression but still
+    // reaches the matcher loop.
+    let result = dispatch(
+        parse(r#"turn("send_prompt", prompt="probe\n", wait=matches(r"never-matches"), timeout=250ms)"#)
+            .unwrap(),
+        &client,
+        &mut ctx,
+        Duration::from_secs(5),
+    );
+    match result {
+        Err(error) => {
+            // -32001 is the matcher timeout code defined in src/rpc.rs.
+            // Anything else means the dispatcher rejected the call
+            // before it reached the server.
+            let message = error.to_string();
+            assert!(
+                message.contains("-32001") || message.contains("matcher"),
+                "expected matcher timeout from adapter.turn, got `{message}`"
+            );
+        }
+        Ok(other) => panic!("expected -32001 matcher timeout, got {other:?}"),
+    }
+
+    let _ = dispatch(
+        parse(&format!(r#"session.close("{adapter}")"#)).unwrap(),
+        &client,
+        &mut ctx,
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn notifications_meta_forwards_filter_to_server() {
+    // `:notifications on adapters=e1,e2 sessions=s1` must serialize to
+    // a `server.set_notifications` call carrying the filter arrays.
+    // The server echoes the resolved filter back, so we can assert
+    // round-trip equality.
+    let (client, _server) = in_process_client();
+    let mut ctx = ReplCtx::new();
+    let outcome = dispatch(
+        parse(":notifications on adapters=e1,e2 sessions=s1").unwrap(),
+        &client,
+        &mut ctx,
+        Duration::from_secs(5),
+    )
+    .expect("dispatch :notifications");
+    let CmdOutcome::Json(value) = outcome else {
+        panic!("expected json from :notifications, got {outcome:?}");
+    };
+    assert_eq!(value["enabled"], true);
+    assert_eq!(value["adapters"], json!(["e1", "e2"]));
+    assert_eq!(value["sessions"], json!(["s1"]));
+}
+
+#[test]
 fn rpc_meta_passthrough_invokes_server() {
     let (client, _server) = in_process_client();
     let mut ctx = ReplCtx::new();

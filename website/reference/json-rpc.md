@@ -120,6 +120,21 @@ Enable or disable coalesced server-originated notifications. Notifications are d
 }
 ```
 
+Optional `adapters` and `sessions` arrays scope the stream — events only fire for sessions whose id matches `sessions` or whose owning adapter id matches `adapters`. An empty / omitted filter delivers every session (the default). Adapter ids that don't match a live adapter at filter time are silently ignored so callers can pre-subscribe before `adapter.start` returns; the server response echoes the resolved filter:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "server.set_notifications",
+  "params": { "enabled": true, "adapters": ["e1"], "sessions": ["s2"] }
+}
+```
+
+```json
+{ "enabled": true, "adapters": ["e1"], "sessions": ["s2"] }
+```
+
 When enabled, ptywright may emit:
 
 ```json
@@ -186,20 +201,23 @@ Matcher payloads:
 
 `adapter.*` is the generic plugin-name-aware surface for driving any TUI through ptywright's extension layer. Callers select a plugin manifest by name; the server spawns a PTY session and wraps it in an `ExtensionHandle` for that plugin. Subsequent calls reference the handle by id. There is no per-application RPC namespace — application-specific behaviour (state names, intent names, evidence strings) lives entirely in Lua plugins under `plugins/<name>/`.
 
-| Method               | Params                                                                                                                | Result                                                                                                                                                                                                                   |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `adapter.list`       | —                                                                                                                     | `{ "plugins": [PluginManifest, ...] }`                                                                                                                                                                                   |
-| `adapter.start`      | `{ "plugin": "claude-code", "program"?, "args"?, "cwd"?, "env"?, "rows"?, "cols"?, "pixel_width"?, "pixel_height"? }` | `{ "adapter": "e1", "plugin": "claude-code", "session": "s1", "state": ... }` (the `session` field is the underlying session id, usable directly with `session.*` methods)                                               |
-| `adapter.resume`     | same as `adapter.start` plus `"prior_adapter"?`                                                                       | same as `adapter.start`; closes `prior_adapter` first when it is supplied and still live                                                                                                                                 |
-| `adapter.state`      | `{ "adapter": "e1" }`                                                                                                 | `{ "state": ... }`                                                                                                                                                                                                       |
-| `adapter.send`       | `{ "adapter": "e1", "intent": "send_prompt", "params": { "prompt": "..." } }`                                         | `{ "state": ... }`                                                                                                                                                                                                       |
-| `adapter.wait`       | `{ "adapter": "e1", "intent"?: "wait_turn_matcher", "params"?: { ... }, "timeout_ms"?: 120000 }`                      | `{ "state": ..., "matched": { "kind": ..., "pattern"?, "capture"?, "text"?, "row"?, "col"?, "min_ms"?, "matched"? } }` — `matched` describes which matcher branch fired (see SKILL.md for the full `MatchOutcome` shape) |
-| `adapter.snapshot`   | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                        | `ScreenSnapshot` (same shape as `session.snapshot`)                                                                                                                                                                      |
-| `adapter.transcript` | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                        | `{ "text": "..." }`                                                                                                                                                                                                      |
-| `adapter.inspect`    | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                        | `{ "adapter", "plugin", "state", "plain_text", "body_text", "status_text", "transcript_tail", "sequence" }`                                                                                                              |
-| `adapter.close`      | `{ "adapter": "e1" }`                                                                                                 | `{ "closed": true }`                                                                                                                                                                                                     |
+| Method               | Params                                                                                                                   | Result                                                                                                                                                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `adapter.list`       | —                                                                                                                        | `{ "plugins": [PluginManifest, ...] }`                                                                                                                                                                                   |
+| `adapter.start`      | `{ "plugin": "claude-code", "program"?, "args"?, "cwd"?, "env"?, "rows"?, "cols"?, "pixel_width"?, "pixel_height"? }`    | `{ "adapter": "e1", "plugin": "claude-code", "session": "s1", "state": ... }` (the `session` field is the underlying session id, usable directly with `session.*` methods)                                               |
+| `adapter.resume`     | same as `adapter.start` plus `"prior_adapter"?`                                                                          | same as `adapter.start`; closes `prior_adapter` first when it is supplied and still live                                                                                                                                 |
+| `adapter.state`      | `{ "adapter": "e1" }`                                                                                                    | `{ "state": ... }`                                                                                                                                                                                                       |
+| `adapter.send`       | `{ "adapter": "e1", "intent": "send_prompt", "params": { "prompt": "..." } }`                                            | `{ "state": ... }`                                                                                                                                                                                                       |
+| `adapter.wait`       | `{ "adapter": "e1", "intent"?: "wait_turn_matcher", "params"?: { ... }, "timeout_ms"?: 120000 }`                         | `{ "state": ..., "matched": { "kind": ..., "pattern"?, "capture"?, "text"?, "row"?, "col"?, "min_ms"?, "matched"? } }` — `matched` describes which matcher branch fired (see SKILL.md for the full `MatchOutcome` shape) |
+| `adapter.turn`       | `{ "adapter": "e1", "send": { "intent": "...", "params"?: { ... } }, "wait"?: { "intent"?, "params"?, "timeout_ms"? } }` | `{ "state": ..., "matched": ... }` — atomic send-then-wait with the same shape as `adapter.wait`                                                                                                                         |
+| `adapter.snapshot`   | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                           | `ScreenSnapshot` (same shape as `session.snapshot`)                                                                                                                                                                      |
+| `adapter.transcript` | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                           | `{ "text": "..." }`                                                                                                                                                                                                      |
+| `adapter.inspect`    | `{ "adapter": "e1", "redact"?, "redaction"? }`                                                                           | `{ "adapter", "plugin", "state", "plain_text", "body_text", "status_text", "transcript_tail", "sequence" }`                                                                                                              |
+| `adapter.close`      | `{ "adapter": "e1" }`                                                                                                    | `{ "closed": true }`                                                                                                                                                                                                     |
 
 `adapter.list` enumerates the built-in plugin manifests this server can instantiate. Each manifest may declare an optional `default_target = { program, args }`; `adapter.start` reads that field when the caller omits `program` (so e.g. `{"plugin": "claude-code"}` is enough to spawn the bundled claude-code adapter, since its manifest declares `"program": "claude"`). Plugins without a `default_target` require callers to pass `program` explicitly. `adapter.send` takes a plugin-defined `intent` string plus arbitrary JSON `params`; the server forwards them verbatim to the plugin and returns the post-apply classified state. `adapter.wait` defaults `intent` to `wait_turn_matcher` so simple callers can omit it, and defaults `timeout_ms` to `120000`. `adapter.inspect` applies the same body/status split the classifier uses (bottom three rows treated as status bar) so misclassification reports can be reproduced without standing up a parallel `session.*` connection.
+
+`adapter.turn` is the atomic `send` + `wait` convenience — the same intent dispatch as `adapter.send` followed by the same matcher loop as `adapter.wait`, with the per-adapter mutex held across both legs so no other connection can slip an intent between them. The `wait` block may be omitted entirely (defaults to `wait_turn_matcher` with a 120 s timeout). Requires both `input.write` and `matcher.wait` permissions. **Head-of-line blocking warning:** the per-adapter mutex is held for the entire `wait` leg — every other RPC method that touches the same adapter from any connection blocks until `adapter.turn` returns. Use separate `adapter.send` + `adapter.wait` calls when finer scheduling matters.
 
 #### Driving the built-in `claude-code` plugin
 
@@ -221,14 +239,22 @@ See the [Extensions guide](../guide/extensions.md) for plugin authoring and the 
 
 ### Plugin methods
 
-| Method                     | Params                                         | Result                    |
-| -------------------------- | ---------------------------------------------- | ------------------------- |
-| `plugin.capabilities`      | none                                           | Host plugin capabilities. |
-| `plugin.validate_manifest` | `{ "manifest": { ... } }`                      | `{ "valid": true }`.      |
-| `plugin.load`              | `{ "manifest_path": "path/to/manifest.toml" }` | `{ "plugin": "<name>" }`. |
-| `plugin.unload`            | `{ "plugin": "<name>" }`                       | `{ "unloaded": true }`.   |
+| Method                     | Params                                         | Result                                                           |
+| -------------------------- | ---------------------------------------------- | ---------------------------------------------------------------- |
+| `plugin.capabilities`      | none                                           | Host plugin capabilities.                                        |
+| `plugin.validate_manifest` | `{ "manifest": { ... } }`                      | `{ "valid": true }`.                                             |
+| `plugin.describe`          | `{ "plugin": "<name>" }`                       | `{ "plugin", "manifest", "intents", "wait_matchers", "states" }` |
+| `plugin.load`              | `{ "manifest_path": "path/to/manifest.toml" }` | `{ "plugin": "<name>" }`.                                        |
+| `plugin.unload`            | `{ "plugin": "<name>" }`                       | `{ "unloaded": true }`.                                          |
 
 `plugin.capabilities` reports `embedded_lua: true` and includes built-in plugin manifests in `builtin_plugins`, including the `claude-code` Lua adapter. See [Plugins and extensions](./plugins.md) for manifest fields, runtime names, and permission names.
+
+`plugin.describe` returns the catalog of intents, wait matchers, and classifier states a plugin advertises — used by consumers (the REPL completer, third-party drivers) to discover what a plugin supports without hard-coding intent names. Source of truth, in order:
+
+1. If the plugin's Lua source exports a `describe()` function, the host returns its value verbatim. Plugins owning a richer catalog (per-intent param schemas, per-state descriptions) should provide one.
+2. Otherwise the host introspects the exports table: function names ending with `_matcher` are listed under `wait_matchers`; `classify` and `describe` are filtered out; everything else lands under `intents`. `states` is `[]` in the fallback path because the classifier vocabulary lives inside the function body.
+
+Each entry in `intents` / `wait_matchers` / `states` is at minimum `{ "name": "..." }`; plugins are free to add `description`, `params_schema`, or other fields a caller can opt into.
 
 `plugin.load` registers a trusted-local third-party plugin from a TOML manifest file on disk. The manifest's `entrypoint` is resolved relative to the manifest file's parent directory; absolute paths, `..` components, and symlinks that resolve outside the manifest's own directory are all rejected. Built-in plugins (claude-code) cannot be replaced — a name collision returns an error.
 
@@ -375,12 +401,14 @@ The server accepts JSON-RPC notifications. Server-originated notifications are o
 
 ## Error codes
 
-| Code     | Meaning           |
-| -------- | ----------------- |
-| `-32700` | Parse error.      |
-| `-32600` | Invalid request.  |
-| `-32601` | Method not found. |
-| `-32602` | Invalid params.   |
-| `-32603` | Internal error.   |
-| `-32001` | Matcher timeout.  |
-| `-32002` | Session closed.   |
+| Code     | Meaning                               |
+| -------- | ------------------------------------- |
+| `-32700` | Parse error.                          |
+| `-32600` | Invalid request.                      |
+| `-32601` | Method not found.                     |
+| `-32602` | Invalid params.                       |
+| `-32603` | Internal error.                       |
+| `-32001` | Matcher timeout.                      |
+| `-32002` | Session closed.                       |
+| `-32004` | Permission denied (with `data` body). |
+| `-32005` | Cancelled (cooperative cancellation). |

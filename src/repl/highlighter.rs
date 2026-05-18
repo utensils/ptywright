@@ -27,6 +27,7 @@ enum Kind {
 
 const METHOD_NAMES: &[&str] = &[
     "plugins",
+    "describe",
     "session",
     "spawn",
     "resume",
@@ -40,6 +41,7 @@ const METHOD_NAMES: &[&str] = &[
     "text",
     "key",
     "intent",
+    "turn",
     "wait",
     "matches",
     "screen_stable",
