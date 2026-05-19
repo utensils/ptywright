@@ -19,6 +19,8 @@
 use std::time::Duration;
 
 use nu_ansi_term::{Color, Style};
+use ratatui::style::{Color as RColor, Modifier as RModifier, Style as RStyle};
+use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 /// One `↳` summary rendered under a command in the REPL log.
@@ -66,6 +68,29 @@ impl Note {
             out.push_str(&Color::Fixed(214).reverse().paint(chip).to_string());
         }
         out
+    }
+
+    /// Convert the note into a single ratatui `Line` ready to drop into a
+    /// `Paragraph` or list widget. Uses the same `↳ <dim primary> [ amber
+    /// chip ]…` visual language as [`Self::render`], but with ratatui's
+    /// styled spans instead of inline ANSI bytes.
+    pub fn to_line(&self) -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(3 + self.badges.len() * 2);
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("↳", RStyle::default().fg(RColor::DarkGray)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            self.primary.clone(),
+            RStyle::default().add_modifier(RModifier::DIM),
+        ));
+        for badge in &self.badges {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!(" {badge} "),
+                RStyle::default().fg(RColor::Black).bg(RColor::Indexed(214)),
+            ));
+        }
+        Line::from(spans)
     }
 }
 

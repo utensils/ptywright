@@ -1,14 +1,41 @@
-//! reedline `Completer` impl for the REPL's DSL.
+//! Tab-completion engine for the REPL DSL.
 //!
 //! The completion set is small enough to hand-curate: a static table of
 //! command paths plus context-aware dynamic entries (live adapter ids for
-//! `:focus`, cached plugin names for `session.spawn`).
+//! `:focus` / `:attach`, cached plugin names for `session.spawn`).
+//!
+//! Returns plain [`Suggestion`] values — the TUI layer turns them into a
+//! popup widget rendered above the input box. No TUI framework or
+//! line-editor library is referenced here.
 
 use std::sync::{Arc, Mutex};
 
-use reedline::{Completer, Span, Suggestion};
-
 use super::ctx::ReplCtx;
+
+/// One completion candidate surfaced to the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    /// Text inserted into the input buffer when accepted.
+    pub value: String,
+    /// Optional short description rendered alongside the candidate.
+    pub description: Option<String>,
+    /// Half-open byte range `[start, end)` in the input buffer that the
+    /// candidate replaces.
+    pub span: Span,
+}
+
+/// Half-open byte range in the input buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Span {
+    fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
 
 /// Snippets the completer emits unconditionally — every DSL form that has
 /// a fixed prefix is listed here so tab completion always surfaces them
@@ -160,7 +187,7 @@ const KEY_NAMES: &[(&str, &str)] = &[
 
 /// Cached plugin names from the most recent `adapter.list` response.
 /// `Arc<Mutex<_>>` so the TUI thread can refresh it after a `plugins()`
-/// roundtrip without blocking the completer's `&mut` call site.
+/// roundtrip without blocking concurrent completion requests.
 #[derive(Debug, Default, Clone)]
 pub struct PluginCache {
     inner: Arc<Mutex<Vec<String>>>,
@@ -210,6 +237,7 @@ impl AdapterCache {
 /// Completer for the REPL. Reads adapter ids out of [`ReplCtx`] and plugin
 /// names out of a `PluginCache`, both behind locks so the TUI can update
 /// them between completion requests.
+#[derive(Clone)]
 pub struct ReplCompleter {
     ctx: Arc<Mutex<ReplCtx>>,
     plugins: PluginCache,
@@ -224,10 +252,12 @@ impl ReplCompleter {
             adapters,
         }
     }
-}
 
-impl Completer for ReplCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    /// Compute completion candidates for the buffer `line` with the
+    /// cursor at byte offset `pos`. The candidates' `span` field tells
+    /// the caller which bytes of `line` to replace with the chosen
+    /// `value`.
+    pub fn complete(&self, line: &str, pos: usize) -> Vec<Suggestion> {
         let prefix_end = pos.min(line.len());
         let prefix = &line[..prefix_end];
         let token = current_token(prefix);
@@ -251,8 +281,6 @@ impl Completer for ReplCompleter {
                     value: id,
                     description: Some("adapter id".into()),
                     span,
-                    append_whitespace: false,
-                    ..Default::default()
                 })
                 .collect();
         }
@@ -271,8 +299,6 @@ impl Completer for ReplCompleter {
                     value: "all".to_string(),
                     description: Some("attach every live adapter".into()),
                     span,
-                    append_whitespace: false,
-                    ..Default::default()
                 });
             }
             for id in self.adapters.snapshot() {
@@ -281,8 +307,6 @@ impl Completer for ReplCompleter {
                         value: id,
                         description: Some("server-side adapter".into()),
                         span,
-                        append_whitespace: false,
-                        ..Default::default()
                     });
                 }
             }
@@ -294,8 +318,6 @@ impl Completer for ReplCompleter {
                             value: tab.id.clone(),
                             description: Some("adapter id".into()),
                             span,
-                            append_whitespace: false,
-                            ..Default::default()
                         });
                     }
                 }
@@ -318,8 +340,6 @@ impl Completer for ReplCompleter {
                         value: name,
                         description: Some("plugin".into()),
                         span,
-                        append_whitespace: false,
-                        ..Default::default()
                     })
                     .collect();
             }
@@ -340,8 +360,6 @@ impl Completer for ReplCompleter {
                         value: (*name).to_string(),
                         description: Some((*hint).to_string()),
                         span,
-                        append_whitespace: false,
-                        ..Default::default()
                     })
                     .collect();
             }
@@ -356,8 +374,6 @@ impl Completer for ReplCompleter {
                 value: (*value).to_string(),
                 description: Some((*description).to_string()),
                 span,
-                append_whitespace: false,
-                ..Default::default()
             })
             .collect()
     }
@@ -396,7 +412,7 @@ mod tests {
     #[test]
     fn empty_buffer_returns_full_dsl_table() {
         let ctx = ctx_with_adapters(&[]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let suggestions = completer.complete("", 0);
         assert!(suggestions.len() >= DSL_COMMANDS.len());
     }
@@ -404,7 +420,7 @@ mod tests {
     #[test]
     fn prefix_filters_dsl_table() {
         let ctx = ctx_with_adapters(&[]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let suggestions = completer.complete("ses", 3);
         assert!(suggestions.iter().all(|s| s.value.starts_with("session.")));
         assert!(
@@ -419,7 +435,7 @@ mod tests {
     #[test]
     fn focus_completes_known_adapter_ids() {
         let ctx = ctx_with_adapters(&[("e1", "claude-code"), ("e2", "claude-code")]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let suggestions = completer.complete(":focus ", 7);
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert!(values.contains(&"e1"));
@@ -431,7 +447,7 @@ mod tests {
         let ctx = ctx_with_adapters(&[]);
         let plugins = PluginCache::new();
         plugins.set(vec!["claude-code".into(), "future-plugin".into()]);
-        let mut completer = ReplCompleter::new(ctx, plugins, AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, plugins, AdapterCache::new());
         let line = r#"session.spawn(""#;
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
@@ -444,7 +460,7 @@ mod tests {
         let ctx = ctx_with_adapters(&[]);
         let plugins = PluginCache::new();
         plugins.set(vec!["claude-code".into(), "rspec".into()]);
-        let mut completer = ReplCompleter::new(ctx, plugins, AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, plugins, AdapterCache::new());
         let line = r#"session.spawn("cla"#;
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
@@ -454,7 +470,7 @@ mod tests {
     #[test]
     fn attach_completer_suggests_all_and_known_ids() {
         let ctx = ctx_with_adapters(&[("e7", "claude-code")]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let line = ":attach ";
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
@@ -464,12 +480,10 @@ mod tests {
 
     #[test]
     fn attach_completer_surfaces_server_only_ids() {
-        // No local tab for `e9` — only the server-side adapter cache
-        // knows it. The completer must still surface it inside `:attach`.
         let ctx = ctx_with_adapters(&[]);
         let server = AdapterCache::new();
         server.set(vec!["e9".into(), "e10".into()]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), server);
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), server);
         let line = ":attach e";
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
@@ -482,7 +496,7 @@ mod tests {
         let ctx = ctx_with_adapters(&[("e1", "claude-code")]);
         let server = AdapterCache::new();
         server.set(vec!["e1".into(), "e2".into()]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), server);
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), server);
         let suggestions = completer.complete(":attach e", ":attach e".len());
         let count_e1 = suggestions.iter().filter(|s| s.value == "e1").count();
         assert_eq!(count_e1, 1, "expected one `e1` suggestion, got {count_e1}");
@@ -497,13 +511,8 @@ mod tests {
 
     #[test]
     fn send_key_completer_lists_submission_keys_first() {
-        // Pin the "most-common-first" contract for the key completion
-        // list: enter / escape / tab / shift-tab / backspace must all
-        // appear before any function key or text-fallthrough entry, so
-        // tab-completing in `send.key("` surfaces them at the top of
-        // the picker.
         let ctx = ctx_with_adapters(&[]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let line = r#"send.key(""#;
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
@@ -528,11 +537,8 @@ mod tests {
 
     #[test]
     fn send_key_completer_filters_by_partial_prefix() {
-        // Typing `shi` inside `send.key("` should narrow to the
-        // `shift-tab` suggestion — proves the prefix filter still
-        // works against the expanded table.
         let ctx = ctx_with_adapters(&[]);
-        let mut completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
+        let completer = ReplCompleter::new(ctx, PluginCache::new(), AdapterCache::new());
         let line = r#"send.key("shi"#;
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();

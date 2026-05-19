@@ -1,18 +1,19 @@
-//! reedline `Highlighter` impl for the REPL's DSL.
+//! Syntax highlighter for the REPL DSL.
 //!
 //! Intentionally regex-free at runtime: a small character-driven scanner
 //! recognises identifiers, dotted paths, string / regex / duration / int
 //! literals, and the `:meta` prefix. Mapping each token kind to a
-//! `nu_ansi_term::Style` keeps the dependency footprint small (no syntect)
-//! while still producing a Rails-console-style coloured prompt.
+//! `ratatui::style::Style` keeps the dependency footprint small (no
+//! syntect) while still producing a Rails-console-style coloured prompt.
 
-use nu_ansi_term::{Color, Style};
-use reedline::{Highlighter, StyledText};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 
-/// Token categories recognised by the highlighter. Kept private — the
-/// scanner emits these directly; the only public surface is `StyledText`.
+/// Token categories recognised by the highlighter. Public so the input
+/// widget can request styled spans and the test suite can assert kinds
+/// without poking the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub enum Kind {
     Whitespace,
     Method,
     Keyword,
@@ -55,40 +56,38 @@ const METHOD_NAMES: &[&str] = &[
 
 const KEYWORDS: &[&str] = &["true", "false", "null", "nil"];
 
-fn style_for(kind: Kind) -> Style {
+/// Map a token kind to its display style. Public so the input renderer
+/// and tests can both refer to the same table.
+pub fn style_for(kind: Kind) -> Style {
     match kind {
-        Kind::Whitespace => Style::new(),
-        Kind::Method => Color::Cyan.bold(),
-        Kind::Keyword => Color::Purple.bold(),
-        Kind::String => Color::Green.normal(),
-        Kind::Regex => Color::Yellow.normal(),
-        Kind::Duration => Color::LightYellow.normal(),
-        Kind::Int => Color::LightCyan.normal(),
-        Kind::Meta => Color::Magenta.bold(),
-        Kind::Punctuation => Style::new().dimmed(),
-        Kind::Other => Style::new(),
+        Kind::Whitespace => Style::default(),
+        Kind::Method => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        Kind::Keyword => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+        Kind::String => Style::default().fg(Color::Green),
+        Kind::Regex => Style::default().fg(Color::Yellow),
+        Kind::Duration => Style::default().fg(Color::LightYellow),
+        Kind::Int => Style::default().fg(Color::LightCyan),
+        Kind::Meta => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        Kind::Punctuation => Style::default().add_modifier(Modifier::DIM),
+        Kind::Other => Style::default(),
     }
 }
 
-/// reedline-facing highlighter — no state, no allocations beyond what
-/// `StyledText` requires.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ReplHighlighter;
-
-impl ReplHighlighter {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Highlighter for ReplHighlighter {
-    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
-        let mut styled = StyledText::new();
-        for (kind, slice) in scan(line) {
-            styled.push((style_for(kind), slice.to_string()));
-        }
-        styled
-    }
+/// Highlight `line` into a vector of ratatui-styled spans, ready to drop
+/// into a `Line` widget. The cursor position is unused — the scanner is
+/// position-agnostic — but we accept it so future highlighters can paint
+/// a cursor halo without a breaking API change.
+pub fn highlight<'a>(line: &'a str, _cursor: usize) -> Vec<Span<'a>> {
+    scan(line)
+        .into_iter()
+        .map(|(kind, slice)| Span::styled(slice, style_for(kind)))
+        .collect()
 }
 
 fn scan(line: &str) -> Vec<(Kind, &str)> {
@@ -288,18 +287,12 @@ mod tests {
 
     #[test]
     fn negative_integer_keeps_int_kind() {
-        // The lexer accepts a leading `-` as part of an integer; the
-        // highlighter must mirror that or `count=-5` paints the digits
-        // separately from the sign.
         let out = kinds("send.intent(\"x\", count=-5)");
         assert!(out.iter().any(|(k, s)| *k == Kind::Int && s == "-5"));
     }
 
     #[test]
     fn unterminated_string_does_not_panic_and_returns_string_kind() {
-        // The user is mid-typing — the highlighter must paint the
-        // partial token as a String span so the open quote is visible
-        // rather than swallowed as Other.
         let out = kinds(r#"send.text("hello"#);
         assert!(out.iter().any(|(k, _)| *k == Kind::String));
     }
@@ -327,33 +320,23 @@ mod tests {
 
     #[test]
     fn leading_whitespace_does_not_disable_meta_prefix() {
-        // The TUI input strip pads the prompt with a leading space
-        // sometimes; the highlighter should still treat `:foo` as Meta
-        // because the first non-whitespace byte is a colon.
         let out = kinds("   :tabs");
         assert!(out.iter().any(|(k, s)| *k == Kind::Meta && s == ":tabs"));
     }
 
     #[test]
-    fn highlighter_handle_returns_styled_text_in_kind_order() {
-        // The reedline-facing `highlight` impl pushes one styled span
-        // per scan token. Confirm the impl doesn't drop tokens.
-        let h = ReplHighlighter::new();
-        let styled = h.highlight("session.spawn(\"x\")", 0);
-        // 7 tokens: `session`, `.`, `spawn`, `(`, `"x"`, `)`, …
+    fn highlight_returns_one_span_per_scan_token() {
+        let spans = highlight("session.spawn(\"x\")", 0);
         assert!(
-            styled.buffer.len() >= 6,
-            "expected ≥6 styled spans, got {}",
-            styled.buffer.len()
+            spans.len() >= 6,
+            "expected ≥6 spans, got {} ({:?})",
+            spans.len(),
+            spans
         );
     }
 
     #[test]
     fn style_for_assigns_distinct_styles_per_kind() {
-        // Style equality is a poor man's "the table is wired up" smoke
-        // test — if a future contributor adds a Kind and forgets to
-        // extend `style_for`, the default `Style::new()` would silently
-        // un-style it.
         assert_ne!(style_for(Kind::Method), style_for(Kind::Other));
         assert_ne!(style_for(Kind::String), style_for(Kind::Regex));
         assert_ne!(style_for(Kind::Int), style_for(Kind::Duration));

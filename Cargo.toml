@@ -21,11 +21,13 @@ default-run = "ptywright"
 default = ["repl"]
 # Interactive REPL client (`ptywright repl`). Enabled by default; opt out
 # with `cargo build --no-default-features` if you need the lean baseline
-# build without `reedline` / `crossbeam-channel` / `nu-ansi-term`.
+# build without `ratatui` / `tui-input` / `crossbeam-channel` /
+# `nu-ansi-term`.
 repl = [
     "dep:crossbeam-channel",
     "dep:nu-ansi-term",
-    "dep:reedline",
+    "dep:ratatui",
+    "dep:tui-input",
 ]
 # Internal feature gate for the test-only `ptywright-echo-tui` fixture
 # binary. Not part of the public surface — exists solely so the bin
@@ -55,7 +57,8 @@ vt100 = "0.16.2"
 # Optional dependencies, only pulled in by the `repl` feature.
 crossbeam-channel = { version = "0.5", optional = true }
 nu-ansi-term = { version = "0.50", optional = true }
-reedline = { version = "0.47", optional = true, default-features = false, features = ["external_printer"] }
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
+tui-input = { version = "0.15", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"

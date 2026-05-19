@@ -69,7 +69,7 @@ See [JSON-RPC](./json-rpc.md) for methods and payloads.
 
 ## `ptywright repl`
 
-Interactive REPL client for a running `ptywright serve`. Shipped as the default-on `repl` Cargo feature — pass `--no-default-features` at build time to opt out of the `reedline` / `crossbeam-channel` / `nu-ansi-term` dependencies.
+Interactive REPL client for a running `ptywright serve`. Shipped as the default-on `repl` Cargo feature — pass `--no-default-features` at build time to opt out of the `ratatui` / `tui-input` / `crossbeam-channel` / `nu-ansi-term` dependencies.
 
 ```bash
 # Connect to a running daemon (Unix domain socket or Windows named pipe).
@@ -92,26 +92,28 @@ If neither `--socket` nor `--stdio` is supplied, the REPL connects to the defaul
 
 ### Layout
 
-The REPL runs inside the terminal's alternate screen with a fixed three-region layout:
+The REPL is a `ratatui`-based full-screen TUI with a fixed four-region vertical layout:
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ e1 · claude-code  │  e2 · zsh  │  +              80×24 · …  │ ← tab strip
+│ ptywright  e1 · claude-code · thinking      socket:/tmp/…   │ ← tab strip (1 row)
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│   live render of the focused PTY session                    │ ← snapshot pane
-│   (auto-refreshes on session.changed, debounced 30 ms)      │   (≈ 60% of rows)
+│   snapshot · e1 · 80×24 · seq 14                            │ ← snapshot pane
+│   (focused adapter rendered cell-by-cell, auto-refreshes    │   (~55% of remaining)
+│    on session.changed via background dispatcher thread)     │
 │                                                             │
 ├─────────────────────────────────────────────────────────────┤
-│ pty> wait(screen_stable(250ms))                             │ ← scrolling log
-│   ↳ stable after 412ms · seq 14                             │   (reedline-managed)
-│ pty> _                                                      │
+│ pty> wait(screen_stable(250ms))                             │ ← command log
+│   ↳ stable after 412ms · seq 14                             │
+├─────────────────────────────────────────────────────────────┤
+│  pty>  session.spawn("claude-code")                         │ ← input box (3 rows)
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The top region holds the tab strip (one chip per adapter, focused chip highlighted) and a live render of the focused PTY session. The bottom region holds the scrolling REPL log: each command renders as `pty> <syntax-highlighted DSL>` and the result follows on the next line as `↳ <dim summary>` matching the homepage mockup. Line editing, completion, syntax highlighting, history, and ghost-text hinting are delegated to reedline.
+Every frame is drawn from a single `App` state — no terminal-state coordination between the input widget and the rest of the screen. Resize, focus changes, typing, and pasted text all funnel through the same draw call. The terminal is restored on every exit path including panic.
 
-The split uses a DECSTBM scroll region under the hood so terminal scrolling stays confined to the log region — the live pane never drifts. On terminals smaller than 40×20 the REPL falls back to plain line-mode rendering (no alt-screen) and the tab strip is suppressed.
+Keybindings: `Enter` submits, `Tab` / `Shift-Tab` cycle completions in a popup above the input, `Up` / `Down` walk command history, `Ctrl-C` clears the input then quits on a second press, `Ctrl-D` quits when the input is empty, `Ctrl-L` clears the log. The input widget supports the usual readline-style cursor movement (`Ctrl-A` / `Ctrl-E` / `Ctrl-W` / `Ctrl-U` / `Alt-←` / `Alt-→` / arrow keys / paste).
 
 ### DSL
 
@@ -235,7 +237,7 @@ ptywright keeps configuration, log files, and other per-user state under `~/.pty
 | `ptywright run`                              |   ✗    |  ✓   | `run` bridges raw bytes to your terminal — extra stderr would corrupt the live PTY.                                                                                                                                             |
 | `ptywright serve --stdio`                    |   ✓    |  ✓   | stdout is JSON-RPC framing only and is never written.                                                                                                                                                                           |
 | `ptywright serve --socket`                   |   ✓    |  ✓   | Same sinks as `--stdio`.                                                                                                                                                                                                        |
-| `ptywright repl`                             |   ✓    |  ✓   | Uses the oneshot init. The REPL is a sequential reedline loop that writes its prompt to stdout interleaved with the operator's commands; stderr is rare in normal use, but any messages that do land share the same scrollback. |
+| `ptywright repl`                             |   ✓    |  ✓   | Uses the oneshot init. The REPL is a `ratatui`-based full-screen TUI that owns the alternate screen; the operator never sees raw stdout/stderr — server messages route through the dispatcher's notification channel into the command log. |
 | `--help`, `--version`, `completions`, `logs` |   ✓    |  ✗   | Minimal stderr-only init for short-lived commands. `logs` reads existing files without writing new entries.                                                                                                                     |
 
 ### Environment variables
