@@ -53,6 +53,16 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(200);
 /// pause rather than block the dispatcher forever.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Focus update from the main thread. Carries both the adapter id (used
+/// as the key for the snapshot cache) and the session id (used to filter
+/// `session.changed` notifications — the server emits those keyed by
+/// session, not adapter).
+#[derive(Debug, Clone, Default)]
+pub struct FocusInfo {
+    pub adapter: Option<String>,
+    pub session: Option<String>,
+}
+
 /// Spawn the dispatcher thread. Returns its `JoinHandle` so callers can
 /// observe panics; the thread reads `stop` between every recv and exits
 /// cleanly when the flag is set.
@@ -60,30 +70,33 @@ pub fn spawn_dispatcher(
     client: Arc<RpcClient>,
     notifications: Receiver<Notification>,
     ui_tx: Sender<UiEvent>,
-    focus_rx: Receiver<Option<String>>,
+    focus_rx: Receiver<FocusInfo>,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("ptywright-repl-dispatcher".into())
         .spawn(move || {
-            let mut focus: Option<String> = None;
+            let mut focus = FocusInfo::default();
             while !stop.load(Ordering::Relaxed) {
                 // Drain pending focus updates before each notification
                 // poll so we always see the latest focus when deciding
                 // whether to snapshot.
+                let mut focus_changed = false;
                 while let Ok(new_focus) = focus_rx.try_recv() {
+                    focus_changed = focus_changed || focus.adapter != new_focus.adapter;
                     focus = new_focus;
-                    if let Some(ref id) = focus {
-                        // Kick an immediate snapshot for the new focus
-                        // so the pane fills in without waiting for the
-                        // next session.changed.
-                        if let Some(snap) = fetch_snapshot(&client, id) {
-                            let _ = ui_tx.send(UiEvent::Snapshot {
-                                adapter: id.clone(),
-                                snapshot: snap,
-                            });
-                        }
-                    }
+                }
+                if focus_changed
+                    && let Some(adapter) = focus.adapter.clone()
+                    && let Some(snap) = fetch_snapshot(&client, &adapter)
+                {
+                    // Kick an immediate snapshot for the new focus so
+                    // the pane fills in without waiting for the next
+                    // session.changed.
+                    let _ = ui_tx.send(UiEvent::Snapshot {
+                        adapter,
+                        snapshot: snap,
+                    });
                 }
                 match notifications.recv_timeout(RECV_TIMEOUT) {
                     Ok(notification) => {
@@ -99,7 +112,7 @@ pub fn spawn_dispatcher(
 
 fn handle_notification(
     client: &RpcClient,
-    focus: &Option<String>,
+    focus: &FocusInfo,
     ui_tx: &Sender<UiEvent>,
     notification: &Notification,
 ) {
@@ -107,21 +120,18 @@ fn handle_notification(
         // High-rate, low-signal — absorbed by the live pane.
         "session.output" => {}
         "session.changed" => {
-            let adapter = notification
-                .params
-                .get("adapter")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let Some(adapter) = adapter else {
-                return;
-            };
-            // Only fetch when the change is for the focused adapter.
-            // The dispatcher's snapshot cache is per-focus to keep the
-            // RPC traffic bounded; if the user switches focus, the
-            // pending focus update upstream will trigger a fresh fetch.
-            if focus.as_deref() != Some(&adapter) {
+            // `session.changed` is keyed by session id, not adapter id.
+            // Only fetch when the change is for the focused adapter's
+            // session; if focus has no session (no live adapter yet), we
+            // can't meaningfully snapshot.
+            let session = notification.params.get("session").and_then(Value::as_str);
+            let Some(session) = session else { return };
+            if focus.session.as_deref() != Some(session) {
                 return;
             }
+            let Some(adapter) = focus.adapter.clone() else {
+                return;
+            };
             if let Some(snap) = fetch_snapshot(client, &adapter) {
                 let _ = ui_tx.send(UiEvent::Snapshot {
                     adapter,
@@ -137,6 +147,9 @@ fn handle_notification(
 }
 
 fn fetch_snapshot(client: &RpcClient, adapter: &str) -> Option<ScreenSnapshot> {
+    // `adapter.snapshot` returns the `ScreenSnapshot` directly as the
+    // top-level result — it is not wrapped in `{ "snapshot": ... }`, so
+    // we deserialize the response value as-is.
     let response = client
         .call(
             "adapter.snapshot",
@@ -144,8 +157,7 @@ fn fetch_snapshot(client: &RpcClient, adapter: &str) -> Option<ScreenSnapshot> {
             SNAPSHOT_TIMEOUT,
         )
         .ok()?;
-    let snap = response.get("snapshot").cloned()?;
-    serde_json::from_value(snap).ok()
+    serde_json::from_value(response).ok()
 }
 
 /// Render a survivor notification as a one-liner. Plain text (no ANSI
@@ -187,5 +199,12 @@ mod tests {
         let rendered = render_notice(&n);
         assert!(rendered.starts_with("future.event"));
         assert!(rendered.contains("anything"));
+    }
+
+    #[test]
+    fn focus_info_default_is_empty() {
+        let info = FocusInfo::default();
+        assert!(info.adapter.is_none());
+        assert!(info.session.is_none());
     }
 }

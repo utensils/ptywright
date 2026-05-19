@@ -48,6 +48,18 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+/// Pick a plugin name to surface in the empty-state hint, without
+/// hard-coding any application-specific identifier in `src/repl`. Prefers
+/// the first entry in the live plugin cache; falls back to a generic
+/// `<plugin>` placeholder when the cache is empty or unavailable.
+fn spawn_hint_plugin(app: &App) -> String {
+    app.plugins
+        .snapshot()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "<plugin>".to_string())
+}
+
 fn snapshot_height(total: u16) -> u16 {
     // Reserve 3 for input + 1 for tabs + 3 minimum for log. Of the
     // remainder, allocate 55% to the snapshot pane with a floor of 8
@@ -69,7 +81,7 @@ fn render_tab_strip(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().add_modifier(Modifier::DIM),
         ));
         spans.push(Span::styled(
-            "session.spawn(\"claude-code\")",
+            format!("session.spawn(\"{}\")", spawn_hint_plugin(app)),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -138,9 +150,12 @@ fn render_snapshot(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .map(|c| c.adapters.is_empty())
             .unwrap_or(true)
         {
-            "session.spawn(\"claude-code\")  · spawn an adapter to start a session"
+            format!(
+                "session.spawn(\"{}\")  · spawn an adapter to start a session",
+                spawn_hint_plugin(app)
+            )
         } else {
-            ":focus <adapter>  · pick an adapter to render in this pane"
+            ":focus <adapter>  · pick an adapter to render in this pane".to_string()
         };
         let paragraph = Paragraph::new(Line::from(vec![
             Span::raw("  "),

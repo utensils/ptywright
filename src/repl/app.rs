@@ -22,7 +22,7 @@ use tui_input::backend::crossterm::EventHandler;
 use super::command::{self, Cmd, CmdOutcome};
 use super::completer::{AdapterCache, PluginCache, ReplCompleter, Suggestion};
 use super::ctx::ReplCtx;
-use super::dispatcher::UiEvent;
+use super::dispatcher::{FocusInfo, UiEvent};
 use super::history::ReplHistory;
 use super::notes::Note;
 use super::transport::RpcClient;
@@ -64,9 +64,9 @@ pub struct App {
     completer: ReplCompleter,
     history: ReplHistory,
     transport_label: String,
-    ui_tx: Sender<UiEvent>,
-    focus_tx: Sender<Option<String>>,
     #[allow(dead_code)]
+    ui_tx: Sender<UiEvent>,
+    focus_tx: Sender<FocusInfo>,
     pub(super) plugins: PluginCache,
     #[allow(dead_code)]
     pub(super) adapters_cache: AdapterCache,
@@ -80,14 +80,28 @@ pub struct App {
     pub(super) should_quit: bool,
     #[allow(dead_code)]
     pub(super) status: Option<String>,
+    /// Maps adapter id → session id learned from `adapter.start` /
+    /// `adapter.live` responses. The dispatcher needs this to filter
+    /// `session.changed` notifications: the server emits them keyed by
+    /// session id, but the REPL tracks focus by adapter id.
+    pub(super) adapter_sessions: HashMap<String, String>,
 }
 
 /// State for an open completion popup. `index` is which candidate is
 /// currently highlighted; cycling wraps around inside the list.
+/// `original_buffer` / `original_cursor` snapshot the input at the
+/// moment the popup opened — every applied suggestion replaces its
+/// `span` in *that* buffer, not in the buffer modified by the previous
+/// suggestion. Without this, cycling past the first candidate corrupts
+/// the input (the second suggestion replaces only the original prefix
+/// span, leaving the tail of the first candidate behind).
 #[derive(Debug, Clone)]
 pub(super) struct CompletionState {
     pub suggestions: Vec<Suggestion>,
     pub index: usize,
+    pub original_buffer: String,
+    #[allow(dead_code)]
+    pub original_cursor: usize,
 }
 
 impl App {
@@ -99,7 +113,7 @@ impl App {
         history: ReplHistory,
         transport_label: String,
         ui_tx: Sender<UiEvent>,
-        focus_tx: Sender<Option<String>>,
+        focus_tx: Sender<FocusInfo>,
         plugins: PluginCache,
         adapters_cache: AdapterCache,
     ) -> Self {
@@ -121,6 +135,7 @@ impl App {
             history_stash: None,
             should_quit: false,
             status: None,
+            adapter_sessions: HashMap::new(),
         };
         app.push_log(LogEntry::Banner(format!(
             "ptywright repl  {}",
@@ -258,14 +273,14 @@ impl App {
         }
         // Tell the dispatcher about a possible focus change after every
         // command — `session.spawn`, `:focus`, `:attach`, etc. all shift
-        // which adapter the snapshot pane should poll.
-        let focus = self.ctx.lock().ok().and_then(|c| c.focus.clone());
-        let _ = self.focus_tx.send(focus.clone());
-        // Kick an immediate snapshot refresh by posting an empty notice
-        // to the UI channel — drains in the next loop iteration. Cheap.
-        if let Some(focus) = focus {
-            self.fetch_snapshot_async(focus);
-        }
+        // which adapter the snapshot pane should poll. Send the paired
+        // (adapter, session) so the dispatcher can match `session.changed`
+        // notifications by session id.
+        let adapter = self.ctx.lock().ok().and_then(|c| c.focus.clone());
+        let session = adapter
+            .as_ref()
+            .and_then(|id| self.adapter_sessions.get(id).cloned());
+        let _ = self.focus_tx.send(FocusInfo { adapter, session });
     }
 
     fn dispatch(&mut self, cmd: Cmd) {
@@ -283,6 +298,17 @@ impl App {
             }
             Ok(CmdOutcome::Note { note, value }) => {
                 self.push_log(LogEntry::Note(note));
+                // `adapter.start` / `adapter.resume` responses include
+                // both fields — stash the mapping so the dispatcher can
+                // filter session.changed by session id. The map is also
+                // populated lazily when adapters are attached.
+                if let (Some(adapter), Some(session)) = (
+                    value.get("adapter").and_then(Value::as_str),
+                    value.get("session").and_then(Value::as_str),
+                ) {
+                    self.adapter_sessions
+                        .insert(adapter.to_string(), session.to_string());
+                }
                 // If the response carries a usable snapshot already (e.g.
                 // adapter.snapshot), cache it so the live pane updates
                 // without waiting for the next session.changed.
@@ -303,23 +329,9 @@ impl App {
         }
     }
 
-    fn fetch_snapshot_async(&self, adapter: String) {
-        // The dispatcher thread already polls session.changed for live
-        // snapshots; this is the kick we send when the operator switches
-        // focus or just spawned an adapter and wants the first frame.
-        let _ = self
-            .ui_tx
-            .send(UiEvent::Notice(format!("focus · {adapter}")));
-        // The dispatcher will pick up the new focus through `focus_tx`
-        // (already sent in `submit`) and issue the snapshot RPC itself,
-        // pushing the result back as `UiEvent::Snapshot`.
-    }
-
     // ---- completion ---------------------------------------------------
 
     fn advance_completion(&mut self, direction: i32) {
-        let buffer = self.input.value().to_string();
-        let cursor = self.input.cursor();
         if let Some(state) = self.completions.as_mut() {
             if state.suggestions.is_empty() {
                 self.completions = None;
@@ -328,9 +340,15 @@ impl App {
             let len = state.suggestions.len() as i32;
             let next = (state.index as i32 + direction).rem_euclid(len);
             state.index = next as usize;
-            apply_suggestion(&mut self.input, &buffer, &state.suggestions[state.index]);
+            apply_suggestion(
+                &mut self.input,
+                &state.original_buffer,
+                &state.suggestions[state.index],
+            );
             return;
         }
+        let buffer = self.input.value().to_string();
+        let cursor = self.input.cursor();
         let suggestions = self
             .completer
             .complete(&buffer, byte_offset(&buffer, cursor));
@@ -342,17 +360,18 @@ impl App {
             self.completions = None;
             return;
         }
-        let mut state = CompletionState {
+        let initial_index = if direction == -1 {
+            suggestions.len() - 1
+        } else {
+            0
+        };
+        let state = CompletionState {
             suggestions,
-            index: 0,
+            index: initial_index,
+            original_buffer: buffer.clone(),
+            original_cursor: cursor,
         };
         apply_suggestion(&mut self.input, &buffer, &state.suggestions[state.index]);
-        if direction == -1 {
-            let len = state.suggestions.len();
-            state.index = len - 1;
-            let value = self.input.value().to_string();
-            apply_suggestion(&mut self.input, &value, &state.suggestions[state.index]);
-        }
         self.completions = Some(state);
     }
 
@@ -522,6 +541,36 @@ mod tests {
         assert!(first.starts_with("session."));
         assert!(second.starts_with("session."));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn cycling_completion_replaces_against_the_original_buffer() {
+        // Regression: pressing Tab twice from a 3-char prefix used to
+        // replace only the first 3 bytes of the *already-expanded* buffer,
+        // leaving the tail of the first candidate stuck on the end of the
+        // second one. Confirm cycling now always produces a clean
+        // candidate that *starts with* the original prefix and *equals* a
+        // known DSL form.
+        let mut app = make_app();
+        app.input = Input::default()
+            .with_value("ses".to_string())
+            .with_cursor(3);
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..6 {
+            app.advance_completion(1);
+            seen.push(app.input.value().to_string());
+        }
+        for value in &seen {
+            assert!(value.starts_with("session."), "got: {value}");
+            // None of the buffers should contain an interior `(` followed
+            // by `session.` — that's the corruption signature.
+            assert!(
+                !value
+                    .split_once("(")
+                    .map_or(false, |(_, after)| after.contains("session.")),
+                "buffer corruption: {value}"
+            );
+        }
     }
 
     #[test]

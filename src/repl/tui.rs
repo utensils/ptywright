@@ -32,7 +32,7 @@ use serde_json::json;
 use super::app::App;
 use super::completer::{AdapterCache, PluginCache, ReplCompleter};
 use super::ctx::ReplCtx;
-use super::dispatcher::{UiEvent, spawn_dispatcher};
+use super::dispatcher::{FocusInfo, UiEvent, spawn_dispatcher};
 use super::history::ReplHistory;
 use super::transport::RpcClient;
 use crate::error::{Error, Result};
@@ -90,7 +90,7 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     // loop; main loop pushes "focus changed" hints back so the dispatcher
     // knows which adapter to snapshot on `session.changed`.
     let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<UiEvent>();
-    let (focus_tx, focus_rx) = crossbeam_channel::unbounded::<Option<String>>();
+    let (focus_tx, focus_rx) = crossbeam_channel::unbounded::<FocusInfo>();
     let stop = Arc::new(AtomicBool::new(false));
     let _dispatcher = spawn_dispatcher(
         Arc::clone(&client),
