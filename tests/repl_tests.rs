@@ -98,9 +98,17 @@ fn command_dispatcher_drives_full_spawn_and_close_cycle() {
             Duration::from_secs(5),
         )
         .expect("dispatch spawn");
-        let CmdOutcome::Json(value) = outcome else {
-            panic!("expected json outcome")
+        let CmdOutcome::Note { value, note } = outcome else {
+            panic!("expected note outcome from spawn")
         };
+        // The note must carry the spawn summary so the TUI's `↳` line
+        // can render it instead of the raw JSON dump that used to bury
+        // the prompt under unreadable RPC payloads.
+        assert!(
+            note.primary.contains("spawned"),
+            "spawn note must lead with `spawned`, got `{}`",
+            note.primary,
+        );
         let adapter = value["adapter"].as_str().expect("adapter id");
         assert_eq!(ctx.focus.as_deref(), Some(adapter));
         assert!(
@@ -198,8 +206,8 @@ fn turn_dispatches_send_then_wait_atomically() {
         Duration::from_secs(5),
     )
     .expect("dispatch session.spawn");
-    let CmdOutcome::Json(value) = outcome else {
-        panic!("expected json from session.spawn, got {outcome:?}");
+    let CmdOutcome::Note { value, .. } = outcome else {
+        panic!("expected note outcome from session.spawn, got {outcome:?}");
     };
     let adapter = value["adapter"].as_str().expect("adapter id").to_string();
 

@@ -100,8 +100,20 @@ pub enum CmdOutcome {
     /// Human-readable line (the dispatched command produced no result we
     /// want to dump into the history pane, e.g. `:tabs` or `:focus`).
     Line(String),
-    /// JSON result from a JSON-RPC call. The TUI pretty-prints it.
+    /// JSON result from a JSON-RPC call. The TUI pretty-prints it. Used
+    /// when the operator probably wants the raw payload (`:rpc`,
+    /// `:live`, `plugins.describe`, `state`, `inspect`).
     Json(Value),
+    /// A structured note for the `↳` summary line plus the underlying
+    /// RPC value. The TUI surfaces the note's [`render`](crate::repl::notes::Note::render)
+    /// output; tests and `:debug` modes can still inspect `value`.
+    /// Use this for commands where a pretty summary is more useful than
+    /// the raw JSON: `session.spawn`, `session.close`, `send.text`,
+    /// `send.key`, `send.intent`, `wait`, `turn`, `transcript.snapshot`.
+    Note {
+        note: crate::repl::notes::Note,
+        value: Value,
+    },
     /// Multi-line help text the TUI should surface as a modal overlay
     /// rather than squeezing into the history pane.
     ShowHelp(String),
@@ -879,13 +891,21 @@ fn dispatch_dsl(
         "send.intent" => send_intent(call, client, ctx, timeout),
         "send.text" => {
             let text = expect_one_string(&call, "send.text")?;
-            let (intent, params) = send_text_payload(text);
-            send_named_intent(client, ctx, intent, params, timeout)
+            let (intent, params) = send_text_payload(text.clone());
+            let value = invoke_intent(client, ctx, intent, params, timeout)?;
+            Ok(CmdOutcome::Note {
+                note: crate::repl::notes::send_text(&text, &value),
+                value,
+            })
         }
         "send.key" => {
             let key = expect_one_string(&call, "send.key")?;
-            let (intent, params) = send_key_payload(key);
-            send_named_intent(client, ctx, intent, params, timeout)
+            let (intent, params) = send_key_payload(key.clone());
+            let value = invoke_intent(client, ctx, intent, params, timeout)?;
+            Ok(CmdOutcome::Note {
+                note: crate::repl::notes::send_key(&key, &value),
+                value,
+            })
         }
         "turn" => turn_command(call, client, ctx, timeout),
         "wait" => wait_command(call, client, ctx, timeout),
@@ -920,7 +940,10 @@ fn dispatch_dsl(
                 json!({ "adapter": adapter, "redact": redact }),
                 timeout,
             )?;
-            Ok(CmdOutcome::Json(result))
+            Ok(CmdOutcome::Note {
+                note: crate::repl::notes::transcript(&result),
+                value: result,
+            })
         }
         "screen.snapshot" | "screen.view" | "view" => {
             let adapter = focus_or_err(ctx)?.to_string();
@@ -960,7 +983,10 @@ fn session_spawn(
     insert_adapter_start_kwargs(&mut params, &call)?;
     let result = client.call("adapter.start", Value::Object(params), timeout)?;
     adopt_started_adapter(ctx, &plugin, &result);
-    Ok(CmdOutcome::Json(result))
+    Ok(CmdOutcome::Note {
+        note: crate::repl::notes::spawned(&result),
+        value: result,
+    })
 }
 
 fn session_resume(
@@ -985,7 +1011,10 @@ fn session_resume(
         ctx.remove_adapter(prior);
     }
     adopt_started_adapter(ctx, &plugin, &result);
-    Ok(CmdOutcome::Json(result))
+    Ok(CmdOutcome::Note {
+        note: crate::repl::notes::spawned(&result),
+        value: result,
+    })
 }
 
 fn adopt_started_adapter(ctx: &mut ReplCtx, requested_plugin: &str, result: &Value) {
@@ -1110,7 +1139,10 @@ fn session_close(
     };
     let result = client.call("adapter.close", json!({ "adapter": adapter }), timeout)?;
     ctx.remove_adapter(&adapter);
-    Ok(CmdOutcome::Json(result))
+    Ok(CmdOutcome::Note {
+        note: crate::repl::notes::closed(&adapter),
+        value: result,
+    })
 }
 
 fn send_intent(
@@ -1121,7 +1153,11 @@ fn send_intent(
 ) -> Result<CmdOutcome> {
     let intent = expect_one_string(&call, "send.intent")?;
     let params = kwargs_to_json(&call.kwargs);
-    send_named_intent(client, ctx, &intent, params, timeout)
+    let value = invoke_intent(client, ctx, &intent, params, timeout)?;
+    Ok(CmdOutcome::Note {
+        note: crate::repl::notes::send_intent(&intent, &value),
+        value,
+    })
 }
 
 /// Wire payload for `send.text("…")`. The claude-code plugin's
@@ -1140,15 +1176,24 @@ fn send_key_payload(key: String) -> (&'static str, Value) {
     ("key", json!({ "key": key }))
 }
 
-fn send_named_intent(
+/// Send a named intent to the focused adapter and return the raw RPC
+/// response. Callers wrap the response in a [`CmdOutcome::Note`] with
+/// the appropriate per-command formatter (see [`crate::repl::notes`]).
+///
+/// The intermediate `Result<Value>` shape exists because the note
+/// content differs by command — `send.text` reports a byte count,
+/// `send.key` reports the key name, `send.intent` reports the intent
+/// name — and we want the wire-format details to live next to the
+/// dispatcher entry that knows them.
+fn invoke_intent(
     client: &RpcClient,
     ctx: &ReplCtx,
     intent: &str,
     params: Value,
     timeout: Duration,
-) -> Result<CmdOutcome> {
+) -> Result<Value> {
     let adapter = focus_or_err(ctx)?.to_string();
-    let result = client.call(
+    client.call(
         "adapter.send",
         json!({
             "adapter": adapter,
@@ -1156,8 +1201,7 @@ fn send_named_intent(
             "params": params,
         }),
         timeout,
-    )?;
-    Ok(CmdOutcome::Json(result))
+    )
 }
 
 /// `turn("send_prompt", prompt="...", wait=matches(r"…"), timeout=5s)` —
@@ -1235,8 +1279,13 @@ fn turn_command(
     if !wait_obj.is_empty() {
         params.insert("wait".to_string(), Value::Object(wait_obj));
     }
+    let started = std::time::Instant::now();
     let result = client.call("adapter.turn", Value::Object(params), timeout)?;
-    Ok(CmdOutcome::Json(result))
+    let elapsed = started.elapsed();
+    Ok(CmdOutcome::Note {
+        note: crate::repl::notes::turn_complete(elapsed, &result),
+        value: result,
+    })
 }
 
 fn wait_command(
@@ -1258,7 +1307,19 @@ fn wait_command(
     let timeout_arg = duration_kwarg(&call, "timeout")?;
     let wait_id = string_kwarg(&call, "wait_id");
     let (intent, params) = matcher_to_params(matcher_arg)?;
-    wait_with_params_and_id(client, ctx, &intent, params, timeout_arg, wait_id, timeout)
+    let (elapsed, value) = invoke_wait(
+        client,
+        ctx,
+        &intent,
+        params.clone(),
+        timeout_arg,
+        wait_id,
+        timeout,
+    )?;
+    Ok(CmdOutcome::Note {
+        note: note_for_wait(&params, elapsed, &value),
+        value,
+    })
 }
 
 fn wait_with_params(
@@ -1269,18 +1330,43 @@ fn wait_with_params(
     timeout_override: Option<Duration>,
     fallback_timeout: Duration,
 ) -> Result<CmdOutcome> {
-    wait_with_params_and_id(
+    let (elapsed, value) = invoke_wait(
         client,
         ctx,
         intent,
-        matcher_params,
+        matcher_params.clone(),
         timeout_override,
         None,
         fallback_timeout,
-    )
+    )?;
+    Ok(CmdOutcome::Note {
+        note: note_for_wait(&matcher_params, elapsed, &value),
+        value,
+    })
 }
 
-fn wait_with_params_and_id(
+/// Pick the correct [`crate::repl::notes`] formatter for a `wait()` call
+/// based on the params we sent. The intent is always
+/// `wait_turn_matcher`; the params discriminator (`pattern` vs
+/// `stable_ms`) is what distinguishes a regex match from a
+/// screen-stable wait. Anything else falls back to a generic
+/// `wait_stable` shape — that's the closest visual analogue and avoids
+/// adding a third note variant that would only ever fire for plugin
+/// matchers we don't have today.
+fn note_for_wait(params: &Value, elapsed: Duration, response: &Value) -> crate::repl::notes::Note {
+    if params.get("pattern").is_some() {
+        crate::repl::notes::wait_match(elapsed, response)
+    } else {
+        crate::repl::notes::wait_stable(elapsed, response)
+    }
+}
+
+/// Issue the `adapter.wait` RPC and return `(elapsed, value)`. Callers
+/// build the [`CmdOutcome::Note`] with the appropriate formatter. The
+/// elapsed time is measured around the blocking call so the operator
+/// sees wall-clock latency, not just whatever timestamp the server
+/// reports.
+fn invoke_wait(
     client: &RpcClient,
     ctx: &mut ReplCtx,
     intent: &str,
@@ -1288,7 +1374,7 @@ fn wait_with_params_and_id(
     timeout_override: Option<Duration>,
     wait_id: Option<String>,
     fallback_timeout: Duration,
-) -> Result<CmdOutcome> {
+) -> Result<(Duration, Value)> {
     let adapter = focus_or_err(ctx)?.to_string();
     let mut req = Map::new();
     req.insert("adapter".to_string(), Value::String(adapter));
@@ -1303,8 +1389,9 @@ fn wait_with_params_and_id(
     if let Some(id) = wait_id {
         req.insert("wait_id".to_string(), Value::String(id));
     }
+    let started = std::time::Instant::now();
     let result = client.call("adapter.wait", Value::Object(req), fallback_timeout)?;
-    Ok(CmdOutcome::Json(result))
+    Ok((started.elapsed(), result))
 }
 
 /// REPL DSL: `cancel_wait("wait-id-1")` — issues `adapter.cancel_wait
@@ -1933,8 +2020,8 @@ mod tests {
         let cmd = parse(r#"session.spawn("claude-code", program="/bin/sh")"#).expect("parse spawn");
         let outcome =
             dispatch(cmd, &client, &mut ctx, Duration::from_secs(5)).expect("spawn dispatch");
-        let CmdOutcome::Json(value) = outcome else {
-            panic!()
+        let CmdOutcome::Note { value, .. } = outcome else {
+            panic!("expected note outcome from spawn, got {outcome:?}")
         };
         let adapter = value["adapter"].as_str().expect("adapter id");
         assert_eq!(ctx.focus.as_deref(), Some(adapter));
@@ -1963,8 +2050,11 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("spawn prior");
-        let CmdOutcome::Json(first_value) = first else {
-            panic!("expected json outcome from spawn")
+        let CmdOutcome::Note {
+            value: first_value, ..
+        } = first
+        else {
+            panic!("expected note outcome from spawn, got {first:?}")
         };
         let prior = first_value["adapter"]
             .as_str()
@@ -1981,8 +2071,12 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("resume");
-        let CmdOutcome::Json(resumed_value) = resumed else {
-            panic!("expected json outcome from resume")
+        let CmdOutcome::Note {
+            value: resumed_value,
+            ..
+        } = resumed
+        else {
+            panic!("expected note outcome from resume, got {resumed:?}")
         };
         let replacement = resumed_value["adapter"]
             .as_str()
@@ -2015,8 +2109,11 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("spawn prior");
-        let CmdOutcome::Json(first_value) = first else {
-            panic!("expected json outcome from spawn")
+        let CmdOutcome::Note {
+            value: first_value, ..
+        } = first
+        else {
+            panic!("expected note outcome from spawn, got {first:?}")
         };
         let prior = first_value["adapter"]
             .as_str()
@@ -2033,8 +2130,12 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("resume with prior alias");
-        let CmdOutcome::Json(resumed_value) = resumed else {
-            panic!("expected json outcome from resume")
+        let CmdOutcome::Note {
+            value: resumed_value,
+            ..
+        } = resumed
+        else {
+            panic!("expected note outcome from resume, got {resumed:?}")
         };
         let replacement = resumed_value["adapter"]
             .as_str()
@@ -2184,8 +2285,8 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("seed spawn");
-        let CmdOutcome::Json(value) = spawn else {
-            panic!("expected json outcome from spawn")
+        let CmdOutcome::Note { value, .. } = spawn else {
+            panic!("expected note outcome from spawn, got {spawn:?}")
         };
         let id = value["adapter"].as_str().expect("adapter id").to_string();
 

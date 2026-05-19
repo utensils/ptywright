@@ -211,6 +211,7 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
                     Ok(CmdOutcome::ShowHelp(text)) => print_help(&text),
                     Ok(CmdOutcome::Line(text)) => print_line_result(&text),
                     Ok(CmdOutcome::Json(value)) => print_json_result(&value),
+                    Ok(CmdOutcome::Note { note, .. }) => print_note_result(&note),
                     Ok(CmdOutcome::Screen { adapter, snapshot }) => {
                         print_screen(&adapter, &snapshot)
                     }
@@ -367,6 +368,12 @@ fn print_json_result(value: &Value) {
         Color::Cyan.paint("↳"),
         Style::new().dimmed().paint(truncated),
     );
+}
+
+/// Render a structured [`super::notes::Note`] under the prompt. The note
+/// already knows how to paint itself — we just emit its line.
+fn print_note_result(note: &super::notes::Note) {
+    println!("{}", note.render());
 }
 
 fn print_help(text: &str) {
