@@ -115,7 +115,9 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
             while !printer_stop_clone.load(Ordering::Relaxed) {
                 match notifications_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(notification) => {
-                        let line = format_notification(&notification);
+                        let Some(line) = format_notification(&notification) else {
+                            continue;
+                        };
                         if notification_sender.send(line).is_err() {
                             return;
                         }
@@ -297,8 +299,29 @@ fn format_live_hint(value: &Value) -> Option<String> {
 }
 
 /// Format a server notification into the dim line surfaced through the
-/// reedline external printer.
-fn format_notification(notification: &Notification) -> String {
+/// reedline external printer, or `None` to drop the frame entirely.
+///
+/// The high-rate, low-signal notifications — `session.output` (raw VT
+/// bytes that render as JSON-escaped garbage above the prompt) and
+/// `session.changed` (one frame per PTY byte burst, no human-readable
+/// payload) — are absorbed by the live screen pane instead of being
+/// printed inline. `session.exited` and any future plugin-defined
+/// notifications still surface here so the operator sees lifecycle
+/// events and unknown methods rather than silently dropping them.
+fn format_notification(notification: &Notification) -> Option<String> {
+    match notification.method.as_str() {
+        // Dropped: handled by the live screen pane redraw path. Printing
+        // them inline buried the prompt in escape-byte noise and was the
+        // single biggest UX complaint about the old REPL.
+        "session.output" | "session.changed" => None,
+        _ => Some(render_notification_line(notification)),
+    }
+}
+
+/// Build the dim `[notif] …` line for notifications the operator should
+/// see. Split out from [`format_notification`] so future-method handling
+/// stays in one place and tests can exercise it directly.
+fn render_notification_line(notification: &Notification) -> String {
     let session = notification
         .params
         .get("session")
@@ -306,9 +329,7 @@ fn format_notification(notification: &Notification) -> String {
         .unwrap_or("?");
     let sequence = notification.params.get("sequence").and_then(Value::as_u64);
     let body = match (notification.method.as_str(), sequence) {
-        ("session.changed", Some(seq)) => format!("session.changed {session} seq={seq}"),
         ("session.exited", Some(seq)) => format!("session.exited  {session} seq={seq}"),
-        ("session.changed", None) => format!("session.changed {session}"),
         ("session.exited", None) => format!("session.exited  {session}"),
         (other, _) => format!("{other} {}", notification.params),
     };
@@ -586,24 +607,58 @@ mod tests {
     }
 
     #[test]
-    fn notification_line_includes_session_and_sequence() {
+    fn session_changed_is_dropped_from_the_printer() {
         let notif = Notification {
             method: "session.changed".to_string(),
             params: json!({ "session": "s4", "sequence": 42 }),
         };
-        let line = format_notification(&notif);
-        assert!(line.contains("session.changed"));
-        assert!(line.contains("s4"));
-        assert!(line.contains("seq=42"));
+        assert!(
+            format_notification(&notif).is_none(),
+            "session.changed must not surface as an inline `[notif]` line; the live pane absorbs it",
+        );
     }
 
     #[test]
-    fn notification_line_falls_back_for_unknown_method() {
+    fn session_output_is_dropped_from_the_printer() {
+        // The original bug: `session.output` carries raw VT bytes that
+        // render as JSON-escaped garbage when printed inline. Confirm
+        // the filter drops them regardless of payload content.
+        let notif = Notification {
+            method: "session.output".to_string(),
+            params: json!({
+                "session": "s1",
+                "sequence": 6,
+                "output": "\u{001b}[<\u{001b}[>1\u{001b}[>4;2m",
+            }),
+        };
+        assert!(
+            format_notification(&notif).is_none(),
+            "session.output must never reach the printer — it's raw VT bytes",
+        );
+    }
+
+    #[test]
+    fn session_exited_still_prints() {
+        let notif = Notification {
+            method: "session.exited".to_string(),
+            params: json!({ "session": "s1", "sequence": 9 }),
+        };
+        let line = format_notification(&notif).expect("session.exited prints");
+        assert!(line.contains("session.exited"));
+        assert!(line.contains("s1"));
+        assert!(line.contains("seq=9"));
+    }
+
+    #[test]
+    fn unknown_notification_methods_still_print() {
+        // Forward-compat: plugins may emit their own notification
+        // methods in the future. Drop them at the filter is wrong —
+        // the operator should at least see they exist.
         let notif = Notification {
             method: "future.event".to_string(),
             params: json!({ "anything": "goes" }),
         };
-        let line = format_notification(&notif);
+        let line = format_notification(&notif).expect("unknown notifications still print");
         assert!(line.contains("future.event"));
     }
 }
