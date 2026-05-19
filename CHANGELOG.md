@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **REPL: always-on live screen pane + sticky tab strip.** Brings the REPL in line with the `OperatorHome.vue` mockup on the docs site: a tab strip across the top, a live render of the focused PTY session below it, then a horizontal rule, and finally the scrolling REPL log + reedline prompt at the bottom. Replaces the old static `view()` snapshot that dumped the screen cell-by-cell into the prompt history every time it was called.
+
+  The new layout is implemented in `src/repl/live.rs` as a hand-rolled crossterm-only alt-screen layer. Reedline doesn't natively support a regioned terminal, so the implementation:
+  1. Enters the alternate screen at REPL startup (cleared on Drop even on panic, via `AltScreenGuard`).
+  2. Sets a DECSTBM scrolling region (`ESC [ <top> ; <bottom> r`) so terminal scrolling never pushes the top pane up.
+  3. Parks reedline's prompt origin inside the scroll region.
+  4. Repaints the top region with absolute `MoveTo` cursor moves bracketed by DEC save/restore cursor so reedline's tracked origin survives concurrent updates.
+
+  A background redraw thread debounces `session.changed` notifications (30 ms) and re-paints the top region on every command boundary. Resize is picked up automatically — the redraw thread re-reads `term_size()` and re-emits DECSTBM on every paint. Terminals smaller than 40×20 fall back to plain line-mode rendering.
+
+- **REPL: silenced `session.output` + `session.changed` notification spam.** The reedline external printer used to surface every server notification as a `[notif] …` line above the prompt. Two of those — `session.output` (raw VT bytes that rendered as JSON-escaped garbage) and `session.changed` (one frame per PTY byte burst) — buried the prompt. The notification filter now drops both at the printer; the live pane absorbs the screen-change signal. `session.exited` and any future plugin-defined notifications still surface.
+
+- **REPL: enriched `↳` result notes to match the homepage mockup.** Previously the dispatcher emitted `CmdOutcome::Json(value)` for every RPC-returning command, so the `↳` line dumped raw JSON like `{"state":{"state":"thinking",...}}` truncated at 240 chars. Notes are now structured: `spawned · e1 · claude-code · 80×24`, `wrote 18 bytes · state: thinking`, `stable after 412ms · seq 14`, `turn completed in 412ms · row 19  [turn complete]`. Implementation in the new `src/repl/notes.rs` module; high-signal commands (`session.spawn`, `session.resume`, `session.close`, `send.text`, `send.key`, `send.intent`, `wait`, `turn`, `transcript.snapshot`) migrate to the new `CmdOutcome::Note { note, value }` variant. `wait` and `turn` are timed around the blocking RPC so the operator sees wall-clock latency.
+
+  Raw-JSON-friendly commands (`:rpc`, `:live`, `plugins.describe`, `state`, `inspect`) keep `CmdOutcome::Json` — these dump payloads the operator usually wants verbatim.
+
 ## [0.2.0] - 2026-05-19
 
 Second release. Spans Milestones 23 (claudette adoption readiness), 24 (post-release hardening), 25 (M23.7 cancellation architecture + polish), and 26 (`claude-stream` survival fixes for Claude Code 2.1.143). Two source-breaking Rust API changes (`DefaultTarget` and `ExtensionStateSnapshot` both became `#[non_exhaustive]`) so this is a 0.x minor bump rather than a patch; JSON-RPC wire shapes remain back-compatible.

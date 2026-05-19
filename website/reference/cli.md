@@ -90,7 +90,32 @@ Options:
 
 If neither `--socket` nor `--stdio` is supplied, the REPL connects to the default socket at `~/.ptywright/socket`.
 
-The REPL is a sequential `reedline`-based loop: each command is rendered as `pty> <syntax-highlighted DSL>` and the result follows on the next line as `↳ <dim summary>`. Line editing, completion, syntax highlighting, history, and ghost-text hinting are delegated to reedline; the REPL drives the generic `adapter.*` JSON-RPC surface from a small friendly DSL. The most common forms:
+### Layout
+
+The REPL runs inside the terminal's alternate screen with a fixed three-region layout:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ e1 · claude-code  │  e2 · zsh  │  +              80×24 · …  │ ← tab strip
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   live render of the focused PTY session                    │ ← snapshot pane
+│   (auto-refreshes on session.changed, debounced 30 ms)      │   (≈ 60% of rows)
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ pty> wait(screen_stable(250ms))                             │ ← scrolling log
+│   ↳ stable after 412ms · seq 14                             │   (reedline-managed)
+│ pty> _                                                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The top region holds the tab strip (one chip per adapter, focused chip highlighted) and a live render of the focused PTY session. The bottom region holds the scrolling REPL log: each command renders as `pty> <syntax-highlighted DSL>` and the result follows on the next line as `↳ <dim summary>` matching the homepage mockup. Line editing, completion, syntax highlighting, history, and ghost-text hinting are delegated to reedline.
+
+The split uses a DECSTBM scroll region under the hood so terminal scrolling stays confined to the log region — the live pane never drifts. On terminals smaller than 40×20 the REPL falls back to plain line-mode rendering (no alt-screen) and the tab strip is suppressed.
+
+### DSL
+
+The REPL drives the generic `adapter.*` JSON-RPC surface from a small friendly DSL. The most common forms:
 
 ```text
 plugins()                              # list built-in plugins
@@ -127,10 +152,28 @@ Meta commands prefixed with `:` cover REPL control and a raw JSON-RPC escape hat
 | `:focus <id>`            | Switch focus to an adapter id.                                                                                                                                              |
 | `:live`                  | List adapters live on the server (cross-connection visibility).                                                                                                             |
 | `:attach <id\|all>`      | Adopt a sibling connection's adapter (tmux-style attach). `all` adopts every live adapter; `:attach <id>` auto-renders the adapter's current screen on attach.              |
-| `:notifications on\|off` | Subscribe / unsubscribe to `session.changed` / `session.exited` events. Notifications are enabled by default and rendered above the prompt via reedline's external printer. |
+| `:notifications on\|off` | Subscribe / unsubscribe to `session.changed` / `session.exited` events. Notifications are enabled by default; `session.output` and `session.changed` are absorbed by the live pane rather than printed inline, so only `session.exited` and plugin-defined notifications surface as `[notif]` lines above the prompt. |
 | `:rpc <method> {json}`   | Send a raw JSON-RPC call and dump the response.                                                                                                                             |
 | `:help`                  | Show the inline help popup.                                                                                                                                                 |
 | `:quit`                  | Exit the REPL (also `Ctrl-D` on an empty prompt).                                                                                                                           |
+
+### Result notes
+
+Each command renders a structured `↳` summary instead of dumping the raw RPC JSON. Time-sensitive commands time themselves around the blocking RPC so the operator sees wall-clock latency directly.
+
+| Command                    | Example `↳` note                                            |
+| -------------------------- | ----------------------------------------------------------- |
+| `session.spawn(...)`       | `spawned · e1 · claude-code · 80×24`                        |
+| `session.close(...)`       | `closed · e1`                                               |
+| `send.text("hello")`       | `wrote 5 bytes · state: thinking`                           |
+| `send.key("enter")`        | `sent key enter · state: ready`                             |
+| `send.intent("approve")`   | `intent approve · state: completed_turn`                    |
+| `wait(matches(r"❯"))`      | `matched after 412ms · row 19 · seq 14`                     |
+| `wait(screen_stable(...))` | `stable after 412ms · seq 14`                               |
+| `turn(...)`                | `turn completed in 412ms · row 19  [turn complete]`         |
+| `transcript.snapshot()`    | `transcript · 1.2 KiB · redacted 2 patterns`                |
+
+Raw-JSON-friendly commands (`:rpc`, `:live`, `plugins.describe`, `state()`, `inspect()`) keep their full payload as the `↳` line — for those calls the operator usually wants the payload verbatim.
 
 History is persisted to `~/.ptywright/repl-history` so previous sessions remain reachable through `Ctrl-R` reverse-search.
 
