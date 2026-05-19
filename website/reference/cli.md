@@ -20,7 +20,7 @@ ptywright --version
 Example output:
 
 ```text
-ptywright 0.1.1
+ptywright 0.2.0
 ```
 
 ## `ptywright run`

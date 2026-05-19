@@ -80,7 +80,7 @@ export default defineConfig({
       { text: 'Guide', link: '/guide/' },
       { text: 'Reference', link: '/reference/' },
       {
-        text: 'v0.1.1',
+        text: 'v0.2.0',
         items: [
           {
             text: 'Changelog',
