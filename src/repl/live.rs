@@ -44,7 +44,7 @@ use std::time::Duration;
 use crossterm::cursor::MoveTo;
 use crossterm::style::Print;
 use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, ScrollUp, size as term_size,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, size as term_size,
 };
 use crossterm::{execute, queue};
 use nu_ansi_term::{Color, Style};
@@ -728,13 +728,6 @@ pub fn handle_change_notification(
     // already covers the burst — drop the extra signal silently.
     refresh_tx.try_send(()).is_ok()
 }
-
-/// Crossterm helper missing from the public API: avoid an unused
-/// import error if [`ScrollUp`] isn't referenced elsewhere in the
-/// module. (We import it for the future `Ctrl-L` log-clear path; this
-/// stub keeps the import live until that path lands.)
-#[allow(dead_code)]
-fn _force_use(_: ScrollUp) {}
 
 #[cfg(test)]
 mod tests {
