@@ -24,6 +24,10 @@ use super::command::{CmdOutcome, parse};
 use super::completer::{AdapterCache, PluginCache, ReplCompleter};
 use super::ctx::ReplCtx;
 use super::highlighter::ReplHighlighter;
+use super::live::{
+    AltScreenGuard, LiveLayout, PaintLock, RefreshTx, handle_change_notification, refresh_channel,
+    spawn_redraw_thread,
+};
 use super::transport::{Notification, RpcClient};
 use crate::error::{Error, Result};
 use crate::paths::Paths;
@@ -44,6 +48,25 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Public entry. Builds reedline + prompt and runs the read-eval-print
 /// loop until the user quits with `:quit` / `Ctrl-D`.
+///
+/// Three concurrent surfaces run inside `run`:
+///
+/// 1. **Reedline** owns the bottom region — prompt, input, log
+///    scrolling — and reads the keyboard.
+/// 2. **Notification printer thread** consumes the broadcast channel
+///    from [`RpcClient`], filters notification noise (see
+///    [`format_notification`]), and forwards the few survivors to
+///    reedline's external printer.
+/// 3. **Live-pane redraw thread** (`src/repl/live.rs`) paints the top
+///    region — tab strip, focused snapshot, divider — on every
+///    `session.changed` notification (debounced) and on every command
+///    boundary.
+///
+/// The alt-screen + DECSTBM scroll region keep these three writers
+/// from clobbering each other: reedline's `MoveTo` calls land inside
+/// the scroll region, the redraw thread's `MoveTo` calls land in the
+/// fixed top region, and both bracket their paints with DEC save /
+/// restore cursor so the prompt origin survives concurrent updates.
 pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     let ctx = Arc::new(Mutex::new(ReplCtx::new()));
     let plugins = PluginCache::new();
@@ -108,6 +131,15 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     let notifications_rx = client.notifications();
     let printer_stop = Arc::new(AtomicBool::new(false));
     let printer_stop_clone = Arc::clone(&printer_stop);
+    // Live-pane refresh channel — bounded(1) coalesces a flurry of
+    // session.changed notifications into one redraw. The notification
+    // thread feeds it; the redraw thread drains it (with a 30 ms
+    // debounce) and re-fetches the focused adapter's snapshot. The
+    // main thread keeps a clone of the sender so it can kick refreshes
+    // from command boundaries (`session.spawn`, `:focus`, etc.).
+    let (refresh_tx, refresh_rx) = refresh_channel();
+    let refresh_tx_for_printer: RefreshTx = refresh_tx.clone();
+    let ctx_for_printer = Arc::clone(&ctx);
     std::thread::Builder::new()
         .name("ptywright-repl-notif-printer".into())
         .spawn(move || {
@@ -115,6 +147,17 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
             while !printer_stop_clone.load(Ordering::Relaxed) {
                 match notifications_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(notification) => {
+                        // Push a refresh signal first — the live pane
+                        // wants to repaint whether or not we also log
+                        // a line.
+                        {
+                            let ctx = ctx_for_printer.lock().expect("repl ctx mutex");
+                            let _ = handle_change_notification(
+                                &notification,
+                                &ctx,
+                                &refresh_tx_for_printer,
+                            );
+                        }
                         let Some(line) = format_notification(&notification) else {
                             continue;
                         };
@@ -134,6 +177,34 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
     // panic). Constructed immediately after the spawn so any panic in
     // the line-editor setup below still trips it on stack unwind.
     let _printer_guard = PrinterStopGuard(Arc::clone(&printer_stop));
+
+    // Enter the alternate screen + DECSTBM scroll region for the live
+    // pane. The guard restores the terminal on Drop, including on
+    // panic — without it, an unwinding Ctrl-C would leave the operator
+    // in a half-raw, half-alt-screen terminal.
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let layout = LiveLayout::compute(term_cols, term_rows);
+    let alt_guard = AltScreenGuard::enter(&layout)
+        .map_err(|error| Error::Rpc(format!("enter alt-screen: {error}")))?;
+    let _alt_guard = alt_guard;
+
+    // Live-pane paint coordination + background redraw thread.
+    let paint_lock = Arc::new(PaintLock::default());
+    let redraw_stop = Arc::new(AtomicBool::new(false));
+    let _redraw_handle = spawn_redraw_thread(
+        Arc::clone(&client),
+        Arc::clone(&ctx),
+        Arc::clone(&paint_lock),
+        refresh_rx,
+        Arc::clone(&redraw_stop),
+    );
+    let _redraw_stop_guard = RedrawStopGuard(Arc::clone(&redraw_stop));
+    // Kick an initial paint so the empty-state hint ("no live sessions
+    // — try session.spawn(...)") shows up before the operator even
+    // types. The bounded(1) channel coalesces with subsequent refreshes
+    // from real notifications, so worst case we double-paint once at
+    // startup.
+    let _ = refresh_tx.try_send(());
 
     // Register a columnar completion menu so Tab shows candidates and
     // Tab / Shift-Tab cycle through them.
@@ -217,6 +288,12 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
                     }
                     Err(error) => print_error(&error.to_string()),
                 }
+                // Refresh the live pane after every command — most
+                // commands shift state (focus, spawn, close,
+                // send.text, etc.) that the tab strip or snapshot
+                // would surface, and the bounded(1) channel keeps
+                // back-to-back refreshes from queuing up.
+                let _ = refresh_tx.try_send(());
             }
             Ok(Signal::CtrlC) => {
                 println!("{}", Style::new().dimmed().paint("(input cancelled)"));
@@ -244,6 +321,18 @@ pub fn run(client: Arc<RpcClient>, transport_label: String) -> Result<()> {
 struct PrinterStopGuard(Arc<AtomicBool>);
 
 impl Drop for PrinterStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// RAII helper analogous to [`PrinterStopGuard`] for the live-pane
+/// redraw thread. The redraw thread also keys on this flag, so a
+/// panic during reedline setup or `read_line` still tears the thread
+/// down cleanly.
+struct RedrawStopGuard(Arc<AtomicBool>);
+
+impl Drop for RedrawStopGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
     }

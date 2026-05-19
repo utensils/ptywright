@@ -20,6 +20,7 @@ pub mod completer;
 pub mod ctx;
 pub mod highlighter;
 pub mod history;
+pub mod live;
 pub mod notes;
 pub mod socket;
 pub mod spawn;
