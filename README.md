@@ -8,7 +8,7 @@
 
 ptywright is an early general-purpose PTY/TUI automation toolkit. It is designed to drive interactive terminal applications from code without coupling the core abstractions to any one program. A generic `Extension` trait sits above the PTY/session/screen/action/matcher primitives, with Claude Code shipped as the first plugin under that trait.
 
-The library now includes initial target, session, rich screen snapshot, action, temporal matcher, bounded transcripts with optional raw file streaming, redaction, JSON-RPC, the generic `Extension` layer, a Lua-backed interactive Claude Code adapter with stable-screen turn evidence, plugin manifest/runtime primitives, and shell completion primitives backed by real PTYs. The CLI includes `run` for live stdin/stdout PTY debugging, `serve --stdio` for NDJSON or LSP-style JSON-RPC automation, multi-client local IPC via Unix sockets on macOS/Linux and named pipes on Windows, and `completions` for shell setup.
+The library now includes target, session, rich screen snapshot, action, temporal and plugin-defined matchers, bounded transcripts with turn segmentation marks and optional raw file streaming, redaction, JSON-RPC with atomic `adapter.turn` / cooperative `adapter.cancel_wait` / introspection via `plugin.describe`, the generic `Extension` layer with in-process `Session::events` / `ExtensionHandle::subscribe`, a Lua-backed interactive Claude Code adapter with stable-screen turn evidence and structured `metadata.*` channels (permission, plan, error, usage, status, dialog correlation), plugin manifest/runtime primitives with per-method permission gating, a `Session` SIGTERM→SIGKILL signal ladder, and shell completion primitives backed by real PTYs. The CLI includes `run` for live stdin/stdout PTY debugging, `serve --stdio` for NDJSON or LSP-style JSON-RPC automation, multi-client local IPC via Unix sockets on macOS/Linux and named pipes on Windows, `serve --plugin <manifest.toml>` for trusted-local third-party plugins, `logs --tail` for following the rotated log file, `repl` for an interactive DSL client over a running server, and `completions` for shell setup.
 
 Docs: <https://utensils.io/ptywright/>
 
@@ -70,6 +70,10 @@ nix run github:utensils/ptywright -- --help
 13. Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
 14. Rich screen snapshots with cell/style/mode metadata.
 15. Redaction helpers with built-in and caller-supplied patterns plus default RPC redaction for sensitive-looking output.
+16. In-process event subscription on `Session` and `ExtensionHandle`; structured matcher outcomes on `adapter.wait`; cooperative cancellation via `CancellationToken` / `adapter.cancel_wait`; plugin-defined `Matcher::Lua` predicates evaluated against a bound `PluginRegistry`.
+17. Atomic `adapter.turn` (send + wait under the per-adapter mutex), `adapter.resume` chaining across PTY restarts, and `plugin.describe` runtime introspection of intents, wait matchers, and classifier states.
+18. Cross-platform PID + signal ladder (`Session::pid`, `Session::signal`, `Session::terminate` with SIGTERM→SIGKILL escalation) and plugin-mandated env (`default_target.required_env`) plus `Target::clear_env` for sandboxed spawns.
+19. Bounded transcript turn segmentation (`Transcript::mark` / `marker` / `slice_between`), classifier-driven `host_marks`, and the `Action::MarkTranscript` plan primitive.
 
 ## Planned layers
 
