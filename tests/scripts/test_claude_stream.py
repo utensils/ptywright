@@ -177,6 +177,55 @@ class ExtractRecentActivityTests(unittest.TestCase):
         self.assertEqual(activity, "⏺ Bash(cargo test)")
 
 
+class PromptEditableAnchorTests(unittest.TestCase):
+    """Submission verification must distinguish a submitted prompt echo
+    from prompt text still sitting in Claude's editable input box."""
+
+    def test_detects_prompt_still_editable_on_last_body_row(self):
+        body = "\n".join([
+            " ▐▛███▜▌   Claude Code v2.1.145",
+            "▝▜█████▛▘  Sonnet 4.6 · Claude API",
+            "",
+            "─" * 80,
+            "❯\u00a0Explore project and summerize it.",
+        ])
+        self.assertTrue(
+            CS._prompt_anchor_looks_editable(
+                body,
+                "⏵⏵ auto mode on (shift+tab to cycle)",
+                "Explore project and summerize it.",
+            )
+        )
+
+    def test_activity_indicator_means_prompt_was_submitted(self):
+        body = "\n".join([
+            "❯\u00a0Explore project and summerize it.",
+            "",
+            "✽ Simmering… (5s · ↓ 215 tokens · thinking)",
+        ])
+        self.assertFalse(
+            CS._prompt_anchor_looks_editable(
+                body,
+                "",
+                "Explore project and summerize it.",
+            )
+        )
+
+    def test_answer_line_after_prompt_is_not_editable_prompt(self):
+        body = "\n".join([
+            "❯\u00a0Explore project and summerize it.",
+            "",
+            "⏺ I'll explore the project structure.",
+        ])
+        self.assertFalse(
+            CS._prompt_anchor_looks_editable(
+                body,
+                "",
+                "Explore project and summerize it.",
+            )
+        )
+
+
 class DumpAnswerRegionFromTranscriptTests(unittest.TestCase):
     """Primary fallback at completion — pulls the answer region out
     of the full PTY scrollback. The visible body is bounded (alt-screen

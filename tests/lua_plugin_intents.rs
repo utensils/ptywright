@@ -189,7 +189,7 @@ fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
 
 #[test]
 fn send_prompt_plan_dismisses_then_pastes_then_submits() {
-    // The plan emits FOUR actions in this exact order:
+    // The plan emits FIVE actions in this exact order:
     //   1. Enter  — dismiss any first-keypress interceptor (welcome
     //      panel, compact-launch view). On a clean empty input box
     //      Claude treats this as a no-op submit.
@@ -201,12 +201,15 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
     //      bracketed wrapper so the trailing Enter is not absorbed into
     //      the paste tokeniser on longer prompts.
     //   4. Enter — submit the now-populated input box.
+    //   5. Enter — recovery submit for Claude Code builds that accept
+    //      the bracketed paste but swallow the first trailing Enter,
+    //      leaving the prompt text editable and the turn never started.
     //
     // Without action #1, the bracketed paste's CSI-200~ open marker
     // gets consumed by Claude's first-keypress interceptor on a fresh
     // launch, the rest of the paste lands as input that's then
     // truncated, and the trailing Enter submits a partial prompt or
-    // nothing at all. Locking the four-action sequence here so a
+    // nothing at all. Locking the five-action sequence here so a
     // future plugin edit can't silently regress.
     let extension = claude_plugin();
     let plan = plan(
@@ -223,6 +226,7 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
                 label: "turn_start".to_string()
             },
             Action::BracketedPaste("hello Claude".to_string()),
+            Action::Key(Key::Enter),
             Action::Key(Key::Enter),
         ]
     );

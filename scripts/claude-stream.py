@@ -315,6 +315,33 @@ def _extract_recent_activity(body: str) -> str | None:
             return s
     return None
 
+
+def _prompt_anchor_looks_editable(body: str, status: str, prompt_anchor: str) -> bool:
+    """Return True when the prompt still appears to be in the input row.
+
+    A real submitted prompt is echoed into the body too, so `anchor in
+    body` is not enough. The bad race is narrower: the prompt anchor is
+    on the last meaningful body row, that row is a prompt glyph, and
+    there is no visible work indicator anywhere in body/status. That is
+    the shape produced when bracketed paste lands but Claude swallows the
+    trailing Enter.
+    """
+    if not prompt_anchor:
+        return False
+    full_screen = body + ("\n" + status if status else "")
+    if _extract_recent_activity(full_screen):
+        return False
+    for line in reversed(body.splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        if _CHROME_RULE_RE.match(s):
+            continue
+        prompt_row = s.startswith("❯") or s.startswith("> ")
+        return prompt_row and prompt_anchor in s
+    return False
+
+
 class Stream:
     """Robust Claude Code streaming driver — TUI-version-agnostic."""
 
@@ -846,12 +873,20 @@ class Stream:
                 trans = self.client.rpc("adapter.transcript",
                     {"adapter": self.aid, "redact": False}, t=5.0)["text"]
                 grew = len(trans) - baseline
-                cur_body, _ = self.inspect()
+                cur_body, cur_ins = self.inspect()
                 # Real submission echoes the prompt into BODY (not
                 # just status_text). Without this check, the launch
                 # banner's idle redraws pass a naive body-diff check
                 # even when nothing was submitted.
                 anchored = bool(prompt_anchor) and (prompt_anchor in cur_body)
+                status = cur_ins.get("status_text", "") or ""
+                editable_anchor = _prompt_anchor_looks_editable(
+                    cur_body, status, prompt_anchor
+                )
+                if editable_anchor:
+                    self._tick_alive(f"waiting for Claude to accept prompt (+{grew}B)")
+                    time.sleep(self.heartbeat)
+                    continue
                 if grew >= PASTE_REACTION_BYTES and anchored:
                     return True, grew
                 self._tick_alive(f"waiting for Claude to accept prompt (+{grew}B)")
@@ -1082,26 +1117,18 @@ class Stream:
             if state in self.TERMINAL_STATES:
                 self._clear_alive()
                 grew_by = max(0, len(body) - baseline_len)
-                # Fallback: surface the answer region. Two layers, in
-                # order of data fidelity:
-                #   1. Transcript-based — scans this turn's full PTY
-                #      scrollback (not just the visible body). ALWAYS
-                #      runs at completion, even if the streaming diff
-                #      printed something, because long turns can have
-                #      the final answer scroll past between the last
-                #      polled body and the terminal-state check —
-                #      `streamed_anything = True` alone is not proof
-                #      the user saw the actual reply. Already-printed
-                #      lines are deduped via the `printed_lines` set
-                #      so this only fills gaps, never repeats.
-                #   2. Body-based — runs only when the transcript was
-                #      empty / unavailable AND the body has grown.
-                #      Covers the Haiku-style ack-and-stop case where
-                #      transcript baseline wasn't established (test
-                #      harness paths).
-                transcript_dumped = self._dump_answer_region_from_transcript(
-                    already_printed=printed_lines
-                )
+                # Fallback: surface the answer region only when the live
+                # body diff printed nothing. `adapter.transcript` is raw
+                # PTY scrollback; using it as a gap-filler after a normal
+                # streamed turn can leak cursor-control bytes and status
+                # bar repaint fragments. The final body fallback below is
+                # already screen-rendered text, so prefer it when we need
+                # to rescue very brief ack-and-stop replies.
+                transcript_dumped = False
+                if not streamed_anything:
+                    transcript_dumped = self._dump_answer_region_from_transcript(
+                        already_printed=printed_lines
+                    )
                 if not transcript_dumped and not streamed_anything and grew_by > 0:
                     self._dump_answer_region(body)
                 if state == self.SUCCESS_STATE:
