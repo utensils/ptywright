@@ -405,4 +405,78 @@ mod tests {
             other => panic!("expected ShowTips, got {other:?}"),
         }
     }
+
+    /// An `RpcClient` wired to dead pipes. Every meta command tested
+    /// below resolves before issuing an RPC call, so the client only
+    /// needs to exist — a real network round-trip would deadlock and
+    /// surface as a test hang.
+    fn idle_client() -> std::sync::Arc<crate::repl::transport::RpcClient> {
+        let (c2s_r, c2s_w) = std::io::pipe().expect("pipe c→s");
+        let (s2c_r, _s2c_w) = std::io::pipe().expect("pipe s→c");
+        drop(c2s_r);
+        crate::repl::transport::RpcClient::new(s2c_r, c2s_w, crate::repl::Framing::Ndjson)
+    }
+
+    #[test]
+    fn help_quit_and_tabs_dispatch_locally() {
+        let client = idle_client();
+        let mut ctx = ReplCtx::new();
+        let t = Duration::from_millis(50);
+
+        assert!(matches!(
+            dispatch("help", &client, &mut ctx, t).unwrap(),
+            MetaOutcome::ShowHelp(_)
+        ));
+        for quit in ["quit", "q", "exit"] {
+            assert!(matches!(
+                dispatch(quit, &client, &mut ctx, t).unwrap(),
+                MetaOutcome::Quit
+            ));
+        }
+        let MetaOutcome::Line(text) = dispatch("tabs", &client, &mut ctx, t).unwrap() else {
+            panic!("expected Line from :tabs");
+        };
+        assert_eq!(text, "(no adapters)");
+    }
+
+    #[test]
+    fn focus_switches_and_rejects_unknown_or_missing_ids() {
+        let client = idle_client();
+        let mut ctx = ReplCtx::new();
+        ctx.upsert_adapter("e1", "claude-code");
+        let t = Duration::from_millis(50);
+
+        let MetaOutcome::Line(text) = dispatch("focus e1", &client, &mut ctx, t).unwrap() else {
+            panic!("expected Line from :focus");
+        };
+        assert!(text.contains("e1"));
+        assert_eq!(ctx.focus.as_deref(), Some("e1"));
+
+        // Missing arg and unknown id both error before any RPC call.
+        assert!(dispatch("focus", &client, &mut ctx, t).is_err());
+        assert!(dispatch("focus nope", &client, &mut ctx, t).is_err());
+    }
+
+    #[test]
+    fn meta_arg_validation_errors_before_any_rpc_call() {
+        let client = idle_client();
+        let mut ctx = ReplCtx::new();
+        let t = Duration::from_millis(50);
+
+        // Unknown meta command.
+        let err = dispatch("bogus", &client, &mut ctx, t).unwrap_err();
+        assert!(err.to_string().contains("bogus"));
+        // `:attach` with no spec.
+        assert!(dispatch("attach", &client, &mut ctx, t).is_err());
+        // `:notifications` with an unparseable on/off head.
+        assert!(dispatch("notifications maybe", &client, &mut ctx, t).is_err());
+        // `:notifications off` does not accept filter args.
+        assert!(dispatch("notifications off adapters=e1", &client, &mut ctx, t).is_err());
+        // `:notifications on` with an unknown filter token.
+        assert!(dispatch("notifications on bogus=e1", &client, &mut ctx, t).is_err());
+        // `:rpc` with no method name.
+        assert!(dispatch("rpc", &client, &mut ctx, t).is_err());
+        // `:rpc` with malformed JSON params.
+        assert!(dispatch("rpc server.capabilities {bad", &client, &mut ctx, t).is_err());
+    }
 }

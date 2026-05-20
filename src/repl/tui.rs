@@ -1050,4 +1050,53 @@ mod tests {
         assert_eq!(range.trimmed_top, 4);
         assert_eq!(range.trimmed_bottom, 5);
     }
+
+    /// Build a real `ScreenSnapshot` by driving the vt100-backed
+    /// `Terminal` with `bytes`. Lets the render smoke tests exercise
+    /// `print_screen` against authentic cell / style / cursor data
+    /// instead of a hand-assembled struct.
+    fn snapshot_from(rows: u16, cols: u16, bytes: &[u8]) -> ScreenSnapshot {
+        let mut term = crate::screen::Terminal::new(crate::target::TerminalSize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        term.process(bytes);
+        term.snapshot(1)
+    }
+
+    #[test]
+    fn print_screen_renders_without_panicking() {
+        // Smoke coverage for the render path: empty screen, a screen
+        // with content, and a screen whose content overruns the clamp
+        // (forcing the `…` truncation branch). The assertion is
+        // "doesn't panic" — stdout content is exercised, not captured.
+        print_screen("e1", &snapshot_from(10, 40, b""));
+        print_screen("e1", &snapshot_from(10, 40, b"hello\r\nworld\r\n"));
+        // A line far wider than the 40-col PTY → per-row trim + clamp.
+        let wide = "x".repeat(200);
+        print_screen("e1", &snapshot_from(10, 40, wide.as_bytes()));
+        // Styled content exercises cell_style_to_ansi / parse_cell_color.
+        print_screen(
+            "e1",
+            &snapshot_from(8, 30, b"\x1b[1;31mbold-red\x1b[0m plain\r\n"),
+        );
+    }
+
+    #[test]
+    fn print_helpers_render_without_panicking() {
+        // The `print_*` helpers are pure stdout writers; calling them
+        // here covers the formatting branches (section headers, blank
+        // lines, multi-line indentation, JSON truncation).
+        print_help(crate::repl::meta::help_text());
+        print_tips(crate::repl::tips::long_guide());
+        print_error("something went wrong");
+        print_line_result("single line");
+        print_line_result("first line\nsecond line\n\nfourth line");
+        print_json_result(&json!({ "ok": true, "n": 7 }));
+        // A payload longer than the 240-char cap exercises truncation.
+        let big = json!({ "blob": "z".repeat(400) });
+        print_json_result(&big);
+    }
 }

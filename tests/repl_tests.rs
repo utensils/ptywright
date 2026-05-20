@@ -113,6 +113,42 @@ fn rpc_meta_passthrough_invokes_server() {
 }
 
 #[test]
+fn live_meta_lists_server_adapters() {
+    // `:live` calls `adapter.live`; with no adapters spawned the
+    // server returns an empty array, which the dispatcher surfaces
+    // verbatim as a `Json` outcome.
+    let (client, _server) = in_process_client();
+    let mut ctx = ReplCtx::new();
+    let outcome =
+        meta::dispatch("live", &client, &mut ctx, Duration::from_secs(5)).expect("dispatch :live");
+    let MetaOutcome::Json(value) = outcome else {
+        panic!("expected json outcome from :live")
+    };
+    assert!(
+        value["adapters"].as_array().is_some(),
+        "`:live` response should carry an `adapters` array, got {value}",
+    );
+}
+
+#[test]
+fn attach_all_on_empty_server_reports_no_adapters() {
+    // `:attach all` with nothing live exercises the empty-iteration
+    // branch — it must report cleanly rather than erroring.
+    let (client, _server) = in_process_client();
+    let mut ctx = ReplCtx::new();
+    let outcome = meta::dispatch("attach all", &client, &mut ctx, Duration::from_secs(5))
+        .expect("dispatch :attach all");
+    let MetaOutcome::Line(text) = outcome else {
+        panic!("expected line outcome from :attach all")
+    };
+    assert!(
+        text.contains("no live adapters"),
+        "expected an empty-server message, got: {text}",
+    );
+    assert!(ctx.adapters.is_empty(), "no adapters should be adopted");
+}
+
+#[test]
 #[cfg(unix)]
 fn notifications_subscription_fires_for_adapter_sessions() {
     let (client, _server) = in_process_client();

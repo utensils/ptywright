@@ -128,6 +128,18 @@ mod tests {
     }
 
     #[test]
+    fn rotating_tip_returns_a_member_of_the_set() {
+        // Exercises the clock-seeded public path (`rotating_tip` →
+        // `seed_from_clock`); whatever second it runs in, the result
+        // must be one of the curated entries.
+        let tip = rotating_tip();
+        assert!(
+            ROTATING_TIPS.contains(&tip),
+            "rotating_tip must return a set member, got: {tip}",
+        );
+    }
+
+    #[test]
     fn rotating_tip_for_is_deterministic_per_seed() {
         let a = rotating_tip_for(7);
         let b = rotating_tip_for(7);
