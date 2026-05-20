@@ -440,31 +440,18 @@ fn repl_command(
             ));
         }
         (None, false) => {
-            // No transport flag → connect to the per-user default socket.
-            // Matches `ptywright serve` running without --socket below.
+            // No transport flag → connect to the per-user default
+            // socket. If no server is listening we auto-spawn one in
+            // the background (handled inside `repl::run` via the
+            // `DefaultSocket` variant), so the operator can just type
+            // `ptywright repl` and have a working session even on a
+            // fresh install. On exit we prompt: shutdown or detach.
             let path = Paths::from_env().default_socket_path();
-            // Pre-check for the most common first-run failure (no server
-            // running) so the operator gets a friendlier message than
-            // ENOENT bubbled up from inside the transport.
-            #[cfg(unix)]
-            if !path.exists() {
-                return Err(ptywright::Error::Rpc(format!(
-                    "no ptywright server is listening at {path} (the default socket).\n\
-                     \n\
-                     Start one in another terminal:\n  \
-                     ptywright serve\n\
-                     \n\
-                     …or pipe a child server through stdio in one command:\n  \
-                     ptywright repl --stdio -- ptywright serve --stdio\n\
-                     \n\
-                     To use a non-default path, pass --socket on both sides:\n  \
-                     ptywright serve --socket /tmp/p.sock &\n  \
-                     ptywright repl   --socket /tmp/p.sock",
-                    path = path.display(),
-                )));
-            }
-            tracing::info!(socket = %path.display(), "ptywright repl: connecting to default socket");
-            Transport::Socket(path)
+            tracing::info!(
+                socket = %path.display(),
+                "ptywright repl: connecting to default socket (auto-spawn enabled)",
+            );
+            Transport::DefaultSocket(path)
         }
     };
     let framing = match framing {
@@ -614,6 +601,18 @@ fn install_socket_cleanup(path: &Path) {
 fn serve_socket(path: &Path, framing: RpcFraming, state: RpcServerState) -> ptywright::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
+
+    // Make sure the runtime directory exists. On a fresh install
+    // `~/.ptywright/` (or whatever `PTYWRIGHT_HOME` points at) won't
+    // exist yet, and `UnixListener::bind` returns `ENOENT` without
+    // creating the parent itself. The REPL's auto-spawn path hides
+    // stderr, so without this the server crashes silently and the
+    // REPL times out connecting.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
 
     if let Ok(metadata) = std::fs::metadata(path) {
         if metadata.file_type().is_socket() {
