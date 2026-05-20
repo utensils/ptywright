@@ -609,7 +609,9 @@ fn visible_range(rows: &[Vec<&crate::screen::ScreenCell>], cursor_row: usize) ->
     let (start, end_inclusive) = match (first_content, last_content) {
         (Some(f), Some(l)) => (f.min(cursor_row), l.max(cursor_row)),
         // Empty screen — anchor on the cursor so we always paint at
-        // least one row, but never report it as "hidden".
+        // least one row. `trimmed_top` / `trimmed_bottom` are still
+        // computed from `start` / `end`, so the footer accurately
+        // reports the blank rows above and below that anchored row.
         _ => (cursor_row, cursor_row),
     };
     let end = (end_inclusive + 1).min(total);

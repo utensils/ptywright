@@ -495,6 +495,49 @@ struct StringArgContext<'a> {
     needs_opening_quote: bool,
 }
 
+/// Returns `true` when byte offset `pos` in `prefix` falls inside a Lua
+/// string literal or a `--` line comment.
+///
+/// `detect_string_arg` scans for call names with `rfind`, which happily
+/// matches text the operator merely *typed inside a string* — e.g. the
+/// `session.spawn(` substring of `send.text("run session.spawn(x)")`.
+/// Completing a plugin name there would be wrong, so a call-name match
+/// whose start offset is inside a string / comment is skipped. REPL
+/// input is one logical line per submitted chunk, so a `--` outside a
+/// string runs to the end of `prefix`.
+fn is_in_string_or_comment(prefix: &str, pos: usize) -> bool {
+    let bytes = prefix.as_bytes();
+    let limit = pos.min(bytes.len());
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < limit {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    // Skip the escaped byte so `"\""` doesn't close early.
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'-' && i + 1 < limit && bytes[i + 1] == b'-' {
+                    // A `--` outside a string opens a comment that runs
+                    // to end-of-line — `pos` is past it, so it's inside.
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    quote.is_some()
+}
+
 /// Recognise a first-string-argument context anywhere in `prefix`. The
 /// rightmost matching call wins, so a chained / multi-statement line
 /// resolves to the call the cursor is actually inside of.
@@ -511,6 +554,11 @@ fn detect_string_arg(prefix: &str) -> Option<StringArgContext<'_>> {
             if prev.is_ascii_alphanumeric() || prev == b'_' {
                 continue;
             }
+        }
+        // Reject a call name the operator typed *inside* a string
+        // literal or comment — the cursor there is not in a real call.
+        if is_in_string_or_comment(prefix, call_at) {
+            continue;
         }
         let after_start = call_at + name.len();
         let after = &prefix[after_start..];
@@ -1341,5 +1389,71 @@ mod tests {
             !values.contains(&r#""claude-code""#),
             "identifier suffix match must be rejected; got {values:?}"
         );
+    }
+
+    #[test]
+    fn call_name_inside_a_string_literal_does_not_trigger_completion() {
+        // `session.spawn(` typed *inside* another call's string arg must
+        // not surface plugin names — the cursor is in a `send.text`
+        // string, not a real `session.spawn` call.
+        let ctx = ctx_with_adapters(&[]);
+        let plugins = PluginCache::new();
+        plugins.set(vec!["claude-code".into()]);
+        let (mut completer, _server) = build_completer_with(ctx, plugins, AdapterCache::new());
+        let line = r#"send.text("run session.spawn("#;
+        let suggestions = completer.complete(line, line.len());
+        let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
+        assert!(
+            !values.iter().any(|v| v.contains("claude-code")),
+            "call name inside a string literal must not trigger completion; got {values:?}"
+        );
+    }
+
+    #[test]
+    fn call_name_inside_a_comment_does_not_trigger_completion() {
+        let ctx = ctx_with_adapters(&[]);
+        let plugins = PluginCache::new();
+        plugins.set(vec!["claude-code".into()]);
+        let (mut completer, _server) = build_completer_with(ctx, plugins, AdapterCache::new());
+        let line = "-- session.spawn(";
+        let suggestions = completer.complete(line, line.len());
+        let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
+        assert!(
+            !values.iter().any(|v| v.contains("claude-code")),
+            "call name inside a comment must not trigger completion; got {values:?}"
+        );
+    }
+
+    #[test]
+    fn real_call_after_a_closed_string_still_completes() {
+        // The guard must only suppress matches *inside* a string — a
+        // genuine `session.spawn(` that follows a complete, closed
+        // string literal must still complete.
+        let ctx = ctx_with_adapters(&[]);
+        let plugins = PluginCache::new();
+        plugins.set(vec!["claude-code".into()]);
+        let (mut completer, _server) = build_completer_with(ctx, plugins, AdapterCache::new());
+        let line = r#"local label = "spawned"; session.spawn(""#;
+        let suggestions = completer.complete(line, line.len());
+        let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
+        assert!(
+            values.contains(&"claude-code"),
+            "a real call after a closed string must still complete; got {values:?}"
+        );
+    }
+
+    #[test]
+    fn is_in_string_or_comment_tracks_quotes_escapes_and_comments() {
+        // Outside any string / comment.
+        assert!(!is_in_string_or_comment("session.spawn(", 0));
+        assert!(!is_in_string_or_comment("local s = session.spawn(", 11));
+        // Inside an open double-quoted string.
+        assert!(is_in_string_or_comment(r#"send.text("abc"#, 12));
+        // After a closed string — back outside.
+        assert!(!is_in_string_or_comment(r#"f("done") g("#, 10));
+        // An escaped quote does not close the string.
+        assert!(is_in_string_or_comment(r#"f("a\"b"#, 6));
+        // Inside a `--` line comment.
+        assert!(is_in_string_or_comment("-- session.spawn(", 5));
     }
 }

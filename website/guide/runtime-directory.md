@@ -11,11 +11,13 @@ ptywright keeps configuration, log files, and any future cached state under a si
 ├── data/            # reserved for future on-disk state
 ├── transcripts/     # reserved for opt-in raw transcript files
 ├── sockets/         # reserved for IPC paths created by serve --socket
-├── socket           # default `serve --socket` endpoint (the path `repl` connects to — or auto-spawns a server on — when no transport is supplied)
+├── socket           # default `serve --socket` endpoint on macOS / Linux (see note below)
 └── repl-history     # persisted REPL command history (Ctrl-R reverse search)
 ```
 
 ptywright creates each subdirectory lazily, only when the corresponding feature writes to it.
+
+The default `serve --socket` endpoint — the one `repl` connects to (or auto-spawns a server on) when no transport flag is supplied — is the `socket` file shown above on macOS / Linux. **On Windows there is no `socket` file in the runtime directory:** named pipes must live under `\\.\pipe\`, so the default endpoint is the kernel object `\\.\pipe\ptywright-<user>` instead.
 
 ## Resolution order
 

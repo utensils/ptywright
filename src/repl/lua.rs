@@ -20,10 +20,12 @@
 //! 3. The caller (the TUI in [`super::tui`]) maps each [`RenderedValue`] back
 //!    onto the existing print helpers.
 //!
-//! This module currently exposes only the `plugins()` / `plugins.describe(...)`
-//! binding as a working slice. Remaining DSL verbs are still routed through
-//! [`super::command::dispatch`] by the TUI until the rest of the bindings
-//! land in subsequent commits.
+//! This module installs the **entire** REPL-exposed global surface —
+//! `plugins`, `session`, `send`, `wait`, `turn`, `cancel_wait`, `state`,
+//! `transcript`, `screen`, `view`, `inspect`, and the `re` / `ms` / `s`
+//! helpers — through the `install_*` helpers. The TUI in [`super::tui`]
+//! only owns line-editing, prompt rendering, and result printing; there
+//! is no separate command dispatcher.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -389,7 +391,7 @@ fn install_plugins(
 /// Each binding accepts both `session.spawn("name", { rows = 24 })` and the
 /// Lua-sugar `session.spawn{ "name", rows = 24 }` forms via [`read_call`].
 /// `session.spawn` / `session.resume` populate `ctx.adapters` + `ctx.focus`
-/// on success exactly the way `command::adopt_started_adapter` did.
+/// on success through the shared [`adopt_started_adapter`] helper.
 fn install_session(
     lua: &Lua,
     rpc: &Arc<RpcClient>,
@@ -1274,7 +1276,7 @@ fn resolve_matcher(value: Value) -> mlua::Result<(String, serde_json::Value)> {
 }
 
 /// Read the focused adapter id, returning a friendly Lua error when no
-/// adapter is focused. Mirrors `command::focus_or_err`.
+/// adapter is focused.
 fn focus_required(ctx: &Mutex<ReplCtx>) -> mlua::Result<String> {
     ctx.lock()
         .expect("ctx mutex")
@@ -1287,7 +1289,6 @@ fn focus_required(ctx: &Mutex<ReplCtx>) -> mlua::Result<String> {
 }
 
 /// Adopt a freshly-started adapter into the local tab list + focus pointer.
-/// Mirrors `command::adopt_started_adapter`.
 fn adopt_started_adapter(
     ctx: &Arc<Mutex<ReplCtx>>,
     requested_plugin: &str,
