@@ -141,22 +141,22 @@ opens a continuation prompt (`…`) and Enter on the closing `end` /
 
 ### Globals reference
 
-| Global | Form | Notes |
-| --- | --- | --- |
-| `plugins` | `plugins()` / `plugins.describe("name")` | Read-only registry queries. |
-| `session.spawn` | `(plugin, opts?)` or `{plugin, ...opts}` | Optional opts: `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, `pixel_height`. |
-| `session.resume` | same shape + `prior_adapter` / `prior` | Closes the prior adapter if still live. |
-| `session.list` / `session.live` / `session.attach` / `session.close` | — | Local tab list / server-side list / adopt / close. |
-| `state` | `state()` | `adapter.state` for the focused adapter. |
-| `send.text` / `send.key` / `send.intent` | `(string)` or `(intent, opts?)` | `send.text` wires to `intent=send_prompt` with `{prompt}`. |
-| `turn` | `(intent, opts?)` | Reserved opts: `wait` (a matcher), `wait_intent` (override the matcher fn), `timeout` (ms). |
-| `wait` | `wait(matcher, opts?)` / `wait.matches("...", opts?)` / `wait.screen_stable(ms, opts?)` | `wait_id = "..."` makes the wait cancellable from another connection. |
-| `matches` / `screen_stable` | `matches("regex")` / `screen_stable(ms)` | Return tagged matcher values; standalone calls do no RPC. |
-| `cancel_wait` | `cancel_wait("wait-id")` | Break a still-in-flight wait. |
-| `transcript.snapshot` | `({ redact = true })` | `redact` defaults to true. |
-| `screen.snapshot` / `view` | `()` | Renders the focused PTY inline; `view()` is an alias. |
-| `inspect` | `inspect()` | Adapter diagnostic dump. |
-| `re(s)` / `ms(n)` / `s(n)` | — | `re` and `ms` are identity (document intent); `s(n)` returns `n * 1000`. |
+| Global                                                               | Form                                                                                    | Notes                                                                                          |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `plugins`                                                            | `plugins()` / `plugins.describe("name")`                                                | Read-only registry queries.                                                                    |
+| `session.spawn`                                                      | `(plugin, opts?)` or `{plugin, ...opts}`                                                | Optional opts: `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, `pixel_height`. |
+| `session.resume`                                                     | same shape + `prior_adapter` / `prior`                                                  | Closes the prior adapter if still live.                                                        |
+| `session.list` / `session.live` / `session.attach` / `session.close` | —                                                                                       | Local tab list / server-side list / adopt / close.                                             |
+| `state`                                                              | `state()`                                                                               | `adapter.state` for the focused adapter.                                                       |
+| `send.text` / `send.key` / `send.intent`                             | `(string)` or `(intent, opts?)`                                                         | `send.text` wires to `intent=send_prompt` with `{prompt}`.                                     |
+| `turn`                                                               | `(intent, opts?)`                                                                       | Reserved opts: `wait` (a matcher), `wait_intent` (override the matcher fn), `timeout` (ms).    |
+| `wait`                                                               | `wait(matcher, opts?)` / `wait.matches("...", opts?)` / `wait.screen_stable(ms, opts?)` | `wait_id = "..."` makes the wait cancellable from another connection.                          |
+| `matches` / `screen_stable`                                          | `matches("regex")` / `screen_stable(ms)`                                                | Return tagged matcher values; standalone calls do no RPC.                                      |
+| `cancel_wait`                                                        | `cancel_wait("wait-id")`                                                                | Break a still-in-flight wait.                                                                  |
+| `transcript.snapshot`                                                | `({ redact = true })`                                                                   | `redact` defaults to true.                                                                     |
+| `screen.snapshot` / `view`                                           | `()`                                                                                    | Renders the focused PTY inline; `view()` is an alias.                                          |
+| `inspect`                                                            | `inspect()`                                                                             | Adapter diagnostic dump.                                                                       |
+| `re(s)` / `ms(n)` / `s(n)`                                           | —                                                                                       | `re` and `ms` are identity (document intent); `s(n)` returns `n * 1000`.                       |
 
 `send.key(...)` accepts the full host `Key` surface (see the [Lua extension API](../guide/extensions.md#host-api-exposed-to-lua-plugins)) with hyphens as a convenience: `enter`, `escape`, `tab`, `shift-tab`, `backspace`, `delete`, `space`, the arrows, the navigation cluster (`home`, `end`, `page-up`, `page-down`, `insert`), every `ctrl-a` through `ctrl-z` except the four that alias named keys (`ctrl-h`/`ctrl-i`/`ctrl-j`/`ctrl-m`), and `f1` through `f12`. Single characters that aren't aliases (`"y"`, `"n"`, `"1"`) fall through to typed text so quick acknowledgements work without dropping to `send.text`. Tab completion lists the most common keys (submit/cancel/edit, arrows, navigation) first.
 
