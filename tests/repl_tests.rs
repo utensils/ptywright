@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ptywright::repl::Framing;
-use ptywright::repl::command::{CmdOutcome, dispatch, parse};
 use ptywright::repl::ctx::ReplCtx;
+use ptywright::repl::meta::{self, MetaOutcome};
 use ptywright::repl::transport::RpcClient;
 use ptywright::rpc::{RpcServerState, serve_ndjson_with_state};
 use serde_json::json;
@@ -72,184 +72,22 @@ fn rpc_client_surfaces_capabilities_and_adapter_methods() {
 }
 
 #[test]
-fn command_dispatcher_drives_full_spawn_and_close_cycle() {
-    let (client, _server) = in_process_client();
-    let mut ctx = ReplCtx::new();
-
-    // plugins() should return the built-in list.
-    let outcome = dispatch(
-        parse("plugins()").unwrap(),
-        &client,
-        &mut ctx,
-        Duration::from_secs(5),
-    )
-    .expect("dispatch plugins");
-    assert!(matches!(outcome, CmdOutcome::Json(_)));
-
-    // The dispatch path that actually spawns a PTY is unix-only because
-    // the claude-code plugin's default target points at /bin/sh on
-    // Linux/macOS. On Windows the test stops at the previous assertion.
-    #[cfg(unix)]
-    {
-        let outcome = dispatch(
-            parse(r#"session.spawn("claude-code", program="/bin/sh")"#).unwrap(),
-            &client,
-            &mut ctx,
-            Duration::from_secs(5),
-        )
-        .expect("dispatch spawn");
-        let CmdOutcome::Json(value) = outcome else {
-            panic!("expected json outcome")
-        };
-        let adapter = value["adapter"].as_str().expect("adapter id");
-        assert_eq!(ctx.focus.as_deref(), Some(adapter));
-        assert!(
-            ctx.adapter(adapter).is_some(),
-            "spawn must register the adapter"
-        );
-
-        // state() should now succeed against the focused adapter.
-        let state = dispatch(
-            parse("state()").unwrap(),
-            &client,
-            &mut ctx,
-            Duration::from_secs(5),
-        )
-        .expect("dispatch state");
-        assert!(matches!(state, CmdOutcome::Json(_)));
-
-        // Close it back out — the cleanup logic should drop the tab and
-        // clear focus.
-        let _ = dispatch(
-            parse("session.close()").unwrap(),
-            &client,
-            &mut ctx,
-            Duration::from_secs(5),
-        );
-        assert!(ctx.adapters.is_empty(), "session.close must drop the tab");
-        assert!(ctx.focus.is_none(), "session.close must clear focus");
-    }
-}
-
-#[test]
-fn plugins_describe_round_trips_through_dispatcher() {
-    // The DSL `plugins.describe("claude-code")` must call `plugin.describe`
-    // with the right wire shape and surface the resulting catalog.
-    let (client, _server) = in_process_client();
-    let mut ctx = ReplCtx::new();
-    let outcome = dispatch(
-        parse(r#"plugins.describe("claude-code")"#).unwrap(),
-        &client,
-        &mut ctx,
-        Duration::from_secs(5),
-    )
-    .expect("dispatch plugins.describe");
-    let CmdOutcome::Json(value) = outcome else {
-        panic!("expected json outcome, got {outcome:?}");
-    };
-    assert_eq!(value["plugin"], "claude-code");
-    // The claude-code plugin owns its describe() catalog, so the
-    // server-side fallback path should not have run — we expect at
-    // minimum the canonical `send_prompt` intent and the
-    // `wait_turn_matcher` wait function.
-    let intent_names: Vec<&str> = value["intents"]
-        .as_array()
-        .expect("intents array")
-        .iter()
-        .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()))
-        .collect();
-    assert!(
-        intent_names.contains(&"send_prompt"),
-        "describe missing send_prompt: {intent_names:?}"
-    );
-    let wait_names: Vec<&str> = value["wait_matchers"]
-        .as_array()
-        .expect("wait_matchers array")
-        .iter()
-        .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()))
-        .collect();
-    assert!(
-        wait_names.contains(&"wait_turn_matcher"),
-        "describe missing wait_turn_matcher: {wait_names:?}"
-    );
-}
-
-#[test]
-#[cfg(unix)]
-fn turn_dispatches_send_then_wait_atomically() {
-    // End-to-end smoke test: `turn(...)` must route through
-    // `adapter.turn`. The claude-code wait_turn_matcher anchors on
-    // claude-specific turn-end markers that /bin/sh can't emit, so we
-    // assert the RPC reached the server (matcher timed out -> -32001)
-    // rather than a successful wait. A timeout error proves the
-    // serialization path is intact: dispatcher → adapter.turn → plugin
-    // dispatch → matcher loop. The wire-shape contract itself is
-    // pinned by the unit tests in src/repl/command.rs.
-    let (client, _server) = in_process_client();
-    let mut ctx = ReplCtx::new();
-
-    let outcome = dispatch(
-        parse(
-            r#"session.spawn("claude-code", program="/bin/sh", args=["-lc", "printf ready; cat"])"#,
-        )
-        .unwrap(),
-        &client,
-        &mut ctx,
-        Duration::from_secs(5),
-    )
-    .expect("dispatch session.spawn");
-    let CmdOutcome::Json(value) = outcome else {
-        panic!("expected json from session.spawn, got {outcome:?}");
-    };
-    let adapter = value["adapter"].as_str().expect("adapter id").to_string();
-
-    // Tight 250 ms wait so the test fails fast on regression but still
-    // reaches the matcher loop.
-    let result = dispatch(
-        parse(r#"turn("send_prompt", prompt="probe\n", wait=matches(r"never-matches"), timeout=250ms)"#)
-            .unwrap(),
-        &client,
-        &mut ctx,
-        Duration::from_secs(5),
-    );
-    match result {
-        Err(error) => {
-            // -32001 is the matcher timeout code defined in src/rpc.rs.
-            // Anything else means the dispatcher rejected the call
-            // before it reached the server.
-            let message = error.to_string();
-            assert!(
-                message.contains("-32001") || message.contains("matcher"),
-                "expected matcher timeout from adapter.turn, got `{message}`"
-            );
-        }
-        Ok(other) => panic!("expected -32001 matcher timeout, got {other:?}"),
-    }
-
-    let _ = dispatch(
-        parse(&format!(r#"session.close("{adapter}")"#)).unwrap(),
-        &client,
-        &mut ctx,
-        Duration::from_secs(5),
-    );
-}
-
-#[test]
 fn notifications_meta_forwards_filter_to_server() {
     // `:notifications on adapters=e1,e2 sessions=s1` must serialize to
     // a `server.set_notifications` call carrying the filter arrays.
     // The server echoes the resolved filter back, so we can assert
-    // round-trip equality.
+    // round-trip equality. Driven through `meta::dispatch` directly
+    // since the DSL parser was deleted in favour of the Lua REPL.
     let (client, _server) = in_process_client();
     let mut ctx = ReplCtx::new();
-    let outcome = dispatch(
-        parse(":notifications on adapters=e1,e2 sessions=s1").unwrap(),
+    let outcome = meta::dispatch(
+        "notifications on adapters=e1,e2 sessions=s1",
         &client,
         &mut ctx,
         Duration::from_secs(5),
     )
     .expect("dispatch :notifications");
-    let CmdOutcome::Json(value) = outcome else {
+    let MetaOutcome::Json(value) = outcome else {
         panic!("expected json from :notifications, got {outcome:?}");
     };
     assert_eq!(value["enabled"], true);
@@ -261,17 +99,53 @@ fn notifications_meta_forwards_filter_to_server() {
 fn rpc_meta_passthrough_invokes_server() {
     let (client, _server) = in_process_client();
     let mut ctx = ReplCtx::new();
-    let outcome = dispatch(
-        parse(":rpc server.capabilities").unwrap(),
+    let outcome = meta::dispatch(
+        "rpc server.capabilities",
         &client,
         &mut ctx,
         Duration::from_secs(5),
     )
     .expect("dispatch :rpc");
-    let CmdOutcome::Json(value) = outcome else {
+    let MetaOutcome::Json(value) = outcome else {
         panic!("expected json outcome")
     };
     assert_eq!(value["name"], "ptywright");
+}
+
+#[test]
+fn live_meta_lists_server_adapters() {
+    // `:live` calls `adapter.live`; with no adapters spawned the
+    // server returns an empty array, which the dispatcher surfaces
+    // verbatim as a `Json` outcome.
+    let (client, _server) = in_process_client();
+    let mut ctx = ReplCtx::new();
+    let outcome =
+        meta::dispatch("live", &client, &mut ctx, Duration::from_secs(5)).expect("dispatch :live");
+    let MetaOutcome::Json(value) = outcome else {
+        panic!("expected json outcome from :live")
+    };
+    assert!(
+        value["adapters"].as_array().is_some(),
+        "`:live` response should carry an `adapters` array, got {value}",
+    );
+}
+
+#[test]
+fn attach_all_on_empty_server_reports_no_adapters() {
+    // `:attach all` with nothing live exercises the empty-iteration
+    // branch — it must report cleanly rather than erroring.
+    let (client, _server) = in_process_client();
+    let mut ctx = ReplCtx::new();
+    let outcome = meta::dispatch("attach all", &client, &mut ctx, Duration::from_secs(5))
+        .expect("dispatch :attach all");
+    let MetaOutcome::Line(text) = outcome else {
+        panic!("expected line outcome from :attach all")
+    };
+    assert!(
+        text.contains("no live adapters"),
+        "expected an empty-server message, got: {text}",
+    );
+    assert!(ctx.adapters.is_empty(), "no adapters should be adopted");
 }
 
 #[test]

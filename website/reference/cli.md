@@ -88,34 +88,75 @@ Options:
 | `--stdio`           | —        | Spawn a child server (pass its command + args after `--`).             |
 | `--framing FRAMING` | `ndjson` | JSON-RPC framing (`ndjson` or `lsp`). Must match the server's framing. |
 
-If neither `--socket` nor `--stdio` is supplied, the REPL connects to the default socket at `~/.ptywright/socket`.
+If neither `--socket` nor `--stdio` is supplied, the REPL targets the per-user default endpoint — a Unix domain socket at `~/.ptywright/socket` on macOS / Linux, or a named pipe `\\.\pipe\ptywright-<user>` on Windows. When a server is already listening there it connects directly. When nothing is listening, the REPL **auto-spawns** a background `ptywright serve` on that same endpoint (the same binary, detached stdio, its own process group) and connects once the endpoint is accepting. On exit you are prompted whether to shut that auto-started server down (the default) or detach it so other clients can keep using it; a non-interactive stdin defaults to shutdown so scripted invocations never leak a daemon. Passing `--socket <path>` explicitly skips the auto-spawn — that form assumes you are managing the server yourself.
 
-The REPL is a sequential `reedline`-based loop: each command is rendered as `pty> <syntax-highlighted DSL>` and the result follows on the next line as `↳ <dim summary>`. Line editing, completion, syntax highlighting, history, and ghost-text hinting are delegated to reedline; the REPL drives the generic `adapter.*` JSON-RPC surface from a small friendly DSL. The most common forms:
+The REPL is a sequential `reedline`-based loop and **each input line is real Lua 5.4** evaluated against a curated set of REPL-bound globals. Line editing, completion, syntax highlighting, history, multi-line continuation, and ghost-text hinting are delegated to reedline; the bindings drive the generic `adapter.*` JSON-RPC surface. The most common forms:
 
-```text
-plugins()                              # list built-in plugins
-session.spawn("claude-code")           # spawn an adapter
-session.spawn("claude-code", args=["--model", "haiku"], env={NO_COLOR:"1"})
-session.resume("claude-code", prior_adapter="e1", args=["--resume", "abc"])
-session.list()                         # local tabs in this REPL
-session.live()                         # all adapters live on the server
-session.attach("e3")                   # adopt a sibling connection's adapter
-session.attach("all")                  # adopt every live adapter at once
+Lua's call-with-table-argument sugar (`f{...}`) and call-with-string sugar (`f"..."`) make the REPL surface read naturally:
 
-send.text("hello")                     # bracketed-paste a prompt
-send.key("shift-tab")                  # send a single named key
-send.intent("approve")                 # invoke an arbitrary plugin intent
+```lua
+plugins()                                -- list built-in plugins
+plugins.describe "claude-code"            -- string sugar — same as plugins.describe("claude-code")
 
-wait(matches(r"❯"))                    # wait for a regex match
-wait(screen_stable(250ms))             # wait for the screen to settle
+session.spawn{ "claude-code", rows = 24, cols = 80 }   -- combined form
+session.spawn{ "claude-code", args = {"--model", "haiku"}, env = { NO_COLOR = "1" } }
+session.spawn("claude-code", { rows = 24 })            -- equivalent parenthesised form
+session.resume{ "claude-code", prior_adapter = "e1", args = {"--resume", "abc"} }
+session.list()                           -- local tabs in this REPL
+session.live()                           -- all adapters live on the server
+session.attach "e3"                       -- adopt a sibling connection's adapter
+session.attach "all"                      -- adopt every live adapter at once
 
-state()                                # re-classify the focused adapter
-screen.snapshot()                      # render the PTY inline (styled)
-transcript.snapshot()                  # dump the focused adapter's transcript
-inspect()                              # diagnostic adapter dump
+send.text "hello"                         -- send a prompt
+send.key "shift-tab"                      -- send a single named key
+send.intent{ "approve", reason = "ok" }   -- invoke a plugin intent with kwargs
+
+wait(matches "^❯")                        -- wait for a regex match
+wait(screen_stable(250))                  -- wait for the screen to settle (250 ms)
+wait.matches "^❯"                         -- shorthand with the default matcher
+wait.screen_stable(s(2))                  -- s(n) is sugar for n * 1000 ms
+turn{ "send_prompt", prompt = "go", wait = matches "done", timeout = s(5) }
+
+state()                                  -- re-classify the focused adapter
+screen.snapshot() / view()                -- render the PTY inline (styled)
+transcript.snapshot{ redact = false }     -- dump the transcript
+inspect()                                -- diagnostic adapter dump
 ```
 
-`session.spawn(...)` mirrors `adapter.start`: optional kwargs are `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, and `pixel_height`. `session.resume(...)` mirrors `adapter.resume` and additionally accepts `prior_adapter` (or `prior`) to close a live adapter before spawning the replacement.
+Because each line is real Lua, you also have the full standard library
+and language available — variables, loops, conditionals, `os.date()`,
+`string.format(...)`, etc:
+
+```lua
+for i = 1, 3 do session.spawn("claude-code") end
+local replies = {}
+for _, adapter in ipairs(session.list()) do
+  -- focus, fetch, store …
+end
+```
+
+Multi-line input is supported: any unclosed block / table / function
+opens a continuation prompt (`…`) and Enter on the closing `end` /
+`}` submits the whole chunk.
+
+### Globals reference
+
+| Global                                                               | Form                                                                                    | Notes                                                                                          |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `plugins`                                                            | `plugins()` / `plugins.describe("name")`                                                | Read-only registry queries.                                                                    |
+| `session.spawn`                                                      | `(plugin, opts?)` or `{plugin, ...opts}`                                                | Optional opts: `program`, `args`, `cwd`, `env`, `rows`, `cols`, `pixel_width`, `pixel_height`. |
+| `session.resume`                                                     | same shape + `prior_adapter` / `prior`                                                  | Closes the prior adapter if still live.                                                        |
+| `session.list` / `session.live` / `session.attach` / `session.close` | —                                                                                       | Local tab list / server-side list / adopt / close.                                             |
+| `state`                                                              | `state()`                                                                               | `adapter.state` for the focused adapter.                                                       |
+| `send.text` / `send.key` / `send.intent`                             | `(string)` or `(intent, opts?)`                                                         | `send.text` wires to `intent=send_prompt` with `{prompt}`.                                     |
+| `turn`                                                               | `(intent, opts?)`                                                                       | Reserved opts: `wait` (a matcher), `wait_intent` (override the matcher fn), `timeout` (ms).    |
+| `wait`                                                               | `wait(matcher, opts?)` / `wait.matches("...", opts?)` / `wait.screen_stable(ms, opts?)` | `wait_id = "..."` makes the wait cancellable from another connection.                          |
+| `matches` / `screen_stable`                                          | `matches("regex")` / `screen_stable(ms)`                                                | Return tagged matcher values; standalone calls do no RPC.                                      |
+| `cancel_wait`                                                        | `cancel_wait("wait-id")`                                                                | Break a still-in-flight wait.                                                                  |
+| `transcript.snapshot`                                                | `({ redact = true })`                                                                   | `redact` defaults to true.                                                                     |
+| `screen.snapshot` / `view`                                           | `()`                                                                                    | Renders the focused PTY inline; `view()` is an alias.                                          |
+| `inspect`                                                            | `inspect()`                                                                             | Adapter diagnostic dump.                                                                       |
+| `re(s)` / `ms(n)` / `s(n)`                                           | —                                                                                       | `re` and `ms` are identity (document intent); `s(n)` returns `n * 1000`.                       |
 
 `send.key(...)` accepts the full host `Key` surface (see the [Lua extension API](../guide/extensions.md#host-api-exposed-to-lua-plugins)) with hyphens as a convenience: `enter`, `escape`, `tab`, `shift-tab`, `backspace`, `delete`, `space`, the arrows, the navigation cluster (`home`, `end`, `page-up`, `page-down`, `insert`), every `ctrl-a` through `ctrl-z` except the four that alias named keys (`ctrl-h`/`ctrl-i`/`ctrl-j`/`ctrl-m`), and `f1` through `f12`. Single characters that aren't aliases (`"y"`, `"n"`, `"1"`) fall through to typed text so quick acknowledgements work without dropping to `send.text`. Tab completion lists the most common keys (submit/cancel/edit, arrows, navigation) first.
 
@@ -129,10 +170,11 @@ Meta commands prefixed with `:` cover REPL control and a raw JSON-RPC escape hat
 | `:attach <id\|all>`      | Adopt a sibling connection's adapter (tmux-style attach). `all` adopts every live adapter; `:attach <id>` auto-renders the adapter's current screen on attach.              |
 | `:notifications on\|off` | Subscribe / unsubscribe to `session.changed` / `session.exited` events. Notifications are enabled by default and rendered above the prompt via reedline's external printer. |
 | `:rpc <method> {json}`   | Send a raw JSON-RPC call and dump the response.                                                                                                                             |
+| `:tips`                  | Show a curated five-section tour of the most useful idioms.                                                                                                                 |
 | `:help`                  | Show the inline help popup.                                                                                                                                                 |
 | `:quit`                  | Exit the REPL (also `Ctrl-D` on an empty prompt).                                                                                                                           |
 
-History is persisted to `~/.ptywright/repl-history` so previous sessions remain reachable through `Ctrl-R` reverse-search.
+On launch the banner surfaces one rotating one-liner tip (a different one most sessions) plus a pointer to `:tips` and `:help`. History is persisted to `~/.ptywright/repl-history` so previous sessions remain reachable through `Ctrl-R` reverse-search.
 
 A 500 ms `server.capabilities` heartbeat keeps the server's per-connection notification pump warm so events from sibling connections actually flush to an idle REPL. The heartbeat call is read-only by design, so it cannot race with a concurrent `:notifications off`.
 
