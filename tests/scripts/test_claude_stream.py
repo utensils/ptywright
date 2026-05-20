@@ -225,6 +225,20 @@ class PromptEditableAnchorTests(unittest.TestCase):
             )
         )
 
+    def test_markdown_blockquote_is_not_editable_prompt(self):
+        body = "\n".join([
+            "❯\u00a0Explain this phrase.",
+            "",
+            "> Explain this phrase.",
+        ])
+        self.assertFalse(
+            CS._prompt_anchor_looks_editable(
+                body,
+                "",
+                "Explain this phrase.",
+            )
+        )
+
 
 class DumpAnswerRegionFromTranscriptTests(unittest.TestCase):
     """Primary fallback at completion — pulls the answer region out
@@ -321,6 +335,31 @@ class DumpAnswerRegionFromTranscriptTests(unittest.TestCase):
         self.assertIn("⏺ Project summary:", out)
         self.assertIn("Rust CLI for PTY automation", out)
         self.assertIn("✻ Brewed for 1s", out)
+
+    def test_skips_raw_pty_control_fragment_lines(self):
+        stream = self._make_stream()
+        transcript_text = "\n".join([
+            "❯ summarize the project",
+            "",
+            "\x1b[7A✶",
+            "\x1b[2C\x1b[4Astatus repaint",
+            "⏺ Project summary:",
+            "- Rust CLI for PTY automation",
+            "✻ Brewed for 1s",
+        ])
+        stream._transcript_baseline = 0
+        stream._submitted_prompt = "summarize the project"
+        stream.client.rpc.return_value = {"text": transcript_text}
+
+        captured = io.StringIO()
+        with mock.patch.object(sys, "stdout", captured):
+            stream._dump_answer_region_from_transcript()
+        out = captured.getvalue()
+
+        self.assertIn("⏺ Project summary:", out)
+        self.assertIn("Rust CLI for PTY automation", out)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("status repaint", out)
 
 
 class DumpAnswerRegionTests(unittest.TestCase):

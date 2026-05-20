@@ -337,9 +337,28 @@ def _prompt_anchor_looks_editable(body: str, status: str, prompt_anchor: str) ->
             continue
         if _CHROME_RULE_RE.match(s):
             continue
-        prompt_row = s.startswith("❯") or s.startswith("> ")
+        prompt_row = s.startswith("❯")
         return prompt_row and prompt_anchor in s
     return False
+
+
+def _safe_transcript_line(line: str) -> bool:
+    """Return False for raw PTY control-fragment lines.
+
+    `adapter.transcript` is raw scrollback, not a rendered screen. Lines
+    containing escape/control bytes are usually cursor movement, status
+    bar repaint fragments, or OSC hyperlinks. The body diff and body
+    fallback use rendered screen text; this guard keeps the transcript
+    gap-fill from leaking terminal control bytes while still allowing
+    plain text that scrolled out of the visible body.
+    """
+    for ch in line:
+        code = ord(ch)
+        if ch == "\t":
+            continue
+        if code < 32 or code == 127:
+            return False
+    return True
 
 
 class Stream:
@@ -778,6 +797,8 @@ class Stream:
         # so any line the diff path emitted isn't repeated here.
         seen: set[str] = set(already_printed) if already_printed else set()
         for line in lines[start:end]:
+            if not _safe_transcript_line(line):
+                continue
             s = line.strip()
             if not s:
                 continue
@@ -1117,18 +1138,13 @@ class Stream:
             if state in self.TERMINAL_STATES:
                 self._clear_alive()
                 grew_by = max(0, len(body) - baseline_len)
-                # Fallback: surface the answer region only when the live
-                # body diff printed nothing. `adapter.transcript` is raw
-                # PTY scrollback; using it as a gap-filler after a normal
-                # streamed turn can leak cursor-control bytes and status
-                # bar repaint fragments. The final body fallback below is
-                # already screen-rendered text, so prefer it when we need
-                # to rescue very brief ack-and-stop replies.
-                transcript_dumped = False
-                if not streamed_anything:
-                    transcript_dumped = self._dump_answer_region_from_transcript(
-                        already_printed=printed_lines
-                    )
+                # Fallback: surface transcript lines that scrolled out of
+                # the visible body. The transcript is raw PTY scrollback,
+                # so `_dump_answer_region_from_transcript` filters unsafe
+                # control-fragment lines before printing.
+                transcript_dumped = self._dump_answer_region_from_transcript(
+                    already_printed=printed_lines
+                )
                 if not transcript_dumped and not streamed_anything and grew_by > 0:
                     self._dump_answer_region(body)
                 if state == self.SUCCESS_STATE:
