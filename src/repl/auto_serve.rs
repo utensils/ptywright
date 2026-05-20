@@ -98,11 +98,20 @@ pub fn spawn(path: &Path, framing: Framing) -> Result<ManagedServer> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: setsid() before exec is safe — it has no Rust-visible
-        // effects on the parent process.
+        // SAFETY: setsid() before exec is safe — it runs in the forked
+        // child and has no Rust-visible effect on the parent process.
         unsafe {
             command.pre_exec(|| {
-                libc::setsid();
+                // A freshly-forked child is never already a process
+                // group leader, so setsid() cannot realistically fail
+                // here — but if it ever did, the "own process group"
+                // guarantee would be silently broken. Surface the
+                // failure as an `io::Error` so `spawn()` reports it
+                // instead of starting a server that a stray Ctrl-C
+                // could tear down.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -118,7 +127,7 @@ pub fn spawn(path: &Path, framing: Framing) -> Result<ManagedServer> {
         pid,
     };
 
-    wait_for_socket(path)?;
+    wait_for_socket(path, SERVER_READY_TIMEOUT)?;
     eprintln!(
         "ptywright: server ready · pid {} · socket {}",
         server.pid(),
@@ -127,11 +136,15 @@ pub fn spawn(path: &Path, framing: Framing) -> Result<ManagedServer> {
     Ok(server)
 }
 
-/// Poll the socket path until it accepts a connection or the deadline
-/// fires. We can't just wait for `path.exists()` — the server creates
+/// Poll the socket path until it accepts a connection or `timeout`
+/// elapses. We can't just wait for `path.exists()` — the server creates
 /// the file slightly before it starts accepting on it.
-fn wait_for_socket(path: &Path) -> Result<()> {
-    let deadline = Instant::now() + SERVER_READY_TIMEOUT;
+///
+/// `timeout` is a parameter rather than a hard-coded constant so the
+/// timeout-path test can exercise the deadline branch with a short
+/// budget instead of blocking the whole suite for [`SERVER_READY_TIMEOUT`].
+fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if can_connect(path) {
             return Ok(());
@@ -141,7 +154,7 @@ fn wait_for_socket(path: &Path) -> Result<()> {
     Err(Error::Rpc(format!(
         "auto-server: socket {} did not start accepting connections within {:?}",
         path.display(),
-        SERVER_READY_TIMEOUT,
+        timeout,
     )))
 }
 
@@ -238,21 +251,23 @@ mod tests {
 
     #[test]
     fn wait_for_socket_times_out_when_no_server_appears() {
-        // Use a definitely-nonexistent path. The wait must return Err
-        // within ~SERVER_READY_TIMEOUT — we give it a slightly larger
-        // budget so the test doesn't trip on a slow CI scheduler.
+        // Use a definitely-nonexistent path with a short injected
+        // timeout — the deadline branch is what's under test, and a
+        // 200 ms budget exercises it without blocking the suite for
+        // the full production `SERVER_READY_TIMEOUT`.
         let path =
             std::env::temp_dir().join(format!("ptywright-auto-test-{}.sock", std::process::id()));
+        let budget = Duration::from_millis(200);
         let start = Instant::now();
-        let outcome = wait_for_socket(&path);
+        let outcome = wait_for_socket(&path, budget);
         let elapsed = start.elapsed();
         assert!(outcome.is_err(), "expected timeout error for absent socket");
         assert!(
-            elapsed >= SERVER_READY_TIMEOUT,
+            elapsed >= budget,
             "wait must run the full timeout window before erroring; took {elapsed:?}"
         );
         assert!(
-            elapsed < SERVER_READY_TIMEOUT + Duration::from_secs(2),
+            elapsed < budget + Duration::from_secs(2),
             "wait should not exceed the timeout by more than a small slack; took {elapsed:?}"
         );
     }

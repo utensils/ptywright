@@ -519,7 +519,12 @@ fn print_screen(adapter: &str, snapshot: &ScreenSnapshot) {
                 continue;
             }
             let col = cell.col as usize;
-            if col >= render_width {
+            // Stop before a glyph that would spill past the clamp. A
+            // wide cell occupies two columns, so a plain `col >=
+            // render_width` test would still let a wide glyph starting
+            // at `render_width - 1` print its second half out of bounds.
+            let glyph_width = if cell.wide { 2 } else { 1 };
+            if col + glyph_width > render_width {
                 break;
             }
             let style = cell_style_to_ansi(&cell.style);
@@ -641,7 +646,9 @@ fn row_content_width(row: &[&crate::screen::ScreenCell]) -> usize {
 ///     the PTY actually has).
 ///
 /// Clamped to a 40-column floor so the header `─── preview ─── ` still
-/// renders sensibly when the screen is mostly empty.
+/// renders sensibly when the screen is mostly empty — but the floor is
+/// itself capped at `pty_cols`, so a PTY narrower than 40 columns never
+/// produces a rule wider than the PTY it describes.
 fn effective_render_width(content_width: usize, term_cols: usize, pty_cols: usize) -> usize {
     const LEADING_INDENT: usize = 2;
     const MIN_WIDTH: usize = 40;
@@ -651,7 +658,10 @@ fn effective_render_width(content_width: usize, term_cols: usize, pty_cols: usiz
         width = width.min(term_avail);
     }
     width = width.min(pty_cols);
-    width.max(MIN_WIDTH)
+    // The floor must never push the width back above `pty_cols`: a
+    // 20-column PTY would otherwise yield a 40-column rule wider than
+    // any row it could possibly contain.
+    width.max(MIN_WIDTH.min(pty_cols))
 }
 
 /// Best-effort terminal width detection. Returns `0` when stdout is not
@@ -950,6 +960,10 @@ mod tests {
         assert_eq!(effective_render_width(0, 200, 200), 40);
         // term_cols == 0 (non-TTY) → fall back to min(content, pty).
         assert_eq!(effective_render_width(80, 0, 200), 80);
+        // The floor must not exceed a sub-40-col PTY — a 20-col PTY
+        // yields at most a 20-col rule, never the bare 40-col floor.
+        assert_eq!(effective_render_width(0, 200, 20), 20);
+        assert_eq!(effective_render_width(100, 200, 20), 20);
     }
 
     #[test]

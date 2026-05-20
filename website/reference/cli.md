@@ -88,7 +88,7 @@ Options:
 | `--stdio`           | —        | Spawn a child server (pass its command + args after `--`).             |
 | `--framing FRAMING` | `ndjson` | JSON-RPC framing (`ndjson` or `lsp`). Must match the server's framing. |
 
-If neither `--socket` nor `--stdio` is supplied, the REPL connects to the default socket at `~/.ptywright/socket`.
+If neither `--socket` nor `--stdio` is supplied, the REPL targets the default socket at `~/.ptywright/socket`. When a server is already listening there it connects directly. When nothing is listening, the REPL **auto-spawns** a background `ptywright serve --socket ~/.ptywright/socket` (the same binary, detached stdio, its own process group) and connects once the socket is accepting. On exit you are prompted whether to shut that auto-started server down (the default) or detach it so other clients can keep using it; a non-interactive stdin defaults to shutdown so scripted invocations never leak a daemon. Passing `--socket <path>` explicitly skips the auto-spawn — that form assumes you are managing the server yourself.
 
 The REPL is a sequential `reedline`-based loop and **each input line is real Lua 5.4** evaluated against a curated set of REPL-bound globals. Line editing, completion, syntax highlighting, history, multi-line continuation, and ghost-text hinting are delegated to reedline; the bindings drive the generic `adapter.*` JSON-RPC surface. The most common forms:
 
@@ -136,7 +136,7 @@ end
 ```
 
 Multi-line input is supported: any unclosed block / table / function
-opens a continuation prompt (`...>`) and Enter on the closing `end` /
+opens a continuation prompt (`…`) and Enter on the closing `end` /
 `}` submits the whole chunk.
 
 ### Globals reference
@@ -170,10 +170,11 @@ Meta commands prefixed with `:` cover REPL control and a raw JSON-RPC escape hat
 | `:attach <id\|all>`      | Adopt a sibling connection's adapter (tmux-style attach). `all` adopts every live adapter; `:attach <id>` auto-renders the adapter's current screen on attach.              |
 | `:notifications on\|off` | Subscribe / unsubscribe to `session.changed` / `session.exited` events. Notifications are enabled by default and rendered above the prompt via reedline's external printer. |
 | `:rpc <method> {json}`   | Send a raw JSON-RPC call and dump the response.                                                                                                                             |
+| `:tips`                  | Show a curated five-section tour of the most useful idioms.                                                                                                                 |
 | `:help`                  | Show the inline help popup.                                                                                                                                                 |
 | `:quit`                  | Exit the REPL (also `Ctrl-D` on an empty prompt).                                                                                                                           |
 
-History is persisted to `~/.ptywright/repl-history` so previous sessions remain reachable through `Ctrl-R` reverse-search.
+On launch the banner surfaces one rotating one-liner tip (a different one most sessions) plus a pointer to `:tips` and `:help`. History is persisted to `~/.ptywright/repl-history` so previous sessions remain reachable through `Ctrl-R` reverse-search.
 
 A 500 ms `server.capabilities` heartbeat keeps the server's per-connection notification pump warm so events from sibling connections actually flush to an idle REPL. The heartbeat call is read-only by design, so it cannot race with a concurrent `:notifications off`.
 

@@ -1845,8 +1845,7 @@ mod tests {
             })
             .expect("create_function");
         lua.globals().set("f", test).expect("set f");
-        let (pos_len, opts_empty): (usize, bool) =
-            lua.load(r#"return f{}"#).eval().expect("eval");
+        let (pos_len, opts_empty): (usize, bool) = lua.load(r#"return f{}"#).eval().expect("eval");
         assert_eq!(pos_len, 0, "empty brace-form must yield no positional");
         assert!(opts_empty, "empty brace-form must yield no opts");
     }

@@ -35,7 +35,7 @@ ptywright is early-stage. This roadmap captures the intended shape without promi
 - Shell completion generation for bash, zsh, fish, elvish, and PowerShell.
 - Plugin manifests and host capability reporting.
 - Per-method permission gating at the JSON-RPC dispatcher (`-32004 PermissionDenied` with structured `data`).
-- Interactive REPL client (`ptywright repl`, default-on `repl` Cargo feature) with reedline-based DSL.
+- Interactive REPL client (`ptywright repl`, default-on `repl` Cargo feature): an embedded Lua 5.4 evaluator over the generic `adapter.*` surface, with reedline line-editing and auto-spawn of a background server when none is listening.
 
 ## Adapters and plugins
 

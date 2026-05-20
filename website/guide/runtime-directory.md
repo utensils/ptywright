@@ -11,7 +11,7 @@ ptywright keeps configuration, log files, and any future cached state under a si
 ├── data/            # reserved for future on-disk state
 ├── transcripts/     # reserved for opt-in raw transcript files
 ├── sockets/         # reserved for IPC paths created by serve --socket
-├── socket           # default `serve --socket` endpoint (and the path `repl` connects to when no transport is supplied)
+├── socket           # default `serve --socket` endpoint (the path `repl` connects to — or auto-spawns a server on — when no transport is supplied)
 └── repl-history     # persisted REPL command history (Ctrl-R reverse search)
 ```
 

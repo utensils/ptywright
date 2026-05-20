@@ -6,9 +6,12 @@
 //! meta command for when a refresher is wanted.
 //!
 //! Picking from the rotating set is deterministic per-session: the
-//! selection is keyed off the wall clock at startup, so the same line
-//! never appears twice in a row but tests can still seed a specific
-//! index via [`rotating_tip_for`].
+//! selection is keyed off the wall clock (seconds) at startup, so the
+//! tip varies run-to-run without any stored state. Two sessions
+//! launched within the same second see the same tip — that's
+//! acceptable; the goal is variety across sessions, not a strict
+//! no-repeat guarantee. Tests seed a specific index via
+//! [`rotating_tip_for`].
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +31,7 @@ const ROTATING_TIPS: &[&str] = &[
     "the full Lua stdlib is available — `os.date()`, `string.format(...)`, `for i = 1, 5 do ... end`",
     "`:rpc <method> {json}` is the raw JSON-RPC pass-through for anything the bindings don't cover",
     "`:notifications off` silences `session.changed` chatter when you want a quiet prompt",
-    "multi-line input just works: open a `do` / `function` / `{` and the prompt switches to `...`",
+    "multi-line input just works: open a `do` / `function` / `{` and the prompt switches to `…`",
 ];
 
 /// Curated tour rendered by the `:tips` meta command. Kept verbatim
