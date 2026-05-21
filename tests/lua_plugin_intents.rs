@@ -527,6 +527,45 @@ Do you want to proceed?
 }
 
 #[test]
+fn choose_option_accepts_model_picker_dialog_id() {
+    let extension = claude_plugin();
+    let screen = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/claude-code/fixtures/model_picker.txt"),
+    )
+    .expect("read model picker fixture");
+
+    let state = classify_state(&extension, &screen, 45, None, None);
+    assert_eq!(state.state, "waiting_for_model_select");
+    let metadata = state.metadata.expect("model picker should expose metadata");
+    let dialog_id = metadata
+        .get("dialog_id")
+        .and_then(|value| value.as_str())
+        .expect("model picker should expose dialog_id");
+
+    let plan = plan(
+        &extension,
+        "choose_option",
+        json!({ "option": "opus", "dialog_id": dialog_id }),
+    );
+    assert_eq!(
+        plan.actions,
+        vec![Action::Text("2".to_string()), Action::Key(Key::Enter)],
+    );
+
+    let err = extension
+        .plan(
+            "choose_option",
+            &json!({ "option": "opus", "dialog_id": "deadbeef" }),
+        )
+        .expect_err("stale model picker dialog_id must be rejected");
+    assert!(
+        err.to_string().contains("stale_dialog"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn approve_trust_types_numeric_option_one() {
     // The workspace-trust dialog requires typing "1" before Enter; a bare
     // Enter does not accept option 1 in the Claude Code TUI. Lock the

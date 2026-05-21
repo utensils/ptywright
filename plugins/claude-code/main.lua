@@ -33,8 +33,8 @@ local matcher = ptywright.matcher
 
 -- Module-level dialog tracking for `metadata.dialog_id` correlation.
 -- `_current_dialog_id` is updated by the classifier whenever a dialog
--- is detected (permission, plan approval, trust); intent functions
--- (approve / deny / approve_trust / deny_trust) cross-check the
+-- is detected (permission, plan approval, model picker, trust); intent functions
+-- (approve / deny / choose_option / approve_trust / deny_trust) cross-check the
 -- caller-supplied `dialog_id` against this value and refuse to act on
 -- a stale id rather than blindly pressing Enter on a different dialog.
 --
@@ -1624,7 +1624,7 @@ function M.classify(input)
   end
 
   -- Model picker (opened by `/model`). Anchored on THREE structural
-  -- cues together (header phrase ending in `:`, a focused `❯ <digit>.`
+  -- cues together (supported header phrase, a focused `❯ <digit>.`
   -- option, AND a navigation-hint line like `enter to select`), so
   -- prose mentioning "select a model" can't trip it on its own.
   if has_model_picker_indicator(body_text) or has_model_picker_indicator(body_and_status) then
@@ -1632,7 +1632,9 @@ function M.classify(input)
     local metadata = nil
     if #options > 0 then
       M._current_options = options
-      metadata = { model_select = { options = options } }
+      local dialog_id = fnv1a_hex("model_select:" .. table.concat(options, "|"))
+      M._current_dialog_id = dialog_id
+      metadata = { model_select = { options = options }, dialog_id = dialog_id }
     end
     return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence, metadata)
   end
@@ -2355,9 +2357,8 @@ function M.key(input)
       },
     }
   end
-  -- Fall through: arbitrary single characters or short strings ("y",
-  -- "n", "1", "q") are sent as raw text so the PTY treats them as
-  -- typed input.
+  -- Fall through: any unrecognised string is sent as raw text so the PTY
+  -- treats it as typed input.
   return {
     actions = {
       action.text(raw),
