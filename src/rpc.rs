@@ -3707,11 +3707,11 @@ mod tests {
     }
 
     #[test]
-    fn plugin_describe_lists_claude_code_catalog() {
+    fn plugin_describe_lists_builtin_plugin_catalog_shape() {
         // Plugins can either provide a `describe()` function in their
         // Lua source or rely on the host's introspection fallback. The
-        // built-in claude-code plugin opts in, so we assert the explicit
-        // shape here (intents, wait_matchers, states all populated).
+        // built-in plugin opts in, so core only asserts the generic wire
+        // shape here. Plugin-specific vocabulary is covered by plugin tests.
         let mut server = RpcServer::new();
         let response = handle(
             &mut server,
@@ -3722,43 +3722,33 @@ mod tests {
         assert_eq!(result["manifest"]["name"], "claude-code");
 
         let intents = result["intents"].as_array().expect("intents array");
-        let intent_names: Vec<&str> = intents.iter().filter_map(|i| i["name"].as_str()).collect();
-        for required in &[
-            "send_prompt",
-            "approve",
-            "deny",
-            "cancel",
-            "approve_trust",
-            "deny_trust",
-            "attach_file",
-        ] {
-            assert!(
-                intent_names.contains(required),
-                "intent `{required}` missing from describe(): {intent_names:?}"
-            );
-        }
+        assert!(
+            !intents.is_empty(),
+            "built-in catalog should expose intents"
+        );
+        assert!(
+            intents.iter().all(|i| i["name"].is_string()),
+            "every intent entry should expose a string name: {intents:?}"
+        );
 
         let matchers = result["wait_matchers"]
             .as_array()
             .expect("wait_matchers array");
-        let matcher_names: Vec<&str> = matchers.iter().filter_map(|i| i["name"].as_str()).collect();
-        assert!(matcher_names.contains(&"wait_turn_matcher"));
+        assert!(
+            !matchers.is_empty(),
+            "built-in catalog should expose wait matchers"
+        );
+        assert!(
+            matchers.iter().all(|i| i["name"].is_string()),
+            "every wait matcher entry should expose a string name: {matchers:?}"
+        );
 
         let states = result["states"].as_array().expect("states array");
-        let state_names: Vec<&str> = states.iter().filter_map(|i| i["name"].as_str()).collect();
-        for required in &[
-            "starting",
-            "ready",
-            "completed_turn",
-            "thinking",
-            "waiting_for_permission",
-            "error",
-        ] {
-            assert!(
-                state_names.contains(required),
-                "state `{required}` missing from describe(): {state_names:?}"
-            );
-        }
+        assert!(!states.is_empty(), "built-in catalog should expose states");
+        assert!(
+            states.iter().all(|i| i["name"].is_string()),
+            "every state entry should expose a string name: {states:?}"
+        );
     }
 
     #[test]

@@ -83,6 +83,81 @@ fn wait_matcher(extension: &LuaExtension, intent: &str, params: serde_json::Valu
 }
 
 #[test]
+fn describe_exposes_claude_code_catalog() {
+    let extension = claude_plugin();
+    let catalog = extension
+        .plugin()
+        .call_value("describe", &json!({}))
+        .expect("describe catalog");
+
+    let intents = catalog["intents"].as_array().expect("intents array");
+    let intent_names: Vec<&str> = intents.iter().filter_map(|i| i["name"].as_str()).collect();
+    for required in &[
+        "send_prompt",
+        "steer",
+        "attach_file",
+        "approve",
+        "deny",
+        "choose_option",
+        "approve_trust",
+        "deny_trust",
+        "dismiss_welcome",
+        "expand",
+        "model_effort_left",
+        "model_effort_right",
+        "slash_command",
+        "cancel",
+        "force_cancel",
+        "key",
+    ] {
+        assert!(
+            intent_names.contains(required),
+            "intent `{required}` missing from describe(): {intent_names:?}"
+        );
+    }
+
+    let wait_matchers = catalog["wait_matchers"]
+        .as_array()
+        .expect("wait_matchers array");
+    let wait_matcher_names: Vec<&str> = wait_matchers
+        .iter()
+        .filter_map(|i| i["name"].as_str())
+        .collect();
+    for required in &["wait_turn_matcher", "wait_cancel_settled_matcher"] {
+        assert!(
+            wait_matcher_names.contains(required),
+            "wait matcher `{required}` missing from describe(): {wait_matcher_names:?}"
+        );
+    }
+
+    let states = catalog["states"].as_array().expect("states array");
+    let state_names: Vec<&str> = states.iter().filter_map(|i| i["name"].as_str()).collect();
+    for required in &[
+        "starting",
+        "ready",
+        "waiting_for_login",
+        "waiting_for_trust",
+        "waiting_for_model_select",
+        "waiting_for_enter_plan_mode",
+        "waiting_for_plan_approval",
+        "waiting_for_permission",
+        "waiting_for_external_editor",
+        "usage_screen",
+        "local_ui_screen",
+        "waiting_for_user_input",
+        "thinking",
+        "cancelling",
+        "completed_turn",
+        "error",
+    ] {
+        assert!(
+            state_names.contains(required),
+            "state `{required}` missing from describe(): {state_names:?}"
+        );
+    }
+}
+
+#[test]
 fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
     // Reproduces the Claude Code 2.1.143 behaviour where the post-trust
     // welcome panel stays rendered as visual residue even after the user
