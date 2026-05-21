@@ -237,23 +237,23 @@ The registry's plugin instances are SEPARATE from any adapter's own runtime inst
 
 The Lua plugin exposes the following intents through `adapter.send`:
 
-| Intent            | Params                | Behaviour                                                                                                        |
-| ----------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `send_prompt`     | `{ "prompt": "..." }` | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`.                          |
-| `approve`         | `{}`                  | Presses Enter to accept the current permission / plan-approval dialog.                                           |
-| `deny`            | `{}`                  | Presses Escape to dismiss the current dialog.                                                                    |
-| `choose_option`   | `{ "index": 2 }`, `{ "option": "2" }`, or `{ "option": "label" }` | Types a numbered option and presses Enter. Label matching uses the options cached by the most recent classifier pass. |
-| `cancel`          | `{}`                  | Sends Escape. Sets `last_intent = "cancelling"` so the classifier reports `cancelling` until the screen settles. |
-| `force_cancel`    | `{}`                  | Sends Escape twice for tool calls already mid-flight. Same `last_intent = "cancelling"` as `cancel`.             |
-| `steer`           | `{ "prompt": "..." }` | Mid-turn prompt injection without setting `last_intent = "prompt_submitted"`.                                    |
-| `key`             | `{ "key": "..." }`    | Sends a named key alias or falls through to literal text for unrecognised short strings.                         |
-| `approve_trust`   | `{}`                  | Types `1` + Enter for the workspace-trust dialog (bare Enter does not accept option 1 in the Claude Code TUI).   |
-| `deny_trust`      | `{}`                  | Types `2` + Enter to deny workspace trust.                                                                       |
-| `dismiss_welcome` | `{}`                  | Presses Enter to clear the first-launch welcome panel.                                                           |
-| `expand`          | `{}`                  | Sends Ctrl+O to expand/collapse the focused tool-progress row.                                                   |
-| `model_effort_left` / `model_effort_right` | `{}` | Sends Left / Right for model-picker effort controls.                                               |
-| `slash_command`   | `{ "command": "usage" }` or `{ "name": "usage" }` | Bracketed-pastes a slash command and presses Enter without marking a conversation turn.          |
-| `attach_file`     | `{ "path": "..." }`   | Bracketed-pastes a file path into the prompt buffer without pressing Enter.                                      |
+| Intent                                     | Params                                                            | Behaviour                                                                                                             |
+| ------------------------------------------ | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `send_prompt`                              | `{ "prompt": "..." }`                                             | Bracketed-pastes the prompt and presses Enter. Sets `last_intent = "prompt_submitted"`.                               |
+| `approve`                                  | `{}`                                                              | Presses Enter to accept the current permission / plan-approval dialog.                                                |
+| `deny`                                     | `{}`                                                              | Presses Escape to dismiss the current dialog.                                                                         |
+| `choose_option`                            | `{ "index": 2 }`, `{ "option": "2" }`, or `{ "option": "label" }` | Types a numbered option and presses Enter. Label matching uses the options cached by the most recent classifier pass. |
+| `cancel`                                   | `{}`                                                              | Sends Escape. Sets `last_intent = "cancelling"` so the classifier reports `cancelling` until the screen settles.      |
+| `force_cancel`                             | `{}`                                                              | Sends Escape twice for tool calls already mid-flight. Same `last_intent = "cancelling"` as `cancel`.                  |
+| `steer`                                    | `{ "prompt": "..." }`                                             | Mid-turn prompt injection without setting `last_intent = "prompt_submitted"`.                                         |
+| `key`                                      | `{ "key": "..." }`                                                | Sends a named key alias or falls through to literal text for unrecognised short strings.                              |
+| `approve_trust`                            | `{}`                                                              | Types `1` + Enter for the workspace-trust dialog (bare Enter does not accept option 1 in the Claude Code TUI).        |
+| `deny_trust`                               | `{}`                                                              | Types `2` + Enter to deny workspace trust.                                                                            |
+| `dismiss_welcome`                          | `{}`                                                              | Presses Enter to clear the first-launch welcome panel.                                                                |
+| `expand`                                   | `{}`                                                              | Sends Ctrl+O to expand/collapse the focused tool-progress row.                                                        |
+| `model_effort_left` / `model_effort_right` | `{}`                                                              | Sends Left / Right for model-picker effort controls.                                                                  |
+| `slash_command`                            | `{ "command": "usage" }` or `{ "name": "usage" }`                 | Bracketed-pastes a slash command and presses Enter without marking a conversation turn.                               |
+| `attach_file`                              | `{ "path": "..." }`                                               | Bracketed-pastes a file path into the prompt buffer without pressing Enter.                                           |
 
 Plugin-defined state strings the classifier emits (matches the plugin's own `describe().states` catalog): `starting`, `ready`, `waiting_for_login`, `waiting_for_trust`, `waiting_for_model_select`, `waiting_for_enter_plan_mode`, `waiting_for_plan_approval`, `waiting_for_permission`, `waiting_for_external_editor`, `usage_screen`, `local_ui_screen`, `waiting_for_user_input`, `thinking`, `cancelling`, `completed_turn`, `error`. The host additionally synthesizes a `plugin_error` fallback state when a classifier call itself fails (e.g. Lua runtime error); this is not plugin-owned. The classifier also threads a separate `last_intent` string (e.g. `"prompt_submitted"`, `"cancelling"`) — that lives on the snapshot's `last_intent` field, not on `state`. The state vocabulary is owned by the Lua plugin — the Rust core does not interpret it.
 
