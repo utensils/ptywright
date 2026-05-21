@@ -1,0 +1,15 @@
+Claude Code
+
+Enter plan mode?
+
+Claude wants to enter plan mode to explore and design an implementation approach.
+
+  It will:
+  • Explore your codebase
+  • Identify patterns and constraints
+  • Present a plan before editing
+
+❯ 1. Yes, enter plan mode
+  2. No, start implementing now
+
+Enter to confirm · Esc to cancel

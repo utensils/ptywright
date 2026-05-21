@@ -30,7 +30,7 @@ These are the questions the spike needs to answer before code goes in. Each maps
    - Drives whether `task.list` should return a structured `{ id, name, state }` shape or just a flat list of names.
 
 5. **Does background task state ever reach the classifier as a top-level state worth detecting?**
-   - E.g. "task X failed and is blocking the prompt." If so, we'd add a new classifier state to the existing set (`starting`, `cancelling`, `waiting_for_trust`, `waiting_for_plan_approval`, `waiting_for_permission`, `thinking`, `error`, `completed_turn`, `ready`, `waiting_for_user_input` — see `plugins/claude-code/main.lua`).
+   - E.g. "task X failed and is blocking the prompt." If so, we'd add a new classifier state to the existing set advertised by `plugin.describe` (currently including `starting`, `ready`, `waiting_for_login`, `waiting_for_trust`, `waiting_for_model_select`, `waiting_for_enter_plan_mode`, `waiting_for_plan_approval`, `waiting_for_permission`, `waiting_for_external_editor`, `usage_screen`, `local_ui_screen`, `waiting_for_user_input`, `thinking`, `cancelling`, `completed_turn`, and `error` — see `plugins/claude-code/main.lua`).
    - Or it stays in the metadata channel established by the usage-screen parser PR and doesn't earn a top-level state.
 
 ## Recommended workflow for the spike

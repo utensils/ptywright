@@ -1,0 +1,19 @@
+{
+  "state": "waiting_for_permission",
+  "evidence": "permission or approval prompt text detected",
+  "last_intent": null,
+  "min_confidence": 0.6,
+  "metadata": {
+    "dialog_id": "961c6346",
+    "permission": {
+      "tool": "Bash",
+      "summary": "cargo test --locked --features _test-fixtures",
+      "options": [
+        "Yes",
+        "Yes, and don't ask again for cargo test",
+        "Yes, apply suggestions",
+        "No, and tell Claude what to do differently"
+      ]
+    }
+  }
+}

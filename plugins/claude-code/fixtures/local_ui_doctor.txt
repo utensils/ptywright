@@ -1,0 +1,9 @@
+Claude Code
+
+Claude Code health
+
+✓ Authentication
+✓ Network
+✓ Terminal
+
+Esc to cancel

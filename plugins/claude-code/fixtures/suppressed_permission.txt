@@ -1,0 +1,7 @@
+Claude Code
+
+Waiting for permission…
+
+────────────────────────────────────────────────────────────
+  user @ host /workspace                         [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

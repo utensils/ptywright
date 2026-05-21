@@ -33,8 +33,8 @@ local matcher = ptywright.matcher
 
 -- Module-level dialog tracking for `metadata.dialog_id` correlation.
 -- `_current_dialog_id` is updated by the classifier whenever a dialog
--- is detected (permission, plan approval, trust); intent functions
--- (approve / deny / approve_trust / deny_trust) cross-check the
+-- is detected (permission, plan approval, model picker, trust); intent functions
+-- (approve / deny / choose_option / approve_trust / deny_trust) cross-check the
 -- caller-supplied `dialog_id` against this value and refuse to act on
 -- a stale id rather than blindly pressing Enter on a different dialog.
 --
@@ -44,6 +44,7 @@ local matcher = ptywright.matcher
 -- dialog active right now" and intent calls with a non-nil
 -- `dialog_id` are rejected.
 M._current_dialog_id = nil
+M._current_options = nil
 
 -- Bring the shared helpers in as locals so the rest of this file reads
 -- identically to the pre-split version. Anything new that needs a
@@ -143,6 +144,10 @@ local function has_error_indicator(screen)
       if starts_with(text, prefix) or starts_with(stripped, prefix) then
         return true
       end
+    end
+    if (starts_with(text, "you've hit your ") or starts_with(stripped, "you've hit your "))
+        and (contains(text, " limit") or contains(stripped, " limit")) then
+      return true
     end
     -- Retry hints — these appear on their own line after a banner,
     -- typically as just the action verb. Still anchored at line
@@ -244,6 +249,13 @@ local function parse_error_subtype(body)
           subtype = pattern.kind
           message = raw_stripped
           break
+        end
+      end
+      if not subtype then
+        if (starts_with(text, "you've hit your ") or starts_with(stripped, "you've hit your "))
+            and (contains(text, " limit") or contains(stripped, " limit")) then
+          subtype = "rate_limit"
+          message = raw_stripped
         end
       end
       if subtype then
@@ -720,8 +732,57 @@ local function has_permission_indicator(text)
         end
       end
     end
+    -- Newer permission panels do not always render the "Do you want to
+    -- proceed?" question; some render a tool-specific title plus a
+    -- focused numbered selector. Keep this structural: title-like row
+    -- AND focused option row nearby, not a loose substring.
+    if line:find("❯%s*%d+%.") then
+      local window_start = math.max(1, idx - 8)
+      for j = window_start, idx do
+        local title = trim(lines[j])
+        if title:match("^[%w%-]+ command$")
+            or title:match("^[%w%-]+ tool$")
+            or contains(title, "file edit")
+            or contains(title, "file write")
+            or contains(title, "notebook edit")
+            or contains(title, "webfetch")
+            or contains(title, "review artifact")
+            or contains(title, "ask user question")
+            or contains(title, "workflow")
+            or contains(title, "monitor") then
+          return true
+        end
+      end
+    end
   end
   return false
+end
+
+local function parse_numbered_options(lines)
+  local options = {}
+  local selector_glyph = "❯"
+  for _, line in ipairs(lines) do
+    local trimmed = trim(line)
+    if trimmed:sub(1, #selector_glyph) == selector_glyph then
+      trimmed = trim(trimmed:sub(#selector_glyph + 1))
+    elseif trimmed:sub(1, 1) == ">" then
+      trimmed = trim(trimmed:sub(2))
+    end
+    local body = trimmed:match("^%d+%.%s+(.+)$")
+      or trimmed:match("^%d+%)%s+(.+)$")
+    if body then
+      table.insert(options, trim(body))
+    end
+  end
+  return options
+end
+
+local function parse_numbered_options_from_text(text)
+  local lines = {}
+  for line in string.gmatch(text or "", "[^\n]+") do
+    table.insert(lines, line)
+  end
+  return parse_numbered_options(lines)
 end
 
 -- Parse the permission dialog into `{ permission = { tool?, summary?,
@@ -765,12 +826,29 @@ local function parse_permission_dialog(text)
     -- non-empty line. Anchoring on the exact line shape rejects matches
     -- against prior prose mentioning the word "command".
     local list_tool = trimmed:match("^([%w%-]+) command$") or trimmed:match("^([%w%-]+) tool$")
+    if not list_tool then
+      local lower_title = lower(trimmed)
+      local known_titles = {
+        ["file edit"] = "FileEdit",
+        ["file write"] = "FileWrite",
+        ["notebook edit"] = "NotebookEdit",
+        ["webfetch"] = "WebFetch",
+        ["review artifact"] = "ReviewArtifact",
+        ["ask user question"] = "AskUserQuestion",
+        ["workflow"] = "Workflow",
+        ["monitor"] = "Monitor",
+      }
+      list_tool = known_titles[lower_title]
+    end
     if list_tool then
       permission.tool = permission.tool or list_tool
       for follow_idx = idx + 1, #lines do
         local follow = trim(lines[follow_idx])
         if follow ~= "" then
-          if not contains(lower(follow), "do you want to proceed") then
+          local follow_lower = lower(follow)
+          if not contains(follow_lower, "do you want to proceed")
+              and not follow:match("^%d+%.%s+")
+              and not follow:match("^❯%s*%d+%.%s+") then
             permission.summary = permission.summary or follow
           end
           break
@@ -787,19 +865,7 @@ local function parse_permission_dialog(text)
   -- Enter/Esc labels below could fail to parse. Lua patterns can't
   -- represent the multi-byte `❯` in a `[...]` class, so strip it (and
   -- the `>` ASCII fallback) up front, then anchor with `^`.
-  local selector_glyph = "❯"
-  for _, line in ipairs(lines) do
-    local trimmed = trim(line)
-    if trimmed:sub(1, #selector_glyph) == selector_glyph then
-      trimmed = trim(trimmed:sub(#selector_glyph + 1))
-    elseif trimmed:sub(1, 1) == ">" then
-      trimmed = trim(trimmed:sub(2))
-    end
-    local body = trimmed:match("^%d+%.%s+(.+)$")
-    if body then
-      table.insert(options, trim(body))
-    end
-  end
+  options = parse_numbered_options(lines)
   if #options == 0 then
     -- Enter/Esc bracketed layout: preserve whichever label the TUI
     -- actually rendered rather than normalising to Approve / Deny.
@@ -824,6 +890,36 @@ local function parse_permission_dialog(text)
     return nil
   end
   return { permission = permission }
+end
+
+local function has_enter_plan_mode_indicator(text)
+  if not contains(text, "enter plan mode?") then
+    return false
+  end
+  if text:find("❯%s*%d+%.") then
+    return true
+  end
+  return contains(text, "yes, enter plan mode")
+    or contains(text, "no, start implementing")
+end
+
+local function parse_enter_plan_mode_dialog(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local lines = {}
+  for line in string.gmatch(text, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  local options = parse_numbered_options(lines)
+  local metadata = {}
+  if #options > 0 then
+    metadata.options = options
+  end
+  if next(metadata) == nil then
+    return nil
+  end
+  return { enter_plan_mode = metadata }
 end
 
 -- Extract the plan body for `metadata.plan` on the
@@ -864,7 +960,10 @@ local function parse_plan_body(text)
   local footer_idx = #lines + 1
   for idx = header_idx + 1, #lines do
     local t = lower(trim(lines[idx]))
-    if starts_with(t, "approve plan") or starts_with(t, "approve the plan") then
+    if starts_with(t, "approve plan")
+        or starts_with(t, "approve the plan")
+        or contains(t, "ready to code?")
+        or contains(t, "exit plan mode?") then
       footer_idx = idx
       break
     end
@@ -882,6 +981,31 @@ local function parse_plan_body(text)
   return table.concat(body_lines, "\n")
 end
 
+local function parse_plan_options(text)
+  if text == nil or text == "" then
+    return nil
+  end
+  local lines = {}
+  for line in string.gmatch(text, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  local option_lines = {}
+  local in_options = false
+  for _, line in ipairs(lines) do
+    local t = lower(trim(line))
+    if contains(t, "ready to code?") or contains(t, "exit plan mode?") then
+      in_options = true
+    elseif in_options then
+      table.insert(option_lines, line)
+    end
+  end
+  local options = parse_numbered_options(option_lines)
+  if #options == 0 then
+    return nil
+  end
+  return options
+end
+
 local function has_plan_indicator(text)
   -- Structural pattern: a "plan" header on its own line followed by
   -- a numbered list within a line or two. Both fixtures match this:
@@ -897,6 +1021,21 @@ local function has_plan_indicator(text)
   if text:match("\nplan[^\n]*\n%s*1[%.%)]") then return true end
   -- Match at start-of-text too (in case the body starts with "Plan").
   if text:match("^plan[^\n]*\n%s*1[%.%)]") then return true end
+  if contains(text, "ready to code?")
+      and text:find("❯%s*%d+%.")
+      and contains_any(text, {
+        "yes, and use",
+        "yes, manually",
+        "yes, auto",
+        "no, keep planning",
+      }) then
+    return true
+  end
+  if contains(text, "exit plan mode?")
+      and text:find("❯%s*%d+%.")
+      and contains_any(text, { "yes", "no" }) then
+    return true
+  end
   return false
 end
 
@@ -924,15 +1063,14 @@ local function has_trust_indicator(text)
     })
 end
 
--- `/model` opens an interactive selection panel: a "Select a model:"
--- (or "Switch to model:") header followed by a numbered list of
+-- `/model` opens an interactive selection panel: a "Select model" /
+-- "Select a model:" / "Switch to model:" header followed by a numbered list of
 -- available models, with the focus glyph `❯` on one row. Three
 -- structural anchors are required so assistant prose that explains
 -- model selection — and might reasonably list `1. Sonnet 2. Opus
 -- 3. Haiku` in the middle of a paragraph — can't trip the detector:
---   1. A header phrase (`select a model:` / `choose a model:` /
---      `switch to model:` / `available models:`) — note the COLON,
---      which Claude's TUI renders and prose typically doesn't.
+--   1. A header phrase (`select model` / `select a model:` /
+--      `choose a model:` / `switch to model:` / `available models:`).
 --   2. A focused numbered option line (`❯ 1.` / `❯ 1)`).
 --   3. A keyboard hint line (`enter to select`, `esc to cancel`,
 --      `↑/↓` arrows). Real pickers always render this; prose lists
@@ -942,7 +1080,10 @@ end
 -- right structure.
 local MODEL_PICKER_HEADERS = {
   "select a model:",
+  "select a model",
+  "select model",
   "switch to model:",
+  "switch between claude models",
   "choose a model:",
   "available models:",
 }
@@ -962,9 +1103,13 @@ local function has_model_picker_indicator(text)
   -- (`↑/↓`, `esc to cancel`, `enter to select`).
   return contains_any(text, {
     "enter to select",
+    "enter confirm",
     "esc to cancel",
+    "esc exit",
     "↑/↓",
     "↑ / ↓",
+    "← → to adjust",
+    "to adjust effort",
   })
 end
 
@@ -1086,9 +1231,18 @@ local function has_login_indicator(text)
 end
 
 local function has_usage_screen(text)
-  return contains(text, "total cost:")
-    and contains(text, "usage:")
-    and contains_any(text, { "current session", "current week", "total duration" })
+  if contains(text, "total cost:")
+      and contains(text, "usage:")
+      and contains_any(text, { "current session", "current week", "total duration" }) then
+    return true
+  end
+  if contains_any(text, { "loading usage data", "usage data", "usage error" })
+      and contains_any(text, { "settings", "usage", "current session", "current week" }) then
+    return true
+  end
+  return contains(text, "current session")
+    and contains(text, "current week")
+    and contains_any(text, { "extra usage", "% used", "resets" })
 end
 
 -- Parse the "Total cost: $0.0000" / "Usage: 0 input, 0 output, ..." panel
@@ -1130,7 +1284,87 @@ local function parse_usage_screen(text)
   local added, removed = text:match("[Tt]otal code changes:%s*(%d+)%s*lines added,%s*(%d+)%s*lines removed")
   maybe_set("lines_added", tonumber(added))
   maybe_set("lines_removed", tonumber(removed))
+  if next(usage) == nil then
+    local limits = {}
+    local current_label = nil
+    for line in string.gmatch(text or "", "[^\n]+") do
+      local t = trim(line)
+      local l = lower(t)
+      if l == "current session"
+          or l == "current week (all models)"
+          or l == "current week (sonnet only)"
+          or l == "extra usage" then
+        current_label = l
+      else
+        local pct = t:match("(%d+)%%%s*used")
+        if pct and current_label then
+          limits[current_label] = limits[current_label] or {}
+          limits[current_label].percent_used = tonumber(pct)
+        end
+        local reset = t:match("^[Rr]esets%s+(.+)$")
+        if reset and current_label then
+          limits[current_label] = limits[current_label] or {}
+          limits[current_label].resets = reset
+        end
+        if current_label == "extra usage" and t ~= "" and l ~= "extra usage" and not contains(l, "esc to cancel") then
+          limits[current_label] = limits[current_label] or {}
+          limits[current_label].status = limits[current_label].status or t
+        end
+      end
+    end
+    if next(limits) ~= nil then
+      usage.limits = limits
+    end
+  end
   return { usage = usage }
+end
+
+local function has_external_editor_indicator(text)
+  return contains(text, "save and close editor to continue")
+end
+
+local function has_suppressed_permission_indicator(text)
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local t = trim(line)
+    if t == "waiting for permission"
+        or t == "waiting for permission..."
+        or t == "waiting for permission…" then
+      return true
+    end
+  end
+  return false
+end
+
+local LOCAL_UI_ANCHORS = {
+  "claude code health",
+  "mcp servers",
+  "installed plugins",
+  "select theme",
+  "resume conversation",
+  "rate limit options",
+  "extra usage",
+}
+
+local function has_local_ui_screen(text)
+  local has_anchor = contains_any(text, LOCAL_UI_ANCHORS)
+  if not has_anchor then
+    for line in string.gmatch(text or "", "[^\n]+") do
+      local t = trim(line)
+      if t == "tasks" or t == "agents" then
+        has_anchor = true
+        break
+      end
+    end
+  end
+  if not has_anchor then
+    return false
+  end
+  return contains_any(text, {
+    "esc to cancel",
+    "enter to confirm",
+    "enter confirm",
+    "↑/↓",
+  })
 end
 
 -- Parse the bottom status-bar text into the structured `status` table the
@@ -1242,6 +1476,7 @@ function M.classify(input)
   -- deny calls with a stale id are rejected rather than blindly
   -- pressing Enter on whatever is now on screen.
   M._current_dialog_id = nil
+  M._current_options = nil
   local screen = input.screen or ""
   -- body_text excludes the bottom status-bar rows so that benign status
   -- strings like `⏵⏵ bypass permissions on (shift+tab to cycle)` do not
@@ -1384,12 +1619,37 @@ function M.classify(input)
     )
   end
 
+  if has_external_editor_indicator(body_text) then
+    return state_snapshot("waiting_for_external_editor", 0.78, "external editor active", sequence)
+  end
+
   -- Model picker (opened by `/model`). Anchored on THREE structural
-  -- cues together (header phrase ending in `:`, a focused `❯ <digit>.`
+  -- cues together (supported header phrase, a focused `❯ <digit>.`
   -- option, AND a navigation-hint line like `enter to select`), so
   -- prose mentioning "select a model" can't trip it on its own.
-  if has_model_picker_indicator(body_text) then
-    return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence)
+  if has_model_picker_indicator(body_text) or has_model_picker_indicator(body_and_status) then
+    local options = parse_numbered_options_from_text(screen)
+    local metadata = nil
+    if #options > 0 then
+      M._current_options = options
+      local dialog_id = fnv1a_hex("model_select:" .. table.concat(options, "|"))
+      M._current_dialog_id = dialog_id
+      metadata = { model_select = { options = options }, dialog_id = dialog_id }
+    end
+    return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence, metadata)
+  end
+
+  if has_enter_plan_mode_indicator(body_text) or has_enter_plan_mode_indicator(body_and_status) then
+    local metadata = parse_enter_plan_mode_dialog(screen)
+    if metadata then
+      local options = metadata.enter_plan_mode and metadata.enter_plan_mode.options
+      M._current_options = options
+      local fingerprint = "enter_plan_mode:" .. table.concat(options or {}, "|")
+      local dialog_id = fnv1a_hex(fingerprint)
+      M._current_dialog_id = dialog_id
+      metadata.dialog_id = dialog_id
+    end
+    return state_snapshot("waiting_for_enter_plan_mode", 0.82, "enter plan mode dialog detected", sequence, metadata)
   end
 
   if has_plan_indicator(body_text) or (contains(body_text, "plan") and has_plan_indicator(body_and_status)) then
@@ -1405,6 +1665,11 @@ function M.classify(input)
       local dialog_id = fnv1a_hex("plan:" .. plan_text)
       M._current_dialog_id = dialog_id
       plan_metadata = { plan = plan_text, dialog_id = dialog_id }
+      local options = parse_plan_options(screen)
+      if options then
+        plan_metadata.options = options
+        M._current_options = options
+      end
     end
     return state_snapshot("waiting_for_plan_approval", 0.8, "plan approval text detected", sequence, plan_metadata)
   end
@@ -1424,8 +1689,15 @@ function M.classify(input)
       local dialog_id = fnv1a_hex(fingerprint)
       M._current_dialog_id = dialog_id
       permission_metadata.dialog_id = dialog_id
+      if p.options then
+        M._current_options = p.options
+      end
     end
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
+  end
+
+  if has_suppressed_permission_indicator(body_text) then
+    return state_snapshot("waiting_for_permission", 0.72, "suppressed permission dialog detected", sequence)
   end
 
   if has_active_work_indicator(screen_text) then
@@ -1437,13 +1709,16 @@ function M.classify(input)
     return state_snapshot("error", 0.72, "visible error banner detected", sequence, error_metadata)
   end
 
-  if has_usage_screen(body_text) and last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
+  if has_usage_screen(body_text)
+      and last_intent == "prompt_submitted"
+      and completed_turn_stable_ms > 0
+      and stable_ms >= completed_turn_stable_ms then
     -- Pull the cost / tokens / duration out of the rendered usage panel
     -- so callers get a machine-readable view alongside the state. Parsing
     -- the unlowered body avoids losing currency casing if Claude ever
     -- ships a tweak that depends on it; `parse_usage_screen` lower-cases
     -- only the bits it asserts against.
-    local usage_metadata = parse_usage_screen(body)
+    local usage_metadata = parse_usage_screen(screen)
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
   end
 
@@ -1471,6 +1746,15 @@ function M.classify(input)
       "turn in flight; no accepted completion marker on screen",
       sequence
     )
+  end
+
+  if has_usage_screen(body_text) then
+    local usage_metadata = parse_usage_screen(screen)
+    return state_snapshot("usage_screen", 0.74, "usage screen detected", sequence, usage_metadata)
+  end
+
+  if has_local_ui_screen(body_text) or has_local_ui_screen(body_and_status) then
+    return state_snapshot("local_ui_screen", 0.68, "local UI screen detected", sequence)
   end
 
   -- Poll-path completed_turn — fires when adapter.state polling sees
@@ -1689,12 +1973,24 @@ function M.wait_turn_matcher(input)
   return matcher.all({
     matcher.any({
       matcher.contains_text("Do you want to proceed"),
+      matcher.contains_text("Enter plan mode?"),
+      matcher.contains_text("Ready to code?"),
+      matcher.contains_text("Exit plan mode?"),
       matcher.contains_text("Do you trust the files"),
       matcher.contains_text("Accessing workspace"),
       matcher.contains_text("Yes, I trust this folder"),
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
+      matcher.contains_text("Current week (all models)"),
+      matcher.contains_text("Loading usage data"),
+      matcher.contains_text("Save and close editor to continue"),
+      matcher.contains_text("Waiting for permission"),
+      matcher.contains_text("Claude Code health"),
+      matcher.contains_text("MCP servers"),
+      matcher.contains_text("Installed plugins"),
+      matcher.contains_text("Resume conversation"),
+      matcher.contains_text("Rate limit options"),
       -- Login / sign-in dialog. Mirrors `has_login_indicator` so
       -- callers using `adapter.wait` after `adapter.start` against
       -- an unauthenticated user wake on the sign-in panel instead
@@ -1712,9 +2008,11 @@ function M.wait_turn_matcher(input)
       matcher.screen_regex("(?m)^\\s*https?://[\\w./\\-_?=&%]*anthropic\\.com"),
       -- Model picker dialog (opened by `/model`). Mirrors the full
       -- `MODEL_PICKER_HEADERS` list in `has_model_picker_indicator`
-      -- so any of the four header shapes wakes the wait.
+      -- so any supported header shape wakes the wait.
       matcher.contains_text("Select a model:"),
+      matcher.contains_text("Select model"),
       matcher.contains_text("Switch to model:"),
+      matcher.contains_text("Switch between Claude models"),
       matcher.contains_text("Choose a model:"),
       matcher.contains_text("Available models:"),
       -- Error banners that `has_error_indicator` recognises — mirror
@@ -1729,6 +2027,7 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("You've used your Pro plan"),
       matcher.contains_text("You've used your Max plan"),
       matcher.contains_text("You've reached your usage limit"),
+      matcher.screen_regex("(?mi)^\\s*You've hit your .* limit"),
       matcher.contains_text("Credit balance is too low"),
       matcher.contains_text("Connection error"),
       matcher.contains_text("Connection issue"),
@@ -1824,6 +2123,61 @@ function M.deny(input)
   }
 end
 
+-- Select a focused dialog/list option by index, or by label when the
+-- caller has just classified a screen and the plugin has the current
+-- numbered options cached. This stays plugin-owned: the host only sees
+-- generic text + Enter actions.
+function M.choose_option(input)
+  check_dialog_id(input)
+  local raw = input and (input.index or input.option or input.choice)
+  local index = nil
+  if type(raw) == "number" then
+    index = tostring(math.floor(raw))
+  elseif type(raw) == "string" then
+    local numeric = raw:match("^%s*(%d+)%s*$")
+    if numeric then
+      index = numeric
+    elseif M._current_options then
+      local wanted = lower(trim(raw))
+      for i, option in ipairs(M._current_options) do
+        local candidate = lower(trim(option))
+        if candidate == wanted then
+          index = tostring(i)
+          break
+        end
+      end
+      if not index then
+        for i, option in ipairs(M._current_options) do
+          local candidate = lower(trim(option))
+          if contains(candidate, wanted) then
+            index = tostring(i)
+            break
+          end
+        end
+      end
+    end
+  end
+  if index and M._current_options then
+    local n = tonumber(index)
+    if not n or n < 1 or n > #M._current_options then
+      error(string.format(
+        "choose_option: index %s is outside the current option range 1..%d",
+        tostring(index),
+        #M._current_options
+      ))
+    end
+  end
+  if not index or index == "" then
+    error("choose_option: index, numeric option, or currently visible option label is required")
+  end
+  return {
+    actions = {
+      action.text(index),
+      action.key("enter"),
+    },
+  }
+end
+
 -- Trust-dialog approval needs a numbered selection (1 = Yes, proceed)
 -- followed by Enter, since the TUI does not treat a bare Enter on the
 -- list as accepting option 1. Kept as a separate intent so callers can
@@ -1870,6 +2224,22 @@ function M.expand(_input)
   return {
     actions = {
       action.key("ctrl_o"),
+    },
+  }
+end
+
+function M.model_effort_left(_input)
+  return {
+    actions = {
+      action.key("left"),
+    },
+  }
+end
+
+function M.model_effort_right(_input)
+  return {
+    actions = {
+      action.key("right"),
     },
   }
 end
@@ -1987,9 +2357,8 @@ function M.key(input)
       },
     }
   end
-  -- Fall through: arbitrary single characters or short strings ("y",
-  -- "n", "1", "q") are sent as raw text so the PTY treats them as
-  -- typed input.
+  -- Fall through: any unrecognised string is sent as raw text so the PTY
+  -- treats it as typed input.
   return {
     actions = {
       action.text(raw),
@@ -2011,10 +2380,13 @@ function M.describe()
       { name = "attach_file" },
       { name = "approve" },
       { name = "deny" },
+      { name = "choose_option" },
       { name = "approve_trust" },
       { name = "deny_trust" },
       { name = "dismiss_welcome" },
       { name = "expand" },
+      { name = "model_effort_left" },
+      { name = "model_effort_right" },
       { name = "slash_command" },
       { name = "cancel" },
       { name = "force_cancel" },
@@ -2030,8 +2402,12 @@ function M.describe()
       { name = "waiting_for_login" },
       { name = "waiting_for_trust" },
       { name = "waiting_for_model_select" },
+      { name = "waiting_for_enter_plan_mode" },
       { name = "waiting_for_plan_approval" },
       { name = "waiting_for_permission" },
+      { name = "waiting_for_external_editor" },
+      { name = "usage_screen" },
+      { name = "local_ui_screen" },
       { name = "waiting_for_user_input" },
       { name = "thinking" },
       { name = "cancelling" },

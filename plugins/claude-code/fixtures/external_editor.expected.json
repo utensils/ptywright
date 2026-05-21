@@ -1,0 +1,6 @@
+{
+  "state": "waiting_for_external_editor",
+  "evidence": "external editor active",
+  "last_intent": null,
+  "min_confidence": 0.6
+}

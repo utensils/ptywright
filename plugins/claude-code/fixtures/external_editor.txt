@@ -1,0 +1,7 @@
+Claude Code
+
+Save and close editor to continue...
+
+────────────────────────────────────────────────────────────
+  user @ host /workspace                         [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

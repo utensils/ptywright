@@ -1,0 +1,11 @@
+Select model
+
+Switch between Claude models and reasoning effort.
+
+❯ 1. Claude Sonnet 4.6
+     Medium effort
+  2. Claude Opus 4.7
+     Effort not supported
+  3. Claude Haiku 4.5
+
+Enter confirm · Esc exit · ← → to adjust effort

@@ -1,0 +1,9 @@
+Claude Code
+
+⏺ The deploy job is currently waiting for permission from the release approver,
+so I left the rollout paused and documented the follow-up.
+
+❯
+────────────────────────────────────────────────────────────
+  user @ host /workspace                         [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

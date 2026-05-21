@@ -1,0 +1,22 @@
+Claude Code
+
+Settings  Status   Config   Usage   Stats
+
+Usage
+
+Current session
+████████████                                      24% used
+Resets 12:40pm (America/Phoenix)
+
+Current week (all models)
+█████████████████████████████████████████        82% used
+Resets May 21 at 1am (America/Phoenix)
+
+Current week (Sonnet only)
+████████████████                                  33% used
+Resets May 21 at 1am (America/Phoenix)
+
+Extra usage
+Extra usage not enabled · /extra-usage to enable
+
+Esc to cancel

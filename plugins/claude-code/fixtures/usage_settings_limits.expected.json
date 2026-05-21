@@ -1,0 +1,27 @@
+{
+  "state": "usage_screen",
+  "evidence": "usage screen detected",
+  "last_intent": null,
+  "min_confidence": 0.6,
+  "metadata": {
+    "usage": {
+      "limits": {
+        "current session": {
+          "percent_used": 24,
+          "resets": "12:40pm (America/Phoenix)"
+        },
+        "current week (all models)": {
+          "percent_used": 82,
+          "resets": "May 21 at 1am (America/Phoenix)"
+        },
+        "current week (sonnet only)": {
+          "percent_used": 33,
+          "resets": "May 21 at 1am (America/Phoenix)"
+        },
+        "extra usage": {
+          "status": "Extra usage not enabled · /extra-usage to enable"
+        }
+      }
+    }
+  }
+}

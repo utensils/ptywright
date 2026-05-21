@@ -1,0 +1,12 @@
+Claude Code
+
+Bash command
+  cargo test --locked --features _test-fixtures
+
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and don't ask again for cargo test
+  3. Yes, apply suggestions
+  4. No, and tell Claude what to do differently
+
+Tab to amend · Esc to cancel
