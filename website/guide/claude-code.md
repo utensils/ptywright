@@ -87,6 +87,7 @@ The classifier may attach the following keys to `metadata`, depending on which s
 | `status`     | always (status-bar row parsed) | `{ "model": "...", "permission_mode": "..." }`                                                                          |
 | `permission` | `waiting_for_permission`       | `{ "tool": "Bash", "summary": "...", "options": ["Yes", "Yes, and don't ask again", "No"] }`                            |
 | `enter_plan_mode` | `waiting_for_enter_plan_mode` | `{ "options": ["Yes, enter plan mode", "No, start implementing now"] }`                                              |
+| `model_select` | `waiting_for_model_select` | `{ "options": ["Claude Sonnet 4.6", "Claude Opus 4.7", ...] }`                                                            |
 | `plan`       | `waiting_for_plan_approval`    | Multi-line plan body text (the bullet/step list Claude Code rendered). `metadata.options` may also list approval-mode choices such as auto mode, bypass permissions, or keep planning. |
 | `error`      | `error`                        | `{ "kind": "rate_limit"\|"quota"\|"connection"\|"auth"\|"api"\|"unknown", "message": "...", "retry_after_s"?: number }` |
 | `login`      | `waiting_for_login`            | `{ "url": "https://..." }` — extracted sign-in URL (bare-domain forms supported, host-suffix attacks rejected).         |

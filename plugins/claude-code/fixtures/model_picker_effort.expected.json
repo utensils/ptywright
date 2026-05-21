@@ -2,5 +2,14 @@
   "state": "waiting_for_model_select",
   "evidence": "model picker dialog detected",
   "last_intent": null,
-  "min_confidence": 0.6
+  "min_confidence": 0.6,
+  "metadata": {
+    "model_select": {
+      "options": [
+        "Claude Sonnet 4.6",
+        "Claude Opus 4.7",
+        "Claude Haiku 4.5"
+      ]
+    }
+  }
 }

@@ -482,6 +482,51 @@ Do you want to proceed?
 }
 
 #[test]
+fn choose_option_prefers_exact_label_before_substring_label() {
+    let extension = claude_plugin();
+    let screen = "\
+Claude Code
+
+Do you want to proceed?
+❯ 1. Yes, proceed once
+  2. Yes
+  3. No
+";
+
+    let state = classify_state(&extension, screen, 43, None, None);
+    assert_eq!(state.state, "waiting_for_permission");
+
+    let plan = plan(&extension, "choose_option", json!({ "option": "yes" }));
+    assert_eq!(
+        plan.actions,
+        vec![Action::Text("2".to_string()), Action::Key(Key::Enter)],
+    );
+}
+
+#[test]
+fn choose_option_rejects_out_of_range_index_when_options_are_known() {
+    let extension = claude_plugin();
+    let screen = "\
+Claude Code
+
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+";
+
+    let state = classify_state(&extension, screen, 44, None, None);
+    assert_eq!(state.state, "waiting_for_permission");
+
+    let err = extension
+        .plan("choose_option", &json!({ "index": 99 }))
+        .expect_err("out-of-range option should be rejected when current options are known");
+    assert!(
+        err.to_string().contains("outside the current option range"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn approve_trust_types_numeric_option_one() {
     // The workspace-trust dialog requires typing "1" before Enter; a bare
     // Enter does not accept option 1 in the Claude Code TUI. Lock the

@@ -86,11 +86,6 @@ local ERROR_BANNER_PREFIXES = {
   "you've used your max plan",
   "you've reached your usage limit",
   "you've hit your limit",
-  "you've hit your",
-  "you've used",
-  "you're now using extra usage",
-  "you're close to",
-  "you're out of extra usage",
   "credit balance is too low",
   -- Mid-turn API error wrapping a per-request usage / context-window
   -- quota condition. Claude Code 2.1.x renders this when an account
@@ -188,11 +183,6 @@ local ERROR_SUBTYPE_PATTERNS = {
   { kind = "rate_limit", prefix = "you've used your max plan" },
   { kind = "rate_limit", prefix = "you've reached your usage limit" },
   { kind = "rate_limit", prefix = "you've hit your limit" },
-  { kind = "rate_limit", prefix = "you've hit your" },
-  { kind = "rate_limit", prefix = "you've used" },
-  { kind = "rate_limit", prefix = "you're now using extra usage" },
-  { kind = "rate_limit", prefix = "you're close to" },
-  { kind = "rate_limit", prefix = "you're out of extra usage" },
   -- Specific quota variants must come before generic `api error`
   -- so the right kind wins.
   { kind = "quota",      prefix = "api error: extra usage is required" },
@@ -259,6 +249,13 @@ local function parse_error_subtype(body)
           subtype = pattern.kind
           message = raw_stripped
           break
+        end
+      end
+      if not subtype then
+        if (starts_with(text, "you've hit your ") or starts_with(stripped, "you've hit your "))
+            and (contains(text, " limit") or contains(stripped, " limit")) then
+          subtype = "rate_limit"
+          message = raw_stripped
         end
       end
       if subtype then
@@ -899,8 +896,10 @@ local function has_enter_plan_mode_indicator(text)
   if not contains(text, "enter plan mode?") then
     return false
   end
-  return text:find("❯%s*%d+%.")
-    or contains(text, "yes, enter plan mode")
+  if text:find("❯%s*%d+%.") then
+    return true
+  end
+  return contains(text, "yes, enter plan mode")
     or contains(text, "no, start implementing")
 end
 
@@ -1325,7 +1324,15 @@ local function has_external_editor_indicator(text)
 end
 
 local function has_suppressed_permission_indicator(text)
-  return contains(text, "waiting for permission")
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local t = trim(line)
+    if t == "waiting for permission"
+        or t == "waiting for permission..."
+        or t == "waiting for permission…" then
+      return true
+    end
+  end
+  return false
 end
 
 local LOCAL_UI_ANCHORS = {
@@ -1336,12 +1343,20 @@ local LOCAL_UI_ANCHORS = {
   "resume conversation",
   "rate limit options",
   "extra usage",
-  "tasks",
-  "agents",
 }
 
 local function has_local_ui_screen(text)
-  if not contains_any(text, LOCAL_UI_ANCHORS) then
+  local has_anchor = contains_any(text, LOCAL_UI_ANCHORS)
+  if not has_anchor then
+    for line in string.gmatch(text or "", "[^\n]+") do
+      local t = trim(line)
+      if t == "tasks" or t == "agents" then
+        has_anchor = true
+        break
+      end
+    end
+  end
+  if not has_anchor then
     return false
   end
   return contains_any(text, {
@@ -1349,7 +1364,6 @@ local function has_local_ui_screen(text)
     "enter to confirm",
     "enter confirm",
     "↑/↓",
-    "settings",
   })
 end
 
@@ -1609,20 +1623,18 @@ function M.classify(input)
     return state_snapshot("waiting_for_external_editor", 0.78, "external editor active", sequence)
   end
 
-  if has_suppressed_permission_indicator(body_text) then
-    return state_snapshot("waiting_for_permission", 0.72, "suppressed permission dialog detected", sequence)
-  end
-
   -- Model picker (opened by `/model`). Anchored on THREE structural
   -- cues together (header phrase ending in `:`, a focused `❯ <digit>.`
   -- option, AND a navigation-hint line like `enter to select`), so
   -- prose mentioning "select a model" can't trip it on its own.
   if has_model_picker_indicator(body_text) or has_model_picker_indicator(body_and_status) then
     local options = parse_numbered_options_from_text(screen)
+    local metadata = nil
     if #options > 0 then
       M._current_options = options
+      metadata = { model_select = { options = options } }
     end
-    return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence)
+    return state_snapshot("waiting_for_model_select", 0.82, "model picker dialog detected", sequence, metadata)
   end
 
   if has_enter_plan_mode_indicator(body_text) or has_enter_plan_mode_indicator(body_and_status) then
@@ -1682,6 +1694,10 @@ function M.classify(input)
     return state_snapshot("waiting_for_permission", 0.84, "permission or approval prompt text detected", sequence, permission_metadata)
   end
 
+  if has_suppressed_permission_indicator(body_text) then
+    return state_snapshot("waiting_for_permission", 0.72, "suppressed permission dialog detected", sequence)
+  end
+
   if has_active_work_indicator(screen_text) then
     return state_snapshot("thinking", 0.76, "active work indicator detected", sequence)
   end
@@ -1691,21 +1707,17 @@ function M.classify(input)
     return state_snapshot("error", 0.72, "visible error banner detected", sequence, error_metadata)
   end
 
-  if has_usage_screen(body_text) then
+  if has_usage_screen(body_text)
+      and last_intent == "prompt_submitted"
+      and completed_turn_stable_ms > 0
+      and stable_ms >= completed_turn_stable_ms then
     -- Pull the cost / tokens / duration out of the rendered usage panel
     -- so callers get a machine-readable view alongside the state. Parsing
     -- the unlowered body avoids losing currency casing if Claude ever
     -- ships a tweak that depends on it; `parse_usage_screen` lower-cases
     -- only the bits it asserts against.
     local usage_metadata = parse_usage_screen(screen)
-    if last_intent == "prompt_submitted" and completed_turn_stable_ms > 0 and stable_ms >= completed_turn_stable_ms then
-      return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
-    end
-    return state_snapshot("usage_screen", 0.74, "usage screen detected", sequence, usage_metadata)
-  end
-
-  if has_local_ui_screen(body_text) or has_local_ui_screen(body_and_status) then
-    return state_snapshot("local_ui_screen", 0.68, "local UI screen detected", sequence)
+    return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
   end
 
   -- Mid-turn determinism — when a turn is in flight (`prompt_submitted`)
@@ -1732,6 +1744,15 @@ function M.classify(input)
       "turn in flight; no accepted completion marker on screen",
       sequence
     )
+  end
+
+  if has_usage_screen(body_text) then
+    local usage_metadata = parse_usage_screen(screen)
+    return state_snapshot("usage_screen", 0.74, "usage screen detected", sequence, usage_metadata)
+  end
+
+  if has_local_ui_screen(body_text) or has_local_ui_screen(body_and_status) then
+    return state_snapshot("local_ui_screen", 0.68, "local UI screen detected", sequence)
   end
 
   -- Poll-path completed_turn — fires when adapter.state polling sees
@@ -2004,11 +2025,7 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("You've used your Pro plan"),
       matcher.contains_text("You've used your Max plan"),
       matcher.contains_text("You've reached your usage limit"),
-      matcher.contains_text("You've hit your"),
-      matcher.contains_text("You've used"),
-      matcher.contains_text("You're now using extra usage"),
-      matcher.contains_text("You're close to"),
-      matcher.contains_text("You're out of extra usage"),
+      matcher.screen_regex("(?mi)^\\s*You've hit your .* limit"),
       matcher.contains_text("Credit balance is too low"),
       matcher.contains_text("Connection error"),
       matcher.contains_text("Connection issue"),
@@ -2109,9 +2126,7 @@ end
 -- numbered options cached. This stays plugin-owned: the host only sees
 -- generic text + Enter actions.
 function M.choose_option(input)
-  if input and input.dialog_id then
-    check_dialog_id(input)
-  end
+  check_dialog_id(input)
   local raw = input and (input.index or input.option or input.choice)
   local index = nil
   if type(raw) == "number" then
@@ -2124,11 +2139,30 @@ function M.choose_option(input)
       local wanted = lower(trim(raw))
       for i, option in ipairs(M._current_options) do
         local candidate = lower(trim(option))
-        if candidate == wanted or contains(candidate, wanted) then
+        if candidate == wanted then
           index = tostring(i)
           break
         end
       end
+      if not index then
+        for i, option in ipairs(M._current_options) do
+          local candidate = lower(trim(option))
+          if contains(candidate, wanted) then
+            index = tostring(i)
+            break
+          end
+        end
+      end
+    end
+  end
+  if index and M._current_options then
+    local n = tonumber(index)
+    if not n or n < 1 or n > #M._current_options then
+      error(string.format(
+        "choose_option: index %s is outside the current option range 1..%d",
+        tostring(index),
+        #M._current_options
+      ))
     end
   end
   if not index or index == "" then

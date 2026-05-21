@@ -1,0 +1,11 @@
+Claude Code
+
+⏺ I refactored the helper and found one more cleanup:
+
+You've used the deprecated two-arg form in a few call sites, so I replaced it
+with the newer options-table shape.
+
+❯
+────────────────────────────────────────────────────────────
+  user @ host /workspace                         [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

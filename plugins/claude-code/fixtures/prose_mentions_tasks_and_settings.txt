@@ -1,0 +1,9 @@
+Claude Code
+
+⏺ Done. I split the work into three tasks and moved the defaults into the
+project settings file so the next pass is easier to audit.
+
+❯
+────────────────────────────────────────────────────────────
+  user @ host /workspace                         [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)
