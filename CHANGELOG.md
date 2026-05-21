@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-21
+
+Third release. Focuses on making `ptywright repl` a real Lua 5.4 operator console, improving REPL startup and rendering ergonomics, and tightening the built-in `claude-code` plugin against newer Claude Code TUI screens without adding Claude-specific Rust surface area.
+
 ### Changed
 
 - **`ptywright repl` now evaluates real Lua 5.4 instead of a hand-rolled DSL.** The bespoke lexer/parser/dispatcher in `src/repl/command.rs` is replaced by an embedded `mlua` VM with the full Lua standard library. Every line typed at `pty>` is loaded as a Lua chunk; REPL-exposed globals (`session`, `send`, `wait`, `matches`, `screen_stable`, `turn`, `cancel_wait`, `re`, `ms`, `s`, `plugins`, `state`, `transcript`, `screen`, `view`, `inspect`) translate into the existing `adapter.*` JSON-RPC surface. The wire shapes are unchanged — the operator-facing change is syntactic. Notable consequences:
@@ -182,6 +186,7 @@ Initial public release. (`0.1.0` on crates.io was an accidental early-skeleton p
 
 - `cargo install ptywright` no longer installs the test-only `ptywright-echo-tui` fixture binary alongside the real CLI. The fixture is now gated behind an internal `_test-fixtures` Cargo feature via `required-features`, so it is only built when CI test runs (and the devshell `run-tests` / `ci-local` commands) enable it explicitly.
 
-[Unreleased]: https://github.com/utensils/ptywright/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/utensils/ptywright/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/utensils/ptywright/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/utensils/ptywright/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/utensils/ptywright/releases/tag/v0.1.1

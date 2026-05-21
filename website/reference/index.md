@@ -6,7 +6,7 @@ ptywright exposes an early CLI, Rust library, JSON-RPC automation protocol, trus
 
 - Crate: `ptywright`
 - Binary: `ptywright`
-- Current version: `0.2.0`
+- Current version: `0.3.0`
 - License: MIT
 - Repository: <https://github.com/utensils/ptywright>
 - Docs site: <https://utensils.io/ptywright/>
