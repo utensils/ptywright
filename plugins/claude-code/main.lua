@@ -1557,11 +1557,15 @@ end
 
 function M.send_prompt(input)
   -- Use bracketed paste explicitly. Claude Code v2.1+ enables bracketed
-  -- paste mode (`CSI ? 2004 h`) for its input box, so the wrapper lets
-  -- the trailing Enter submit cleanly. Without the wrapper a long
-  -- prompt races against Claude's input tokeniser: the bytes land but
-  -- the Enter gets absorbed and the prompt sits un-submitted. The
-  -- generic `action.paste(...)` still exists for callers / plugins
+  -- paste mode (`CSI ? 2004 h`) for its input box. Live builds can still
+  -- occasionally swallow the first Enter after bracketed paste, leaving
+  -- the prompt visibly editable and never starting the turn. Sending a
+  -- second Enter is the plugin-owned recovery: on the bad path it
+  -- submits the already-pasted text; on the normal path Claude is already
+  -- starting the turn and ignores the extra empty submit. Keeping this
+  -- in the plugin makes `adapter.send(send_prompt)` reliable for every
+  -- consumer, not just the `claude-stream` wrapper.
+  -- The generic `action.paste(...)` still exists for callers / plugins
   --
   -- The leading Enter handles Claude Code 2.1.x's first-keypress
   -- interceptors (welcome panel, compact-launch view). On a clean
@@ -1603,6 +1607,7 @@ function M.send_prompt(input)
       action.key("enter"),
       action.mark_transcript("turn_start"),
       action.bracketed_paste(prompt),
+      action.key("enter"),
       action.key("enter"),
     },
     last_intent = "prompt_submitted",
