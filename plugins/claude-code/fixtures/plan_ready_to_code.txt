@@ -1,0 +1,14 @@
+Claude Code
+
+Plan
+1. Update the classifier fixtures for the new dialogs.
+2. Extend only the claude-code Lua plugin.
+3. Run the classifier and intent tests.
+
+Ready to code?
+❯ 1. Yes, and use auto mode
+  2. Yes, and bypass permissions
+  3. Yes, manually approve edits
+  4. No, keep planning
+
+Enter to confirm · Esc to cancel

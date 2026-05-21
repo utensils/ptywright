@@ -1,0 +1,6 @@
+{
+  "state": "local_ui_screen",
+  "evidence": "local UI screen detected",
+  "last_intent": null,
+  "min_confidence": 0.6
+}

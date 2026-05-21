@@ -1,0 +1,12 @@
+{
+  "state": "waiting_for_enter_plan_mode",
+  "evidence": "enter plan mode dialog detected",
+  "last_intent": null,
+  "min_confidence": 0.6,
+  "metadata": {
+    "dialog_id": "9b441460",
+    "enter_plan_mode": {
+      "options": ["Yes, enter plan mode", "No, start implementing now"]
+    }
+  }
+}

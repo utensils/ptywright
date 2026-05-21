@@ -438,6 +438,50 @@ fn deny_plan_sends_escape_with_no_intent() {
 }
 
 #[test]
+fn choose_option_types_numeric_choice_and_submits() {
+    let extension = claude_plugin();
+    let plan = plan(&extension, "choose_option", json!({ "index": 3 }));
+
+    assert_eq!(
+        plan.actions,
+        vec![Action::Text("3".to_string()), Action::Key(Key::Enter)],
+    );
+    assert!(
+        plan.last_intent.is_none(),
+        "choosing a dialog/list option must not mark a conversation turn"
+    );
+}
+
+#[test]
+fn choose_option_can_resolve_current_visible_label() {
+    let extension = claude_plugin();
+    let screen = "\
+Claude Code
+
+Bash command
+  cargo test --locked --features _test-fixtures
+
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and don't ask again for cargo test
+  3. No
+";
+
+    let state = classify_state(&extension, screen, 42, None, None);
+    assert_eq!(state.state, "waiting_for_permission");
+
+    let plan = plan(
+        &extension,
+        "choose_option",
+        json!({ "option": "don't ask again" }),
+    );
+    assert_eq!(
+        plan.actions,
+        vec![Action::Text("2".to_string()), Action::Key(Key::Enter)],
+    );
+}
+
+#[test]
 fn approve_trust_types_numeric_option_one() {
     // The workspace-trust dialog requires typing "1" before Enter; a bare
     // Enter does not accept option 1 in the Claude Code TUI. Lock the
@@ -479,6 +523,19 @@ fn key_intent_routes_named_keys_to_action_key() {
 
     let ctrl_d_plan = plan(&extension, "key", json!({ "key": "ctrl_d" }));
     assert_eq!(ctrl_d_plan.actions, vec![Action::Key(Key::CtrlD)]);
+}
+
+#[test]
+fn model_effort_intents_send_arrow_keys_without_intent() {
+    let extension = claude_plugin();
+
+    let left = plan(&extension, "model_effort_left", json!({}));
+    assert_eq!(left.actions, vec![Action::Key(Key::Left)]);
+    assert!(left.last_intent.is_none());
+
+    let right = plan(&extension, "model_effort_right", json!({}));
+    assert_eq!(right.actions, vec![Action::Key(Key::Right)]);
+    assert!(right.last_intent.is_none());
 }
 
 #[test]
@@ -683,6 +740,18 @@ fn wait_turn_matcher_includes_v2_trust_dialog_anchors() {
             .iter()
             .any(|matcher| matcher == &Matcher::ContainsText("Total cost:".to_string()))
     );
+    assert!(
+        boundary_matchers
+            .iter()
+            .any(|matcher| matcher == &Matcher::ContainsText("Ready to code?".to_string()))
+    );
+    assert!(
+        boundary_matchers
+            .iter()
+            .any(|matcher| matcher == &Matcher::ContainsText("Select model".to_string()))
+    );
+    assert!(boundary_matchers.iter().any(|matcher| matcher
+        == &Matcher::ContainsText("Save and close editor to continue".to_string())));
     assert!(
         boundary_matchers
             .iter()

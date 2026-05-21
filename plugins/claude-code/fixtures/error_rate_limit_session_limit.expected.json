@@ -1,0 +1,12 @@
+{
+  "state": "error",
+  "evidence": "visible error banner detected",
+  "last_intent": null,
+  "min_confidence": 0.6,
+  "metadata": {
+    "error": {
+      "kind": "rate_limit",
+      "message": "You've hit your session limit · resets 12:40pm (America/Phoenix)"
+    }
+  }
+}
