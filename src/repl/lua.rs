@@ -232,10 +232,10 @@ fn render_one(lua: &Lua, inspect: &Function, value: Value) -> Result<RenderedVal
                 // restore it afterwards so a value that gets printed
                 // *and* assigned to a variable still carries the tag.
                 let restored = mt.clone();
-                tbl.set_metatable(None).map_err(map_lua_err)?;
+                tbl.set_metatable(None);
                 let decode_result: mlua::Result<crate::screen::ScreenSnapshot> =
                     lua.from_value(Value::Table(tbl.clone()));
-                tbl.set_metatable(Some(restored)).map_err(map_lua_err)?;
+                tbl.set_metatable(Some(restored));
                 let snapshot = decode_result.map_err(map_lua_err)?;
                 return Ok(RenderedValue::Screen { adapter, snapshot });
             }
@@ -378,7 +378,7 @@ fn install_plugins(
             lua.to_value(&result)
         })?,
     )?;
-    plugins.set_metatable(Some(mt))?;
+    plugins.set_metatable(Some(mt));
 
     lua.globals().set("plugins", plugins)?;
     repl_globals.insert("plugins");
@@ -901,7 +901,7 @@ fn install_wait(
             wait_dispatch_with_intent(lua, &rpc_call, &ctx_call, &intent, params, &opts, timeout)
         })?,
     )?;
-    wait_tbl.set_metatable(Some(mt))?;
+    wait_tbl.set_metatable(Some(mt));
 
     lua.globals().set("wait", wait_tbl)?;
     repl_globals.insert("wait");
@@ -1146,7 +1146,7 @@ fn tag_screen_value(
         let mt = lua.create_table()?;
         mt.set("__pty_type", "screen")?;
         mt.set("__pty_adapter", adapter.to_string())?;
-        tbl.set_metatable(Some(mt))?;
+        tbl.set_metatable(Some(mt));
     }
     Ok(value)
 }
@@ -1215,7 +1215,7 @@ fn install_duration_helpers(
 /// milliseconds argument.
 fn expect_i64(positional: &[Value], label: &str, what: &str) -> mlua::Result<i64> {
     match positional.first() {
-        Some(Value::Integer(n)) => Ok(*n),
+        Some(Value::Integer(n)) => Ok(i64::from(*n)),
         Some(Value::Number(n)) => Ok(*n as i64),
         Some(other) => Err(rpc_err(format!(
             "{label} expects {what} (integer); got {other:?}"

@@ -162,6 +162,7 @@ local function has_error_indicator(screen)
       or starts_with(text, "authentication failed")
       or starts_with(text, "unauthorized")
       or starts_with(text, "oauth failed")
+      or starts_with(text, "your organization has disabled claude subscription access")
     then
       return true
     end
@@ -195,6 +196,7 @@ local ERROR_SUBTYPE_PATTERNS = {
   { kind = "auth",       prefix = "authentication failed" },
   { kind = "auth",       prefix = "unauthorized" },
   { kind = "auth",       prefix = "oauth failed" },
+  { kind = "auth",       prefix = "your organization has disabled claude subscription access" },
   { kind = "api",        prefix = "api error" },
   { kind = "api",        prefix = "request failed" },
 }
@@ -1840,29 +1842,23 @@ function M.classify(input)
 end
 
 function M.send_prompt(input)
-  -- Use bracketed paste explicitly. Claude Code v2.1+ enables bracketed
-  -- paste mode (`CSI ? 2004 h`) for its input box. Live builds can still
-  -- occasionally swallow the first Enter after bracketed paste, leaving
-  -- the prompt visibly editable and never starting the turn. Sending a
-  -- second Enter is the plugin-owned recovery: on the bad path it
-  -- submits the already-pasted text; on the normal path Claude is already
-  -- starting the turn and ignores the extra empty submit. Keeping this
-  -- in the plugin makes `adapter.send(send_prompt)` reliable for every
-  -- consumer, not just the `claude-stream` wrapper.
-  -- The generic `action.paste(...)` still exists for callers / plugins
+  -- Claude Code v2.1.150 can swallow bracketed paste in Chrome-enabled
+  -- interactive mode even though it advertises bracketed paste support.
+  -- Use raw text for the prompt path so the current TUI accepts the
+  -- input consistently. The generic `action.paste(...)` still exists
+  -- for callers / plugins
   --
   -- The leading Enter handles Claude Code 2.1.x's first-keypress
   -- interceptors (welcome panel, compact-launch view). On a clean
   -- input box Claude treats Enter on empty input as a no-op submit;
   -- on a welcome / interceptor screen it dismisses the overlay and
-  -- focuses the input box, so the bracketed paste that follows lands
-  -- in the right place. Without this leading Enter, callers had to
-  -- send their own Enter and synchronise on stability before pasting,
+  -- focuses the input box, so the typed prompt that follows lands in
+  -- the right place. Without this leading Enter, callers had to
+  -- send their own Enter and synchronise on stability before writing,
   -- which is fragile across machine speeds and Claude Code versions.
-  -- driving programs that have not opted into bracketed paste.
   --
-  -- Empty-prompt guard: an empty bracketed paste leaves Claude at
-  -- idle (the two Enters are no-ops on an empty input box), so do
+  -- Empty-prompt guard: empty text leaves Claude at
+  -- idle (the Enter is a no-op on an empty input box), so do
   -- NOT advance to the `prompt_submitted` intent. The classifier's
   -- mid-turn `thinking` branch keys off that intent; claiming a
   -- turn started when no actual prompt was submitted would lock the
@@ -1890,8 +1886,7 @@ function M.send_prompt(input)
     actions = {
       action.key("enter"),
       action.mark_transcript("turn_start"),
-      action.bracketed_paste(prompt),
-      action.key("enter"),
+      action.text(prompt),
       action.key("enter"),
     },
     last_intent = "prompt_submitted",

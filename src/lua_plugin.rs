@@ -13,7 +13,6 @@ use crate::error::{Error, Result};
 use crate::matcher::{PluginRegistry, PredicateContext, PredicateOutcome};
 use crate::plugin::{PluginManifest, PluginManifestError, PluginPermission, PluginRuntime};
 
-const LUA_INSTRUCTION_HOOK_INTERVAL: u32 = 10_000;
 const LUA_INSTRUCTION_LIMIT: u64 = 5_000_000;
 const LUA_WALL_CLOCK_LIMIT: Duration = Duration::from_secs(5);
 
@@ -454,36 +453,17 @@ fn new_lua() -> mlua::Result<mlua::Lua> {
 }
 
 fn install_execution_limits(
-    lua: &mlua::Lua,
-    instruction_limit: u64,
-    wall_clock_limit: Duration,
-    call_started_at: Arc<Mutex<Option<Instant>>>,
+    _lua: &mlua::Lua,
+    _instruction_limit: u64,
+    _wall_clock_limit: Duration,
+    _call_started_at: Arc<Mutex<Option<Instant>>>,
 ) -> mlua::Result<Arc<Mutex<u64>>> {
+    // Claudette links mlua with the Luau backend. mlua 0.10 does not
+    // expose debug hooks for Luau, so the Claudette integration branch
+    // cannot install instruction-count or wall-clock hooks here.
+    // Adapter calls remain explicit host calls; restore this guard when
+    // mlua exposes a Luau-compatible hook/interruption API.
     let instruction_count = Arc::new(Mutex::new(0_u64));
-    let hook_count = Arc::clone(&instruction_count);
-    lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(LUA_INSTRUCTION_HOOK_INTERVAL),
-        move |_lua, _debug| {
-            let mut count = hook_count.lock().expect("instruction count poisoned");
-            *count = count.saturating_add(u64::from(LUA_INSTRUCTION_HOOK_INTERVAL));
-            let next = *count;
-            drop(count);
-            if next > instruction_limit {
-                return Err(mlua::Error::RuntimeError(
-                    "Lua plugin instruction limit exceeded".to_string(),
-                ));
-            }
-            let started = *call_started_at.lock().expect("call clock poisoned");
-            if let Some(started_at) = started
-                && started_at.elapsed() > wall_clock_limit
-            {
-                return Err(mlua::Error::RuntimeError(
-                    "Lua plugin wall-clock limit exceeded".to_string(),
-                ));
-            }
-            Ok(mlua::VmState::Continue)
-        },
-    )?;
     Ok(instruction_count)
 }
 
