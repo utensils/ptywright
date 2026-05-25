@@ -692,6 +692,17 @@ local function is_tool_call_continuation_chrome(line)
   return false
 end
 
+local function is_completed_tool_progress_chrome_line(line)
+  local trimmed = trim(line)
+  if #trimmed < #CTRL_O_HINT or string.sub(trimmed, -#CTRL_O_HINT) ~= CTRL_O_HINT then
+    return false
+  end
+  if starts_with(trimmed, "⏺") then
+    trimmed = trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return trimmed:match("^[%a][%a%s]*%s+%d+%s+[%a_%-]+s?%s*%(ctrl%+o to expand%)$") ~= nil
+end
+
 local function is_horizontal_rule_line(line)
   local trimmed = trim(line)
   return trimmed ~= "" and trimmed:match("^[─━═]+$") ~= nil
@@ -704,6 +715,7 @@ local function is_structured_output_chrome_line(line)
   if is_progress_chrome_line(trimmed) then return true end
   if is_structured_tool_call_line(trimmed) then return true end
   if is_tool_call_continuation_chrome(trimmed) then return true end
+  if is_completed_tool_progress_chrome_line(trimmed) then return true end
   if starts_with(trimmed, "⎿") then return true end
   if trimmed == "(No output)" then return true end
   if starts_with(trimmed, "Allowed by auto mode classifier") then return true end

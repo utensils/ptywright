@@ -1955,6 +1955,41 @@ Could you remind me what we were working on?
 }
 
 #[test]
+fn classify_completed_turn_filters_completed_tool_progress_from_structured_output() {
+    let extension = claude_plugin();
+    let screen = "SMOKE_OK\n\n✻ Done for 4s\n\n❯ ";
+    let transcript = "\
+❯ Read README.md, then reply with exactly SMOKE_OK.
+
+Read 1 file (ctrl+o to expand)
+
+⏺ SMOKE_OK
+
+✻ Done for 4s
+
+❯ ";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        transcript,
+        101,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert_eq!(text, "SMOKE_OK");
+}
+
+#[test]
 fn classify_thinking_surfaces_partial_turn_text_from_transcript() {
     let extension = claude_plugin();
     let screen = "\
