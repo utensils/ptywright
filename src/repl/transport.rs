@@ -448,9 +448,11 @@ mod tests {
     use std::io::{PipeReader, PipeWriter, pipe};
     use std::sync::Arc;
 
+    type InprocessServer = (PipeReader, PipeWriter, std::thread::JoinHandle<()>);
+
     /// Build a pair of pipes wired up as: client → server → client.
     /// Returns `(client_read, client_write, server_thread)`.
-    fn spawn_inprocess_server() -> (PipeReader, PipeWriter, std::thread::JoinHandle<()>) {
+    fn spawn_inprocess_server() -> InprocessServer {
         let (client_to_server_r, client_to_server_w) = pipe().expect("pipe c→s");
         let (server_to_client_r, server_to_client_w) = pipe().expect("pipe s→c");
         let state = RpcServerState::new();
@@ -464,10 +466,7 @@ mod tests {
     /// [`RpcServerState`] so a test can mutate state on connection A
     /// and observe the effect on connection B — the exact shape of the
     /// cross-connection notification scenario the heartbeat fixes.
-    fn spawn_shared_inprocess_pair() -> (
-        (PipeReader, PipeWriter, std::thread::JoinHandle<()>),
-        (PipeReader, PipeWriter, std::thread::JoinHandle<()>),
-    ) {
+    fn spawn_shared_inprocess_pair() -> (InprocessServer, InprocessServer) {
         let state = RpcServerState::new();
 
         let (a_to_s_r, a_to_s_w) = pipe().expect("pipe a→s");

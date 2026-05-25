@@ -233,6 +233,11 @@ pub enum Signal {
 pub enum Action {
     /// Write text bytes to the PTY.
     Text(String),
+    /// Write text in small chunks, with a short delay between chunks.
+    ///
+    /// This is for TUIs that treat a large single raw write as pasted input
+    /// and collapse it visually, but still accept quickly typed text.
+    StreamText(StreamText),
     /// Send a named key.
     Key(Key),
     /// Paste text as raw bytes — identical wire shape to [`Action::Text`],
@@ -272,6 +277,23 @@ pub enum Action {
     /// [`HostMark`](crate::extension::HostMark) on the returned
     /// snapshot instead.
     MarkTranscript { label: String },
+}
+
+/// Parameters for [`Action::StreamText`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamText {
+    /// Text to write as ordinary terminal input bytes.
+    pub text: String,
+    /// Optional maximum Unicode scalar values per write.
+    ///
+    /// Values are clamped to `1..=1024`; the default is `64`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_chars: Option<usize>,
+    /// Optional delay between chunk writes, in milliseconds.
+    ///
+    /// Values above `100` are clamped to `100`; the default is `2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
 }
 
 #[cfg(test)]

@@ -237,7 +237,7 @@ mod tests {
         Arc::new(names.iter().copied().collect())
     }
 
-    fn kinds<'a>(line: &'a str, names: &[&'static str]) -> Vec<(Kind, String)> {
+    fn kinds(line: &str, names: &[&'static str]) -> Vec<(Kind, String)> {
         let wl = whitelist(names);
         scan(line, &wl)
             .into_iter()

@@ -21,7 +21,7 @@ use ptywright::extension::{
 use ptywright::matcher::Matcher;
 use ptywright::screen::{CursorState, ScreenSnapshot};
 use ptywright::target::TerminalSize;
-use ptywright::{Action, MatcherContext};
+use ptywright::{Action, MatcherContext, StreamText};
 
 const COMPLETED_TURN_STABLE_MS: u64 = 300;
 
@@ -68,6 +68,58 @@ fn classify_with_markers(
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
         markers,
         cursor,
+    };
+    extension.classify(&ctx).expect("classify via Lua plugin")
+}
+
+fn classify_with_transcript(
+    extension: &LuaExtension,
+    screen: &str,
+    transcript: &str,
+    sequence: u64,
+    last_intent: Option<&str>,
+    stable_ms: Option<u64>,
+) -> ExtensionStateSnapshot {
+    classify_with_transcript_and_markers(
+        extension,
+        TranscriptClassifyFixture {
+            screen,
+            transcript,
+            sequence,
+            last_intent,
+            stable_ms,
+            markers: &std::collections::BTreeMap::new(),
+            cursor: 0,
+        },
+    )
+}
+
+struct TranscriptClassifyFixture<'a> {
+    screen: &'a str,
+    transcript: &'a str,
+    sequence: u64,
+    last_intent: Option<&'a str>,
+    stable_ms: Option<u64>,
+    markers: &'a std::collections::BTreeMap<String, u64>,
+    cursor: u64,
+}
+
+fn classify_with_transcript_and_markers(
+    extension: &LuaExtension,
+    fixture: TranscriptClassifyFixture<'_>,
+) -> ExtensionStateSnapshot {
+    let (body_text, status_text) = split_status_bar(fixture.screen, STATUS_BAR_ROWS);
+    let ctx = ClassifyContext {
+        screen: fixture.screen,
+        body_text: &body_text,
+        status_text: &status_text,
+        transcript: fixture.transcript,
+        sequence: fixture.sequence,
+        last_intent: fixture.last_intent,
+        stable_ms: fixture.stable_ms,
+        completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+        markers: fixture.markers,
+        cursor: fixture.cursor,
     };
     extension.classify(&ctx).expect("classify via Lua plugin")
 }
@@ -233,15 +285,13 @@ fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
 }
 
 #[test]
-fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
+fn steer_plan_streams_text_without_setting_prompt_submitted_intent() {
     // Mid-turn steering injects a follow-up prompt while Claude is still
-    // thinking. The action shape is identical to `send_prompt` (bracketed
-    // paste + Enter) but `last_intent` MUST NOT flip to `prompt_submitted`
-    // — that's the marker the classifier uses to decide a `completed_turn`
-    // can fire when the screen settles. Treating steering as the first
-    // half of a fresh turn would cause `adapter.wait` to mistake a
-    // stable-thinking screen for "turn complete" the moment Claude is
-    // just slow on the original turn.
+    // thinking. It uses the same streamed-text path as prompt submission
+    // so Chrome-enabled Claude Code sees real typed input instead of a
+    // collapsed paste placeholder. `last_intent` MUST NOT flip to
+    // `prompt_submitted` — that's the marker the classifier uses to decide
+    // a `completed_turn` can fire when the screen settles.
     let extension = claude_plugin();
     let plan = plan(
         &extension,
@@ -252,7 +302,11 @@ fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
     assert_eq!(
         plan.actions,
         vec![
-            Action::BracketedPaste("actually use /tmp".to_string()),
+            Action::StreamText(StreamText {
+                text: "actually use /tmp".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -272,19 +326,17 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
     //      so callers can later slice the per-turn output via
     //      `Session::transcript_slice`. The matching `turn_end` mark
     //      fires from the classifier's `completed_turn` branch.
-    //   3. BracketedPaste(prompt) — Claude Code v2.1+ requires the
-    //      bracketed wrapper so the trailing Enter is not absorbed into
-    //      the paste tokeniser on longer prompts.
+    //   3. StreamText(prompt) — Claude Code v2.1.150 can swallow bracketed
+    //      paste in Chrome-enabled interactive mode, while huge raw writes
+    //      can render as collapsed paste placeholders.
     //   4. Enter — submit the now-populated input box.
     //   5. Enter — recovery submit for Claude Code builds that accept
-    //      the bracketed paste but swallow the first trailing Enter,
-    //      leaving the prompt text editable and the turn never started.
+    //      the streamed text but leave it editable after the first trailing
+    //      Enter.
     //
-    // Without action #1, the bracketed paste's CSI-200~ open marker
-    // gets consumed by Claude's first-keypress interceptor on a fresh
-    // launch, the rest of the paste lands as input that's then
-    // truncated, and the trailing Enter submits a partial prompt or
-    // nothing at all. Locking the five-action sequence here so a
+    // Without action #1, the text can land in Claude's first-keypress
+    // interceptor on a fresh launch instead of the input box. Locking
+    // the five-action sequence here so a
     // future plugin edit can't silently regress.
     let extension = claude_plugin();
     let plan = plan(
@@ -300,7 +352,11 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
             Action::MarkTranscript {
                 label: "turn_start".to_string()
             },
-            Action::BracketedPaste("hello Claude".to_string()),
+            Action::StreamText(StreamText {
+                text: "hello Claude".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
             Action::Key(Key::Enter),
         ]
@@ -331,7 +387,7 @@ fn expand_plan_sends_ctrl_o_with_no_intent() {
 /// `/help` panel, plain back-at-idle for `/btw` / `/clear`, etc.)
 /// instead of being lied to about a turn in flight.
 #[test]
-fn slash_command_pastes_token_and_presses_enter_without_intent() {
+fn slash_command_streams_token_and_presses_enter_without_intent() {
     let extension = claude_plugin();
 
     // Bare name — plugin adds the leading slash.
@@ -339,7 +395,11 @@ fn slash_command_pastes_token_and_presses_enter_without_intent() {
     assert_eq!(
         bare.actions,
         vec![
-            Action::BracketedPaste("/btw".to_string()),
+            Action::StreamText(StreamText {
+                text: "/btw".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -353,7 +413,11 @@ fn slash_command_pastes_token_and_presses_enter_without_intent() {
     assert_eq!(
         prefixed.actions,
         vec![
-            Action::BracketedPaste("/btw".to_string()),
+            Action::StreamText(StreamText {
+                text: "/btw".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -364,7 +428,31 @@ fn slash_command_pastes_token_and_presses_enter_without_intent() {
     assert_eq!(
         via_name.actions,
         vec![
-            Action::BracketedPaste("/usage".to_string()),
+            Action::StreamText(StreamText {
+                text: "/usage".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
+            Action::Key(Key::Enter),
+        ]
+    );
+
+    // Startup probes can opt into a leading Enter to clear Claude Code's
+    // first-launch welcome interceptor before typing the slash token.
+    let startup = plan(
+        &extension,
+        "slash_command",
+        json!({ "name": "usage", "dismiss_welcome": true }),
+    );
+    assert_eq!(
+        startup.actions,
+        vec![
+            Action::Key(Key::Enter),
+            Action::StreamText(StreamText {
+                text: "/usage".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -907,6 +995,12 @@ fn wait_turn_matcher_includes_v2_trust_dialog_anchors() {
     assert!(
         boundary_matchers
             .iter()
+            .any(|matcher| matcher == &Matcher::ContainsText("Welcome back".to_string())),
+        "wait matcher missing welcome-screen anchor; boundary matchers were {boundary_matchers:?}",
+    );
+    assert!(
+        boundary_matchers
+            .iter()
             .any(|matcher| matcher == &Matcher::ContainsText("Select model".to_string()))
     );
     assert!(boundary_matchers.iter().any(|matcher| matcher
@@ -1160,6 +1254,38 @@ fn classifier_releases_cancelling_once_screen_settles() {
 }
 
 #[test]
+fn classifier_releases_stale_cancelling_on_plain_idle_state_poll() {
+    // `adapter.state`/`try_state` calls do not provide `stable_ms`. A
+    // stale `last_intent = cancelling` must not poison every later state
+    // read once the idle prompt is visible, or app integrations cannot
+    // send the next prompt after an interrupt.
+    let extension = claude_plugin();
+    let post_cancel_idle = "❯ count to 10\n\n────────\n❯\n";
+    let state = classify_state(&extension, post_cancel_idle, 44, Some("cancelling"), None);
+
+    assert_ne!(
+        state.state, "cancelling",
+        "plain idle state polling must release stale cancelling intent; got evidence {}",
+        state.evidence,
+    );
+}
+
+#[test]
+fn classifier_holds_cancelling_on_plain_active_state_poll() {
+    let extension = claude_plugin();
+    let active_cancel_screen = "❯ count to 10\n\n✽ Interrupting…\n\nesc to interrupt\n";
+    let state = classify_state(
+        &extension,
+        active_cancel_screen,
+        45,
+        Some("cancelling"),
+        None,
+    );
+
+    assert_eq!(state.state, "cancelling");
+}
+
+#[test]
 fn classifier_detects_completed_turn_after_prompt_submission() {
     let extension = claude_plugin();
     let state = classify_state(
@@ -1309,7 +1435,46 @@ fn classifier_completed_turn_paths() {
         "completed screen must not require the answer bullet to remain visible"
     );
 
-    // (h) Premature completed_turn regression — a screen where a
+    // (h) Live Claude Code footer notices below the prompt are trailing
+    // chrome, not post-marker content. Claudette saw this exact shape:
+    // the answer and completion marker were visible, but rotating footer
+    // notices (`/mcp`, `/chrome`) kept the classifier stuck in `thinking`.
+    let completed_with_live_footer_notice = classify_state(
+        &extension,
+        " ▐▛███▜▌   Claude Code v2.1.150\n\
+▝▜█████▛▘  Sonnet 4.6 · Claude Max\n\
+  ▘▘ ▝▝    ~/.claudette/workspaces/claudex/brazen-cedar\n\n\
+❯ ping\n\n\
+⏺ pong\n\n\
+✻ Baked for 4s\n\n\
+────────────────────────────────────────────────────────────────────────────────\n\
+❯\u{00a0}\n\
+────────────────────────────────────────────────────────────────────────────────\n\
+  jamesbrink @ halcyon workspaces/claudex/brazen-cedar  james-brink/project-i…\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n\
+                                       2 claude.ai connectors need auth · /mcp",
+        54,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_with_live_footer_notice.state, "completed_turn",
+        "footer notices below a valid completion marker must not keep the turn in thinking"
+    );
+
+    let completed_with_chrome_footer_notice = classify_state(
+        &extension,
+        "❯ ping\n\n⏺ pong\n\n✻ Baked for 4s\n\n❯\u{00a0}\n\nClaude in Chrome enabled · /chrome",
+        57,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_with_chrome_footer_notice.state, "completed_turn",
+        "slash-command footer notices such as /chrome must be accepted after the marker"
+    );
+
+    // (i) Premature completed_turn regression — a screen where a
     // `✻ <Verb> for <N>` line is present (from some parser-captured
     // intermediate render or a transient Claude rendering) but tool
     // progress is STILL on screen below it must not fire
@@ -1330,7 +1495,7 @@ fn classifier_completed_turn_paths() {
         "stray mid-turn marker followed by tool-progress content must NOT fire completed_turn"
     );
 
-    // (i) The `(ctrl+o to expand)` hint is itself a mid-turn signal
+    // (j) The `(ctrl+o to expand)` hint is itself a mid-turn signal
     // (Claude Code's collapsible tool-progress rows render it). With
     // NO marker but tool progress visible, classifier must NOT fire
     // completed_turn — even though `⏺` isn't a spinner glyph and the
@@ -1446,6 +1611,24 @@ fn classifier_detects_usage_screen_as_completed_turn() {
 
     assert_eq!(state.state, "completed_turn");
     assert_eq!(state.evidence, "stable usage screen detected");
+    assert_eq!(
+        state
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/usage/limits/current session/percent_used"))
+            .and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        state
+            .metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata.pointer("/usage/limits/current week (all models)/percent_used")
+            })
+            .and_then(serde_json::Value::as_i64),
+        Some(98)
+    );
 }
 
 #[test]
@@ -1453,7 +1636,7 @@ fn approve_with_dialog_id_succeeds_after_matching_classify() {
     // Walk the full classifier → approve dispatch so the module-level
     // `_current_dialog_id` is set by classify before the intent reads
     // it back. The fixture under plugins/claude-code/fixtures/permission.txt
-    // hashes to `115803ed` (locked in permission.expected.json), so
+    // hashes to `69b9f3d0` (locked in permission.expected.json), so
     // passing that id through approve must succeed.
     let extension = claude_plugin();
     let screen = std::fs::read_to_string(
@@ -1678,6 +1861,365 @@ fn classify_completed_turn_requests_turn_end_marker_and_surfaces_transcript_meta
         .expect("metadata.transcript must be populated");
     assert_eq!(transcript_md["turn_start"], 100);
     assert_eq!(transcript_md["turn_end"], 500);
+
+    let turn = metadata
+        .get("turn")
+        .expect("metadata.turn must be populated for structured output");
+    assert_eq!(
+        turn["text"], "Done. The tests pass.",
+        "completed turns should expose assistant text without Claude Code TUI chrome"
+    );
+}
+
+#[test]
+fn classify_completed_turn_prefers_full_transcript_for_structured_output() {
+    let extension = claude_plugin();
+    let screen = "final visible tail only\n\n✻ Done for 37s\n\n❯ ";
+    let transcript = "\
+❯ Explore this project and tell me about it
+
+⏺ First section
+
+This is the beginning that scrolled out of the viewport.
+
+## What it does
+
+- One
+- Two
+
+✻ Done for 37s
+
+❯ ";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        transcript,
+        99,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert!(text.contains("First section"));
+    assert!(text.contains("This is the beginning"));
+    assert!(text.contains("## What it does"));
+    assert!(!text.contains("final visible tail only"));
+}
+
+#[test]
+fn classify_completed_turn_filters_tool_status_from_structured_output() {
+    let extension = claude_plugin();
+    let screen = "Could you remind me what we were working on?\n\n✻ Done for 28s\n\n❯ ";
+    let transcript = "\
+❯ continue
+Recalling
+Recalling 1 memory…
+⎿  (No output)
+⎿  Allowed by auto mode classifier Bash(git -C /tmp/project log main..branch --oneline)
+⎿  (No output)
+The branch is identical to main — no commits ahead.
+Could you remind me what we were working on?
+✻ Done for 28s
+
+❯ ";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        transcript,
+        100,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert_eq!(
+        text,
+        "The branch is identical to main — no commits ahead.\nCould you remind me what we were working on?"
+    );
+}
+
+#[test]
+fn classify_completed_turn_filters_completed_tool_progress_from_structured_output() {
+    let extension = claude_plugin();
+    let screen = "SMOKE_OK\n\n✻ Done for 4s\n\n❯ ";
+    let transcript = "\
+❯ Read README.md, then reply with exactly SMOKE_OK.
+
+Read 1 file (ctrl+o to expand)
+
+⏺ SMOKE_OK
+
+✻ Done for 4s
+
+❯ ";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        transcript,
+        101,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert_eq!(text, "SMOKE_OK");
+}
+
+#[test]
+fn classify_thinking_surfaces_partial_turn_text_from_transcript() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ summarize
+
+⏺ Searching for 1 pattern, reading 2 files… (ctrl+o to expand)
+
+The project is a Tauri app.
+It has a Rust backend
+
+· Meandering… (12s · ↓ 100 tokens)";
+    let transcript = "\
+❯ summarize
+Read(src/lib.rs)
+Running...
+
+The project is a Tauri app.
+It has a Rust backend";
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 0);
+
+    let snapshot = classify_with_transcript_and_markers(
+        &extension,
+        TranscriptClassifyFixture {
+            screen,
+            transcript,
+            sequence: 101,
+            last_intent: Some("prompt_submitted"),
+            stable_ms: None,
+            markers: &markers,
+            cursor: transcript.chars().count() as u64,
+        },
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured partial text");
+    assert_eq!(
+        partial,
+        "The project is a Tauri app.\nIt has a Rust backend"
+    );
+}
+
+#[test]
+fn classify_thinking_strips_terminal_controls_from_partial_turn_text() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ summarize
+
+The project is a Tauri app.
+It has a Rust backend
+
+· Meandering… (12s · ↓ 100 tokens)";
+    let transcript = "\
+\u{1b}[?2026h\u{1b}[K\r❯ summarize
+\u{1b}[2C\u{1b}[3A\rThe project is a Tauri app.\u{1b}[K
+It has a Rust backend";
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 0);
+
+    let snapshot = classify_with_transcript_and_markers(
+        &extension,
+        TranscriptClassifyFixture {
+            screen,
+            transcript,
+            sequence: 102,
+            last_intent: Some("prompt_submitted"),
+            stable_ms: None,
+            markers: &markers,
+            cursor: transcript.chars().count() as u64,
+        },
+    );
+
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured partial text");
+    assert_eq!(
+        partial,
+        "The project is a Tauri app.\nIt has a Rust backend"
+    );
+}
+
+#[test]
+fn classify_thinking_omits_wrapped_prompt_echo_from_partial_turn_text() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Use 2 Explore agents to inspect this project briefly. Stream progress
+  normally, summarize in two bullets, and end with exactly SMOKE_AGENT_OK.
+────────────────────────────────────────────────────────────────────────────────
+
+The first useful assistant line.";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        105,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured partial text");
+    assert_eq!(partial, "The first useful assistant line.");
+}
+
+#[test]
+fn classify_thinking_surfaces_visible_tool_metadata() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Explore this project using agents
+
+⎿ Read(mcp_nixos/sources/store.py)
+  Bash(head -50 /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-corn
+       flower/mcp_nixos/sources/home_manager.py)
+  Running...
+  Bash(head -80 /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-corn
+       flower/mcp_nixos/sources/wiki.py)
+  Running...
+  ... +22 tool uses (ctrl+o to expand)
+
+· Meandering… (34s · ↓ 1.3k tokens)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        102,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let tools = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .expect("visible tools");
+    assert_eq!(tools.len(), 3);
+    assert_eq!(tools[0]["name"], "Read");
+    assert_eq!(tools[0]["input"]["file_path"], "mcp_nixos/sources/store.py");
+    assert_eq!(tools[1]["name"], "Bash");
+    assert_eq!(tools[1]["status"], "running");
+    assert_eq!(
+        tools[1]["input"]["command"],
+        "head -50 /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-corn flower/mcp_nixos/sources/home_manager.py"
+    );
+}
+
+#[test]
+fn classify_thinking_surfaces_explore_agents_as_agent_metadata() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Explore this project using agents
+
+⎿ Bash(Running 2 Explore agents…)
+  Running...
+  Bash(Running 3 Explore agents…)
+  Running...
+
+· Meandering… (34s · ↓ 1.3k tokens)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        103,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let tools = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .expect("visible tools");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["name"], "Agent");
+    assert_eq!(tools[0]["summary"], "Explore agents");
+    assert_eq!(tools[0]["status"], "running");
+    assert_eq!(tools[0]["input"]["description"], "Explore agents");
+    assert_eq!(tools[0]["input"]["count"], 2);
+    assert_eq!(tools[1]["name"], "Agent");
+    assert_eq!(tools[1]["input"]["count"], 3);
+}
+
+#[test]
+fn classify_thinking_surfaces_finished_explore_agents_as_completed_agent() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Explore this project using agents
+
+⏺ 3 Explore agents finished
+
+· Meandering… (2m 31s)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        104,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    let tools = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .expect("visible tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "Agent");
+    assert_eq!(tools[0]["summary"], "Explore agents");
+    assert_eq!(tools[0]["status"], "completed");
+    assert_eq!(tools[0]["input"]["count"], 3);
 }
 
 #[test]
@@ -1784,6 +2326,62 @@ fn extension_handle_applies_plan_driven_mark_transcript_action() {
     assert!(
         handle.session().transcript_marker("turn_start").is_some(),
         "send_prompt plan must have stamped turn_start via Action::MarkTranscript"
+    );
+
+    let _ = handle.session().kill();
+}
+
+/// Drive `send`, `wait`, and `classify` with an active TRACE-level
+/// `tracing` subscriber so the macro arms in `ExtensionHandle` evaluate
+/// their format arguments. Without an installed subscriber the
+/// `tracing::debug!` / `tracing::trace!` macros short-circuit before
+/// touching their `%expr` / `?expr` fields, leaving coverage gaps even
+/// when every public method is exercised.
+///
+/// Uses the built-in claude-code plugin to drive the generic surface —
+/// the intent names (`dismiss_welcome`, `wait_cancel_settled_matcher`)
+/// are the closest no-op-shaped probes the plugin exposes, but the host
+/// code under test is plugin-agnostic.
+#[test]
+#[cfg(unix)]
+fn extension_handle_tracing_macros_evaluate_for_send_wait_and_classify() {
+    use ptywright::session::Session;
+    use ptywright::target::Target;
+    use tracing::Level;
+    use tracing_subscriber::FmtSubscriber;
+
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::TRACE)
+        .with_writer(std::io::sink)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // `sleep 30` keeps the PTY alive long enough for the three host
+    // calls without writing anything; classify sees an empty screen and
+    // screen_stable(0) resolves on the first poll.
+    let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+        .expect("spawn /bin/sh sleep");
+    let extension = claude_plugin();
+    let mut handle = ExtensionHandle::start(Box::new(extension), session, 0);
+
+    // classify path — covers the `tracing::trace!` macro at the bottom
+    // of `ExtensionHandle::classify`.
+    let _ = handle.state();
+
+    // send path — `dismiss_welcome` is a pure key-press plan, no PTY
+    // state dependencies. Covers the `tracing::debug!` macro in `send`.
+    handle
+        .send("dismiss_welcome", json!({}))
+        .expect("dismiss_welcome send");
+
+    // wait path — `wait_cancel_settled_matcher` with
+    // `completed_turn_stable_ms = 0` returns `Matcher::ScreenStable(0)`,
+    // which resolves quickly on an idle PTY. Covers the
+    // `tracing::debug!` macro in `wait_inner` and re-exercises classify.
+    let _ = handle.wait(
+        "wait_cancel_settled_matcher",
+        json!({"completed_turn_stable_ms": 0}),
+        Duration::from_secs(2),
     );
 
     let _ = handle.session().kill();

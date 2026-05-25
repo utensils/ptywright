@@ -72,7 +72,7 @@ pub struct SessionExitStatus {
 ///
 /// Pair with `wait_for_cancellable` when you need to break out of a
 /// long-running wait from another thread or RPC connection (e.g.
-/// claudette stopping a turn from its UI while ptywright is still
+/// a GUI client stopping a turn from its UI while ptywright is still
 /// waiting for the classifier's turn-boundary anchor to fire).
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
@@ -415,6 +415,7 @@ impl Session {
     pub fn send(&self, action: Action) -> Result<()> {
         match action {
             Action::Text(text) | Action::Paste(text) => self.write_all(text.as_bytes()),
+            Action::StreamText(text) => self.write_stream_text(&text),
             Action::BracketedPaste(text) => self.write_bracketed_paste(text.as_bytes()),
             Action::Key(key) => self.send_key(key),
             Action::Resize(size) => self.resize(size),
@@ -442,6 +443,31 @@ impl Session {
     /// rather than absorbed into the paste tokeniser.
     fn write_bracketed_paste(&self, bytes: &[u8]) -> Result<()> {
         self.write_all(&bracketed_paste_payload(bytes))
+    }
+
+    fn write_stream_text(&self, text: &crate::StreamText) -> Result<()> {
+        let chunk_chars = text.chunk_chars.unwrap_or(64).clamp(1, 1024);
+        let delay = std::time::Duration::from_millis(text.delay_ms.unwrap_or(2).min(100));
+        let mut chunk = String::new();
+        let mut chunk_len = 0usize;
+
+        for ch in text.text.chars() {
+            chunk.push(ch);
+            chunk_len += 1;
+            if chunk_len >= chunk_chars {
+                self.write_all(chunk.as_bytes())?;
+                chunk.clear();
+                chunk_len = 0;
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+
+        if !chunk.is_empty() {
+            self.write_all(chunk.as_bytes())?;
+        }
+        Ok(())
     }
 }
 
@@ -679,7 +705,7 @@ impl Session {
     /// Graceful-then-forceful shutdown: send [`Signal::Term`], poll for the
     /// child up to `grace`, then [`Signal::Kill`] if still running. Returns
     /// the observed [`SessionExitStatus`] either way. Mirrors the SIGTERM →
-    /// poll → SIGKILL ladder that consumers like claudette build manually.
+    /// poll → SIGKILL ladder that GUI/RPC consumers otherwise build manually.
     pub fn terminate(&self, grace: Duration) -> Result<SessionExitStatus> {
         // Best-effort SIGTERM. If the platform rejects it (Windows for
         // non-Term/Kill/Int variants is impossible here since we're
@@ -988,6 +1014,68 @@ mod tests {
         assert!(
             !transcript.contains("\x1b[200~"),
             "Action::Paste must not emit bracketed-paste markers: {transcript:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_stream_text_writes_raw_text_without_paste_markers() {
+        let target =
+            Target::new("/bin/sh").args(["-lc", "read line; printf 'GOT[%s]done' \"$line\""]);
+        let session = Session::spawn(SessionConfig::new(target)).expect("spawn shell");
+        session
+            .send(Action::StreamText(crate::StreamText {
+                text: "plain".into(),
+                chunk_chars: Some(2),
+                delay_ms: Some(0),
+            }))
+            .expect("send streamed text");
+        session.send(Action::Key(Key::Enter)).expect("send enter");
+        let result = session
+            .wait_for(
+                &Matcher::ContainsText("GOT[plain]done".into()),
+                Duration::from_secs(5),
+            )
+            .expect("wait for done");
+        let transcript = result.transcript_tail;
+        assert!(
+            !transcript.contains("\x1b[200~"),
+            "Action::StreamText must not emit bracketed-paste markers: {transcript:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_stream_text_round_trips_large_prompt_in_order() {
+        let target = Target::new("/bin/sh").args([
+            "-lc",
+            "stty raw -echo min 1 time 0; printf READY; data=$(dd bs=1 count=2058 2>/dev/null); tail=$(printf '%s' \"$data\" | sed 's/^.*\\(..........\\)$/\\1/'); printf 'LEN[%s]TAIL[%s]done' \"${#data}\" \"$tail\"",
+        ]);
+        let session = Session::spawn(SessionConfig::new(target)).expect("spawn shell");
+        let prompt = format!("{}0123456789", "x".repeat(2048));
+        session
+            .wait_for(
+                &Matcher::ContainsText("READY".into()),
+                Duration::from_secs(5),
+            )
+            .expect("wait for raw reader");
+        session
+            .send(Action::StreamText(crate::StreamText {
+                text: prompt,
+                chunk_chars: Some(17),
+                delay_ms: Some(0),
+            }))
+            .expect("send streamed text");
+        let result = session
+            .wait_for(
+                &Matcher::ContainsText("LEN[2058]TAIL[0123456789]done".into()),
+                Duration::from_secs(5),
+            )
+            .expect("wait for done");
+        assert!(
+            !result.transcript_tail.contains("\x1b[200~"),
+            "Action::StreamText must not emit bracketed-paste markers: {:?}",
+            result.transcript_tail
         );
     }
 

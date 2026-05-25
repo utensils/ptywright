@@ -7,6 +7,9 @@
     "status": {
       "model": "Sonnet 4.6",
       "permission_mode": "auto"
+    },
+    "turn": {
+      "text": "You can sign in to Claude in a few ways:\n1. Log in to Claude via the OAuth flow.\n2. Set the API key as an environment variable.\n3. Use SSO via your organization.\nWhen the TUI loads it shows \"Log in to Claude Code\" and offers\n\"Continue with Anthropic\" — pressing Enter then opens the browser\nto https://example.com/auth (paraphrased)."
     }
   }
 }

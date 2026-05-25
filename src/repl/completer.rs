@@ -1278,7 +1278,7 @@ mod tests {
             "kwarg position must not surface quoted plugin names; got {values:?}"
         );
         assert!(
-            !values.iter().any(|v| *v == "claude-code"),
+            !values.contains(&"claude-code"),
             "kwarg position must not surface bare plugin names; got {values:?}"
         );
     }
@@ -1313,7 +1313,7 @@ mod tests {
             let suggestions = completer.complete(line, line.len());
             let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
             assert!(
-                values.iter().any(|v| *v == expected),
+                values.contains(&expected),
                 "expected `{expected}` from `{line}`, got {values:?}",
             );
         }
@@ -1327,7 +1327,7 @@ mod tests {
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert!(
-            values.iter().any(|v| *v == "list()"),
+            values.contains(&"list()"),
             "expected `list()`, got {values:?}",
         );
         // screen.<TAB> → snapshot() in the set
@@ -1335,7 +1335,7 @@ mod tests {
         let suggestions = completer.complete(line, line.len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert!(
-            values.iter().any(|v| *v == "snapshot()"),
+            values.contains(&"snapshot()"),
             "expected `snapshot()`, got {values:?}",
         );
     }
@@ -1349,11 +1349,11 @@ mod tests {
         let suggestions = completer.complete("session.sp", "session.sp".len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert!(
-            values.iter().any(|v| *v == "spawn"),
+            values.contains(&"spawn"),
             "expected bare `spawn`, got {values:?}",
         );
         assert!(
-            !values.iter().any(|v| *v == "spawn()"),
+            !values.contains(&"spawn()"),
             "non-nullary callables must not auto-`()`; got {values:?}",
         );
     }
@@ -1366,11 +1366,11 @@ mod tests {
         let suggestions = completer.complete("transcript.", "transcript.".len());
         let values: Vec<&str> = suggestions.iter().map(|s| s.value.as_str()).collect();
         assert!(
-            values.iter().any(|v| *v == "snapshot"),
+            values.contains(&"snapshot"),
             "expected bare `snapshot`, got {values:?}",
         );
         assert!(
-            !values.iter().any(|v| *v == "snapshot()"),
+            !values.contains(&"snapshot()"),
             "transcript.snapshot takes opts; must not auto-`()`; got {values:?}",
         );
     }

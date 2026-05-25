@@ -9,7 +9,7 @@
       "permission_mode": "auto"
     },
     "turn": {
-      "text": "4"
+      "text": "/tmp/output\n~/project"
     }
   }
 }

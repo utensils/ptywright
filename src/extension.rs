@@ -460,6 +460,15 @@ impl ExtensionHandle {
     pub fn send(&mut self, intent: &str, params: Value) -> Result<ExtensionStateSnapshot> {
         let params = ensure_params_object(params);
         let plan = self.extension.plan(intent, &params)?;
+        tracing::debug!(
+            target: "ptywright::extension",
+            plugin = %self.extension.manifest().name,
+            intent,
+            action_count = plan.actions.len(),
+            actions = ?action_kinds(&plan.actions),
+            last_intent = ?plan.last_intent,
+            "ptywright extension intent plan"
+        );
         self.apply_plan(&plan, intent)?;
         let state = self.try_state()?;
         self.broadcast_state(&state);
@@ -525,6 +534,18 @@ impl ExtensionHandle {
             result.sequence,
             Some(stable_ms),
         )?;
+        tracing::debug!(
+            target: "ptywright::extension",
+            plugin = %self.extension.manifest().name,
+            intent,
+            state = %state.state,
+            evidence = %state.evidence,
+            sequence = state.sequence,
+            stable_ms,
+            metadata_keys = ?metadata_keys(state.metadata.as_ref()),
+            matched = ?result.outcome,
+            "ptywright extension wait matched"
+        );
         self.broadcast_state(&state);
         Ok((state, result.outcome))
     }
@@ -532,7 +553,7 @@ impl ExtensionHandle {
     /// Atomic [`send`](Self::send) followed by [`wait`](Self::wait) using a
     /// single mutex-held turn.
     ///
-    /// `claudette` and similar consumers traditionally hand-rolled
+    /// GUI and RPC consumers traditionally hand-rolled
     /// "submit prompt, then wait for the turn to complete" by chaining
     /// `adapter.send` and `adapter.wait`. In a multi-client setup another
     /// connection could slip a competing intent between those two calls.
@@ -683,6 +704,20 @@ impl ExtensionHandle {
             cursor,
         };
         let snapshot = self.extension.classify(&ctx)?;
+        tracing::trace!(
+            target: "ptywright::extension",
+            plugin = %self.extension.manifest().name,
+            state = %snapshot.state,
+            evidence = %snapshot.evidence,
+            sequence = snapshot.sequence,
+            last_intent = ?ctx.last_intent,
+            stable_ms = ?ctx.stable_ms,
+            screen_len = screen.len(),
+            transcript_len = transcript.len(),
+            metadata_keys = ?metadata_keys(snapshot.metadata.as_ref()),
+            host_marks = ?snapshot.host_marks,
+            "ptywright extension classified state"
+        );
         self.apply_host_marks(&snapshot.host_marks);
         Ok(snapshot)
     }
@@ -696,6 +731,32 @@ impl ExtensionHandle {
             self.session.mark_transcript(&mark.label);
         }
     }
+}
+
+fn action_kinds(actions: &[Action]) -> Vec<&'static str> {
+    actions
+        .iter()
+        .map(|action| match action {
+            Action::Text(_) => "text",
+            Action::StreamText(_) => "stream_text",
+            Action::Key(_) => "key",
+            Action::Paste(_) => "paste",
+            Action::BracketedPaste(_) => "bracketed_paste",
+            Action::Resize(_) => "resize",
+            Action::Interrupt => "interrupt",
+            Action::Eof => "eof",
+            Action::Signal(_) => "signal",
+            Action::Kill => "kill",
+            Action::MarkTranscript { .. } => "mark_transcript",
+        })
+        .collect()
+}
+
+fn metadata_keys(metadata: Option<&serde_json::Value>) -> Vec<String> {
+    metadata
+        .and_then(serde_json::Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Coerce intent params into a JSON object so plugin handlers can index
@@ -1029,5 +1090,68 @@ mod tests {
             merged,
             serde_json::json!({"pattern": "ready", "completed_turn_stable_ms": 300}),
         );
+    }
+
+    #[test]
+    fn action_kinds_labels_every_action_variant() {
+        // The classifier-tracing instrumentation in `send` records the
+        // shape of each plan it executes. If a new `Action` variant lands
+        // without a corresponding arm here, the trace line silently
+        // misclassifies it, hiding bugs in plugin authoring. Exhaustive
+        // match on the input keeps this test honest against future
+        // additions to the enum.
+        let actions = vec![
+            Action::Text("t".into()),
+            Action::StreamText(crate::StreamText {
+                text: "s".into(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
+            Action::Key(crate::action::Key::Enter),
+            Action::Paste("p".into()),
+            Action::BracketedPaste("b".into()),
+            Action::Resize(crate::target::TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }),
+            Action::Interrupt,
+            Action::Eof,
+            Action::Signal(crate::action::Signal::Term),
+            Action::Kill,
+            Action::MarkTranscript { label: "m".into() },
+        ];
+        assert_eq!(
+            action_kinds(&actions),
+            vec![
+                "text",
+                "stream_text",
+                "key",
+                "paste",
+                "bracketed_paste",
+                "resize",
+                "interrupt",
+                "eof",
+                "signal",
+                "kill",
+                "mark_transcript",
+            ],
+        );
+    }
+
+    #[test]
+    fn metadata_keys_returns_object_keys_or_empty() {
+        // Tracing emits the inventory of keys, not values, so PII / large
+        // strings don't leak into rotated log files. Anchor both the
+        // happy path and the None / non-object cases that fall back to
+        // an empty list.
+        assert!(metadata_keys(None).is_empty());
+        assert!(metadata_keys(Some(&serde_json::json!("scalar"))).is_empty());
+        let mut keys = metadata_keys(Some(
+            &serde_json::json!({"usage": 1, "permission": {}, "status": null}),
+        ));
+        keys.sort();
+        assert_eq!(keys, vec!["permission", "status", "usage"]);
     }
 }

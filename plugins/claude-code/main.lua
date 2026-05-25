@@ -162,6 +162,7 @@ local function has_error_indicator(screen)
       or starts_with(text, "authentication failed")
       or starts_with(text, "unauthorized")
       or starts_with(text, "oauth failed")
+      or starts_with(text, "your organization has disabled claude subscription access")
     then
       return true
     end
@@ -195,12 +196,13 @@ local ERROR_SUBTYPE_PATTERNS = {
   { kind = "auth",       prefix = "authentication failed" },
   { kind = "auth",       prefix = "unauthorized" },
   { kind = "auth",       prefix = "oauth failed" },
+  { kind = "auth",       prefix = "your organization has disabled claude subscription access" },
   { kind = "api",        prefix = "api error" },
   { kind = "api",        prefix = "request failed" },
 }
 
 -- Classify the visible error banner into a discrete subtype so
--- consumers (claudette in particular) can pick a retry / surface /
+-- consumers can pick a retry / surface /
 -- escalation policy without re-grepping the screen. Returns
 -- `{ error = { kind, message?, retry_after_s? } }` or nil when no
 -- banner is present.
@@ -426,6 +428,7 @@ local TURN_COMPLETION_GLYPH = "✻"
 -- relying on Lua's hoisting (which only works for the function names,
 -- not the values they close over).
 local CTRL_O_HINT = "(ctrl+o to expand)"
+local MAX_VISIBLE_TOOLS = 23 -- Mirrors Claude Code's visible tool-panel cap.
 
 -- Lines we expect to find AFTER a real end-of-turn `✻ <Verb> for <N>`
 -- marker on a settled screen:
@@ -468,11 +471,15 @@ local function is_post_marker_trailing_line(line)
   -- in `thinking`:
   --   * `⏵⏵ … on …` — permission-mode hint glyph.
   --   * `[<word(s)> <digit>.<digit>]` — model bracket with version.
-  --   * `<token> @ <token>` followed by a `[<word> <digit>]` later
-  --     on the same line (the user@host + model layout).
+  --   * `<token> @ <token>` (the user@host + cwd/repo layout; newer
+  --     Claude Code builds may move the model to a separate footer row).
+  --   * status notices that end in a slash-command affordance, e.g.
+  --     `1 MCP server failed · /mcp` or
+  --     `Claude in Chrome enabled · /chrome`.
   if t:find("⏵⏵") then return true end
   if t:find("%[%u%a-%s%d+%.%d+%]") then return true end
-  if t:find("%S+%s*@%s*%S+") and t:find("%[") and t:find("%]") then return true end
+  if t:find("%S+%s+@%s+%S+") then return true end
+  if t:find("·%s*/[%w_-]+%s*$") then return true end
   return false
 end
 
@@ -620,6 +627,431 @@ local function has_turn_completion_marker(text)
     end
   end
   return false
+end
+
+local function is_completion_marker_line(line)
+  local trimmed = trim(line)
+  return string.sub(trimmed, 1, #TURN_COMPLETION_GLYPH) == TURN_COMPLETION_GLYPH
+    and not line_ends_with_ellipsis(trimmed)
+    and trimmed:find(" for %d") ~= nil
+end
+
+local function strip_answer_bullet(line)
+  local trimmed = trim(line)
+  if string.sub(trimmed, 1, #"⏺") == "⏺" then
+    return trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return trimmed
+end
+
+local function strip_terminal_controls(text)
+  local cleaned = tostring(text or "")
+  cleaned = cleaned:gsub("\27%][^\7]*\7", "")
+  cleaned = cleaned:gsub("\27%][^\27]*\27\\", "")
+  cleaned = cleaned:gsub("\27%[[%?%d;:]*[ -/]*[@-~]", "")
+  cleaned = cleaned:gsub("\27[=>c]", "")
+  cleaned = cleaned:gsub("\r", "")
+  return cleaned
+end
+
+local TOOL_CALL_NAMES = {
+  Bash = true,
+  Glob = true,
+  Grep = true,
+  LS = true,
+  Read = true,
+  Edit = true,
+  MultiEdit = true,
+  Write = true,
+  NotebookRead = true,
+  NotebookEdit = true,
+  WebFetch = true,
+  WebSearch = true,
+  TodoRead = true,
+  TodoWrite = true,
+  Task = true,
+}
+
+local function strip_tool_callout_prefix(line)
+  local trimmed = trim(line)
+  if starts_with(trimmed, "⎿") then
+    return trim(string.sub(trimmed, #"⎿" + 1))
+  end
+  return trimmed
+end
+
+local function parse_tool_call_start(line)
+  local stripped = strip_tool_callout_prefix(line)
+  local name, rest = stripped:match("^([%a][%w_%-]*)%((.*)$")
+  if name and TOOL_CALL_NAMES[name] then
+    return name, rest
+  end
+  return nil, nil
+end
+
+local function is_structured_tool_call_line(line)
+  local name = parse_tool_call_start(line)
+  return name ~= nil
+end
+
+local function is_tool_call_continuation_chrome(line)
+  local trimmed = trim(line)
+  if trimmed == "" then return true end
+  if trimmed == "Running..." or trimmed == "Running…" then return true end
+  if starts_with(trimmed, "... +") and contains(trimmed, "tool use") then return true end
+  if starts_with(trimmed, "└") or starts_with(trimmed, "├") or starts_with(trimmed, "│") then return true end
+  return false
+end
+
+local function is_completed_tool_progress_chrome_line(line)
+  local trimmed = trim(line)
+  if #trimmed < #CTRL_O_HINT or string.sub(trimmed, -#CTRL_O_HINT) ~= CTRL_O_HINT then
+    return false
+  end
+  if starts_with(trimmed, "⏺") then
+    trimmed = trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return trimmed:match("^[%a][%a%s]*%s+%d+%s+[%a_%-]+s?%s*%(ctrl%+o to expand%)$") ~= nil
+end
+
+local function is_agent_progress_chrome_line(line)
+  local trimmed = trim(line)
+  if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") then
+    trimmed = trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return trimmed:match("[Rr]unning%s+%d+%s+Explore agents") ~= nil
+    or trimmed:match("^%d+%s+Explore agents%s+finished") ~= nil
+    or trimmed:match("^%d+%s+Explore agents") ~= nil
+end
+
+local function is_horizontal_rule_line(line)
+  local trimmed = trim(line)
+  return trimmed ~= "" and trimmed:match("^[─━═]+$") ~= nil
+end
+
+local function is_structured_output_chrome_line(line)
+  local trimmed = trim(line)
+  if trimmed == "" then return true end
+  if is_prompt_echo_line(trimmed) then return true end
+  if is_progress_chrome_line(trimmed) then return true end
+  if is_structured_tool_call_line(trimmed) then return true end
+  if is_tool_call_continuation_chrome(trimmed) then return true end
+  if is_completed_tool_progress_chrome_line(trimmed) then return true end
+  if is_agent_progress_chrome_line(trimmed) then return true end
+  if starts_with(trimmed, "⎿") then return true end
+  if trimmed == "(No output)" then return true end
+  if starts_with(trimmed, "Allowed by auto mode classifier") then return true end
+  if contains(trimmed, "Allowed by auto mode classifier ") then return true end
+  if trimmed == "Recalling" then return true end
+  if starts_with(trimmed, "Recalling ") and contains(trimmed, " memory") and line_ends_with_ellipsis(trimmed) then return true end
+  if is_post_marker_trailing_line(trimmed) then return true end
+  if is_completion_marker_line(trimmed) then return true end
+  -- Claude Code banner/header rows. These are useful visually, but callers
+  -- consuming structured turn output want assistant content only.
+  if trimmed == "Claude Code" or contains(trimmed, "Claude Code v") then return true end
+  if contains(trimmed, "Claude Max") then return true end
+  return false
+end
+
+local function utf8_sub_from_cursor(text, cursor)
+  local n = tonumber(cursor) or 0
+  if n <= 0 then return text end
+  if utf8 and utf8.offset then
+    local byte_offset = utf8.offset(text, n + 1)
+    if byte_offset then
+      return string.sub(text, byte_offset)
+    end
+    return ""
+  end
+  -- ASCII fallback for older Lua embedders. ptywright ships Lua with
+  -- utf8, but keeping a degraded path makes the helper safe in tests.
+  return string.sub(text, n + 1)
+end
+
+local function structured_output_start_after_echo(lines, echo_idx, marker_idx)
+  if echo_idx <= 0 then return 1 end
+  local limit = marker_idx and marker_idx - 1 or #lines
+  for i = echo_idx + 1, limit do
+    if is_horizontal_rule_line(lines[i]) then
+      return i + 1
+    end
+  end
+  return echo_idx + 1
+end
+
+local function submitted_prompt_still_pending(screen)
+  local lines = {}
+  for line in string.gmatch(screen or "", "[^\n]+") do
+    table.insert(lines, line)
+  end
+
+  local echo_idx = 0
+  for i = #lines, 1, -1 do
+    if is_prompt_echo_line(lines[i]) then
+      echo_idx = i
+      break
+    end
+  end
+  if echo_idx == 0 then return false end
+
+  local rule_idx = 0
+  for i = echo_idx + 1, #lines do
+    if is_horizontal_rule_line(lines[i]) then
+      rule_idx = i
+      break
+    end
+  end
+  if rule_idx == 0 then return false end
+
+  for i = echo_idx + 1, rule_idx - 1 do
+    local line = lines[i]
+    local trimmed = trim(line)
+    if trimmed ~= "" then
+      if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") or starts_with_spinner_glyph(trimmed) then
+        return false
+      end
+      if not line:match("^%s%s+") then
+        return false
+      end
+    end
+  end
+
+  for i = rule_idx + 1, #lines do
+    local line = lines[i]
+    local trimmed = trim(line)
+    if trimmed ~= "" and not is_post_marker_trailing_line(line) then
+      return false
+    end
+  end
+  return true
+end
+
+local function extract_structured_turn_output(text)
+  local lines = {}
+  for line in string.gmatch(text or "", "[^\n]+") do
+    table.insert(lines, line)
+  end
+
+  local marker_idx = 0
+  for i = #lines, 1, -1 do
+    if is_completion_marker_line(lines[i]) then
+      marker_idx = i
+      break
+    end
+  end
+  if marker_idx == 0 then return nil end
+
+  local echo_idx = 0
+  for i = marker_idx - 1, 1, -1 do
+    if is_prompt_echo_line(lines[i]) then
+      echo_idx = i
+      break
+    end
+  end
+
+  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx)
+  local out = {}
+  for i = start_idx, marker_idx - 1 do
+    local clean_line = strip_terminal_controls(lines[i])
+    if not is_structured_output_chrome_line(clean_line) then
+      local line = strip_answer_bullet(clean_line)
+      if line ~= "" then
+        table.insert(out, line)
+      end
+    end
+  end
+
+  if #out == 0 then return nil end
+  return table.concat(out, "\n")
+end
+
+local function extract_structured_partial_turn_output(text, turn_start)
+  local slice = utf8_sub_from_cursor(text or "", turn_start or 0)
+  if slice == "" then return nil end
+
+  local lines = {}
+  for line in string.gmatch(slice, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  if #lines == 0 then return nil end
+
+  local marker_idx = #lines + 1
+  for i = 1, #lines do
+    if is_completion_marker_line(lines[i]) then
+      marker_idx = i
+      break
+    end
+  end
+
+  local echo_idx = 0
+  for i = marker_idx - 1, 1, -1 do
+    if is_prompt_echo_line(lines[i]) then
+      echo_idx = i
+      break
+    end
+  end
+
+  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx)
+  local out = {}
+  for i = start_idx, marker_idx - 1 do
+    local clean_line = strip_terminal_controls(lines[i])
+    if not is_structured_output_chrome_line(clean_line) then
+      local line = strip_answer_bullet(clean_line)
+      if line ~= "" then
+        table.insert(out, line)
+      end
+    end
+  end
+
+  if #out == 0 then return nil end
+  return table.concat(out, "\n")
+end
+
+local function strip_wrapped_tool_arg(arg)
+  local text = trim(arg or "")
+  if string.sub(text, -1) == ")" then
+    text = string.sub(text, 1, -2)
+  end
+  return trim(text)
+end
+
+local function tool_input_for(name, summary)
+  if name == "Read" or name == "Write" or name == "Edit" or name == "MultiEdit"
+      or name == "NotebookRead" or name == "NotebookEdit" then
+    return { file_path = summary }
+  end
+  if name == "Bash" then
+    return { command = summary }
+  end
+  if name == "Grep" or name == "Glob" or name == "WebSearch" then
+    return { pattern = summary }
+  end
+  if name == "LS" then
+    return { path = summary ~= "" and summary or "." }
+  end
+  if name == "WebFetch" then
+    return { url = summary }
+  end
+  return { description = summary }
+end
+
+local function agent_progress_metadata(summary, status)
+  local cleaned = trim((summary or ""):gsub(CTRL_O_HINT, ""))
+  cleaned = cleaned:gsub("%s+", " ")
+  local count = cleaned:match("[Rr]unning%s+(%d+)%s+Explore agents")
+    or cleaned:match("^(%d+)%s+Explore agents%s+finished")
+    or cleaned:match("^(%d+)%s+Explore agents")
+  if not count then return nil end
+
+  local agent_status = status
+  if cleaned:lower():find("finished", 1, true) then
+    agent_status = "completed"
+  elseif cleaned:lower():find("running", 1, true) then
+    agent_status = "running"
+  end
+
+  local description = "Explore agents"
+  local numeric_count = tonumber(count)
+  return {
+    key = "Agent:" .. description .. ":" .. tostring(count),
+    name = "Agent",
+    summary = description,
+    status = agent_status or "running",
+    input = {
+      description = description,
+      prompt = description,
+      count = numeric_count,
+    },
+  }
+end
+
+local function visible_tool_metadata(name, summary, status)
+  local agent = agent_progress_metadata(summary, status)
+  if agent then return agent end
+  return {
+    key = name .. ":" .. summary,
+    name = name,
+    summary = summary,
+    status = status,
+    input = tool_input_for(name, summary),
+  }
+end
+
+local function parse_standalone_tool_progress(line)
+  local trimmed = strip_tool_callout_prefix(line)
+  if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") then
+    trimmed = trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return agent_progress_metadata(trimmed, "running")
+end
+
+local function parse_visible_tool_calls(screen)
+  local lines = {}
+  for line in string.gmatch(screen or "", "[^\n]+") do
+    table.insert(lines, line)
+  end
+  local tools = {}
+  local i = 1
+  while i <= #lines do
+    local name, rest = parse_tool_call_start(lines[i])
+    if name then
+      local pieces = { rest or "" }
+      local status = "completed"
+      local j = i + 1
+      while j <= #lines do
+        local next_name = parse_tool_call_start(lines[j])
+        local t = trim(lines[j])
+        if next_name
+            or is_prompt_echo_line(t)
+            or is_completion_marker_line(t)
+            or is_horizontal_rule_line(t)
+            or starts_with(t, "⏺") then
+          break
+        end
+        if t == "Running..." or t == "Running…" then
+          status = "running"
+          j = j + 1
+          break
+        end
+        if starts_with(t, "... +") and contains(t, "tool use") then
+          break
+        end
+        if t ~= "" and not starts_with(t, "⎿") then
+          table.insert(pieces, t)
+        end
+        if string.sub(t, -1) == ")" then
+          local next_line = lines[j + 1] and trim(lines[j + 1]) or ""
+          if next_line == "Running..." or next_line == "Running…" then
+            status = "running"
+            j = j + 2
+          else
+            j = j + 1
+          end
+          break
+        end
+        j = j + 1
+      end
+      local summary = strip_wrapped_tool_arg(table.concat(pieces, " "))
+      if summary ~= "" then
+        table.insert(tools, visible_tool_metadata(name, summary, status))
+      end
+      i = math.max(j, i + 1)
+    else
+      local standalone = parse_standalone_tool_progress(lines[i])
+      if standalone then
+        table.insert(tools, standalone)
+      end
+      i = i + 1
+    end
+  end
+
+  if #tools == 0 then return nil end
+  local start = math.max(1, #tools - MAX_VISIBLE_TOOLS + 1)
+  local visible = {}
+  for idx = start, #tools do
+    table.insert(visible, tools[idx])
+  end
+  return { tools = visible }
 end
 
 -- Returns true if any line in `text` is a Claude Code 2.1.x
@@ -931,7 +1363,7 @@ end
 -- Returns the raw plan text as a single string with newlines, or
 -- `nil` if the structure doesn't match (which would indicate the
 -- classifier branch fired on something other than a real plan body).
--- Consumers get this verbatim — claudette surfaces it in the UI for
+-- Consumers get this verbatim — GUI clients can surface it for
 -- human review before approval.
 local function parse_plan_body(text)
   if text == nil or text == "" then
@@ -1284,37 +1716,36 @@ local function parse_usage_screen(text)
   local added, removed = text:match("[Tt]otal code changes:%s*(%d+)%s*lines added,%s*(%d+)%s*lines removed")
   maybe_set("lines_added", tonumber(added))
   maybe_set("lines_removed", tonumber(removed))
-  if next(usage) == nil then
-    local limits = {}
-    local current_label = nil
-    for line in string.gmatch(text or "", "[^\n]+") do
-      local t = trim(line)
-      local l = lower(t)
-      if l == "current session"
-          or l == "current week (all models)"
-          or l == "current week (sonnet only)"
-          or l == "extra usage" then
-        current_label = l
-      else
-        local pct = t:match("(%d+)%%%s*used")
-        if pct and current_label then
-          limits[current_label] = limits[current_label] or {}
-          limits[current_label].percent_used = tonumber(pct)
-        end
-        local reset = t:match("^[Rr]esets%s+(.+)$")
-        if reset and current_label then
-          limits[current_label] = limits[current_label] or {}
-          limits[current_label].resets = reset
-        end
-        if current_label == "extra usage" and t ~= "" and l ~= "extra usage" and not contains(l, "esc to cancel") then
-          limits[current_label] = limits[current_label] or {}
-          limits[current_label].status = limits[current_label].status or t
-        end
+  local limits = {}
+  local current_label = nil
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local t = trim(line)
+    local l = lower(t)
+    if l == "current session"
+        or l == "current week (all models)"
+        or l == "current week (sonnet only)"
+        or l == "current week (opus only)"
+        or l == "extra usage" then
+      current_label = l
+    else
+      local pct = t:match("(%d+)%%%s*used")
+      if pct and current_label then
+        limits[current_label] = limits[current_label] or {}
+        limits[current_label].percent_used = tonumber(pct)
+      end
+      local reset = t:match("^[Rr]esets%s+(.+)$")
+      if reset and current_label then
+        limits[current_label] = limits[current_label] or {}
+        limits[current_label].resets = reset
+      end
+      if current_label == "extra usage" and t ~= "" and l ~= "extra usage" and not contains(l, "esc to cancel") then
+        limits[current_label] = limits[current_label] or {}
+        limits[current_label].status = limits[current_label].status or t
       end
     end
-    if next(limits) ~= nil then
-      usage.limits = limits
-    end
+  end
+  if next(limits) ~= nil then
+    usage.limits = limits
   end
   return { usage = usage }
 end
@@ -1490,6 +1921,7 @@ function M.classify(input)
   local transcript = input.transcript or ""
   local sequence = input.sequence or 0
   local last_intent = input.last_intent
+  local has_stable_ms = input.stable_ms ~= nil
   local stable_ms = tonumber(input.stable_ms) or 0
   local text = lower(body .. "\n" .. transcript)
   local body_text = lower(body)
@@ -1518,9 +1950,30 @@ function M.classify(input)
   local markers = input.markers or {}
   local cursor = tonumber(input.cursor) or 0
   local function state_snapshot(state, confidence, evidence, seq, metadata)
-    local merged = merge_metadata(status_metadata, metadata)
+    local visible_tool_metadata = parse_visible_tool_calls(screen)
+    local merged = merge_metadata(status_metadata, visible_tool_metadata)
+    merged = merge_metadata(merged, metadata)
     local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
+    if last_intent == "prompt_submitted" and not has_stable_ms then
+      local partial_output = extract_structured_partial_turn_output(screen, 0)
+      if partial_output then
+        snap.metadata = merge_metadata(snap.metadata, { turn = { partial_text = partial_output } })
+      end
+    end
     if state == "completed_turn" and last_intent == "prompt_submitted" then
+      -- Prefer the host transcript over the visible viewport. The viewport
+      -- can be scrolled to the tail of a long answer by the time Claude
+      -- returns to the prompt; transcript-backed extraction preserves the
+      -- full answer for app integrations while still falling back to the
+      -- screen for older callers.
+      local turn_output = extract_structured_turn_output(transcript)
+      if not turn_output then
+        turn_output = extract_structured_turn_output(screen)
+      end
+      if turn_output then
+        snap.metadata = merge_metadata(snap.metadata, { turn = { text = turn_output } })
+      end
+
       local turn_start = markers["turn_start"]
       local turn_end = markers["turn_end"]
       -- A turn_end from a previous turn is stale (turn_start has been
@@ -1547,23 +2000,17 @@ function M.classify(input)
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
   end
 
-  -- Recently-sent cancel: report `cancelling` until the screen has been
-  -- quiet for at least the configured stability window. After that the
-  -- classifier falls through to the regular branches and reports
-  -- whatever the post-cancel screen actually shows (usually back at the
-  -- idle prompt, sometimes a completed-turn summary if the interrupt
-  -- arrived right at a boundary). Without this branch the only signal
-  -- that cancel landed is the disappearance of the thinking spinner,
-  -- which is brittle to observe from a polling caller.
-  --
-  -- Note for callers: `adapter.state` polling does not supply
-  -- `stable_ms`, so this branch will fire on every state read until the
-  -- next mutating intent clears `last_intent`. To observe the transition
-  -- out of cancelling, call `adapter.wait` after `cancel`; the wait
-  -- matcher returns once the screen has been stable for the configured
-  -- threshold and then this branch falls through to the normal idle /
-  -- completed-turn classification.
-  if last_intent == "cancelling" and stable_ms < completed_turn_stable_ms then
+  -- Recently-sent cancel: wait callers supply `stable_ms`, so hold
+  -- `cancelling` until the screen has been quiet for at least the
+  -- configured stability window. Plain state polling does not know screen
+  -- stability, so only keep reporting `cancelling` while the screen still
+  -- shows active interrupt/work evidence; once the idle prompt is visible,
+  -- fall through to the normal branches even if the host has not cleared
+  -- `last_intent` yet.
+  if last_intent == "cancelling"
+      and ((has_stable_ms and stable_ms < completed_turn_stable_ms)
+        or (not has_stable_ms and (has_active_work_indicator(screen_text) or contains(screen_text, "interrupting"))))
+  then
     return state_snapshot(
       "cancelling",
       0.72,
@@ -1722,6 +2169,18 @@ function M.classify(input)
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
   end
 
+  if last_intent == "prompt_submitted"
+      and not has_turn_completion_marker(screen)
+      and submitted_prompt_still_pending(screen)
+  then
+    return state_snapshot(
+      "waiting_for_user_input",
+      0.68,
+      "submitted prompt still visible without active work",
+      sequence
+    )
+  end
+
   -- Mid-turn determinism — when a turn is in flight (`prompt_submitted`)
   -- and no completion marker is on screen yet, classify as `thinking`
   -- regardless of whether the active-work indicator happens to be visible
@@ -1840,29 +2299,25 @@ function M.classify(input)
 end
 
 function M.send_prompt(input)
-  -- Use bracketed paste explicitly. Claude Code v2.1+ enables bracketed
-  -- paste mode (`CSI ? 2004 h`) for its input box. Live builds can still
-  -- occasionally swallow the first Enter after bracketed paste, leaving
-  -- the prompt visibly editable and never starting the turn. Sending a
-  -- second Enter is the plugin-owned recovery: on the bad path it
-  -- submits the already-pasted text; on the normal path Claude is already
-  -- starting the turn and ignores the extra empty submit. Keeping this
-  -- in the plugin makes `adapter.send(send_prompt)` reliable for every
-  -- consumer, not just the `claude-stream` wrapper.
-  -- The generic `action.paste(...)` still exists for callers / plugins
+  -- Claude Code v2.1.150 can swallow bracketed paste in Chrome-enabled
+  -- interactive mode even though it advertises bracketed paste support.
+  -- A huge raw write is not ideal either: Claude's prompt UI can render
+  -- it as collapsed paste placeholders. Use a paced text stream for the
+  -- prompt path so the current TUI sees normal input without paste
+  -- markers. The generic `action.paste(...)` still exists for callers /
+  -- plugins driving tools where paste semantics are desired.
   --
   -- The leading Enter handles Claude Code 2.1.x's first-keypress
   -- interceptors (welcome panel, compact-launch view). On a clean
   -- input box Claude treats Enter on empty input as a no-op submit;
   -- on a welcome / interceptor screen it dismisses the overlay and
-  -- focuses the input box, so the bracketed paste that follows lands
-  -- in the right place. Without this leading Enter, callers had to
-  -- send their own Enter and synchronise on stability before pasting,
+  -- focuses the input box, so the typed prompt that follows lands in
+  -- the right place. Without this leading Enter, callers had to
+  -- send their own Enter and synchronise on stability before writing,
   -- which is fragile across machine speeds and Claude Code versions.
-  -- driving programs that have not opted into bracketed paste.
   --
-  -- Empty-prompt guard: an empty bracketed paste leaves Claude at
-  -- idle (the two Enters are no-ops on an empty input box), so do
+  -- Empty-prompt guard: empty text leaves Claude at
+  -- idle (the Enter is a no-op on an empty input box), so do
   -- NOT advance to the `prompt_submitted` intent. The classifier's
   -- mid-turn `thinking` branch keys off that intent; claiming a
   -- turn started when no actual prompt was submitted would lock the
@@ -1890,7 +2345,7 @@ function M.send_prompt(input)
     actions = {
       action.key("enter"),
       action.mark_transcript("turn_start"),
-      action.bracketed_paste(prompt),
+      action.stream_text(prompt),
       action.key("enter"),
       action.key("enter"),
     },
@@ -1918,7 +2373,7 @@ end
 function M.steer(input)
   return {
     actions = {
-      action.bracketed_paste(input.prompt or ""),
+      action.stream_text(input.prompt or ""),
       action.key("enter"),
     },
   }
@@ -1979,6 +2434,10 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("Do you trust the files"),
       matcher.contains_text("Accessing workspace"),
       matcher.contains_text("Yes, I trust this folder"),
+      matcher.contains_text("Welcome back"),
+      matcher.contains_text("Welcome to Claude Code"),
+      matcher.contains_text("Tips for getting started"),
+      matcher.contains_text("What's new"),
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
@@ -2245,14 +2704,14 @@ function M.model_effort_right(_input)
 end
 
 -- Submit a slash command (`/btw`, `/clear`, `/help`, `/usage`, `/model`,
--- `/release-notes`, project-defined commands, …). Bracketed-pastes the
--- token then presses Enter — same shape as `send_prompt` but with two
--- important differences:
+-- `/release-notes`, project-defined commands, …). Streams the token then
+-- presses Enter — same shape as `send_prompt` but with two important
+-- differences:
 --
---   1. The leading Enter dismissal is omitted. Slash commands are only
---      meaningful when the input box already has focus (no welcome
---      panel covering it); spurious Enter on a settled input row would
---      submit an empty turn first, which can race with the slash text.
+--   1. The leading Enter dismissal is opt-in (`dismiss_welcome = true`).
+--      Slash commands are usually only meaningful when the input box
+--      already has focus; startup probes can opt into the same interceptor
+--      dismissal as `send_prompt` without hand-rolling an extra wait loop.
 --   2. `last_intent` is NOT set to `prompt_submitted`. Slash commands
 --      open a UI (modal / panel / inline action) rather than starting a
 --      conversation turn, so the classifier's mid-turn `thinking`
@@ -2271,11 +2730,14 @@ function M.slash_command(input)
   if string.sub(name, 1, 1) ~= "/" then
     name = "/" .. name
   end
+  local actions = {}
+  if input and input.dismiss_welcome then
+    table.insert(actions, action.key("enter"))
+  end
+  table.insert(actions, action.stream_text(name))
+  table.insert(actions, action.key("enter"))
   return {
-    actions = {
-      action.bracketed_paste(name),
-      action.key("enter"),
-    },
+    actions = actions,
   }
 end
 
@@ -2370,7 +2832,7 @@ end
 -- function fall through to introspection (intent names + names ending
 -- with `_matcher` go to wait_matchers) but lose the classifier
 -- state vocabulary, which lives only inside `classify`. Surfacing it
--- explicitly lets consumers (claudette, the REPL completer) drive the
+-- explicitly lets consumers (GUI clients, the REPL completer) drive the
 -- adapter without hard-coding state names.
 function M.describe()
   return {

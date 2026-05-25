@@ -911,9 +911,7 @@ mod tests {
             .collect()
     }
 
-    fn row_refs<'a>(
-        owned: &'a [Vec<crate::screen::ScreenCell>],
-    ) -> Vec<Vec<&'a crate::screen::ScreenCell>> {
+    fn row_refs(owned: &[Vec<crate::screen::ScreenCell>]) -> Vec<Vec<&crate::screen::ScreenCell>> {
         owned.iter().map(|r| r.iter().collect()).collect()
     }
 

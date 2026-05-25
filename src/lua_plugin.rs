@@ -554,6 +554,14 @@ fn action_api(
             lua.create_function(|lua, value: String| tagged_value(lua, "text", value))?,
         )?;
         action.set(
+            "stream_text",
+            lua.create_function(|lua, value: String| {
+                let payload = lua.create_table()?;
+                payload.set("text", value)?;
+                tagged_value(lua, "stream_text", payload)
+            })?,
+        )?;
+        action.set(
             "paste",
             lua.create_function(|lua, value: String| tagged_value(lua, "paste", value))?,
         )?;
@@ -719,6 +727,7 @@ mod tests {
                 return {
                   actions = {
                     ptywright.action.text("hello"),
+                    ptywright.action.stream_text("type me"),
                     ptywright.action.paste("world"),
                     ptywright.action.bracketed_paste("paste me"),
                     ptywright.action.key("enter"),
@@ -752,6 +761,7 @@ mod tests {
             value["actions"],
             json!([
                 { "type": "text", "value": "hello" },
+                { "type": "stream_text", "value": { "text": "type me" } },
                 { "type": "paste", "value": "world" },
                 { "type": "bracketed_paste", "value": "paste me" },
                 { "type": "key", "value": "enter" },

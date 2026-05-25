@@ -1,0 +1,10 @@
+❯ Show two paths
+
+⏺ /tmp/output
+  ~/project
+
+✻ Brewed for 1s
+
+❯
+  user @ host /workspace                              [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)

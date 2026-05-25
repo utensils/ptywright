@@ -1,0 +1,8 @@
+❯ Explore this project using agents
+
+⎿ Bash(Running 2 Explore agents…)
+  Running...
+  Bash(Running 3 Explore agents…)
+  Running...
+
+· Meandering… (34s · ↓ 1.3k tokens)
