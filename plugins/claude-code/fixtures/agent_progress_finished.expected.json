@@ -1,0 +1,21 @@
+{
+  "state": "thinking",
+  "evidence": "active work indicator detected",
+  "last_intent": "prompt_submitted",
+  "min_confidence": 0.76,
+  "metadata": {
+    "tools": [
+      {
+        "key": "Agent:Explore agents:3",
+        "name": "Agent",
+        "summary": "Explore agents",
+        "status": "completed",
+        "input": {
+          "description": "Explore agents",
+          "prompt": "Explore agents",
+          "count": 3
+        }
+      }
+    ]
+  }
+}

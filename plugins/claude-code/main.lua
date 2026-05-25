@@ -643,6 +643,16 @@ local function strip_answer_bullet(line)
   return trimmed
 end
 
+local function strip_terminal_controls(text)
+  local cleaned = tostring(text or "")
+  cleaned = cleaned:gsub("\27%][^\7]*\7", "")
+  cleaned = cleaned:gsub("\27%][^\27]*\27\\", "")
+  cleaned = cleaned:gsub("\27%[[%?%d;:]*[ -/]*[@-~]", "")
+  cleaned = cleaned:gsub("\27[=>c]", "")
+  cleaned = cleaned:gsub("\r", "")
+  return cleaned
+end
+
 local TOOL_CALL_NAMES = {
   Bash = true,
   Glob = true,
@@ -703,6 +713,16 @@ local function is_completed_tool_progress_chrome_line(line)
   return trimmed:match("^[%a][%a%s]*%s+%d+%s+[%a_%-]+s?%s*%(ctrl%+o to expand%)$") ~= nil
 end
 
+local function is_agent_progress_chrome_line(line)
+  local trimmed = trim(line)
+  if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") then
+    trimmed = trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return trimmed:match("[Rr]unning%s+%d+%s+Explore agents") ~= nil
+    or trimmed:match("^%d+%s+Explore agents%s+finished") ~= nil
+    or trimmed:match("^%d+%s+Explore agents") ~= nil
+end
+
 local function is_horizontal_rule_line(line)
   local trimmed = trim(line)
   return trimmed ~= "" and trimmed:match("^[─━═]+$") ~= nil
@@ -716,6 +736,7 @@ local function is_structured_output_chrome_line(line)
   if is_structured_tool_call_line(trimmed) then return true end
   if is_tool_call_continuation_chrome(trimmed) then return true end
   if is_completed_tool_progress_chrome_line(trimmed) then return true end
+  if is_agent_progress_chrome_line(trimmed) then return true end
   if starts_with(trimmed, "⎿") then return true end
   if trimmed == "(No output)" then return true end
   if starts_with(trimmed, "Allowed by auto mode classifier") then return true end
@@ -747,6 +768,64 @@ local function utf8_sub_from_cursor(text, cursor)
   return string.sub(text, n + 1)
 end
 
+local function structured_output_start_after_echo(lines, echo_idx, marker_idx)
+  if echo_idx <= 0 then return 1 end
+  local limit = marker_idx and marker_idx - 1 or #lines
+  for i = echo_idx + 1, limit do
+    if is_horizontal_rule_line(lines[i]) then
+      return i + 1
+    end
+  end
+  return echo_idx + 1
+end
+
+local function submitted_prompt_still_pending(screen)
+  local lines = {}
+  for line in string.gmatch(screen or "", "[^\n]+") do
+    table.insert(lines, line)
+  end
+
+  local echo_idx = 0
+  for i = #lines, 1, -1 do
+    if is_prompt_echo_line(lines[i]) then
+      echo_idx = i
+      break
+    end
+  end
+  if echo_idx == 0 then return false end
+
+  local rule_idx = 0
+  for i = echo_idx + 1, #lines do
+    if is_horizontal_rule_line(lines[i]) then
+      rule_idx = i
+      break
+    end
+  end
+  if rule_idx == 0 then return false end
+
+  for i = echo_idx + 1, rule_idx - 1 do
+    local line = lines[i]
+    local trimmed = trim(line)
+    if trimmed ~= "" then
+      if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") or starts_with_spinner_glyph(trimmed) then
+        return false
+      end
+      if not line:match("^%s%s+") then
+        return false
+      end
+    end
+  end
+
+  for i = rule_idx + 1, #lines do
+    local line = lines[i]
+    local trimmed = trim(line)
+    if trimmed ~= "" and not is_post_marker_trailing_line(line) then
+      return false
+    end
+  end
+  return true
+end
+
 local function extract_structured_turn_output(text)
   local lines = {}
   for line in string.gmatch(text or "", "[^\n]+") do
@@ -770,11 +849,12 @@ local function extract_structured_turn_output(text)
     end
   end
 
-  local start_idx = echo_idx > 0 and echo_idx + 1 or 1
+  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx)
   local out = {}
   for i = start_idx, marker_idx - 1 do
-    if not is_structured_output_chrome_line(lines[i]) then
-      local line = strip_answer_bullet(lines[i])
+    local clean_line = strip_terminal_controls(lines[i])
+    if not is_structured_output_chrome_line(clean_line) then
+      local line = strip_answer_bullet(clean_line)
       if line ~= "" then
         table.insert(out, line)
       end
@@ -811,11 +891,12 @@ local function extract_structured_partial_turn_output(text, turn_start)
     end
   end
 
-  local start_idx = echo_idx > 0 and echo_idx + 1 or 1
+  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx)
   local out = {}
   for i = start_idx, marker_idx - 1 do
-    if not is_structured_output_chrome_line(lines[i]) then
-      local line = strip_answer_bullet(lines[i])
+    local clean_line = strip_terminal_controls(lines[i])
+    if not is_structured_output_chrome_line(clean_line) then
+      local line = strip_answer_bullet(clean_line)
       if line ~= "" then
         table.insert(out, line)
       end
@@ -852,6 +933,56 @@ local function tool_input_for(name, summary)
     return { url = summary }
   end
   return { description = summary }
+end
+
+local function agent_progress_metadata(summary, status)
+  local cleaned = trim((summary or ""):gsub(CTRL_O_HINT, ""))
+  cleaned = cleaned:gsub("%s+", " ")
+  local count = cleaned:match("[Rr]unning%s+(%d+)%s+Explore agents")
+    or cleaned:match("^(%d+)%s+Explore agents%s+finished")
+    or cleaned:match("^(%d+)%s+Explore agents")
+  if not count then return nil end
+
+  local agent_status = status
+  if cleaned:lower():find("finished", 1, true) then
+    agent_status = "completed"
+  elseif cleaned:lower():find("running", 1, true) then
+    agent_status = "running"
+  end
+
+  local description = "Explore agents"
+  local numeric_count = tonumber(count)
+  return {
+    key = "Agent:" .. description .. ":" .. tostring(count),
+    name = "Agent",
+    summary = description,
+    status = agent_status or "running",
+    input = {
+      description = description,
+      prompt = description,
+      count = numeric_count,
+    },
+  }
+end
+
+local function visible_tool_metadata(name, summary, status)
+  local agent = agent_progress_metadata(summary, status)
+  if agent then return agent end
+  return {
+    key = name .. ":" .. summary,
+    name = name,
+    summary = summary,
+    status = status,
+    input = tool_input_for(name, summary),
+  }
+end
+
+local function parse_standalone_tool_progress(line)
+  local trimmed = strip_tool_callout_prefix(line)
+  if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") then
+    trimmed = trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return agent_progress_metadata(trimmed, "running")
 end
 
 local function parse_visible_tool_calls(screen)
@@ -902,16 +1033,14 @@ local function parse_visible_tool_calls(screen)
       end
       local summary = strip_wrapped_tool_arg(table.concat(pieces, " "))
       if summary ~= "" then
-        table.insert(tools, {
-          key = name .. ":" .. summary,
-          name = name,
-          summary = summary,
-          status = status,
-          input = tool_input_for(name, summary),
-        })
+        table.insert(tools, visible_tool_metadata(name, summary, status))
       end
       i = math.max(j, i + 1)
     else
+      local standalone = parse_standalone_tool_progress(lines[i])
+      if standalone then
+        table.insert(tools, standalone)
+      end
       i = i + 1
     end
   end
@@ -1825,13 +1954,10 @@ function M.classify(input)
     local merged = merge_metadata(status_metadata, visible_tool_metadata)
     merged = merge_metadata(merged, metadata)
     local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
-    if last_intent == "prompt_submitted" then
-      local turn_start = markers["turn_start"]
-      if turn_start then
-        local partial_output = extract_structured_partial_turn_output(transcript, turn_start)
-        if partial_output then
-          snap.metadata = merge_metadata(snap.metadata, { turn = { partial_text = partial_output } })
-        end
+    if last_intent == "prompt_submitted" and not has_stable_ms then
+      local partial_output = extract_structured_partial_turn_output(screen, 0)
+      if partial_output then
+        snap.metadata = merge_metadata(snap.metadata, { turn = { partial_text = partial_output } })
       end
     end
     if state == "completed_turn" and last_intent == "prompt_submitted" then
@@ -2041,6 +2167,18 @@ function M.classify(input)
     -- only the bits it asserts against.
     local usage_metadata = parse_usage_screen(screen)
     return state_snapshot("completed_turn", 0.86, "stable usage screen detected", sequence, usage_metadata)
+  end
+
+  if last_intent == "prompt_submitted"
+      and not has_turn_completion_marker(screen)
+      and submitted_prompt_still_pending(screen)
+  then
+    return state_snapshot(
+      "waiting_for_user_input",
+      0.68,
+      "submitted prompt still visible without active work",
+      sequence
+    )
   end
 
   -- Mid-turn determinism — when a turn is in flight (`prompt_submitted`)

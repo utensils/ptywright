@@ -1,0 +1,10 @@
+ ▐▛███▜▌   Claude Code v2.1.150
+▝▜█████▛▘  Sonnet 4.6 · Claude Max
+  ▘▘ ▝▝    ~/.claudette/workspaces/mcp-nixos/plucky-cornflower
+
+────────────────────────────────────────────────────────────────────────────────
+❯ Use 2 Explore agents to inspect this project briefly. Stream progress
+  normally, summarize in two bullets, and end with exactly SMOKE_AGENT_OK.
+────────────────────────────────────────────────────────────────────────────────
+  jamesbrink @ halcyon workspaces/mcp-nixos/plucky-cornflower  james-brink/ex…
+  ⏵⏵ auto mode on (shift+tab to cycle)                        ● high · /effort

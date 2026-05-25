@@ -1997,6 +1997,9 @@ fn classify_thinking_surfaces_partial_turn_text_from_transcript() {
 
 ⏺ Searching for 1 pattern, reading 2 files… (ctrl+o to expand)
 
+The project is a Tauri app.
+It has a Rust backend
+
 · Meandering… (12s · ↓ 100 tokens)";
     let transcript = "\
 ❯ summarize
@@ -2032,6 +2035,76 @@ It has a Rust backend";
         partial,
         "The project is a Tauri app.\nIt has a Rust backend"
     );
+}
+
+#[test]
+fn classify_thinking_strips_terminal_controls_from_partial_turn_text() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ summarize
+
+The project is a Tauri app.
+It has a Rust backend
+
+· Meandering… (12s · ↓ 100 tokens)";
+    let transcript = "\
+\u{1b}[?2026h\u{1b}[K\r❯ summarize
+\u{1b}[2C\u{1b}[3A\rThe project is a Tauri app.\u{1b}[K
+It has a Rust backend";
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 0);
+
+    let snapshot = classify_with_transcript_and_markers(
+        &extension,
+        TranscriptClassifyFixture {
+            screen,
+            transcript,
+            sequence: 102,
+            last_intent: Some("prompt_submitted"),
+            stable_ms: None,
+            markers: &markers,
+            cursor: transcript.chars().count() as u64,
+        },
+    );
+
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured partial text");
+    assert_eq!(
+        partial,
+        "The project is a Tauri app.\nIt has a Rust backend"
+    );
+}
+
+#[test]
+fn classify_thinking_omits_wrapped_prompt_echo_from_partial_turn_text() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Use 2 Explore agents to inspect this project briefly. Stream progress
+  normally, summarize in two bullets, and end with exactly SMOKE_AGENT_OK.
+────────────────────────────────────────────────────────────────────────────────
+
+The first useful assistant line.";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        105,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured partial text");
+    assert_eq!(partial, "The first useful assistant line.");
 }
 
 #[test]
@@ -2076,6 +2149,77 @@ fn classify_thinking_surfaces_visible_tool_metadata() {
         tools[1]["input"]["command"],
         "head -50 /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-corn flower/mcp_nixos/sources/home_manager.py"
     );
+}
+
+#[test]
+fn classify_thinking_surfaces_explore_agents_as_agent_metadata() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Explore this project using agents
+
+⎿ Bash(Running 2 Explore agents…)
+  Running...
+  Bash(Running 3 Explore agents…)
+  Running...
+
+· Meandering… (34s · ↓ 1.3k tokens)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        103,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let tools = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .expect("visible tools");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["name"], "Agent");
+    assert_eq!(tools[0]["summary"], "Explore agents");
+    assert_eq!(tools[0]["status"], "running");
+    assert_eq!(tools[0]["input"]["description"], "Explore agents");
+    assert_eq!(tools[0]["input"]["count"], 2);
+    assert_eq!(tools[1]["name"], "Agent");
+    assert_eq!(tools[1]["input"]["count"], 3);
+}
+
+#[test]
+fn classify_thinking_surfaces_finished_explore_agents_as_completed_agent() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Explore this project using agents
+
+⏺ 3 Explore agents finished
+
+· Meandering… (2m 31s)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        104,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    let tools = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .expect("visible tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "Agent");
+    assert_eq!(tools[0]["summary"], "Explore agents");
+    assert_eq!(tools[0]["status"], "completed");
+    assert_eq!(tools[0]["input"]["count"], 3);
 }
 
 #[test]
