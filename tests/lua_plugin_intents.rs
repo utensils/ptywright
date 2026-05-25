@@ -1645,7 +1645,7 @@ fn approve_with_dialog_id_succeeds_after_matching_classify() {
     )
     .expect("read permission fixture");
     let _ = classify_state(&extension, &screen, 1, None, Some(COMPLETED_TURN_STABLE_MS));
-    let plan = plan(&extension, "approve", json!({ "dialog_id": "69b9f3d0" }));
+    let plan = plan(&extension, "approve", json!({ "dialog_id": "115803ed" }));
     assert_eq!(plan.actions, vec![Action::Key(Key::Enter)]);
 }
 

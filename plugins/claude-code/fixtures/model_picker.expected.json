@@ -4,7 +4,7 @@
   "last_intent": null,
   "min_confidence": 0.6,
   "metadata": {
-    "dialog_id": "fa8a0f40",
+    "dialog_id": "988723a3",
     "model_select": {
       "options": [
         "Sonnet 4.6 (default)",

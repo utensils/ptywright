@@ -1267,7 +1267,7 @@ impl RpcServer {
 
     /// `plugin.describe` — return the catalog of a plugin's intents, wait
     /// matchers, classifier states, and manifest. Used by consumers
-    /// (claudette, the REPL completer) to discover what a plugin supports
+    /// (GUI clients, the REPL completer) to discover what a plugin supports
     /// without hard-coding intent names.
     ///
     /// Source of truth, in order:

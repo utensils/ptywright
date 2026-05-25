@@ -4,7 +4,7 @@
   "last_intent": null,
   "min_confidence": 0.6,
   "metadata": {
-    "dialog_id": "5bc1942f",
+    "dialog_id": "961c6346",
     "permission": {
       "tool": "Bash",
       "summary": "cargo test --locked --features _test-fixtures",

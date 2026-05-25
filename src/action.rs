@@ -282,9 +282,16 @@ pub enum Action {
 /// Parameters for [`Action::StreamText`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamText {
+    /// Text to write as ordinary terminal input bytes.
     pub text: String,
+    /// Optional maximum Unicode scalar values per write.
+    ///
+    /// Values are clamped to `1..=1024`; the default is `64`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_chars: Option<usize>,
+    /// Optional delay between chunk writes, in milliseconds.
+    ///
+    /// Values above `100` are clamped to `100`; the default is `2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_ms: Option<u64>,
 }

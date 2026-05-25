@@ -202,7 +202,7 @@ local ERROR_SUBTYPE_PATTERNS = {
 }
 
 -- Classify the visible error banner into a discrete subtype so
--- consumers (claudette in particular) can pick a retry / surface /
+-- consumers can pick a retry / surface /
 -- escalation policy without re-grepping the screen. Returns
 -- `{ error = { kind, message?, retry_after_s? } }` or nil when no
 -- banner is present.
@@ -428,6 +428,7 @@ local TURN_COMPLETION_GLYPH = "✻"
 -- relying on Lua's hoisting (which only works for the function names,
 -- not the values they close over).
 local CTRL_O_HINT = "(ctrl+o to expand)"
+local MAX_VISIBLE_TOOLS = 23 -- Mirrors Claude Code's visible tool-panel cap.
 
 -- Lines we expect to find AFTER a real end-of-turn `✻ <Verb> for <N>`
 -- marker on a settled screen:
@@ -477,7 +478,7 @@ local function is_post_marker_trailing_line(line)
   --     `Claude in Chrome enabled · /chrome`.
   if t:find("⏵⏵") then return true end
   if t:find("%[%u%a-%s%d+%.%d+%]") then return true end
-  if t:find("%S+%s*@%s*%S+") then return true end
+  if t:find("%S+%s+@%s+%S+") then return true end
   if t:find("·%s*/[%w_-]+%s*$") then return true end
   return false
 end
@@ -749,7 +750,6 @@ local function is_structured_output_chrome_line(line)
   -- consuming structured turn output want assistant content only.
   if trimmed == "Claude Code" or contains(trimmed, "Claude Code v") then return true end
   if contains(trimmed, "Claude Max") then return true end
-  if starts_with(trimmed, "~") or starts_with(trimmed, "/") then return true end
   return false
 end
 
@@ -1046,7 +1046,7 @@ local function parse_visible_tool_calls(screen)
   end
 
   if #tools == 0 then return nil end
-  local start = math.max(1, #tools - 23)
+  local start = math.max(1, #tools - MAX_VISIBLE_TOOLS + 1)
   local visible = {}
   for idx = start, #tools do
     table.insert(visible, tools[idx])
@@ -1363,7 +1363,7 @@ end
 -- Returns the raw plan text as a single string with newlines, or
 -- `nil` if the structure doesn't match (which would indicate the
 -- classifier branch fired on something other than a real plan body).
--- Consumers get this verbatim — claudette surfaces it in the UI for
+-- Consumers get this verbatim — GUI clients can surface it for
 -- human review before approval.
 local function parse_plan_body(text)
   if text == nil or text == "" then
@@ -2832,7 +2832,7 @@ end
 -- function fall through to introspection (intent names + names ending
 -- with `_matcher` go to wait_matchers) but lose the classifier
 -- state vocabulary, which lives only inside `classify`. Surfacing it
--- explicitly lets consumers (claudette, the REPL completer) drive the
+-- explicitly lets consumers (GUI clients, the REPL completer) drive the
 -- adapter without hard-coding state names.
 function M.describe()
   return {

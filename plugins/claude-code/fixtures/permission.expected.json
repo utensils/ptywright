@@ -4,7 +4,7 @@
   "last_intent": null,
   "min_confidence": 0.6,
   "metadata": {
-    "dialog_id": "69b9f3d0",
+    "dialog_id": "115803ed",
     "permission": {
       "tool": "Bash",
       "summary": "cargo test",

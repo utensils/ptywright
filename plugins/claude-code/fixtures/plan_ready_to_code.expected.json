@@ -4,7 +4,7 @@
   "last_intent": null,
   "min_confidence": 0.6,
   "metadata": {
-    "dialog_id": "64bc072c",
+    "dialog_id": "cbdebdf5",
     "plan": "1. Update the classifier fixtures for the new dialogs.\n2. Extend only the claude-code Lua plugin.\n3. Run the classifier and intent tests.",
     "options": [
       "Yes, and use auto mode",

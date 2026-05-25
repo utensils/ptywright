@@ -316,7 +316,7 @@ impl PluginManifest {
 pub struct PluginHostCapabilities {
     /// Permissions this ptywright build understands.
     pub permissions: Vec<PluginPermission>,
-    /// Whether embedded Lua/Luau execution is available.
+    /// Whether embedded Lua execution is available.
     pub embedded_lua: bool,
     /// Whether WASM plugins are available.
     pub wasm: bool,

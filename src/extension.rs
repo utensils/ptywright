@@ -553,7 +553,7 @@ impl ExtensionHandle {
     /// Atomic [`send`](Self::send) followed by [`wait`](Self::wait) using a
     /// single mutex-held turn.
     ///
-    /// `claudette` and similar consumers traditionally hand-rolled
+    /// GUI and RPC consumers traditionally hand-rolled
     /// "submit prompt, then wait for the turn to complete" by chaining
     /// `adapter.send` and `adapter.wait`. In a multi-client setup another
     /// connection could slip a competing intent between those two calls.

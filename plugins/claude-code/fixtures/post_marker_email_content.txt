@@ -1,0 +1,11 @@
+❯ Explain contact
+
+⏺ Contact line follows the marker in this malformed repaint.
+
+✻ Brewed for 1s
+
+email me at foo@bar.com
+
+❯
+  user @ host /workspace                              [Sonnet 4.6]
+  ⏵⏵ auto mode on (shift+tab to cycle)
