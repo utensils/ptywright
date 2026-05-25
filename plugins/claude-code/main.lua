@@ -1594,7 +1594,15 @@ function M.classify(input)
     local merged = merge_metadata(status_metadata, metadata)
     local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
     if state == "completed_turn" and last_intent == "prompt_submitted" then
-      local turn_output = extract_structured_turn_output(screen)
+      -- Prefer the host transcript over the visible viewport. The viewport
+      -- can be scrolled to the tail of a long answer by the time Claude
+      -- returns to the prompt; transcript-backed extraction preserves the
+      -- full answer for app integrations while still falling back to the
+      -- screen for older callers.
+      local turn_output = extract_structured_turn_output(transcript)
+      if not turn_output then
+        turn_output = extract_structured_turn_output(screen)
+      end
       if turn_output then
         snap.metadata = merge_metadata(snap.metadata, { turn = { text = turn_output } })
       end

@@ -72,6 +72,31 @@ fn classify_with_markers(
     extension.classify(&ctx).expect("classify via Lua plugin")
 }
 
+fn classify_with_transcript(
+    extension: &LuaExtension,
+    screen: &str,
+    transcript: &str,
+    sequence: u64,
+    last_intent: Option<&str>,
+    stable_ms: Option<u64>,
+) -> ExtensionStateSnapshot {
+    let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+    let markers = std::collections::BTreeMap::new();
+    let ctx = ClassifyContext {
+        screen,
+        body_text: &body_text,
+        status_text: &status_text,
+        transcript,
+        sequence,
+        last_intent,
+        stable_ms,
+        completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+        markers: &markers,
+        cursor: 0,
+    };
+    extension.classify(&ctx).expect("classify via Lua plugin")
+}
+
 fn plan(extension: &LuaExtension, intent: &str, params: serde_json::Value) -> ActionPlan {
     extension.plan(intent, &params).expect("plan from Lua")
 }
@@ -1783,6 +1808,49 @@ fn classify_completed_turn_requests_turn_end_marker_and_surfaces_transcript_meta
         turn["text"], "Done. The tests pass.",
         "completed turns should expose assistant text without Claude Code TUI chrome"
     );
+}
+
+#[test]
+fn classify_completed_turn_prefers_full_transcript_for_structured_output() {
+    let extension = claude_plugin();
+    let screen = "final visible tail only\n\n✻ Done for 37s\n\n❯ ";
+    let transcript = "\
+❯ Explore this project and tell me about it
+
+⏺ First section
+
+This is the beginning that scrolled out of the viewport.
+
+## What it does
+
+- One
+- Two
+
+✻ Done for 37s
+
+❯ ";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        transcript,
+        99,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert!(text.contains("First section"));
+    assert!(text.contains("This is the beginning"));
+    assert!(text.contains("## What it does"));
+    assert!(!text.contains("final visible tail only"));
 }
 
 #[test]
