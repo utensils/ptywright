@@ -231,11 +231,16 @@ fn render_one(lua: &Lua, inspect: &Function, value: Value) -> Result<RenderedVal
                 // deserializer doesn't choke on the marker fields. We
                 // restore it afterwards so a value that gets printed
                 // *and* assigned to a variable still carries the tag.
+                // Both set_metatable calls propagate — silently dropping
+                // a restore failure would leave a printed-then-reused
+                // ScreenSnapshot table looking like a plain table on the
+                // second render, which is exactly the kind of silent
+                // state corruption that breaks `s = screen.snapshot(); s`.
                 let restored = mt.clone();
-                let _ = tbl.set_metatable(None);
+                tbl.set_metatable(None).map_err(map_lua_err)?;
                 let decode_result: mlua::Result<crate::screen::ScreenSnapshot> =
                     lua.from_value(Value::Table(tbl.clone()));
-                let _ = tbl.set_metatable(Some(restored));
+                tbl.set_metatable(Some(restored)).map_err(map_lua_err)?;
                 let snapshot = decode_result.map_err(map_lua_err)?;
                 return Ok(RenderedValue::Screen { adapter, snapshot });
             }
