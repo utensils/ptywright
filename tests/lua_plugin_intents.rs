@@ -272,19 +272,17 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
     //      so callers can later slice the per-turn output via
     //      `Session::transcript_slice`. The matching `turn_end` mark
     //      fires from the classifier's `completed_turn` branch.
-    //   3. BracketedPaste(prompt) — Claude Code v2.1+ requires the
-    //      bracketed wrapper so the trailing Enter is not absorbed into
-    //      the paste tokeniser on longer prompts.
+    //   3. Text(prompt) — Claude Code v2.1.150 can swallow bracketed
+    //      paste in Chrome-enabled interactive mode even though it
+    //      advertises bracketed paste support.
     //   4. Enter — submit the now-populated input box.
     //   5. Enter — recovery submit for Claude Code builds that accept
-    //      the bracketed paste but swallow the first trailing Enter,
-    //      leaving the prompt text editable and the turn never started.
+    //      the raw text but leave it editable after the first trailing
+    //      Enter.
     //
-    // Without action #1, the bracketed paste's CSI-200~ open marker
-    // gets consumed by Claude's first-keypress interceptor on a fresh
-    // launch, the rest of the paste lands as input that's then
-    // truncated, and the trailing Enter submits a partial prompt or
-    // nothing at all. Locking the five-action sequence here so a
+    // Without action #1, the text can land in Claude's first-keypress
+    // interceptor on a fresh launch instead of the input box. Locking
+    // the five-action sequence here so a
     // future plugin edit can't silently regress.
     let extension = claude_plugin();
     let plan = plan(
@@ -300,7 +298,7 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
             Action::MarkTranscript {
                 label: "turn_start".to_string()
             },
-            Action::BracketedPaste("hello Claude".to_string()),
+            Action::Text("hello Claude".to_string()),
             Action::Key(Key::Enter),
             Action::Key(Key::Enter),
         ]
@@ -1453,7 +1451,7 @@ fn approve_with_dialog_id_succeeds_after_matching_classify() {
     // Walk the full classifier → approve dispatch so the module-level
     // `_current_dialog_id` is set by classify before the intent reads
     // it back. The fixture under plugins/claude-code/fixtures/permission.txt
-    // hashes to `115803ed` (locked in permission.expected.json), so
+    // hashes to `69b9f3d0` (locked in permission.expected.json), so
     // passing that id through approve must succeed.
     let extension = claude_plugin();
     let screen = std::fs::read_to_string(
@@ -1462,7 +1460,7 @@ fn approve_with_dialog_id_succeeds_after_matching_classify() {
     )
     .expect("read permission fixture");
     let _ = classify_state(&extension, &screen, 1, None, Some(COMPLETED_TURN_STABLE_MS));
-    let plan = plan(&extension, "approve", json!({ "dialog_id": "115803ed" }));
+    let plan = plan(&extension, "approve", json!({ "dialog_id": "69b9f3d0" }));
     assert_eq!(plan.actions, vec![Action::Key(Key::Enter)]);
 }
 
@@ -1678,6 +1676,14 @@ fn classify_completed_turn_requests_turn_end_marker_and_surfaces_transcript_meta
         .expect("metadata.transcript must be populated");
     assert_eq!(transcript_md["turn_start"], 100);
     assert_eq!(transcript_md["turn_end"], 500);
+
+    let turn = metadata
+        .get("turn")
+        .expect("metadata.turn must be populated for structured output");
+    assert_eq!(
+        turn["text"], "Done. The tests pass.",
+        "completed turns should expose assistant text without Claude Code TUI chrome"
+    );
 }
 
 #[test]

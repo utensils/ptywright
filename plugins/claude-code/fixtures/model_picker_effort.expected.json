@@ -4,7 +4,7 @@
   "last_intent": null,
   "min_confidence": 0.6,
   "metadata": {
-    "dialog_id": "687cd383",
+    "dialog_id": "87a71b38",
     "model_select": {
       "options": [
         "Claude Sonnet 4.6",

@@ -7,6 +7,9 @@
     "status": {
       "model": "Sonnet 4.6",
       "permission_mode": "auto"
+    },
+    "turn": {
+      "text": "4"
     }
   }
 }

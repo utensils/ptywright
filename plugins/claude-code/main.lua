@@ -624,6 +624,74 @@ local function has_turn_completion_marker(text)
   return false
 end
 
+local function is_completion_marker_line(line)
+  local trimmed = trim(line)
+  return string.sub(trimmed, 1, #TURN_COMPLETION_GLYPH) == TURN_COMPLETION_GLYPH
+    and not line_ends_with_ellipsis(trimmed)
+    and trimmed:find(" for %d") ~= nil
+end
+
+local function strip_answer_bullet(line)
+  local trimmed = trim(line)
+  if string.sub(trimmed, 1, #"⏺") == "⏺" then
+    return trim(string.sub(trimmed, #"⏺" + 1))
+  end
+  return trimmed
+end
+
+local function is_structured_output_chrome_line(line)
+  local trimmed = trim(line)
+  if trimmed == "" then return true end
+  if is_prompt_echo_line(trimmed) then return true end
+  if is_progress_chrome_line(trimmed) then return true end
+  if is_post_marker_trailing_line(trimmed) then return true end
+  if is_completion_marker_line(trimmed) then return true end
+  -- Claude Code banner/header rows. These are useful visually, but callers
+  -- consuming structured turn output want assistant content only.
+  if trimmed == "Claude Code" or contains(trimmed, "Claude Code v") then return true end
+  if contains(trimmed, "Claude Max") then return true end
+  if starts_with(trimmed, "~") or starts_with(trimmed, "/") then return true end
+  return false
+end
+
+local function extract_structured_turn_output(text)
+  local lines = {}
+  for line in string.gmatch(text or "", "[^\n]+") do
+    table.insert(lines, line)
+  end
+
+  local marker_idx = 0
+  for i = #lines, 1, -1 do
+    if is_completion_marker_line(lines[i]) then
+      marker_idx = i
+      break
+    end
+  end
+  if marker_idx == 0 then return nil end
+
+  local echo_idx = 0
+  for i = marker_idx - 1, 1, -1 do
+    if is_prompt_echo_line(lines[i]) then
+      echo_idx = i
+      break
+    end
+  end
+
+  local start_idx = echo_idx > 0 and echo_idx + 1 or 1
+  local out = {}
+  for i = start_idx, marker_idx - 1 do
+    if not is_structured_output_chrome_line(lines[i]) then
+      local line = strip_answer_bullet(lines[i])
+      if line ~= "" then
+        table.insert(out, line)
+      end
+    end
+  end
+
+  if #out == 0 then return nil end
+  return table.concat(out, "\n")
+end
+
 -- Returns true if any line in `text` is a Claude Code 2.1.x
 -- collapsible tool-progress row: starts with `⏺`, contains
 -- `(ctrl+o to expand)` (the collapse hint the TUI puts at the end
@@ -1523,6 +1591,11 @@ function M.classify(input)
     local merged = merge_metadata(status_metadata, metadata)
     local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
     if state == "completed_turn" and last_intent == "prompt_submitted" then
+      local turn_output = extract_structured_turn_output(screen)
+      if turn_output then
+        snap.metadata = merge_metadata(snap.metadata, { turn = { text = turn_output } })
+      end
+
       local turn_start = markers["turn_start"]
       local turn_end = markers["turn_end"]
       -- A turn_end from a previous turn is stale (turn_start has been
@@ -1887,6 +1960,7 @@ function M.send_prompt(input)
       action.key("enter"),
       action.mark_transcript("turn_start"),
       action.text(prompt),
+      action.key("enter"),
       action.key("enter"),
     },
     last_intent = "prompt_submitted",
