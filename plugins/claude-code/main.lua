@@ -648,6 +648,12 @@ local function is_structured_output_chrome_line(line)
   if trimmed == "" then return true end
   if is_prompt_echo_line(trimmed) then return true end
   if is_progress_chrome_line(trimmed) then return true end
+  if starts_with(trimmed, "⎿") then return true end
+  if trimmed == "(No output)" then return true end
+  if starts_with(trimmed, "Allowed by auto mode classifier") then return true end
+  if contains(trimmed, "Allowed by auto mode classifier ") then return true end
+  if trimmed == "Recalling" then return true end
+  if starts_with(trimmed, "Recalling ") and contains(trimmed, " memory") and line_ends_with_ellipsis(trimmed) then return true end
   if is_post_marker_trailing_line(trimmed) then return true end
   if is_completion_marker_line(trimmed) then return true end
   -- Claude Code banner/header rows. These are useful visually, but callers

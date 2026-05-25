@@ -1886,6 +1886,46 @@ This is the beginning that scrolled out of the viewport.
 }
 
 #[test]
+fn classify_completed_turn_filters_tool_status_from_structured_output() {
+    let extension = claude_plugin();
+    let screen = "Could you remind me what we were working on?\n\n✻ Done for 28s\n\n❯ ";
+    let transcript = "\
+❯ continue
+Recalling
+Recalling 1 memory…
+⎿  (No output)
+⎿  Allowed by auto mode classifier Bash(git -C /tmp/project log main..branch --oneline)
+⎿  (No output)
+The branch is identical to main — no commits ahead.
+Could you remind me what we were working on?
+✻ Done for 28s
+
+❯ ";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        transcript,
+        100,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert_eq!(
+        text,
+        "The branch is identical to main — no commits ahead.\nCould you remind me what we were working on?"
+    );
+}
+
+#[test]
 fn classify_completed_turn_does_not_re_emit_turn_end_when_marker_already_present() {
     // Idempotency: once the host has applied turn_end and the marker
     // is visible in the classifier context, subsequent classifies
