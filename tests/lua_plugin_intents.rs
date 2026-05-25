@@ -333,7 +333,7 @@ fn expand_plan_sends_ctrl_o_with_no_intent() {
 /// `/help` panel, plain back-at-idle for `/btw` / `/clear`, etc.)
 /// instead of being lied to about a turn in flight.
 #[test]
-fn slash_command_pastes_token_and_presses_enter_without_intent() {
+fn slash_command_streams_token_and_presses_enter_without_intent() {
     let extension = claude_plugin();
 
     // Bare name — plugin adds the leading slash.
@@ -341,7 +341,11 @@ fn slash_command_pastes_token_and_presses_enter_without_intent() {
     assert_eq!(
         bare.actions,
         vec![
-            Action::BracketedPaste("/btw".to_string()),
+            Action::StreamText(StreamText {
+                text: "/btw".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -355,7 +359,11 @@ fn slash_command_pastes_token_and_presses_enter_without_intent() {
     assert_eq!(
         prefixed.actions,
         vec![
-            Action::BracketedPaste("/btw".to_string()),
+            Action::StreamText(StreamText {
+                text: "/btw".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -366,7 +374,31 @@ fn slash_command_pastes_token_and_presses_enter_without_intent() {
     assert_eq!(
         via_name.actions,
         vec![
-            Action::BracketedPaste("/usage".to_string()),
+            Action::StreamText(StreamText {
+                text: "/usage".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
+            Action::Key(Key::Enter),
+        ]
+    );
+
+    // Startup probes can opt into a leading Enter to clear Claude Code's
+    // first-launch welcome interceptor before typing the slash token.
+    let startup = plan(
+        &extension,
+        "slash_command",
+        json!({ "name": "usage", "dismiss_welcome": true }),
+    );
+    assert_eq!(
+        startup.actions,
+        vec![
+            Action::Key(Key::Enter),
+            Action::StreamText(StreamText {
+                text: "/usage".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -905,6 +937,12 @@ fn wait_turn_matcher_includes_v2_trust_dialog_anchors() {
         boundary_matchers
             .iter()
             .any(|matcher| matcher == &Matcher::ContainsText("Ready to code?".to_string()))
+    );
+    assert!(
+        boundary_matchers
+            .iter()
+            .any(|matcher| matcher == &Matcher::ContainsText("Welcome back".to_string())),
+        "wait matcher missing welcome-screen anchor; boundary matchers were {boundary_matchers:?}",
     );
     assert!(
         boundary_matchers

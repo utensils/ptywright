@@ -2053,6 +2053,10 @@ function M.wait_turn_matcher(input)
       matcher.contains_text("Do you trust the files"),
       matcher.contains_text("Accessing workspace"),
       matcher.contains_text("Yes, I trust this folder"),
+      matcher.contains_text("Welcome back"),
+      matcher.contains_text("Welcome to Claude Code"),
+      matcher.contains_text("Tips for getting started"),
+      matcher.contains_text("What's new"),
       matcher.contains_text("Approve"),
       matcher.contains_text("Allow"),
       matcher.contains_text("Total cost:"),
@@ -2319,14 +2323,14 @@ function M.model_effort_right(_input)
 end
 
 -- Submit a slash command (`/btw`, `/clear`, `/help`, `/usage`, `/model`,
--- `/release-notes`, project-defined commands, …). Bracketed-pastes the
--- token then presses Enter — same shape as `send_prompt` but with two
--- important differences:
+-- `/release-notes`, project-defined commands, …). Streams the token then
+-- presses Enter — same shape as `send_prompt` but with two important
+-- differences:
 --
---   1. The leading Enter dismissal is omitted. Slash commands are only
---      meaningful when the input box already has focus (no welcome
---      panel covering it); spurious Enter on a settled input row would
---      submit an empty turn first, which can race with the slash text.
+--   1. The leading Enter dismissal is opt-in (`dismiss_welcome = true`).
+--      Slash commands are usually only meaningful when the input box
+--      already has focus; startup probes can opt into the same interceptor
+--      dismissal as `send_prompt` without hand-rolling an extra wait loop.
 --   2. `last_intent` is NOT set to `prompt_submitted`. Slash commands
 --      open a UI (modal / panel / inline action) rather than starting a
 --      conversation turn, so the classifier's mid-turn `thinking`
@@ -2345,11 +2349,14 @@ function M.slash_command(input)
   if string.sub(name, 1, 1) ~= "/" then
     name = "/" .. name
   end
+  local actions = {}
+  if input and input.dismiss_welcome then
+    table.insert(actions, action.key("enter"))
+  end
+  table.insert(actions, action.stream_text(name))
+  table.insert(actions, action.key("enter"))
   return {
-    actions = {
-      action.bracketed_paste(name),
-      action.key("enter"),
-    },
+    actions = actions,
   }
 end
 
