@@ -54,6 +54,20 @@ Guidelines:
 - Expose library APIs first; keep CLI commands thin and scriptable.
 - Make new behavior observable and testable through transcripts, screen snapshots, or explicit result types.
 
+## Screen evidence over timing heuristics
+
+Classifier and detector logic must lean on structural shape — regex over the rendered screen, glyph sets, line layouts, marker positions, the `last_intent` thread — never on byte-count thresholds, settle delays, debounce windows, or "wait N polls before trusting" guards. The one acknowledged timing exception is `claude-stream`'s bounded 3 s initial settle in `submit()`, and even that is skipped when prior evidence already justifies submission. Treat any new timing-based heuristic as a code-smell.
+
+Concrete anti-patterns to recognize (all from past incidents — adding them back is a regression, not an improvement):
+
+- **"Also accept ASCII `>` as a prompt glyph."** Breaks Markdown blockquotes in Claude's prose. Rule: `❯ <text>` is prompt-with-text, bare `>` (alone or only whitespace) is the idle-prompt fallback, `> <text>` is Markdown content and is **not** a prompt row. Restrict prompt-row recognition to `❯`; do not introduce a Markdown escape.
+- **"Tighten the spinner regex to require `…` at literal line end."** Claude renders both `✻ Thinking…` and `✻ Thinking… (12s · ↓ N tokens · thinking)`. Sonnet 4.6 extended thinking and Explore-subagent runs almost always carry the trailing parenthesized counter; patterns anchored at `…$` lose it and the classifier never sees a completion marker.
+- **"Move spinner detection to body-only."** During Explore-subagent runs the body freezes while the spinner only repaints in the status bar. Use full-screen scans (`screen_text`, not `body_text`) for active-work indicators; status-bar shape is structurally distinct (`user @ host  [Model X.Y]`, `⏵⏵ auto mode on …`) and doesn't collide with spinner / tool-progress patterns.
+- **"Add a bytes-grown threshold to confirm completion."** Pure timing heuristic. Transcripts can be small for legitimate completions (Haiku ack-and-stop) and large for premature exits (subagent intermediate frames). Substance is structural — the `✻ <Verb> for <duration>` marker, the prompt-row shape, the dialog layout — not numerical.
+- **"Cache the previous classifier response so we can dedupe."** The classifier is stateless by design. Plugin-side state across `M.classify` calls requires both a Rust host change (to surface a stable handle) and a plugin schema change. Don't propose plugin-side caching without acknowledging the host work.
+
+When you have to choose between "this took longer than X ms" and "the screen now looks like Y", choose the screen evidence.
+
 ## TDD requirements
 
 Use test-driven development for behavior changes wherever practical:
@@ -90,11 +104,12 @@ Devshell commands:
 | --- | --- | --- |
 | build | `build` / `build-release` | `cargo build` / `cargo build --release` |
 | check | `check` / `clippy` / `fmt` / `fmt-check` | Standard Rust checks |
-| check | `run-tests` | `cargo test --features _test-fixtures` |
-| check | `ci-local` | fmt-check → check → clippy → test → build |
-| check | `coverage` | `cargo llvm-cov --workspace --summary-only` |
-| run | `ptywright` | `cargo run -- "$@"` |
-| docs | `docs-dev` / `docs-build` / `docs-preview` | VitePress documentation |
+| check | `run-tests` | `cargo test --features _test-fixtures` **plus** `python3 -m unittest discover tests/scripts` (the `claude-stream` script tests) |
+| check | `ci-local` | fmt-check → check → clippy → test (Rust + Python) → release build → `--no-default-features` check/clippy/test |
+| check | `coverage` | `cargo llvm-cov --workspace --summary-only` (pass `--html` for a browsable report) |
+| run | `ptywright` | `cargo run --features repl -- "$@"` |
+| run | `claude-stream` | Runs `scripts/claude-stream.py` against an auto-spawned `ptywright serve --stdio`. Rebuilds `ptywright` when Rust/Lua sources are newer than the cached binary. |
+| docs | `docs-dev` / `docs-build` / `docs-preview` / `docs-fmt` / `docs-fmt-check` | VitePress documentation (dev, static build, preview, prettier format / format-check) |
 
 Direct Cargo fallback (CI uses `--locked` for Cargo check/clippy/test jobs; mirror that when reproducing CI failures locally):
 
@@ -168,11 +183,15 @@ The codebase is organized so each generic abstraction layer lives in one focused
   - `src/repl/ctx.rs` — shared `ReplCtx` (tabs, focus) read/mutated by the Lua bindings and the meta dispatcher.
   - `src/repl/completer.rs`, `src/repl/highlighter.rs`, `src/repl/history.rs` — `reedline` trait impls. The completer introspects the live Lua VM for top-level identifiers + member access (so newly-bound globals light up automatically), falling back to `PluginCache` / `AdapterCache` / `KEY_NAMES` for string-arg paths and `:focus` / `:attach` adapter ids. The highlighter sources its identifier set from the same REPL-globals whitelist plus Lua 5.4's reserved-word set. History is `FileBackedHistory` rooted at `Paths::repl_history_path()`.
   - `src/repl/tui.rs` — **sequential reedline-based REPL**. Each command renders as `pty> <syntax-highlighted Lua>` and the result follows on the next line as `↳ <dim summary>` (or the inline styled `ScreenSnapshot` for `screen.snapshot()` / `view()`). Line editing, completion, syntax highlighting, multi-line continuation, history, and ghost-text hinting are all delegated to reedline; this module owns the read-eval-print loop, the prompt, the screen renderer, and how each `RenderedValue` is printed. Server-side notifications surface above the prompt via reedline's `ExternalPrinter`. **No application-specific identifiers live in any of these modules** — the REPL is a client of the generic `adapter.*` surface.
+- Reference consumer:
+  - `scripts/claude-stream.py` — single-turn Python driver that spawns `ptywright serve --stdio`, starts the built-in `claude-code` adapter, auto-handles workspace-trust and welcome-banner intercepts, submits a prompt, streams the live body + state transitions, and exits cleanly on completion or SIGINT. Stdlib-only (no third-party deps). Treat it as the worked example of every primitive a real consumer touches — `adapter.start` / `adapter.send` / `adapter.state` / `adapter.inspect` / `adapter.transcript` / `adapter.wait` / `adapter.close` plus `session.output` / `session.exited` notifications. The website's `guide/claude-code.md` "Streaming demo" section is the user-facing version of the same material.
 - Tests:
   - `tests/cli_tests.rs` — end-to-end checks for help/version output, basic PTY command execution, JSON-RPC stdio, and completions.
   - `tests/lua_classifier_tests.rs` — auto-enrolling classifier regression matrix. Loads every `<name>.txt` fixture under `plugins/claude-code/fixtures/` with a sibling `<name>.expected.json` and drives it through `LuaExtension::built_in("claude-code")`.
   - `tests/lua_plugin_intents.rs` — per-intent contract tests (`send_prompt`, `approve`, `deny`, `choose_option`, `cancel`, `approve_trust`, `deny_trust`, `dismiss_welcome`, model-effort arrows, `wait_turn_matcher`, the `cancelling` hold-state) driven through the generic `ExtensionHandle` API. Doubles as a reference for plugin authors writing new TUI plugins.
   - `tests/repl_tests.rs` — gated `#[cfg(feature = "repl")]`. Drives `RpcClient` + `meta::dispatch` against an in-process `serve_ndjson_with_state` over pipes: capabilities, `:notifications` filter forwarding, `:rpc` passthrough, `session.output` notification semantics (subscription cursor + redaction + dropped-range flag). Lua-driven dispatcher contracts (spawn → state → close cycle, `turn` round-trip, wire shapes for `send.text` / `wait.matches`, etc.) live as unit tests in `src/repl/lua.rs::tests` and run under the lib target.
+  - `tests/windows_ipc_tests.rs` — gated `#[cfg(windows)]`. End-to-end named-pipe IPC coverage mirroring the Unix-socket test in `cli_tests.rs`; guards `serve --socket \\.\pipe\…` against silent regression. CI's Windows job exercises the `check` lane only, so this lights up locally on Windows hosts and in any future Windows test job.
+  - `tests/scripts/test_claude_stream.py` — stdlib `unittest` suite for `scripts/claude-stream.py`. Locks the chrome filter, the answer-region fallback, the terminal-state taxonomy, the stuck-detector noise floor, and the rate-limit / quota exit-code mapping. **Use `unittest`, not pytest** — the suite must keep running without third-party Python deps (CI's `ci-local` runs `python3 -m unittest discover -s tests/scripts`).
   - `plugins/claude-code/fixtures/` — recorded screen fixtures for the classifier; update these when Claude Code's UI shifts. Adding a new fixture is a single-PR documentation-only change: drop a `<name>.txt` and sibling `<name>.expected.json` and the matrix picks them up.
 - Tooling and packaging:
   - `website/` — VitePress docs site.
