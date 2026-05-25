@@ -1307,7 +1307,46 @@ fn classifier_completed_turn_paths() {
         "completed screen must not require the answer bullet to remain visible"
     );
 
-    // (h) Premature completed_turn regression — a screen where a
+    // (h) Live Claude Code footer notices below the prompt are trailing
+    // chrome, not post-marker content. Claudette saw this exact shape:
+    // the answer and completion marker were visible, but rotating footer
+    // notices (`/mcp`, `/chrome`) kept the classifier stuck in `thinking`.
+    let completed_with_live_footer_notice = classify_state(
+        &extension,
+        " ▐▛███▜▌   Claude Code v2.1.150\n\
+▝▜█████▛▘  Sonnet 4.6 · Claude Max\n\
+  ▘▘ ▝▝    ~/.claudette/workspaces/claudex/brazen-cedar\n\n\
+❯ ping\n\n\
+⏺ pong\n\n\
+✻ Baked for 4s\n\n\
+────────────────────────────────────────────────────────────────────────────────\n\
+❯\u{00a0}\n\
+────────────────────────────────────────────────────────────────────────────────\n\
+  jamesbrink @ halcyon workspaces/claudex/brazen-cedar  james-brink/project-i…\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n\
+                                       2 claude.ai connectors need auth · /mcp",
+        54,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_with_live_footer_notice.state, "completed_turn",
+        "footer notices below a valid completion marker must not keep the turn in thinking"
+    );
+
+    let completed_with_chrome_footer_notice = classify_state(
+        &extension,
+        "❯ ping\n\n⏺ pong\n\n✻ Baked for 4s\n\n❯\u{00a0}\n\nClaude in Chrome enabled · /chrome",
+        57,
+        Some("prompt_submitted"),
+        None,
+    );
+    assert_eq!(
+        completed_with_chrome_footer_notice.state, "completed_turn",
+        "slash-command footer notices such as /chrome must be accepted after the marker"
+    );
+
+    // (i) Premature completed_turn regression — a screen where a
     // `✻ <Verb> for <N>` line is present (from some parser-captured
     // intermediate render or a transient Claude rendering) but tool
     // progress is STILL on screen below it must not fire
@@ -1328,7 +1367,7 @@ fn classifier_completed_turn_paths() {
         "stray mid-turn marker followed by tool-progress content must NOT fire completed_turn"
     );
 
-    // (i) The `(ctrl+o to expand)` hint is itself a mid-turn signal
+    // (j) The `(ctrl+o to expand)` hint is itself a mid-turn signal
     // (Claude Code's collapsible tool-progress rows render it). With
     // NO marker but tool progress visible, classifier must NOT fire
     // completed_turn — even though `⏺` isn't a spinner glyph and the

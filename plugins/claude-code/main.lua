@@ -470,11 +470,15 @@ local function is_post_marker_trailing_line(line)
   -- in `thinking`:
   --   * `⏵⏵ … on …` — permission-mode hint glyph.
   --   * `[<word(s)> <digit>.<digit>]` — model bracket with version.
-  --   * `<token> @ <token>` followed by a `[<word> <digit>]` later
-  --     on the same line (the user@host + model layout).
+  --   * `<token> @ <token>` (the user@host + cwd/repo layout; newer
+  --     Claude Code builds may move the model to a separate footer row).
+  --   * status notices that end in a slash-command affordance, e.g.
+  --     `1 MCP server failed · /mcp` or
+  --     `Claude in Chrome enabled · /chrome`.
   if t:find("⏵⏵") then return true end
   if t:find("%[%u%a-%s%d+%.%d+%]") then return true end
-  if t:find("%S+%s*@%s*%S+") and t:find("%[") and t:find("%]") then return true end
+  if t:find("%S+%s*@%s*%S+") then return true end
+  if t:find("·%s*/[%w_-]+%s*$") then return true end
   return false
 end
 
