@@ -1563,6 +1563,7 @@ function M.classify(input)
   local transcript = input.transcript or ""
   local sequence = input.sequence or 0
   local last_intent = input.last_intent
+  local has_stable_ms = input.stable_ms ~= nil
   local stable_ms = tonumber(input.stable_ms) or 0
   local text = lower(body .. "\n" .. transcript)
   local body_text = lower(body)
@@ -1633,23 +1634,17 @@ function M.classify(input)
     return state_snapshot(last_intent or "starting", 0.35, "no screen evidence yet", sequence)
   end
 
-  -- Recently-sent cancel: report `cancelling` until the screen has been
-  -- quiet for at least the configured stability window. After that the
-  -- classifier falls through to the regular branches and reports
-  -- whatever the post-cancel screen actually shows (usually back at the
-  -- idle prompt, sometimes a completed-turn summary if the interrupt
-  -- arrived right at a boundary). Without this branch the only signal
-  -- that cancel landed is the disappearance of the thinking spinner,
-  -- which is brittle to observe from a polling caller.
-  --
-  -- Note for callers: `adapter.state` polling does not supply
-  -- `stable_ms`, so this branch will fire on every state read until the
-  -- next mutating intent clears `last_intent`. To observe the transition
-  -- out of cancelling, call `adapter.wait` after `cancel`; the wait
-  -- matcher returns once the screen has been stable for the configured
-  -- threshold and then this branch falls through to the normal idle /
-  -- completed-turn classification.
-  if last_intent == "cancelling" and stable_ms < completed_turn_stable_ms then
+  -- Recently-sent cancel: wait callers supply `stable_ms`, so hold
+  -- `cancelling` until the screen has been quiet for at least the
+  -- configured stability window. Plain state polling does not know screen
+  -- stability, so only keep reporting `cancelling` while the screen still
+  -- shows active interrupt/work evidence; once the idle prompt is visible,
+  -- fall through to the normal branches even if the host has not cleared
+  -- `last_intent` yet.
+  if last_intent == "cancelling"
+      and ((has_stable_ms and stable_ms < completed_turn_stable_ms)
+        or (not has_stable_ms and (has_active_work_indicator(screen_text) or contains(screen_text, "interrupting"))))
+  then
     return state_snapshot(
       "cancelling",
       0.72,

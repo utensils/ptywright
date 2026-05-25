@@ -1225,6 +1225,38 @@ fn classifier_releases_cancelling_once_screen_settles() {
 }
 
 #[test]
+fn classifier_releases_stale_cancelling_on_plain_idle_state_poll() {
+    // `adapter.state`/`try_state` calls do not provide `stable_ms`. A
+    // stale `last_intent = cancelling` must not poison every later state
+    // read once the idle prompt is visible, or app integrations cannot
+    // send the next prompt after an interrupt.
+    let extension = claude_plugin();
+    let post_cancel_idle = "❯ count to 10\n\n────────\n❯\n";
+    let state = classify_state(&extension, post_cancel_idle, 44, Some("cancelling"), None);
+
+    assert_ne!(
+        state.state, "cancelling",
+        "plain idle state polling must release stale cancelling intent; got evidence {}",
+        state.evidence,
+    );
+}
+
+#[test]
+fn classifier_holds_cancelling_on_plain_active_state_poll() {
+    let extension = claude_plugin();
+    let active_cancel_screen = "❯ count to 10\n\n✽ Interrupting…\n\nesc to interrupt\n";
+    let state = classify_state(
+        &extension,
+        active_cancel_screen,
+        45,
+        Some("cancelling"),
+        None,
+    );
+
+    assert_eq!(state.state, "cancelling");
+}
+
+#[test]
 fn classifier_detects_completed_turn_after_prompt_submission() {
     let extension = claude_plugin();
     let state = classify_state(
