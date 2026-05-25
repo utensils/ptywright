@@ -80,19 +80,46 @@ fn classify_with_transcript(
     last_intent: Option<&str>,
     stable_ms: Option<u64>,
 ) -> ExtensionStateSnapshot {
-    let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
-    let markers = std::collections::BTreeMap::new();
+    classify_with_transcript_and_markers(
+        extension,
+        TranscriptClassifyFixture {
+            screen,
+            transcript,
+            sequence,
+            last_intent,
+            stable_ms,
+            markers: &std::collections::BTreeMap::new(),
+            cursor: 0,
+        },
+    )
+}
+
+struct TranscriptClassifyFixture<'a> {
+    screen: &'a str,
+    transcript: &'a str,
+    sequence: u64,
+    last_intent: Option<&'a str>,
+    stable_ms: Option<u64>,
+    markers: &'a std::collections::BTreeMap<String, u64>,
+    cursor: u64,
+}
+
+fn classify_with_transcript_and_markers(
+    extension: &LuaExtension,
+    fixture: TranscriptClassifyFixture<'_>,
+) -> ExtensionStateSnapshot {
+    let (body_text, status_text) = split_status_bar(fixture.screen, STATUS_BAR_ROWS);
     let ctx = ClassifyContext {
-        screen,
+        screen: fixture.screen,
         body_text: &body_text,
         status_text: &status_text,
-        transcript,
-        sequence,
-        last_intent,
-        stable_ms,
+        transcript: fixture.transcript,
+        sequence: fixture.sequence,
+        last_intent: fixture.last_intent,
+        stable_ms: fixture.stable_ms,
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
-        markers: &markers,
-        cursor: 0,
+        markers: fixture.markers,
+        cursor: fixture.cursor,
     };
     extension.classify(&ctx).expect("classify via Lua plugin")
 }
@@ -258,15 +285,13 @@ fn welcome_panel_does_not_downgrade_completed_turn_when_prompt_submitted() {
 }
 
 #[test]
-fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
+fn steer_plan_streams_text_without_setting_prompt_submitted_intent() {
     // Mid-turn steering injects a follow-up prompt while Claude is still
-    // thinking. The action shape is identical to `send_prompt` (bracketed
-    // paste + Enter) but `last_intent` MUST NOT flip to `prompt_submitted`
-    // — that's the marker the classifier uses to decide a `completed_turn`
-    // can fire when the screen settles. Treating steering as the first
-    // half of a fresh turn would cause `adapter.wait` to mistake a
-    // stable-thinking screen for "turn complete" the moment Claude is
-    // just slow on the original turn.
+    // thinking. It uses the same streamed-text path as prompt submission
+    // so Chrome-enabled Claude Code sees real typed input instead of a
+    // collapsed paste placeholder. `last_intent` MUST NOT flip to
+    // `prompt_submitted` — that's the marker the classifier uses to decide
+    // a `completed_turn` can fire when the screen settles.
     let extension = claude_plugin();
     let plan = plan(
         &extension,
@@ -277,7 +302,11 @@ fn steer_plan_uses_bracketed_paste_without_setting_prompt_submitted_intent() {
     assert_eq!(
         plan.actions,
         vec![
-            Action::BracketedPaste("actually use /tmp".to_string()),
+            Action::StreamText(StreamText {
+                text: "actually use /tmp".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
         ]
     );
@@ -1922,6 +1951,95 @@ Could you remind me what we were working on?
     assert_eq!(
         text,
         "The branch is identical to main — no commits ahead.\nCould you remind me what we were working on?"
+    );
+}
+
+#[test]
+fn classify_thinking_surfaces_partial_turn_text_from_transcript() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ summarize
+
+⏺ Searching for 1 pattern, reading 2 files… (ctrl+o to expand)
+
+· Meandering… (12s · ↓ 100 tokens)";
+    let transcript = "\
+❯ summarize
+Read(src/lib.rs)
+Running...
+
+The project is a Tauri app.
+It has a Rust backend";
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 0);
+
+    let snapshot = classify_with_transcript_and_markers(
+        &extension,
+        TranscriptClassifyFixture {
+            screen,
+            transcript,
+            sequence: 101,
+            last_intent: Some("prompt_submitted"),
+            stable_ms: None,
+            markers: &markers,
+            cursor: transcript.chars().count() as u64,
+        },
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured partial text");
+    assert_eq!(
+        partial,
+        "The project is a Tauri app.\nIt has a Rust backend"
+    );
+}
+
+#[test]
+fn classify_thinking_surfaces_visible_tool_metadata() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Explore this project using agents
+
+⎿ Read(mcp_nixos/sources/store.py)
+  Bash(head -50 /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-corn
+       flower/mcp_nixos/sources/home_manager.py)
+  Running...
+  Bash(head -80 /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-corn
+       flower/mcp_nixos/sources/wiki.py)
+  Running...
+  ... +22 tool uses (ctrl+o to expand)
+
+· Meandering… (34s · ↓ 1.3k tokens)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        102,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let tools = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .expect("visible tools");
+    assert_eq!(tools.len(), 3);
+    assert_eq!(tools[0]["name"], "Read");
+    assert_eq!(tools[0]["input"]["file_path"], "mcp_nixos/sources/store.py");
+    assert_eq!(tools[1]["name"], "Bash");
+    assert_eq!(tools[1]["status"], "running");
+    assert_eq!(
+        tools[1]["input"]["command"],
+        "head -50 /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-corn flower/mcp_nixos/sources/home_manager.py"
     );
 }
 

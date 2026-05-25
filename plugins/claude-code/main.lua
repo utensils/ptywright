@@ -643,11 +643,67 @@ local function strip_answer_bullet(line)
   return trimmed
 end
 
+local TOOL_CALL_NAMES = {
+  Bash = true,
+  Glob = true,
+  Grep = true,
+  LS = true,
+  Read = true,
+  Edit = true,
+  MultiEdit = true,
+  Write = true,
+  NotebookRead = true,
+  NotebookEdit = true,
+  WebFetch = true,
+  WebSearch = true,
+  TodoRead = true,
+  TodoWrite = true,
+  Task = true,
+}
+
+local function strip_tool_callout_prefix(line)
+  local trimmed = trim(line)
+  if starts_with(trimmed, "⎿") then
+    return trim(string.sub(trimmed, #"⎿" + 1))
+  end
+  return trimmed
+end
+
+local function parse_tool_call_start(line)
+  local stripped = strip_tool_callout_prefix(line)
+  local name, rest = stripped:match("^([%a][%w_%-]*)%((.*)$")
+  if name and TOOL_CALL_NAMES[name] then
+    return name, rest
+  end
+  return nil, nil
+end
+
+local function is_structured_tool_call_line(line)
+  local name = parse_tool_call_start(line)
+  return name ~= nil
+end
+
+local function is_tool_call_continuation_chrome(line)
+  local trimmed = trim(line)
+  if trimmed == "" then return true end
+  if trimmed == "Running..." or trimmed == "Running…" then return true end
+  if starts_with(trimmed, "... +") and contains(trimmed, "tool use") then return true end
+  if starts_with(trimmed, "└") or starts_with(trimmed, "├") or starts_with(trimmed, "│") then return true end
+  return false
+end
+
+local function is_horizontal_rule_line(line)
+  local trimmed = trim(line)
+  return trimmed ~= "" and trimmed:match("^[─━═]+$") ~= nil
+end
+
 local function is_structured_output_chrome_line(line)
   local trimmed = trim(line)
   if trimmed == "" then return true end
   if is_prompt_echo_line(trimmed) then return true end
   if is_progress_chrome_line(trimmed) then return true end
+  if is_structured_tool_call_line(trimmed) then return true end
+  if is_tool_call_continuation_chrome(trimmed) then return true end
   if starts_with(trimmed, "⎿") then return true end
   if trimmed == "(No output)" then return true end
   if starts_with(trimmed, "Allowed by auto mode classifier") then return true end
@@ -662,6 +718,21 @@ local function is_structured_output_chrome_line(line)
   if contains(trimmed, "Claude Max") then return true end
   if starts_with(trimmed, "~") or starts_with(trimmed, "/") then return true end
   return false
+end
+
+local function utf8_sub_from_cursor(text, cursor)
+  local n = tonumber(cursor) or 0
+  if n <= 0 then return text end
+  if utf8 and utf8.offset then
+    local byte_offset = utf8.offset(text, n + 1)
+    if byte_offset then
+      return string.sub(text, byte_offset)
+    end
+    return ""
+  end
+  -- ASCII fallback for older Lua embedders. ptywright ships Lua with
+  -- utf8, but keeping a degraded path makes the helper safe in tests.
+  return string.sub(text, n + 1)
 end
 
 local function extract_structured_turn_output(text)
@@ -700,6 +771,146 @@ local function extract_structured_turn_output(text)
 
   if #out == 0 then return nil end
   return table.concat(out, "\n")
+end
+
+local function extract_structured_partial_turn_output(text, turn_start)
+  local slice = utf8_sub_from_cursor(text or "", turn_start or 0)
+  if slice == "" then return nil end
+
+  local lines = {}
+  for line in string.gmatch(slice, "[^\n]+") do
+    table.insert(lines, line)
+  end
+  if #lines == 0 then return nil end
+
+  local marker_idx = #lines + 1
+  for i = 1, #lines do
+    if is_completion_marker_line(lines[i]) then
+      marker_idx = i
+      break
+    end
+  end
+
+  local echo_idx = 0
+  for i = marker_idx - 1, 1, -1 do
+    if is_prompt_echo_line(lines[i]) then
+      echo_idx = i
+      break
+    end
+  end
+
+  local start_idx = echo_idx > 0 and echo_idx + 1 or 1
+  local out = {}
+  for i = start_idx, marker_idx - 1 do
+    if not is_structured_output_chrome_line(lines[i]) then
+      local line = strip_answer_bullet(lines[i])
+      if line ~= "" then
+        table.insert(out, line)
+      end
+    end
+  end
+
+  if #out == 0 then return nil end
+  return table.concat(out, "\n")
+end
+
+local function strip_wrapped_tool_arg(arg)
+  local text = trim(arg or "")
+  if string.sub(text, -1) == ")" then
+    text = string.sub(text, 1, -2)
+  end
+  return trim(text)
+end
+
+local function tool_input_for(name, summary)
+  if name == "Read" or name == "Write" or name == "Edit" or name == "MultiEdit"
+      or name == "NotebookRead" or name == "NotebookEdit" then
+    return { file_path = summary }
+  end
+  if name == "Bash" then
+    return { command = summary }
+  end
+  if name == "Grep" or name == "Glob" or name == "WebSearch" then
+    return { pattern = summary }
+  end
+  if name == "LS" then
+    return { path = summary ~= "" and summary or "." }
+  end
+  if name == "WebFetch" then
+    return { url = summary }
+  end
+  return { description = summary }
+end
+
+local function parse_visible_tool_calls(screen)
+  local lines = {}
+  for line in string.gmatch(screen or "", "[^\n]+") do
+    table.insert(lines, line)
+  end
+  local tools = {}
+  local i = 1
+  while i <= #lines do
+    local name, rest = parse_tool_call_start(lines[i])
+    if name then
+      local pieces = { rest or "" }
+      local status = "completed"
+      local j = i + 1
+      while j <= #lines do
+        local next_name = parse_tool_call_start(lines[j])
+        local t = trim(lines[j])
+        if next_name
+            or is_prompt_echo_line(t)
+            or is_completion_marker_line(t)
+            or is_horizontal_rule_line(t)
+            or starts_with(t, "⏺") then
+          break
+        end
+        if t == "Running..." or t == "Running…" then
+          status = "running"
+          j = j + 1
+          break
+        end
+        if starts_with(t, "... +") and contains(t, "tool use") then
+          break
+        end
+        if t ~= "" and not starts_with(t, "⎿") then
+          table.insert(pieces, t)
+        end
+        if string.sub(t, -1) == ")" then
+          local next_line = lines[j + 1] and trim(lines[j + 1]) or ""
+          if next_line == "Running..." or next_line == "Running…" then
+            status = "running"
+            j = j + 2
+          else
+            j = j + 1
+          end
+          break
+        end
+        j = j + 1
+      end
+      local summary = strip_wrapped_tool_arg(table.concat(pieces, " "))
+      if summary ~= "" then
+        table.insert(tools, {
+          key = name .. ":" .. summary,
+          name = name,
+          summary = summary,
+          status = status,
+          input = tool_input_for(name, summary),
+        })
+      end
+      i = math.max(j, i + 1)
+    else
+      i = i + 1
+    end
+  end
+
+  if #tools == 0 then return nil end
+  local start = math.max(1, #tools - 23)
+  local visible = {}
+  for idx = start, #tools do
+    table.insert(visible, tools[idx])
+  end
+  return { tools = visible }
 end
 
 -- Returns true if any line in `text` is a Claude Code 2.1.x
@@ -1598,8 +1809,19 @@ function M.classify(input)
   local markers = input.markers or {}
   local cursor = tonumber(input.cursor) or 0
   local function state_snapshot(state, confidence, evidence, seq, metadata)
-    local merged = merge_metadata(status_metadata, metadata)
+    local visible_tool_metadata = parse_visible_tool_calls(screen)
+    local merged = merge_metadata(status_metadata, visible_tool_metadata)
+    merged = merge_metadata(merged, metadata)
     local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
+    if last_intent == "prompt_submitted" then
+      local turn_start = markers["turn_start"]
+      if turn_start then
+        local partial_output = extract_structured_partial_turn_output(transcript, turn_start)
+        if partial_output then
+          snap.metadata = merge_metadata(snap.metadata, { turn = { partial_text = partial_output } })
+        end
+      end
+    end
     if state == "completed_turn" and last_intent == "prompt_submitted" then
       -- Prefer the host transcript over the visible viewport. The viewport
       -- can be scrolled to the tail of a long answer by the time Claude
@@ -2001,7 +2223,7 @@ end
 function M.steer(input)
   return {
     actions = {
-      action.bracketed_paste(input.prompt or ""),
+      action.stream_text(input.prompt or ""),
       action.key("enter"),
     },
   }
