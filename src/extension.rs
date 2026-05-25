@@ -738,6 +738,7 @@ fn action_kinds(actions: &[Action]) -> Vec<&'static str> {
         .iter()
         .map(|action| match action {
             Action::Text(_) => "text",
+            Action::StreamText(_) => "stream_text",
             Action::Key(_) => "key",
             Action::Paste(_) => "paste",
             Action::BracketedPaste(_) => "bracketed_paste",

@@ -21,7 +21,7 @@ use ptywright::extension::{
 use ptywright::matcher::Matcher;
 use ptywright::screen::{CursorState, ScreenSnapshot};
 use ptywright::target::TerminalSize;
-use ptywright::{Action, MatcherContext};
+use ptywright::{Action, MatcherContext, StreamText};
 
 const COMPLETED_TURN_STABLE_MS: u64 = 300;
 
@@ -272,12 +272,12 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
     //      so callers can later slice the per-turn output via
     //      `Session::transcript_slice`. The matching `turn_end` mark
     //      fires from the classifier's `completed_turn` branch.
-    //   3. Text(prompt) — Claude Code v2.1.150 can swallow bracketed
-    //      paste in Chrome-enabled interactive mode even though it
-    //      advertises bracketed paste support.
+    //   3. StreamText(prompt) — Claude Code v2.1.150 can swallow bracketed
+    //      paste in Chrome-enabled interactive mode, while huge raw writes
+    //      can render as collapsed paste placeholders.
     //   4. Enter — submit the now-populated input box.
     //   5. Enter — recovery submit for Claude Code builds that accept
-    //      the raw text but leave it editable after the first trailing
+    //      the streamed text but leave it editable after the first trailing
     //      Enter.
     //
     // Without action #1, the text can land in Claude's first-keypress
@@ -298,7 +298,11 @@ fn send_prompt_plan_dismisses_then_pastes_then_submits() {
             Action::MarkTranscript {
                 label: "turn_start".to_string()
             },
-            Action::Text("hello Claude".to_string()),
+            Action::StreamText(StreamText {
+                text: "hello Claude".to_string(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
             Action::Key(Key::Enter),
             Action::Key(Key::Enter),
         ]

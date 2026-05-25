@@ -1921,9 +1921,11 @@ end
 function M.send_prompt(input)
   -- Claude Code v2.1.150 can swallow bracketed paste in Chrome-enabled
   -- interactive mode even though it advertises bracketed paste support.
-  -- Use raw text for the prompt path so the current TUI accepts the
-  -- input consistently. The generic `action.paste(...)` still exists
-  -- for callers / plugins
+  -- A huge raw write is not ideal either: Claude's prompt UI can render
+  -- it as collapsed paste placeholders. Use a paced text stream for the
+  -- prompt path so the current TUI sees normal input without paste
+  -- markers. The generic `action.paste(...)` still exists for callers /
+  -- plugins driving tools where paste semantics are desired.
   --
   -- The leading Enter handles Claude Code 2.1.x's first-keypress
   -- interceptors (welcome panel, compact-launch view). On a clean
@@ -1963,7 +1965,7 @@ function M.send_prompt(input)
     actions = {
       action.key("enter"),
       action.mark_transcript("turn_start"),
-      action.text(prompt),
+      action.stream_text(prompt),
       action.key("enter"),
       action.key("enter"),
     },

@@ -415,6 +415,7 @@ impl Session {
     pub fn send(&self, action: Action) -> Result<()> {
         match action {
             Action::Text(text) | Action::Paste(text) => self.write_all(text.as_bytes()),
+            Action::StreamText(text) => self.write_stream_text(&text),
             Action::BracketedPaste(text) => self.write_bracketed_paste(text.as_bytes()),
             Action::Key(key) => self.send_key(key),
             Action::Resize(size) => self.resize(size),
@@ -442,6 +443,31 @@ impl Session {
     /// rather than absorbed into the paste tokeniser.
     fn write_bracketed_paste(&self, bytes: &[u8]) -> Result<()> {
         self.write_all(&bracketed_paste_payload(bytes))
+    }
+
+    fn write_stream_text(&self, text: &crate::action::StreamText) -> Result<()> {
+        let chunk_chars = text.chunk_chars.unwrap_or(64).clamp(1, 1024);
+        let delay = std::time::Duration::from_millis(text.delay_ms.unwrap_or(2).min(100));
+        let mut chunk = String::new();
+        let mut chunk_len = 0usize;
+
+        for ch in text.text.chars() {
+            chunk.push(ch);
+            chunk_len += 1;
+            if chunk_len >= chunk_chars {
+                self.write_all(chunk.as_bytes())?;
+                chunk.clear();
+                chunk_len = 0;
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+
+        if !chunk.is_empty() {
+            self.write_all(chunk.as_bytes())?;
+        }
+        Ok(())
     }
 }
 
@@ -988,6 +1014,33 @@ mod tests {
         assert!(
             !transcript.contains("\x1b[200~"),
             "Action::Paste must not emit bracketed-paste markers: {transcript:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_stream_text_writes_raw_text_without_paste_markers() {
+        let target =
+            Target::new("/bin/sh").args(["-lc", "read line; printf 'GOT[%s]done' \"$line\""]);
+        let session = Session::spawn(SessionConfig::new(target)).expect("spawn shell");
+        session
+            .send(Action::StreamText(crate::action::StreamText {
+                text: "plain".into(),
+                chunk_chars: Some(2),
+                delay_ms: Some(0),
+            }))
+            .expect("send streamed text");
+        session.send(Action::Key(Key::Enter)).expect("send enter");
+        let result = session
+            .wait_for(
+                &Matcher::ContainsText("GOT[plain]done".into()),
+                Duration::from_secs(5),
+            )
+            .expect("wait for done");
+        let transcript = result.transcript_tail;
+        assert!(
+            !transcript.contains("\x1b[200~"),
+            "Action::StreamText must not emit bracketed-paste markers: {transcript:?}"
         );
     }
 
