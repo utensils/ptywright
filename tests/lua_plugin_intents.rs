@@ -1487,6 +1487,24 @@ fn classifier_detects_usage_screen_as_completed_turn() {
 
     assert_eq!(state.state, "completed_turn");
     assert_eq!(state.evidence, "stable usage screen detected");
+    assert_eq!(
+        state
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/usage/limits/current session/percent_used"))
+            .and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        state
+            .metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata.pointer("/usage/limits/current week (all models)/percent_used")
+            })
+            .and_then(serde_json::Value::as_i64),
+        Some(98)
+    );
 }
 
 #[test]

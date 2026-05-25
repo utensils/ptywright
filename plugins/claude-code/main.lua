@@ -1358,37 +1358,36 @@ local function parse_usage_screen(text)
   local added, removed = text:match("[Tt]otal code changes:%s*(%d+)%s*lines added,%s*(%d+)%s*lines removed")
   maybe_set("lines_added", tonumber(added))
   maybe_set("lines_removed", tonumber(removed))
-  if next(usage) == nil then
-    local limits = {}
-    local current_label = nil
-    for line in string.gmatch(text or "", "[^\n]+") do
-      local t = trim(line)
-      local l = lower(t)
-      if l == "current session"
-          or l == "current week (all models)"
-          or l == "current week (sonnet only)"
-          or l == "extra usage" then
-        current_label = l
-      else
-        local pct = t:match("(%d+)%%%s*used")
-        if pct and current_label then
-          limits[current_label] = limits[current_label] or {}
-          limits[current_label].percent_used = tonumber(pct)
-        end
-        local reset = t:match("^[Rr]esets%s+(.+)$")
-        if reset and current_label then
-          limits[current_label] = limits[current_label] or {}
-          limits[current_label].resets = reset
-        end
-        if current_label == "extra usage" and t ~= "" and l ~= "extra usage" and not contains(l, "esc to cancel") then
-          limits[current_label] = limits[current_label] or {}
-          limits[current_label].status = limits[current_label].status or t
-        end
+  local limits = {}
+  local current_label = nil
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local t = trim(line)
+    local l = lower(t)
+    if l == "current session"
+        or l == "current week (all models)"
+        or l == "current week (sonnet only)"
+        or l == "current week (opus only)"
+        or l == "extra usage" then
+      current_label = l
+    else
+      local pct = t:match("(%d+)%%%s*used")
+      if pct and current_label then
+        limits[current_label] = limits[current_label] or {}
+        limits[current_label].percent_used = tonumber(pct)
+      end
+      local reset = t:match("^[Rr]esets%s+(.+)$")
+      if reset and current_label then
+        limits[current_label] = limits[current_label] or {}
+        limits[current_label].resets = reset
+      end
+      if current_label == "extra usage" and t ~= "" and l ~= "extra usage" and not contains(l, "esc to cancel") then
+        limits[current_label] = limits[current_label] or {}
+        limits[current_label].status = limits[current_label].status or t
       end
     end
-    if next(limits) ~= nil then
-      usage.limits = limits
-    end
+  end
+  if next(limits) ~= nil then
+    usage.limits = limits
   end
   return { usage = usage }
 end
