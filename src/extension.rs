@@ -1091,4 +1091,67 @@ mod tests {
             serde_json::json!({"pattern": "ready", "completed_turn_stable_ms": 300}),
         );
     }
+
+    #[test]
+    fn action_kinds_labels_every_action_variant() {
+        // The classifier-tracing instrumentation in `send` records the
+        // shape of each plan it executes. If a new `Action` variant lands
+        // without a corresponding arm here, the trace line silently
+        // misclassifies it, hiding bugs in plugin authoring. Exhaustive
+        // match on the input keeps this test honest against future
+        // additions to the enum.
+        let actions = vec![
+            Action::Text("t".into()),
+            Action::StreamText(crate::StreamText {
+                text: "s".into(),
+                chunk_chars: None,
+                delay_ms: None,
+            }),
+            Action::Key(crate::action::Key::Enter),
+            Action::Paste("p".into()),
+            Action::BracketedPaste("b".into()),
+            Action::Resize(crate::target::TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }),
+            Action::Interrupt,
+            Action::Eof,
+            Action::Signal(crate::action::Signal::Term),
+            Action::Kill,
+            Action::MarkTranscript { label: "m".into() },
+        ];
+        assert_eq!(
+            action_kinds(&actions),
+            vec![
+                "text",
+                "stream_text",
+                "key",
+                "paste",
+                "bracketed_paste",
+                "resize",
+                "interrupt",
+                "eof",
+                "signal",
+                "kill",
+                "mark_transcript",
+            ],
+        );
+    }
+
+    #[test]
+    fn metadata_keys_returns_object_keys_or_empty() {
+        // Tracing emits the inventory of keys, not values, so PII / large
+        // strings don't leak into rotated log files. Anchor both the
+        // happy path and the None / non-object cases that fall back to
+        // an empty list.
+        assert!(metadata_keys(None).is_empty());
+        assert!(metadata_keys(Some(&serde_json::json!("scalar"))).is_empty());
+        let mut keys = metadata_keys(Some(
+            &serde_json::json!({"usage": 1, "permission": {}, "status": null}),
+        ));
+        keys.sort();
+        assert_eq!(keys, vec!["permission", "status", "usage"]);
+    }
 }

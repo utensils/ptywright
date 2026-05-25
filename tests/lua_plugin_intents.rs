@@ -2330,3 +2330,59 @@ fn extension_handle_applies_plan_driven_mark_transcript_action() {
 
     let _ = handle.session().kill();
 }
+
+/// Drive `send`, `wait`, and `classify` with an active TRACE-level
+/// `tracing` subscriber so the macro arms in `ExtensionHandle` evaluate
+/// their format arguments. Without an installed subscriber the
+/// `tracing::debug!` / `tracing::trace!` macros short-circuit before
+/// touching their `%expr` / `?expr` fields, leaving coverage gaps even
+/// when every public method is exercised.
+///
+/// Uses the built-in claude-code plugin to drive the generic surface —
+/// the intent names (`dismiss_welcome`, `wait_cancel_settled_matcher`)
+/// are the closest no-op-shaped probes the plugin exposes, but the host
+/// code under test is plugin-agnostic.
+#[test]
+#[cfg(unix)]
+fn extension_handle_tracing_macros_evaluate_for_send_wait_and_classify() {
+    use ptywright::session::Session;
+    use ptywright::target::Target;
+    use tracing::Level;
+    use tracing_subscriber::FmtSubscriber;
+
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::TRACE)
+        .with_writer(std::io::sink)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // `sleep 30` keeps the PTY alive long enough for the three host
+    // calls without writing anything; classify sees an empty screen and
+    // screen_stable(0) resolves on the first poll.
+    let session = Session::spawn_target(Target::new("/bin/sh").args(["-lc", "sleep 30"]))
+        .expect("spawn /bin/sh sleep");
+    let extension = claude_plugin();
+    let mut handle = ExtensionHandle::start(Box::new(extension), session, 0);
+
+    // classify path — covers the `tracing::trace!` macro at the bottom
+    // of `ExtensionHandle::classify`.
+    let _ = handle.state();
+
+    // send path — `dismiss_welcome` is a pure key-press plan, no PTY
+    // state dependencies. Covers the `tracing::debug!` macro in `send`.
+    handle
+        .send("dismiss_welcome", json!({}))
+        .expect("dismiss_welcome send");
+
+    // wait path — `wait_cancel_settled_matcher` with
+    // `completed_turn_stable_ms = 0` returns `Matcher::ScreenStable(0)`,
+    // which resolves quickly on an idle PTY. Covers the
+    // `tracing::debug!` macro in `wait_inner` and re-exercises classify.
+    let _ = handle.wait(
+        "wait_cancel_settled_matcher",
+        json!({"completed_turn_stable_ms": 0}),
+        Duration::from_secs(2),
+    );
+
+    let _ = handle.session().kill();
+}
