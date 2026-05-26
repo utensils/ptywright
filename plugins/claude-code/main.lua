@@ -357,6 +357,7 @@ local ELLIPSIS = "…"
 local THINKING_LINE_MAX_BYTES = 80
 local SPINNER_GLYPHS = {
   "✶", "✻", "✺", "✦", "·", "•",
+  "✳", "✢", "✽",
   "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 }
 
@@ -492,6 +493,7 @@ end
 -- echo and reject the real marker for "no content above".
 local function is_prompt_echo_line(line)
   local t = trim(line)
+  if t == "❯" then return true end
   if starts_with(t, "❯ ") then return true end
   if starts_with(t, "❯\194\160") then return true end
   return false
@@ -648,7 +650,7 @@ local function strip_terminal_controls(text)
   local cleaned = tostring(text or "")
   cleaned = cleaned:gsub("\27%][^\7]*\7", "")
   cleaned = cleaned:gsub("\27%][^\27]*\27\\", "")
-  cleaned = cleaned:gsub("\27%[[%?%d;:]*[ -/]*[@-~]", "")
+  cleaned = cleaned:gsub("\27%[[%?%>%d;:]*[ -/]*[@-~]", "")
   cleaned = cleaned:gsub("\27[=>c]", "")
   cleaned = cleaned:gsub("\r", "")
   return cleaned
@@ -729,11 +731,21 @@ local function is_horizontal_rule_line(line)
   return trimmed ~= "" and trimmed:match("^[─━═]+$") ~= nil
 end
 
+local function is_assistant_output_anchor_line(line)
+  local trimmed = trim(strip_terminal_controls(line))
+  if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") then return true end
+  if starts_with(trimmed, "⎿") then return true end
+  if is_structured_tool_call_line(trimmed) then return true end
+  if is_agent_progress_chrome_line(trimmed) then return true end
+  return false
+end
+
 local function is_structured_output_chrome_line(line)
   local trimmed = trim(line)
   if trimmed == "" then return true end
   if is_prompt_echo_line(trimmed) then return true end
   if is_progress_chrome_line(trimmed) then return true end
+  if starts_with_spinner_glyph(trimmed) then return true end
   if is_structured_tool_call_line(trimmed) then return true end
   if is_tool_call_continuation_chrome(trimmed) then return true end
   if is_completed_tool_progress_chrome_line(trimmed) then return true end
@@ -750,6 +762,27 @@ local function is_structured_output_chrome_line(line)
   -- consuming structured turn output want assistant content only.
   if trimmed == "Claude Code" or contains(trimmed, "Claude Code v") then return true end
   if contains(trimmed, "Claude Max") then return true end
+  if starts_with(trimmed, "▘▘") and contains(trimmed, ".claudette/workspaces/") then return true end
+  return false
+end
+
+local function is_structured_partial_chrome_line(line)
+  local trimmed = trim(line)
+  if is_structured_output_chrome_line(line) then return true end
+  if trimmed:match("^%(%d+[smh]*s*%s*·%s*thinking%)$") then return true end
+  if trimmed:match("^%d+[smh]*s*%s*·%s*thinking$") then return true end
+  if contains(trimmed, "tokens") and contains(trimmed, "thinking") then return true end
+  if contains(trimmed, "ought for") and trimmed:match("%d+s%)$") then return true end
+  if trimmed == "↑" or trimmed == "↓" then return true end
+  if contains(trimmed, "Exploreagents") and contains(trimmed, "finished") then return true end
+  if contains(trimmed, "Explore agents") and contains(trimmed, "finished") then return true end
+  if contains(trimmed, "Exploreagents") and contains(trimmed, "Running") then return true end
+  if contains(trimmed, "Done↑") or contains(trimmed, "Done↓") then return true end
+  if trimmed:match("^↓%s*[%d%.kKmM]+%s+tokens%)?$") then return true end
+  if trimmed:match("^[%d%.kKmM]+%s+tokens%)$") then return true end
+  if trimmed:match("^%d%d?%d?%)$") then return true end
+  if trimmed:match("^%d%d?%d?$") then return true end
+  if starts_with_spinner_glyph(trimmed) then return true end
   return false
 end
 
@@ -768,15 +801,64 @@ local function utf8_sub_from_cursor(text, cursor)
   return string.sub(text, n + 1)
 end
 
-local function structured_output_start_after_echo(lines, echo_idx, marker_idx)
+local function utf8_sub_between_cursors(text, start_cursor, end_cursor)
+  local source = text or ""
+  local start_n = tonumber(start_cursor) or 0
+  local end_n = tonumber(end_cursor) or 0
+  if start_n < 0 then start_n = 0 end
+  if end_n <= 0 or end_n <= start_n then
+    return utf8_sub_from_cursor(source, start_n)
+  end
+
+  if utf8 and utf8.offset then
+    local start_byte = 1
+    if start_n > 0 then
+      start_byte = utf8.offset(source, start_n + 1)
+      if not start_byte then return "" end
+    end
+    local end_byte = utf8.offset(source, end_n + 1)
+    if end_byte then
+      return string.sub(source, start_byte, end_byte - 1)
+    end
+    return string.sub(source, start_byte)
+  end
+
+  return string.sub(source, start_n + 1, end_n)
+end
+
+local function utf8_char_len(text)
+  local source = text or ""
+  if utf8 and utf8.len then
+    local ok, len = pcall(utf8.len, source)
+    if ok and len then return len end
+  end
+  return #source
+end
+
+local function structured_output_start_after_echo(lines, echo_idx, marker_idx, require_anchor)
   if echo_idx <= 0 then return 1 end
   local limit = marker_idx and marker_idx - 1 or #lines
   for i = echo_idx + 1, limit do
-    if is_horizontal_rule_line(lines[i]) then
+    if is_assistant_output_anchor_line(lines[i]) then
+      return i
+    end
+  end
+  if require_anchor then
+    return nil
+  end
+  for i = echo_idx + 1, limit do
+    if is_horizontal_rule_line(strip_terminal_controls(lines[i])) then
       return i + 1
     end
   end
-  return echo_idx + 1
+  for i = echo_idx + 1, limit do
+    local line = strip_terminal_controls(lines[i])
+    local trimmed = trim(line)
+    if trimmed ~= "" and not line:match("^%s%s+%S") then
+      return i
+    end
+  end
+  return limit + 1
 end
 
 local function submitted_prompt_still_pending(screen)
@@ -826,15 +908,19 @@ local function submitted_prompt_still_pending(screen)
   return true
 end
 
-local function extract_structured_turn_output(text)
+local function extract_structured_turn_output(text, turn_start, turn_end)
+  local source = text or ""
+  if turn_start then
+    source = utf8_sub_between_cursors(source, turn_start, turn_end)
+  end
   local lines = {}
-  for line in string.gmatch(text or "", "[^\n]+") do
+  for line in string.gmatch(source, "[^\n]+") do
     table.insert(lines, line)
   end
 
   local marker_idx = 0
   for i = #lines, 1, -1 do
-    if is_completion_marker_line(lines[i]) then
+    if is_completion_marker_line(strip_terminal_controls(lines[i])) then
       marker_idx = i
       break
     end
@@ -843,13 +929,13 @@ local function extract_structured_turn_output(text)
 
   local echo_idx = 0
   for i = marker_idx - 1, 1, -1 do
-    if is_prompt_echo_line(lines[i]) then
+    if is_prompt_echo_line(strip_terminal_controls(lines[i])) then
       echo_idx = i
       break
     end
   end
 
-  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx)
+  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx, false)
   local out = {}
   for i = start_idx, marker_idx - 1 do
     local clean_line = strip_terminal_controls(lines[i])
@@ -877,7 +963,7 @@ local function extract_structured_partial_turn_output(text, turn_start)
 
   local marker_idx = #lines + 1
   for i = 1, #lines do
-    if is_completion_marker_line(lines[i]) then
+    if is_completion_marker_line(strip_terminal_controls(lines[i])) then
       marker_idx = i
       break
     end
@@ -885,17 +971,18 @@ local function extract_structured_partial_turn_output(text, turn_start)
 
   local echo_idx = 0
   for i = marker_idx - 1, 1, -1 do
-    if is_prompt_echo_line(lines[i]) then
+    if is_prompt_echo_line(strip_terminal_controls(lines[i])) then
       echo_idx = i
       break
     end
   end
 
-  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx)
+  local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx, true)
+  if not start_idx then return nil end
   local out = {}
   for i = start_idx, marker_idx - 1 do
     local clean_line = strip_terminal_controls(lines[i])
-    if not is_structured_output_chrome_line(clean_line) then
+    if not is_structured_partial_chrome_line(clean_line) then
       local line = strip_answer_bullet(clean_line)
       if line ~= "" then
         table.insert(out, line)
@@ -1948,32 +2035,26 @@ function M.classify(input)
   local outer_state_snapshot = state_snapshot
   local status_metadata = parse_status_bar(status)
   local markers = input.markers or {}
-  local cursor = tonumber(input.cursor) or 0
+  local cursor = math.max(tonumber(input.cursor) or 0, utf8_char_len(transcript))
   local function state_snapshot(state, confidence, evidence, seq, metadata)
     local visible_tool_metadata = parse_visible_tool_calls(screen)
     local merged = merge_metadata(status_metadata, visible_tool_metadata)
     merged = merge_metadata(merged, metadata)
     local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
     if last_intent == "prompt_submitted" and not has_stable_ms then
-      local partial_output = extract_structured_partial_turn_output(screen, 0)
+      local partial_output = nil
+      local turn_start = markers["turn_start"]
+      if turn_start then
+        partial_output = extract_structured_partial_turn_output(transcript, turn_start)
+      end
+      if not partial_output then
+        partial_output = extract_structured_partial_turn_output(screen, 0)
+      end
       if partial_output then
         snap.metadata = merge_metadata(snap.metadata, { turn = { partial_text = partial_output } })
       end
     end
     if state == "completed_turn" and last_intent == "prompt_submitted" then
-      -- Prefer the host transcript over the visible viewport. The viewport
-      -- can be scrolled to the tail of a long answer by the time Claude
-      -- returns to the prompt; transcript-backed extraction preserves the
-      -- full answer for app integrations while still falling back to the
-      -- screen for older callers.
-      local turn_output = extract_structured_turn_output(transcript)
-      if not turn_output then
-        turn_output = extract_structured_turn_output(screen)
-      end
-      if turn_output then
-        snap.metadata = merge_metadata(snap.metadata, { turn = { text = turn_output } })
-      end
-
       local turn_start = markers["turn_start"]
       local turn_end = markers["turn_end"]
       -- A turn_end from a previous turn is stale (turn_start has been
@@ -1988,6 +2069,23 @@ function M.classify(input)
         snap.host_marks = { { label = "turn_end" } }
         turn_end = cursor
       end
+      -- Prefer the host transcript over the visible viewport. Slice with
+      -- turn_start/turn_end before extracting so a long transcript cannot
+      -- anchor on a later prompt echo and drop the beginning of the answer.
+      local turn_output = nil
+      if turn_start and turn_end then
+        turn_output = extract_structured_turn_output(transcript, turn_start, turn_end)
+      end
+      if not turn_output then
+        turn_output = extract_structured_turn_output(transcript)
+      end
+      if not turn_output then
+        turn_output = extract_structured_turn_output(screen)
+      end
+      if turn_output then
+        snap.metadata = merge_metadata(snap.metadata, { turn = { text = turn_output } })
+      end
+
       if turn_start and turn_end then
         local transcript_md = { transcript = { turn_start = turn_start, turn_end = turn_end } }
         snap.metadata = merge_metadata(snap.metadata, transcript_md)
@@ -2271,7 +2369,6 @@ function M.classify(input)
     if last_intent == "prompt_submitted"
         and completed_turn_stable_ms > 0
         and stable_ms >= completed_turn_stable_ms
-        and not has_active_work_indicator(screen_text)
         and has_turn_completion_marker(screen)
     then
       return state_snapshot("completed_turn", 0.78, "stable input prompt after prompt submission", sequence)

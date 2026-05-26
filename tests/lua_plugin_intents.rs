@@ -1915,6 +1915,117 @@ This is the beginning that scrolled out of the viewport.
 }
 
 #[test]
+fn classify_completed_turn_slices_transcript_with_turn_markers() {
+    let extension = claude_plugin();
+    let screen = "tail bullet only\n\n✻ Done for 41s\n\n❯ ";
+    let prior = "\
+❯ previous prompt
+Previous answer
+✻ Done for 2s
+
+";
+    let current = "\
+❯ Smoke test ptywright Claude integration
+
+## Full answer heading
+
+- First bullet that would scroll out of the viewport
+- Second bullet
+- Third bullet
+
+✻ Done for 41s
+
+❯ ";
+    let transcript = format!("{prior}{current}");
+
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert(
+        "turn_start".to_string(),
+        u64::try_from(prior.chars().count()).unwrap(),
+    );
+    markers.insert(
+        "turn_end".to_string(),
+        u64::try_from(transcript.chars().count()).unwrap(),
+    );
+
+    let snapshot = classify_with_transcript_and_markers(
+        &extension,
+        TranscriptClassifyFixture {
+            screen,
+            transcript: &transcript,
+            sequence: 100,
+            last_intent: Some("prompt_submitted"),
+            stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+            markers: &markers,
+            cursor: u64::try_from(transcript.chars().count()).unwrap(),
+        },
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert!(text.contains("## Full answer heading"));
+    assert!(text.contains("First bullet"));
+    assert!(text.contains("Third bullet"));
+    assert!(!text.contains("Previous answer"));
+    assert!(!text.contains("tail bullet only"));
+}
+
+#[test]
+fn classify_completed_turn_omits_bare_prompt_echo_and_header_chrome() {
+    let extension = claude_plugin();
+    let transcript = "\
+ ▐▛███▜▌   Claude Code v2.1.150
+▝▜█████▛▘  Sonnet 4.6 · Claude Max
+  ▘▘ ▝▝    ~/.claudette/workspaces/mcp-nixos/plucky-cornflower
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+  Wrapped prompt smoke after editable-submit guard. This prompt is
+  intentionally long enough to wrap across several Claude Code prompt lines,
+  and the live stream must not echo this prompt text.
+────────────────────────────────────────────────────────────────────────────────
+
+- Prompt wrapping handled correctly.
+- Live stream output contains only the response.
+WRAP_STREAM_OK
+
+✻ Baked for 4s";
+    let mut markers = std::collections::BTreeMap::new();
+    markers.insert("turn_start".to_string(), 0);
+
+    let snapshot = classify_with_transcript_and_markers(
+        &extension,
+        TranscriptClassifyFixture {
+            screen: transcript,
+            transcript,
+            sequence: 111,
+            last_intent: Some("prompt_submitted"),
+            stable_ms: Some(COMPLETED_TURN_STABLE_MS),
+            markers: &markers,
+            cursor: 120,
+        },
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+    assert_eq!(
+        text,
+        "- Prompt wrapping handled correctly.\n- Live stream output contains only the response.\nWRAP_STREAM_OK"
+    );
+}
+
+#[test]
 fn classify_completed_turn_filters_tool_status_from_structured_output() {
     let extension = claude_plugin();
     let screen = "Could you remind me what we were working on?\n\n✻ Done for 28s\n\n❯ ";
@@ -1990,6 +2101,55 @@ Read 1 file (ctrl+o to expand)
 }
 
 #[test]
+fn classify_completed_turn_filters_agent_summary_and_terminal_chrome() {
+    let extension = claude_plugin();
+    let screen = "SMOKE_AGENT_OK\n\n✻ Crunched for 24s\n\n❯ ";
+    let transcript = "\
+❯ Use 2 Explore agents to inspect this project briefly.
+
+⏺ 2 Explore agents finished (ctrl+o to expand)
+   ├ Explore project structure and entry points · 3 tool uses · 37.9k tokens
+   │ ⎿  Done
+   └ Explore tests and dependencies · 3 tool uses · 38.0k tokens
+     ⎿  Done
+
+⏺ - The project is a FastMCP 3.x async MCP server.
+  - The test suite spans about 4,600 lines.
+
+  SMOKE_AGENT_OK
+
+✻ Crunched for 24s
+
+────────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}
+────────────────────────────────────────────────────────────────────────────────
+  jamesbrink @ halcyon workspaces/mcp-nixos/plucky-cornflower
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        transcript,
+        102,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+
+    assert_eq!(
+        text,
+        "- The project is a FastMCP 3.x async MCP server.\n- The test suite spans about 4,600 lines.\nSMOKE_AGENT_OK"
+    );
+}
+
+#[test]
 fn classify_thinking_surfaces_partial_turn_text_from_transcript() {
     let extension = claude_plugin();
     let screen = "\
@@ -2049,7 +2209,7 @@ It has a Rust backend
 · Meandering… (12s · ↓ 100 tokens)";
     let transcript = "\
 \u{1b}[?2026h\u{1b}[K\r❯ summarize
-\u{1b}[2C\u{1b}[3A\rThe project is a Tauri app.\u{1b}[K
+\u{1b}[2C\u{1b}[3A\r⏺ The project is a Tauri app.\u{1b}[K
 It has a Rust backend";
     let mut markers = std::collections::BTreeMap::new();
     markers.insert("turn_start".to_string(), 0);
@@ -2083,11 +2243,11 @@ It has a Rust backend";
 fn classify_thinking_omits_wrapped_prompt_echo_from_partial_turn_text() {
     let extension = claude_plugin();
     let screen = "\
-❯ Use 2 Explore agents to inspect this project briefly. Stream progress
+\u{1b}[>0q❯ Use 2 Explore agents to inspect this project briefly. Stream progress
   normally, summarize in two bullets, and end with exactly SMOKE_AGENT_OK.
 ────────────────────────────────────────────────────────────────────────────────
 
-The first useful assistant line.";
+⏺ The first useful assistant line.";
 
     let snapshot = classify_with_transcript(
         &extension,
@@ -2105,6 +2265,81 @@ The first useful assistant line.";
         .and_then(serde_json::Value::as_str)
         .expect("structured partial text");
     assert_eq!(partial, "The first useful assistant line.");
+}
+
+#[test]
+fn classify_thinking_does_not_stream_prompt_echo_without_assistant_anchor() {
+    let extension = claude_plugin();
+    let screen = "\
+\u{1b}[>0q❯ Wrapped prompt smoke after ANSI-safe ptywright partial extraction. This
+sentence is deliberately long enough to wrap across multiple Claude Code prompt
+lines in the TUI, and the streamed assistant content must not include it.
+jamesbrink @ halcyon workspaces/mcp-nixos/plucky-cornflower james-brink/ex…
+1 MCP server failed";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        106,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str);
+    assert!(
+        partial.is_none(),
+        "prompt echo and status chrome must not be exposed as assistant text"
+    );
+}
+
+#[test]
+fn classify_thinking_omits_spinner_counter_noise_from_partial_turn_text() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Use 2 Explore agents to inspect this project briefly.
+
+⏺ Running 2 Explore agents…
+
+✳
+✢
+✽
+(1s·thinking)
+↓ 13 tokens·thinking)
+2ought for1s)
+2)
+2 Exploreagents finishedDone↑
+↓
+25
+50
+63
+75
+✢81";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        107,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str);
+    assert!(
+        partial.is_none(),
+        "spinner/token counter fragments must not be exposed as assistant text: {partial:?}"
+    );
 }
 
 #[test]
