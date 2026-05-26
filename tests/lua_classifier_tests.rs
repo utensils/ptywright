@@ -61,6 +61,7 @@ fn classify_fixture(
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
         markers: &markers,
         cursor: 0,
+        last_event_seq: None,
     };
     extension.classify(&ctx)
 }

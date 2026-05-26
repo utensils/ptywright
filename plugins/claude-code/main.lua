@@ -2123,6 +2123,15 @@ function M.classify(input)
   local status_metadata = parse_status_bar(status)
   local markers = input.markers or {}
   local cursor = math.max(tonumber(input.cursor) or 0, utf8_char_len(transcript))
+  -- Turn boundary detection for the event emitter. The host re-runs
+  -- `M.classify` on every poll / wait wake-up; we only reset the
+  -- emitter's per-turn state when the host's `turn_start` transcript
+  -- marker has advanced past the value the emitter last saw. That
+  -- keeps the event buffer monotonic across same-turn classifies and
+  -- starts a fresh buffer (with the seq counter continuing to grow)
+  -- on the next turn. Same-turn polls return the same marker value,
+  -- so calling this on every classify tick is idempotent.
+  events.observe_turn_start(markers["turn_start"])
   local function state_snapshot(state, confidence, evidence, seq, metadata)
     local visible_tool_metadata = parse_visible_tool_calls(screen)
     local progress_metadata = parse_turn_progress_metadata(screen_text)
@@ -2179,6 +2188,51 @@ function M.classify(input)
         local transcript_md = { transcript = { turn_start = turn_start, turn_end = turn_end } }
         snap.metadata = merge_metadata(snap.metadata, transcript_md)
       end
+    end
+
+    -- Append-only TurnEvent stream. Observations are best-effort —
+    -- a nil text or tools list just skips the corresponding event;
+    -- the consumer-side seq watermark dedupes anything we re-emit
+    -- across classify ticks for the same screen state.
+    if last_intent == "prompt_submitted" then
+      -- Pick the strongest available text source: the just-extracted
+      -- final turn output (for completed_turn classifies) takes
+      -- precedence over a partial extract.
+      local extracted_text = nil
+      if snap.metadata then
+        local turn_md = snap.metadata.turn
+        if turn_md then
+          extracted_text = turn_md.text or turn_md.partial_text
+        end
+      end
+      if extracted_text then
+        events.observe_text(extracted_text)
+      end
+    end
+
+    if visible_tool_metadata and visible_tool_metadata.tools then
+      events.observe_tools(visible_tool_metadata.tools)
+    end
+
+    if state == "completed_turn" and last_intent == "prompt_submitted" then
+      local final_text = nil
+      if snap.metadata and snap.metadata.turn then
+        final_text = snap.metadata.turn.text
+      end
+      events.observe_turn_complete(final_text)
+    end
+
+    if state == "error" and snap.metadata and snap.metadata.error then
+      events.observe_error(
+        snap.metadata.error.kind,
+        snap.metadata.error.message,
+        snap.metadata.error.message or snap.evidence
+      )
+    end
+
+    local filtered = events.filter(input.last_event_seq)
+    if filtered and #filtered > 0 then
+      snap.events = filtered
     end
     return snap
   end

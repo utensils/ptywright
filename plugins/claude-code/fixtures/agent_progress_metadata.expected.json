@@ -27,6 +27,13 @@
           "count": 3
         }
       }
-    ]
+    ],
+    "turn": {
+      "progress": {
+        "duration_ms": 34000,
+        "output_tokens": 1300,
+        "total_tokens": 1300
+      }
+    }
   }
 }

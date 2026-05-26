@@ -89,6 +89,210 @@ pub struct ExtensionStateSnapshot {
     /// Omitted on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_marks: Vec<HostMark>,
+    /// Append-only stream of structured events the plugin observed during
+    /// this classify tick. Each event carries a monotonic `seq` so callers
+    /// can dedupe across polls — see [`TurnEvent`].
+    ///
+    /// The classifier filters events to those with `seq > ctx.last_event_seq`
+    /// (the host-supplied watermark), so a consumer that tracks its own
+    /// last-seen sequence and forwards [`ClassifyContext::last_event_seq`]
+    /// will receive each event exactly once. Polling without a watermark
+    /// re-receives the full event buffer.
+    ///
+    /// Domain-neutral: the host treats events as opaque data forwarded
+    /// through the wire. Plugins shape their event kinds; the
+    /// [`TurnEvent`] enum is intentionally `#[non_exhaustive]` so future
+    /// plugin kinds (status_change, dialog_opened, …) can be added without
+    /// breaking the wire shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<TurnEvent>,
+}
+
+/// Append-only structured event emitted by a plugin alongside its
+/// classification, carried on [`ExtensionStateSnapshot::events`].
+///
+/// Each event has a monotonic `seq` (per-adapter, plugin-owned) that
+/// lets consumers dedupe across polls of `adapter.state`. The
+/// classifier filters by [`ClassifyContext::last_event_seq`] so a
+/// consumer that tracks its own watermark sees each event exactly
+/// once.
+///
+/// The enum is `#[non_exhaustive]` so plugins can add new kinds
+/// without breaking the wire shape. The kinds shipped today cover the
+/// streaming case (text deltas, tool start/progress/complete, turn
+/// boundary, error) — that's the minimum needed to give a consumer
+/// like Claudette a clean event-based contract instead of polled
+/// screen snapshots.
+///
+/// Serializes via the `kind` tag (e.g. `{"kind": "text_delta", "seq":
+/// 5, "text": "Hello "}`) so plugin authors can construct events as
+/// plain tables in Lua without juggling serde-tagged variants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TurnEvent {
+    /// Assistant prose appended to the current turn. `text` is the
+    /// delta only — never the full accumulated answer. Concatenating
+    /// every `TextDelta::text` for a turn reconstructs the cleaned
+    /// assistant message.
+    TextDelta {
+        /// Monotonic sequence for dedupe across polls.
+        seq: u64,
+        /// New text appended since the previous delta. May be empty
+        /// across plugin versions — consumers should tolerate empty
+        /// deltas.
+        text: String,
+    },
+    /// A tool call became visible in the rendered transcript. Plugins
+    /// emit this the first time they see a tool invocation; the same
+    /// `id` is reused for the matching [`ToolCompleted`] event so
+    /// consumers can pair them up.
+    ToolStarted {
+        seq: u64,
+        /// Stable per-turn identifier (plugin-chosen — typically
+        /// `<tool>:<summary>` or an opaque hash).
+        id: String,
+        /// Tool name as the TUI rendered it (`Bash`, `Read`, `Edit`,
+        /// `Agent`, …).
+        name: String,
+        /// Plugin-specific tool input. The plugin is responsible for
+        /// shaping this so consumers can present it; opaque to the
+        /// host. Omitted when the plugin has no structured input to
+        /// surface.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+    },
+    /// Progress update for an in-flight tool. Optional — plugins that
+    /// only emit start/complete are fine. Used for long-running tools
+    /// where intermediate progress is interesting (e.g. `Agent`
+    /// sub-agents reporting `Running 4 Explore agents`).
+    ToolProgress {
+        seq: u64,
+        id: String,
+        /// Human-readable progress summary. Plugins should keep this
+        /// monotonically meaningful — consumers may display the latest
+        /// value only.
+        summary: String,
+    },
+    /// A tool call's chrome left the visible transcript. Carries the
+    /// terminal status the plugin observed (typically `"completed"` or
+    /// `"errored"`). The plugin owns the status vocabulary.
+    ToolCompleted {
+        seq: u64,
+        id: String,
+        /// Plugin-defined terminal status (`completed`, `errored`,
+        /// `cancelled`, …).
+        status: String,
+        /// Optional result payload — the plugin may attach a parsed
+        /// or summarized result here. Omitted when unavailable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+    },
+    /// The current turn reached its terminal classifier state
+    /// (typically `completed_turn`). Fired once per turn; the next
+    /// turn begins fresh on the next `send` that advances
+    /// `last_intent`.
+    TurnComplete {
+        seq: u64,
+        /// Optional final text the plugin extracted for the completed
+        /// turn. Concatenating [`TextDelta::text`] up to this event
+        /// should reproduce the same content; the `text` field is
+        /// provided for consumers that want a one-shot final-message
+        /// view without rebuilding from deltas.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Error banner observed on the screen. Plugins emit this once
+    /// per banner (further classifications of the same banner do not
+    /// re-emit). The enum is `#[non_exhaustive]` on purpose — adding
+    /// new error categories requires no consumer changes.
+    ///
+    /// The `category` field name is chosen rather than the more
+    /// natural `kind` to avoid collision with serde's internal
+    /// tag (`#[serde(tag = "kind")]`) — the variant discriminator
+    /// uses `kind` on the wire (e.g. `{"kind": "error", ...}`) and
+    /// would clash with a same-named struct field.
+    Error {
+        seq: u64,
+        /// Plugin-defined error category (`rate_limit`, `quota`,
+        /// `connection`, `auth`, `api`, `unknown`).
+        category: String,
+        /// Plugin-redacted human-readable error message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+impl TurnEvent {
+    /// Returns the event's monotonic sequence id.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::TextDelta { seq, .. }
+            | Self::ToolStarted { seq, .. }
+            | Self::ToolProgress { seq, .. }
+            | Self::ToolCompleted { seq, .. }
+            | Self::TurnComplete { seq, .. }
+            | Self::Error { seq, .. } => *seq,
+        }
+    }
+}
+
+#[cfg(test)]
+mod turn_event_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn text_delta_round_trips_through_json() {
+        let event = TurnEvent::TextDelta {
+            seq: 7,
+            text: "Hello, world.\n".into(),
+        };
+        let wire = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            wire,
+            json!({"kind": "text_delta", "seq": 7, "text": "Hello, world.\n"})
+        );
+        let round_trip: TurnEvent = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(round_trip, event);
+        assert_eq!(round_trip.seq(), 7);
+    }
+
+    #[test]
+    fn tool_started_omits_none_input() {
+        let event = TurnEvent::ToolStarted {
+            seq: 3,
+            id: "Bash:ls -la".into(),
+            name: "Bash".into(),
+            input: None,
+        };
+        let wire = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            wire,
+            json!({"kind": "tool_started", "seq": 3, "id": "Bash:ls -la", "name": "Bash"}),
+            "None input must be omitted from wire shape"
+        );
+    }
+
+    #[test]
+    fn error_uses_category_field() {
+        let event = TurnEvent::Error {
+            seq: 12,
+            category: "rate_limit".into(),
+            message: Some("5-hour limit reached".into()),
+        };
+        let wire = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            wire,
+            json!({
+                "kind": "error",
+                "seq": 12,
+                "category": "rate_limit",
+                "message": "5-hour limit reached",
+            }),
+        );
+    }
 }
 
 /// Plugin-issued request that the host stamp a transcript marker at the
@@ -119,6 +323,7 @@ impl ExtensionStateSnapshot {
             candidates: Vec::new(),
             metadata: None,
             host_marks: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -210,6 +415,17 @@ pub struct ClassifyContext<'a> {
     /// `metadata.transcript.turn_end` in the *same* classify response
     /// that requests the `turn_end` mark.
     pub cursor: u64,
+    /// Last [`TurnEvent::seq`] the host has observed and propagated to
+    /// consumers. Plugins use this to filter their event buffer so each
+    /// event is returned at most once across classify calls — events
+    /// with `seq <= last_event_seq` should be suppressed.
+    ///
+    /// `None` on a freshly-started adapter (no events seen yet) — the
+    /// plugin treats that as "emit everything you have buffered".
+    /// Skipped from serialization when absent so the Lua side sees
+    /// `nil` instead of an `Option`-tagged table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_seq: Option<u64>,
 }
 
 /// Action plan returned by extension intents (e.g. `send_prompt`, `approve`).
@@ -325,6 +541,13 @@ pub struct ExtensionHandle {
     last_intent: Option<String>,
     completed_turn_stable_ms: u64,
     state_subscribers: std::sync::Mutex<Vec<std::sync::mpsc::Sender<ExtensionEvent>>>,
+    /// Highest [`TurnEvent::seq`] observed in any snapshot returned to a
+    /// caller. Forwarded to the classifier as
+    /// [`ClassifyContext::last_event_seq`] so the plugin returns each
+    /// event at most once across polls. Advanced inside `classify_atomic`
+    /// after the plugin returns, so the next classify on the same handle
+    /// only sees fresh events.
+    last_event_seq: std::sync::Mutex<Option<u64>>,
 }
 
 /// Events emitted on the in-process subscription channel returned by
@@ -359,7 +582,17 @@ impl ExtensionHandle {
             last_intent: None,
             completed_turn_stable_ms,
             state_subscribers: std::sync::Mutex::new(Vec::new()),
+            last_event_seq: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Highest [`TurnEvent::seq`] observed by this handle so far. `None`
+    /// before the plugin has emitted any events. Useful for callers
+    /// who want to checkpoint where they are in the stream without
+    /// inspecting the most recent snapshot.
+    #[must_use]
+    pub fn last_event_seq(&self) -> Option<u64> {
+        *self.last_event_seq.lock().expect("last event seq poisoned")
     }
 
     /// Subscribe to in-process [`ExtensionEvent`] notifications.
@@ -431,6 +664,7 @@ impl ExtensionHandle {
                 candidates: Vec::new(),
                 metadata: None,
                 host_marks: Vec::new(),
+                events: Vec::new(),
             })
     }
 
@@ -691,6 +925,10 @@ impl ExtensionHandle {
         cursor: u64,
     ) -> Result<ExtensionStateSnapshot> {
         let (body_text, status_text) = split_status_bar(screen, STATUS_BAR_ROWS);
+        // Take a copy of the watermark BEFORE classifying so the plugin
+        // sees a stable view; the watermark is advanced AFTER classify
+        // returns based on the events the plugin emitted.
+        let last_event_seq = self.last_event_seq();
         let ctx = ClassifyContext {
             screen,
             body_text: &body_text,
@@ -702,6 +940,7 @@ impl ExtensionHandle {
             completed_turn_stable_ms: Some(self.completed_turn_stable_ms),
             markers,
             cursor,
+            last_event_seq,
         };
         let snapshot = self.extension.classify(&ctx)?;
         tracing::trace!(
@@ -716,10 +955,26 @@ impl ExtensionHandle {
             transcript_len = transcript.len(),
             metadata_keys = ?metadata_keys(snapshot.metadata.as_ref()),
             host_marks = ?snapshot.host_marks,
+            event_count = snapshot.events.len(),
             "ptywright extension classified state"
         );
         self.apply_host_marks(&snapshot.host_marks);
+        self.advance_event_watermark(&snapshot.events);
         Ok(snapshot)
+    }
+
+    /// Advance the per-handle event watermark to the highest seq found
+    /// in `events`. Idempotent for re-classifies that return no new
+    /// events (the highest existing seq remains in place).
+    fn advance_event_watermark(&self, events: &[TurnEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        let max_seq = events.iter().map(TurnEvent::seq).max();
+        if let Some(seq) = max_seq {
+            let mut guard = self.last_event_seq.lock().expect("last event seq poisoned");
+            *guard = Some(guard.map_or(seq, |prev| prev.max(seq)));
+        }
     }
 
     /// Apply plugin-requested transcript markers from a freshly-returned
@@ -928,6 +1183,7 @@ mod tests {
             completed_turn_stable_ms: None,
             markers: &empty_markers,
             cursor: 0,
+            last_event_seq: None,
         };
         let value = serde_json::to_value(ctx).expect("serialise ClassifyContext");
         let object = value
@@ -944,6 +1200,10 @@ mod tests {
         assert!(
             !object.contains_key("completed_turn_stable_ms"),
             "None completed_turn_stable_ms must be omitted; got {value}"
+        );
+        assert!(
+            !object.contains_key("last_event_seq"),
+            "None last_event_seq must be omitted; got {value}"
         );
     }
 
@@ -1005,6 +1265,7 @@ mod tests {
             candidates: Vec::new(),
             metadata: None,
             host_marks: Vec::new(),
+            events: Vec::new(),
         };
         let wire = serde_json::to_string(&snapshot).expect("serialize");
         assert!(

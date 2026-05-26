@@ -31,7 +31,7 @@ pub use config::{Config, LogFormat, LoggingConfig};
 pub use error::{Error, Result};
 pub use extension::{
     ActionPlan, ClassifyContext, Extension, ExtensionEvent, ExtensionHandle,
-    ExtensionStateSnapshot, HostMark, LuaExtension, StateCandidate,
+    ExtensionStateSnapshot, HostMark, LuaExtension, StateCandidate, TurnEvent,
 };
 pub use logging::{
     LogGuard, RedactingMakeWriter, RedactingWriter, cleanup_old_logs, init_for_oneshot,

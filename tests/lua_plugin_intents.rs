@@ -68,6 +68,7 @@ fn classify_with_markers(
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
         markers,
         cursor,
+        last_event_seq: None,
     };
     extension.classify(&ctx).expect("classify via Lua plugin")
 }
@@ -120,6 +121,7 @@ fn classify_with_transcript_and_markers(
         completed_turn_stable_ms: Some(COMPLETED_TURN_STABLE_MS),
         markers: fixture.markers,
         cursor: fixture.cursor,
+        last_event_seq: None,
     };
     extension.classify(&ctx).expect("classify via Lua plugin")
 }

@@ -1,6 +1,6 @@
 {
-  "state": "thinking",
-  "evidence": "turn in flight; no accepted completion marker on screen",
+  "state": "waiting_for_user_input",
+  "evidence": "submitted prompt still visible without active work",
   "last_intent": "prompt_submitted",
   "min_confidence": 0.6,
   "metadata": {

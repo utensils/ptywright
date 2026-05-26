@@ -397,10 +397,20 @@ pub(crate) struct BuiltinPlugin {
 pub(crate) const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[BuiltinPlugin {
     manifest: claude_code_manifest,
     source: include_str!("../plugins/claude-code/main.lua"),
-    modules: &[(
-        "helpers",
-        include_str!("../plugins/claude-code/helpers.lua"),
-    )],
+    modules: &[
+        (
+            "helpers",
+            include_str!("../plugins/claude-code/helpers.lua"),
+        ),
+        // events.lua tracks the per-adapter `TurnEvent` buffer that
+        // gets attached to every classifier snapshot. Pre-loaded as a
+        // Lua global so `main.lua` can call `events.observe_text`,
+        // `events.observe_tools`, `events.observe_turn_complete`, …
+        // without needing `require`. Per-adapter Lua VM means the
+        // module's internal state cannot leak across adapters; see
+        // `plugins/claude-code/events.lua` for the per-call contract.
+        ("events", include_str!("../plugins/claude-code/events.lua")),
+    ],
 }];
 
 /// TOML source for the claude-code manifest, embedded at compile time
