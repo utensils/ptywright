@@ -410,6 +410,19 @@ pub(crate) const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[BuiltinPlugin {
         // module's internal state cannot leak across adapters; see
         // `plugins/claude-code/events.lua` for the per-call contract.
         ("events", include_str!("../plugins/claude-code/events.lua")),
+        // strings.lua is the ground-truth catalog of verbatim TUI
+        // strings (spinner verbs, completion verbs, tool names,
+        // error banners, dialog headers, glyphs) extracted directly
+        // from the installed Claude Code binary. main.lua's
+        // structural matchers can consult these instead of
+        // re-deriving phrase lists, so an upstream string drift is
+        // a one-file fix rather than a regex hunt. Re-extract from
+        // a fresh Claude Code binary on every version bump and
+        // diff against the existing strings.lua.
+        (
+            "strings",
+            include_str!("../plugins/claude-code/strings.lua"),
+        ),
     ],
 }];
 

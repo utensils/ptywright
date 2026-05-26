@@ -187,6 +187,7 @@ fn pre_load_plugin_modules(lua: &Lua) {
     let modules = [
         ("helpers", plugins_dir.join("helpers.lua")),
         ("events", plugins_dir.join("events.lua")),
+        ("strings", plugins_dir.join("strings.lua")),
     ];
     for (name, path) in &modules {
         let source = std::fs::read_to_string(path)
