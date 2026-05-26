@@ -61,7 +61,13 @@ function M.redact_secret_patterns(text)
   end
   for _, pattern in ipairs(SECRET_PATTERNS) do
     text = (text:gsub(pattern, function(prefix, _value)
-      if prefix == nil or prefix == "" then
+      -- Lua's `()` empty-capture returns the match POSITION (a number),
+      -- not an empty string. The two-capture patterns above use `()` as
+      -- a sentinel meaning "no key= prefix to preserve" — treat any
+      -- non-string prefix as the redact-the-whole-match path so the
+      -- prefix-less patterns (sk-…, sk-ant-…, AKIA…) don't accidentally
+      -- prepend the position digit to the replacement.
+      if prefix == nil or prefix == "" or type(prefix) ~= "string" then
         return "[REDACTED]"
       end
       return prefix .. "[REDACTED]"

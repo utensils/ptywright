@@ -1,17 +1,21 @@
-//! End-to-end integration test for [`TurnEvent`] emission.
+//! End-to-end integration test for [`TurnEvent`] emission against
+//! the built-in `claude-code` Lua plugin.
 //!
-//! Replays a synthetic screen / transcript sequence through
-//! [`LuaExtension`]'s classifier and asserts the events emitted are
-//! monotonic, gap-free, and shaped correctly. The point of the test is
-//! to pin the wire contract that downstream consumers (Claudette,
-//! `claude-stream.py`, third-party adapters) read, so any regression
-//! in the plugin's event emitter shows up here rather than days later
-//! in the consumer.
+//! Plugin-coupled — the test fixtures use Claude Code's TUI glyphs
+//! (`⏺`, `❯`, `✻`, status-bar shape) and the plugin's intent string
+//! (`prompt_submitted`). Pure wire-shape assertions on
+//! [`ptywright::extension::TurnEvent`] / [`ptywright::extension::ClassifyContext`]
+//! live in `src/extension.rs`'s unit tests; this file pins the
+//! plugin-side emitter behavior (sourced from
+//! `plugins/claude-code/events.lua` + the `M.classify` hook in
+//! `plugins/claude-code/main.lua`).
 //!
 //! Drives the plugin through the generic [`ExtensionHandle`] surface —
 //! no application-specific Rust wrapper sits between the test and the
 //! Lua code. The host-side handle's per-call watermark advancement is
-//! exercised end-to-end via `ExtensionHandle::last_event_seq`.
+//! exercised end-to-end via `ExtensionHandle::last_event_seq`. A new
+//! plugin (Codex, shell wrapper, …) gets its own
+//! `lua_plugin_<name>_turn_events.rs` once shipped.
 
 use ptywright::extension::{
     ClassifyContext, Extension, LuaExtension, STATUS_BAR_ROWS, TurnEvent, split_status_bar,

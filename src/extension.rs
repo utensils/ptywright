@@ -118,11 +118,17 @@ pub struct ExtensionStateSnapshot {
 /// once.
 ///
 /// The enum is `#[non_exhaustive]` so plugins can add new kinds
-/// without breaking the wire shape. The kinds shipped today cover the
-/// streaming case (text deltas, tool start/progress/complete, turn
-/// boundary, error) — that's the minimum needed to give a consumer
-/// like Claudette a clean event-based contract instead of polled
-/// screen snapshots.
+/// without breaking the wire shape. The shipped kinds cover the
+/// generic streaming-TUI surface: incremental text, externally-
+/// invoked operations the TUI has shown the user are running, the
+/// end of a logical unit of work, and an error banner. The "turn" /
+/// "tool" vocabulary in the variant names is conventional for chat
+/// and agent TUIs; the *types* are plugin-agnostic. A shell-wrapper
+/// plugin can emit `ToolStarted { name: "bash", input: Some(json!(
+/// {"cmd": "ls"})) }` for a user-issued command and a build-tool
+/// plugin can emit `ToolStarted { name: "rustc", … }` for a
+/// compile step — the host treats every variant the same way.
+/// Generic primitive, plugin owns the semantics.
 ///
 /// Serializes via the `kind` tag (e.g. `{"kind": "text_delta", "seq":
 /// 5, "text": "Hello "}`) so plugin authors can construct events as
@@ -214,8 +220,12 @@ pub enum TurnEvent {
     /// would clash with a same-named struct field.
     Error {
         seq: u64,
-        /// Plugin-defined error category (`rate_limit`, `quota`,
-        /// `connection`, `auth`, `api`, `unknown`).
+        /// Plugin-defined error category. The host treats this as an
+        /// opaque string; the value space is whatever taxonomy the
+        /// plugin finds useful to expose to its consumers (e.g. a
+        /// chat-agent plugin may use `rate_limit` / `auth`, a shell
+        /// wrapper might use `exit_code` / `signal`, a build tool
+        /// might use `compile_error` / `link_error`).
         category: String,
         /// Plugin-redacted human-readable error message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
