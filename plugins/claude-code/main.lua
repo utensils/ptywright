@@ -26,6 +26,8 @@ assert(ptywright, "ptywright host API not installed")
 assert(ptywright.action, "ptywright action host API not installed")
 assert(ptywright.matcher, "ptywright matcher host API not installed")
 assert(helpers, "helpers module not pre-loaded (see BUILTIN_PLUGINS in src/plugin.rs)")
+assert(events, "events module not pre-loaded (see BUILTIN_PLUGINS in src/plugin.rs)")
+assert(strings, "strings module not pre-loaded (see BUILTIN_PLUGINS in src/plugin.rs)")
 
 local M = {}
 local action = ptywright.action
@@ -74,30 +76,102 @@ end
 -- doesn't trip the detector — e.g. an answer that says `Note that
 -- "you've reached your usage limit" can be reset by …` should NOT
 -- classify as `error`.
-local ERROR_BANNER_PREFIXES = {
-  "error:",
-  "request failed",
-  "api error",
-  -- Rate-limit / plan-limit banners. Claude Code 2.1.x renders one of
-  -- these as a standalone body row when you exhaust your plan budget.
-  "5-hour limit",
-  "rate limit reached",
-  "you've used your pro plan",
-  "you've used your max plan",
-  "you've reached your usage limit",
-  "you've hit your limit",
-  "credit balance is too low",
-  -- Mid-turn API error wrapping a per-request usage / context-window
-  -- quota condition. Claude Code 2.1.x renders this when an account
-  -- hits its quota for the requested model variant (typically the
-  -- 1M-context tier).
-  "api error: extra usage is required",
-  -- Connection / network failure banner.
-  "connection error",
-  "connection issue",
-  "could not connect",
-  "network error",
+--
+-- `ERROR_BANNER_TABLE` is the seed: per-kind lists of lowercased
+-- prefixes that combine
+--   1. Verbatim 2.1.x catalog entries from `strings.ERROR_BANNERS`
+--      (lowercased for case-insensitive `starts_with` matching), and
+--   2. Legacy 2.0.x phrasings that still appear in older captured
+--      fixtures / older Claude Code installs. We keep both because
+--      the classifier has to replay sessions across versions.
+--
+-- A Claude Code release that changes a banner only requires re-running
+-- `scripts/extract_claude_strings.py` and committing the updated
+-- `strings.lua` — no edit to this file unless an entirely new banner
+-- *kind* appears.
+--
+-- Within a kind, order more specific prefixes before less specific
+-- ones so a banner like `5-hour limit reached` classifies as
+-- `rate_limit` rather than falling through.
+local ERROR_BANNER_TABLE = {
+  rate_limit = {
+    -- 2.1.x catalog (rate-limit phrasing was overhauled — older
+    -- "you've hit your X limit" shape is retired upstream).
+    "you're now using extra usage",
+    "you're out of extra usage",
+    "you're close to",
+    "now using extra usage",
+    -- legacy 2.0.x
+    "5-hour limit",
+    "rate limit reached",
+    "you've used your pro plan",
+    "you've used your max plan",
+    "you've reached your usage limit",
+    "you've hit your limit",
+  },
+  quota = {
+    -- 2.1.x catalog
+    "prompt is too long",
+    "pdf too large",
+    "image was too large",
+    -- Mid-turn API error wrapping a per-request usage / context-window
+    -- quota condition. Claude Code 2.1.x renders this when an account
+    -- hits its quota for the requested model variant (typically the
+    -- 1M-context tier).
+    "api error: extra usage is required",
+    "credit balance is too low",
+  },
+  connection = {
+    -- 2.1.x catalog
+    "unable to connect to api: ssl certificate is not yet valid",
+    "unable to connect to api: ssl error",
+    "unable to connect to api. check your internet connection",
+    "unable to connect to api",
+    "request timed out",
+    -- legacy 2.0.x
+    "connection error",
+    "connection issue",
+    "could not connect",
+    "network error",
+  },
+  auth = {
+    -- 2.1.x catalog
+    "not logged in · please run /login",
+    "invalid api key · fix external api key",
+    "your anthropic_api_key belongs to a disabled organization",
+    "oauth token revoked",
+    "authentication error",
+    -- legacy 2.0.x
+    "invalid api key",
+    "authentication failed",
+    "unauthorized",
+    "oauth failed",
+    "your organization has disabled claude subscription access",
+  },
+  api = {
+    -- 2.1.x catalog
+    "api error (status",
+    -- Generic anchor — must stay LAST in `api` so the specific
+    -- variants above (and the `quota` entry `api error: extra usage
+    -- …` higher up in priority order) take precedence.
+    "api error",
+    -- legacy 2.0.x
+    "request failed",
+  },
 }
+
+-- Iteration order across kinds, more specific kinds first. Both the
+-- subtype classifier and the boolean banner detector walk this so a
+-- banner like `api error: extra usage is required` classifies as
+-- `quota`, not `api`.
+local ERROR_KIND_ORDER = { "rate_limit", "quota", "connection", "auth", "api" }
+
+local ERROR_BANNER_PREFIXES = { "error:" }
+for _, kind in ipairs(ERROR_KIND_ORDER) do
+  for _, prefix in ipairs(ERROR_BANNER_TABLE[kind]) do
+    table.insert(ERROR_BANNER_PREFIXES, prefix)
+  end
+end
 
 -- Claude Code 2.1.x tool-call result callout glyph (U+23BF). When an
 -- error fires mid-turn (e.g. `⎿ API Error: ...`), the TUI wraps the
@@ -170,36 +244,20 @@ local function has_error_indicator(screen)
   return false
 end
 
--- Patterns for `parse_error_subtype` — anchored at line start (via
--- `starts_with` below) so prose that quotes them mid-sentence doesn't
--- trip classification.
---
--- Order matters within a kind: longer / more specific prefixes come
--- first so a banner like `5-hour limit reached` classifies as
--- `rate_limit` rather than falling through to `unknown`.
-local ERROR_SUBTYPE_PATTERNS = {
-  { kind = "rate_limit", prefix = "5-hour limit" },
-  { kind = "rate_limit", prefix = "rate limit reached" },
-  { kind = "rate_limit", prefix = "you've used your pro plan" },
-  { kind = "rate_limit", prefix = "you've used your max plan" },
-  { kind = "rate_limit", prefix = "you've reached your usage limit" },
-  { kind = "rate_limit", prefix = "you've hit your limit" },
-  -- Specific quota variants must come before generic `api error`
-  -- so the right kind wins.
-  { kind = "quota",      prefix = "api error: extra usage is required" },
-  { kind = "quota",      prefix = "credit balance is too low" },
-  { kind = "connection", prefix = "connection error" },
-  { kind = "connection", prefix = "connection issue" },
-  { kind = "connection", prefix = "could not connect" },
-  { kind = "connection", prefix = "network error" },
-  { kind = "auth",       prefix = "invalid api key" },
-  { kind = "auth",       prefix = "authentication failed" },
-  { kind = "auth",       prefix = "unauthorized" },
-  { kind = "auth",       prefix = "oauth failed" },
-  { kind = "auth",       prefix = "your organization has disabled claude subscription access" },
-  { kind = "api",        prefix = "api error" },
-  { kind = "api",        prefix = "request failed" },
-}
+-- Flat `{kind, prefix}` list for `parse_error_subtype`, derived from
+-- the same `ERROR_BANNER_TABLE` that powers `ERROR_BANNER_PREFIXES`
+-- above. Walk order honours `ERROR_KIND_ORDER` so specific kinds
+-- (rate_limit, quota) come before the catch-all `api`. Within a kind,
+-- entries appear in the order they're declared in
+-- `ERROR_BANNER_TABLE` — more specific prefixes first so a banner
+-- like `5-hour limit reached` classifies as `rate_limit` rather than
+-- falling through to `unknown`.
+local ERROR_SUBTYPE_PATTERNS = {}
+for _, kind in ipairs(ERROR_KIND_ORDER) do
+  for _, prefix in ipairs(ERROR_BANNER_TABLE[kind]) do
+    table.insert(ERROR_SUBTYPE_PATTERNS, { kind = kind, prefix = prefix })
+  end
+end
 
 -- Classify the visible error banner into a discrete subtype so
 -- consumers can pick a retry / surface /
@@ -657,23 +715,26 @@ local function strip_terminal_controls(text)
   return cleaned
 end
 
-local TOOL_CALL_NAMES = {
-  Bash = true,
-  Glob = true,
-  Grep = true,
-  LS = true,
-  Read = true,
-  Edit = true,
-  MultiEdit = true,
-  Write = true,
-  NotebookRead = true,
-  NotebookEdit = true,
-  WebFetch = true,
-  WebSearch = true,
-  TodoRead = true,
-  TodoWrite = true,
-  Task = true,
-}
+-- Tool names that appear in `<ToolName>(...)` call rows. Seeded from
+-- the verbatim 2.1.150 catalog (`strings.TOOL_NAMES`, 40 entries
+-- including newer additions like `Skill`, `Task*`, `EnterPlanMode`,
+-- `SendMessage`, `ToolSearch`) and extended with the legacy names
+-- that still appear in older fixtures / older Claude Code installs
+-- (`LS`, `MultiEdit`, `TodoRead`) — those were either renamed or
+-- dropped upstream in the 2.1.x cycle but the classifier still has
+-- to recognise them when replaying captured sessions.
+--
+-- Building this from `strings.TOOL_NAMES` means a Claude Code
+-- release that introduces a new built-in tool only requires
+-- re-running `scripts/extract_claude_strings.py` and committing the
+-- updated `strings.lua` — no edit here.
+local TOOL_CALL_NAMES = {}
+for _, name in ipairs(strings.TOOL_NAMES) do
+  TOOL_CALL_NAMES[name] = true
+end
+for _, legacy in ipairs({ "LS", "MultiEdit", "TodoRead" }) do
+  TOOL_CALL_NAMES[legacy] = true
+end
 
 local function strip_tool_callout_prefix(line)
   local trimmed = trim(line)
@@ -1684,15 +1745,34 @@ end
 -- All three together are dialog-unique. A completed answer can
 -- contain any one of them, but very rarely all three with the
 -- right structure.
-local MODEL_PICKER_HEADERS = {
+-- Header phrases that signal the model-picker dialog. The 2.1.x
+-- catalog (`strings.MODEL_PICKER`) carries the verbatim
+-- "Select model" + "Switch between Claude models" header strings —
+-- those two are seeded in (lowercased) so a header rename upstream
+-- is a one-file fix in `strings.lua`. The remaining entries are
+-- legacy 2.0.x / variant phrasings that the verbatim catalog
+-- doesn't cover but older fixtures still use.
+--
+-- `strings.MODEL_PICKER` also includes option-label strings like
+-- "Opus 4.7 only" — those are NOT headers and would false-positive on
+-- assistant prose that lists model names, so they're deliberately
+-- excluded here.
+local MODEL_PICKER_HEADERS = {}
+for _, header in ipairs({
+  strings.MODEL_PICKER[1], -- "Select model"
+  strings.MODEL_PICKER[2], -- "Switch between Claude models"
+}) do
+  table.insert(MODEL_PICKER_HEADERS, lower(header))
+end
+for _, legacy in ipairs({
   "select a model:",
   "select a model",
-  "select model",
   "switch to model:",
-  "switch between claude models",
   "choose a model:",
   "available models:",
-}
+}) do
+  table.insert(MODEL_PICKER_HEADERS, legacy)
+end
 
 local function has_model_picker_indicator(text)
   local has_header = contains_any(text, MODEL_PICKER_HEADERS)

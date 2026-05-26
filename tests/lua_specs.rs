@@ -179,7 +179,7 @@ fn new_lua() -> Lua {
 /// Pre-load every claude-code plugin module under the same module
 /// names the production runtime uses ([`LuaPlugin::trusted_with_modules`]
 /// + [`crate::BUILTIN_PLUGINS`]). Specs reference modules as locals
-/// (`local events = events`) just like `main.lua` does.
+///   (`local events = events`) just like `main.lua` does.
 fn pre_load_plugin_modules(lua: &Lua) {
     let plugins_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("plugins")
