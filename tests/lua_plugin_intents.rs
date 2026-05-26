@@ -2026,6 +2026,36 @@ WRAP_STREAM_OK
 }
 
 #[test]
+fn classify_completed_turn_omits_collapsed_status_identity_chrome() {
+    let extension = claude_plugin();
+    let transcript = "\
+❯ Explore this project and tell me about it
+
+Real assistant answer.
+
+✻ Baked for 4s
+
+jamesbrink@halcyonworkspaces/mcp-nixos/plucky-cornflowerjames-brink/ex...";
+    let snapshot = classify_with_transcript(
+        &extension,
+        transcript,
+        transcript,
+        112,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+    assert_eq!(text, "Real assistant answer.");
+}
+
+#[test]
 fn classify_completed_turn_filters_tool_status_from_structured_output() {
     let extension = claude_plugin();
     let screen = "Could you remind me what we were working on?\n\n✻ Done for 28s\n\n❯ ";
@@ -2311,6 +2341,7 @@ fn classify_thinking_omits_spinner_counter_noise_from_partial_turn_text() {
 ✽
 (1s·thinking)
 ↓ 13 tokens·thinking)
+(1s·↓13tokens)
 2ought for1s)
 2)
 2 Exploreagents finishedDone↑
@@ -2340,6 +2371,127 @@ fn classify_thinking_omits_spinner_counter_noise_from_partial_turn_text() {
         partial.is_none(),
         "spinner/token counter fragments must not be exposed as assistant text: {partial:?}"
     );
+}
+
+#[test]
+fn classify_thinking_surfaces_compact_token_progress_as_metadata_only() {
+    let extension = claude_plugin();
+    let screen = "\
+❯ Explore this project and tell me about it
+
+(1s·↓13tokens)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        screen,
+        screen,
+        44,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str);
+    assert!(
+        partial.is_none(),
+        "compact progress counters must not be streamed as text: {partial:?}"
+    );
+    let progress = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/progress"))
+        .expect("turn progress metadata");
+    assert_eq!(progress["duration_ms"], 1000);
+    assert_eq!(progress["output_tokens"], 13);
+    assert_eq!(progress["total_tokens"], 13);
+}
+
+#[test]
+fn classify_thinking_streams_assistant_text_without_tool_rows() {
+    let extension = claude_plugin();
+    let transcript = "\
+❯ Explore this project and tell me about it
+
+⏺ I'll explore the project structure to give you a solid overview.
+
+Bash(ls -la /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-cornflower/mcp_nixos/)
+Running...
+532 tests/
+Read(mcp_nixos/server.py)
+mcp_nixos/server.py
+... +2 tool uses (ctrl+o to expand)
+
+✢ Meandering… (26s · ↓ 130 tokens)";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        transcript,
+        transcript,
+        45,
+        Some("prompt_submitted"),
+        None,
+    );
+
+    assert_eq!(snapshot.state, "thinking");
+    let partial = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/partial_text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured partial text");
+    assert_eq!(
+        partial,
+        "I'll explore the project structure to give you a solid overview."
+    );
+    assert!(!partial.contains("Bash"));
+    assert!(!partial.contains("mcp_nixos/server.py"));
+}
+
+#[test]
+fn classify_completed_turn_omits_tool_rows_between_assistant_segments() {
+    let extension = claude_plugin();
+    let transcript = "\
+❯ Explore this project and tell me about it
+
+⏺ I'll explore the project structure to give you a solid overview.
+
+Bash(ls -la /Users/jamesbrink/.claudette/workspaces/mcp-nixos/plucky-cornflower/mcp_nixos/)
+Running...
+532 tests/
+Read(mcp_nixos/server.py)
+mcp_nixos/server.py
+... +2 tool uses (ctrl+o to expand)
+
+⏺ The project is a FastMCP server.
+
+✻ Baked for 4s";
+
+    let snapshot = classify_with_transcript(
+        &extension,
+        transcript,
+        transcript,
+        46,
+        Some("prompt_submitted"),
+        Some(COMPLETED_TURN_STABLE_MS),
+    );
+
+    assert_eq!(snapshot.state, "completed_turn");
+    let text = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/turn/text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("structured turn text");
+    assert_eq!(
+        text,
+        "I'll explore the project structure to give you a solid overview.\nThe project is a FastMCP server."
+    );
+    assert!(!text.contains("Bash"));
+    assert!(!text.contains("mcp_nixos/server.py"));
 }
 
 #[test]

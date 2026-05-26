@@ -480,6 +480,7 @@ local function is_post_marker_trailing_line(line)
   if t:find("⏵⏵") then return true end
   if t:find("%[%u%a-%s%d+%.%d+%]") then return true end
   if t:find("%S+%s+@%s+%S+") then return true end
+  if t:find("%S+@%S+") and t:find("workspaces/") then return true end
   if t:find("·%s*/[%w_-]+%s*$") then return true end
   return false
 end
@@ -733,11 +734,23 @@ end
 
 local function is_assistant_output_anchor_line(line)
   local trimmed = trim(strip_terminal_controls(line))
-  if starts_with(trimmed, "⏺") or starts_with(trimmed, "●") then return true end
+  if (starts_with(trimmed, "⏺") or starts_with(trimmed, "●"))
+      and not is_completed_tool_progress_chrome_line(trimmed)
+      and not is_agent_progress_chrome_line(trimmed) then
+    return true
+  end
   if starts_with(trimmed, "⎿") then return true end
   if is_structured_tool_call_line(trimmed) then return true end
   if is_agent_progress_chrome_line(trimmed) then return true end
   return false
+end
+
+local function is_assistant_text_anchor_line(line)
+  local trimmed = trim(strip_terminal_controls(line))
+  if not (starts_with(trimmed, "⏺") or starts_with(trimmed, "●")) then return false end
+  if is_completed_tool_progress_chrome_line(trimmed) then return false end
+  if is_agent_progress_chrome_line(trimmed) then return false end
+  return true
 end
 
 local function is_structured_output_chrome_line(line)
@@ -769,6 +782,8 @@ end
 local function is_structured_partial_chrome_line(line)
   local trimmed = trim(line)
   if is_structured_output_chrome_line(line) then return true end
+  local compact = trimmed:gsub("%s+", "")
+  if contains(compact, "tokens") and (contains(compact, "↑") or contains(compact, "↓")) then return true end
   if trimmed:match("^%(%d+[smh]*s*%s*·%s*thinking%)$") then return true end
   if trimmed:match("^%d+[smh]*s*%s*·%s*thinking$") then return true end
   if contains(trimmed, "tokens") and contains(trimmed, "thinking") then return true end
@@ -784,6 +799,60 @@ local function is_structured_partial_chrome_line(line)
   if trimmed:match("^%d%d?%d?$") then return true end
   if starts_with_spinner_glyph(trimmed) then return true end
   return false
+end
+
+local function parse_compact_token_count(value)
+  local raw = trim(value or "")
+  if raw == "" then return nil end
+  local suffix = string.sub(raw, -1)
+  local multiplier = 1
+  if suffix == "k" or suffix == "K" then
+    multiplier = 1000
+    raw = string.sub(raw, 1, -2)
+  elseif suffix == "m" or suffix == "M" then
+    multiplier = 1000000
+    raw = string.sub(raw, 1, -2)
+  end
+  local number = tonumber(raw)
+  if not number then return nil end
+  return math.floor((number * multiplier) + 0.5)
+end
+
+local function parse_compact_duration_ms(value)
+  local raw = trim(value or "")
+  local amount, unit = raw:match("^(%d+)([smh])$")
+  if not amount then return nil end
+  local n = tonumber(amount)
+  if not n then return nil end
+  if unit == "h" then return n * 60 * 60 * 1000 end
+  if unit == "m" then return n * 60 * 1000 end
+  return n * 1000
+end
+
+local function parse_turn_progress_metadata(text)
+  local best = nil
+  for line in string.gmatch(text or "", "[^\n]+") do
+    local compact = trim(strip_terminal_controls(line)):gsub("%s+", "")
+    if compact ~= "" and contains(compact, "tokens") then
+      local progress = {}
+      local duration = compact:match("%((%d+[smh])·") or compact:match("^(%d+[smh])·")
+      local input_tokens = compact:match("↑([%d%.kKmM]+)tokens")
+      local output_tokens = compact:match("↓([%d%.kKmM]+)tokens")
+      local duration_ms = parse_compact_duration_ms(duration)
+      local input = parse_compact_token_count(input_tokens)
+      local output = parse_compact_token_count(output_tokens)
+      if duration_ms then progress.duration_ms = duration_ms end
+      if input then progress.input_tokens = input end
+      if output then progress.output_tokens = output end
+      if input or output then
+        progress.total_tokens = (input or 0) + (output or 0)
+      end
+      if next(progress) ~= nil then
+        best = { turn = { progress = progress } }
+      end
+    end
+  end
+  return best
 end
 
 local function utf8_sub_from_cursor(text, cursor)
@@ -937,9 +1006,18 @@ local function extract_structured_turn_output(text, turn_start, turn_end)
 
   local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx, false)
   local out = {}
+  local suppress_until_text_anchor = false
   for i = start_idx, marker_idx - 1 do
     local clean_line = strip_terminal_controls(lines[i])
-    if not is_structured_output_chrome_line(clean_line) then
+    if is_structured_tool_call_line(clean_line)
+        or is_completed_tool_progress_chrome_line(clean_line)
+        or is_agent_progress_chrome_line(clean_line) then
+      suppress_until_text_anchor = true
+    elseif suppress_until_text_anchor and not is_assistant_text_anchor_line(clean_line) then
+      -- Tool result/output rows are free-form. Once a tool starts, do not
+      -- resume assistant prose until Claude renders a fresh assistant bullet.
+    elseif not is_structured_output_chrome_line(clean_line) then
+      suppress_until_text_anchor = false
       local line = strip_answer_bullet(clean_line)
       if line ~= "" then
         table.insert(out, line)
@@ -980,9 +1058,18 @@ local function extract_structured_partial_turn_output(text, turn_start)
   local start_idx = structured_output_start_after_echo(lines, echo_idx, marker_idx, true)
   if not start_idx then return nil end
   local out = {}
+  local suppress_until_text_anchor = false
   for i = start_idx, marker_idx - 1 do
     local clean_line = strip_terminal_controls(lines[i])
-    if not is_structured_partial_chrome_line(clean_line) then
+    if is_structured_tool_call_line(clean_line)
+        or is_completed_tool_progress_chrome_line(clean_line)
+        or is_agent_progress_chrome_line(clean_line) then
+      suppress_until_text_anchor = true
+    elseif suppress_until_text_anchor and not is_assistant_text_anchor_line(clean_line) then
+      -- Tool result/output rows are free-form. Once a tool starts, do not
+      -- resume assistant prose until Claude renders a fresh assistant bullet.
+    elseif not is_structured_partial_chrome_line(clean_line) then
+      suppress_until_text_anchor = false
       local line = strip_answer_bullet(clean_line)
       if line ~= "" then
         table.insert(out, line)
@@ -2038,7 +2125,9 @@ function M.classify(input)
   local cursor = math.max(tonumber(input.cursor) or 0, utf8_char_len(transcript))
   local function state_snapshot(state, confidence, evidence, seq, metadata)
     local visible_tool_metadata = parse_visible_tool_calls(screen)
+    local progress_metadata = parse_turn_progress_metadata(screen_text)
     local merged = merge_metadata(status_metadata, visible_tool_metadata)
+    merged = merge_metadata(merged, progress_metadata)
     merged = merge_metadata(merged, metadata)
     local snap = outer_state_snapshot(state, confidence, evidence, seq, merged)
     if last_intent == "prompt_submitted" and not has_stable_ms then
