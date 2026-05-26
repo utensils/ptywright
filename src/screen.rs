@@ -135,13 +135,23 @@ struct Vt100TerminalEngine {
     size: TerminalSize,
 }
 
+/// Scrollback row count for the vt100 parser. vt100 0.16.2 doesn't
+/// expose scrollback contents via its public API — only the visible
+/// rows are readable through `screen.contents()`. A generous
+/// scrollback is still cheap insurance: it keeps the parser's state
+/// machine consistent if the visible buffer overflows during a burst
+/// (the alternative is data being dropped mid-parse), and lets a
+/// future vt100 upgrade plug scrollback into `body_text` without a
+/// separate change here.
+const SCROLLBACK_ROWS: usize = 10_000;
+
 impl Vt100TerminalEngine {
     fn new(size: TerminalSize) -> Self {
         Self {
             parser: vt100::Parser::new_with_callbacks(
                 size.rows,
                 size.cols,
-                1_000,
+                SCROLLBACK_ROWS,
                 TerminalCallbacks::default(),
             ),
             size,

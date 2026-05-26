@@ -30,8 +30,19 @@ impl TerminalSize {
 }
 
 impl Default for TerminalSize {
+    /// Default size is intentionally large (200 rows × 200 cols) because
+    /// ptywright's primary use case is driving long-lived TUI agents
+    /// (Claude Code, Codex, …) whose output frequently exceeds the
+    /// classic 24×80 viewport. A small viewport causes the agent's TUI
+    /// to wrap long lines (truncating file paths) and to scroll
+    /// intermediate state out of the visible buffer before the
+    /// classifier can read it — both of which manifest as missing tool
+    /// calls or garbled text in the consumer.
+    ///
+    /// Tests / callers that need a small viewport (e.g. to assert
+    /// wrap behaviour) should construct an explicit `TerminalSize`.
     fn default() -> Self {
-        Self::new(24, 80)
+        Self::new(200, 200)
     }
 }
 
